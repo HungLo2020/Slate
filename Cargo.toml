@@ -1,0 +1,28 @@
+[workspace]
+members = ["crates/slate-core", "crates/slate-cli", "crates/slate-gui"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+
+[package]
+name = "slate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["gui"]
+gui = ["dep:slate-gui"]
+gui-smoke = ["gui", "slate-gui/smoke"]
+
+[dependencies]
+slate-core = { path = "crates/slate-core" }
+slate-cli = { path = "crates/slate-cli" }
+slate-gui = { path = "crates/slate-gui", optional = true }
+anyhow = "1"
+
+[profile.release]
+lto = "thin"

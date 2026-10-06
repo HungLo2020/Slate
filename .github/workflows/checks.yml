@@ -1,0 +1,29 @@
+name: Prototype checks
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Qt development packages
+        run: sudo apt-get update && sudo apt-get install -y cmake pkg-config qt6-base-dev qt6-declarative-dev
+      - name: Install current stable Rust
+        run: rustup update stable && rustup default stable && rustup component add rustfmt clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --all-targets
+      - run: cargo build
+      - run: python3 scripts/tui-smoke.py target/debug/slate
+      - name: Verify optional TUI-only build
+        run: cargo check --no-default-features
+      # Ubuntu 24.04 lacks a Kirigami 6 runtime. GUI build is checked here;
+      # run scripts/gui-smoke.py on a machine with Kirigami 6 installed.
+  gui:
+    runs-on: ubuntu-24.04
+    container: fedora:latest
+    steps:
+      - name: Install compatible Qt and Kirigami runtime
+        run: dnf install -y git gcc-c++ cmake pkgconf-pkg-config rust cargo qt6-qtbase-devel qt6-qtdeclarative-devel kf6-kirigami dejavu-sans-mono-fonts python3
+      - uses: actions/checkout@v4
+      - run: cargo build --features gui-smoke
+      - run: python3 scripts/gui-offscreen-smoke.py target/debug/slate

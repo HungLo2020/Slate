@@ -1,0 +1,12 @@
+[package]
+name = "slate-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+slate-core = { path = "../slate-core" }
+anyhow = "1"
+ratatui = "0.30"
+crossterm = "0.29"
+
+base64 = "0.22"

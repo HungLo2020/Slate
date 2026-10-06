@@ -7,6 +7,12 @@ configurable workspace model.
 This document records the agreed direction before implementation. It describes
 intended behavior, not features already implemented.
 
+## Critical dependency rule
+
+Runtime dependencies, including Qt and Kirigami, must never require an exact
+version. Use compatible version ranges or minimum API requirements, versionless
+QML imports, and distro-provided runtime packages.
+
 ## One executable, two frontends
 
 - `slate` opens the terminal user interface (TUI).
