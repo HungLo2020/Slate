@@ -3,19 +3,35 @@
 
 Build with --features gui-smoke. Runs 12 window/font combinations per style/scale.
 The C++ driver checks controls for collisions and text/PTY viewport clipping.
+Also check KDE desktop button captions when that style is installed.
 """
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 
 root = pathlib.Path(__file__).resolve().parent
 binary = sys.argv[1] if len(sys.argv) > 1 else 'target/debug/slate'
-for style in ('Basic', 'Fusion'):
+styles = ['Basic', 'Fusion']
+qml_paths = [pathlib.Path(path) for path in os.environ.get('QML_IMPORT_PATH', '').split(os.pathsep) if path]
+qtpaths = shutil.which('qtpaths6') or shutil.which('qtpaths')
+if qtpaths:
+    result = subprocess.run([qtpaths, '--query', 'QT_INSTALL_QML'], capture_output=True, text=True)
+    if result.returncode == 0 and result.stdout.strip():
+        qml_paths.append(pathlib.Path(result.stdout.strip()))
+if any((path/'org/kde/desktop/qmldir').is_file() for path in qml_paths):
+    print('Caption regression check: KDE desktop style', flush=True)
+    subprocess.run([sys.executable, str(root/'gui-offscreen-smoke.py'), binary],
+                   env={**os.environ, 'SLATE_GUI_CAPTION_SMOKE': '1',
+                        'QT_QUICK_CONTROLS_STYLE': 'org.kde.desktop'}, check=True)
+else:
+    print('SKIP KDE desktop style: QML module not found')
+for style in styles:
     for scale in ('1', '1.5', '2'):
         print(f'Layout checks: style={style}, scale={scale}', flush=True)
         environment = {**os.environ, 'SLATE_GUI_LAYOUT_SMOKE': '1',
                        'QT_QUICK_CONTROLS_STYLE': style, 'QT_SCALE_FACTOR': scale}
         subprocess.run([sys.executable, str(root/'gui-offscreen-smoke.py'), binary],
                        env=environment, check=True)
-print('PASS 72 GUI window/font/style/scale combinations')
+print(f'PASS {len(styles) * 36} GUI window/font/style/scale combinations')

@@ -25,6 +25,28 @@ static QByteArray read(const QString &path) {
         return {};
     return file.readAll();
 }
+static QString checkCaptions(Bridge *state, QQuickWindow *window) {
+    for (const auto &entry : state->frame().value("panes").toList()) {
+        const auto pane = entry.toMap();
+        const auto id = pane.value("id").toString();
+        auto tabs = findItem(window->contentItem(), "tabs_" + id);
+        if (!tabs)
+            return "Missing pane tabs";
+        const auto entries = pane.value("tabs").toList();
+        for (int index = 0; index < entries.size(); ++index) {
+            auto tab = findItem(tabs, "tab_" + id + "_" + QString::number(index));
+            // ListView may not instantiate tabs outside the visible viewport.
+            if (!tab)
+                continue;
+            auto background = tab->property("background").value<QQuickItem *>();
+            auto content = tab->property("contentItem").value<QQuickItem *>();
+            if (background && content && !background->property("text").toString().isEmpty() &&
+                !content->property("text").toString().isEmpty())
+                return "Pane tab paints captions in both its background and content";
+        }
+    }
+    return {};
+}
 static QString checkLayout(Bridge *state, QQuickWindow *window) {
     auto actions = findItem(window->contentItem(), "mainActions");
     if (!actions)
@@ -39,7 +61,12 @@ static QString checkLayout(Bridge *state, QQuickWindow *window) {
             return "Toolbar control outside its layout: " + item->objectName();
         if (item->height() + 1 < item->implicitHeight() ||
             item->width() + 1 < item->implicitWidth())
-            return "Toolbar label clipped: " + item->objectName();
+            return QString("Toolbar label clipped: %1 (%2x%3, implicit %4x%5)")
+                .arg(item->objectName())
+                .arg(item->width())
+                .arg(item->height())
+                .arg(item->implicitWidth())
+                .arg(item->implicitHeight());
         for (const auto &other : controls)
             if (rect.intersects(other))
                 return "Toolbar controls overlap";
@@ -68,7 +95,7 @@ static QString checkLayout(Bridge *state, QQuickWindow *window) {
                 return "Editor/PTY rows extend behind the pane boundary";
         }
     }
-    return {};
+    return checkCaptions(state, window);
 }
 static void startLayoutSmoke(Bridge *state, QQuickWindow *window) {
     const QString dir = qEnvironmentVariable("SLATE_GUI_SMOKE_DIR");
@@ -110,6 +137,8 @@ static void startLayoutSmoke(Bridge *state, QQuickWindow *window) {
             window->resize(sizes[scenario % sizes.size()]);
         } else if (*phase % 4 == 1) {
             state->refresh();
+            // Rendering polishes layouts after font/size changes before we inspect geometry.
+            window->grabWindow().save(dir + QString("/layout-%1.png").arg(scenario));
             const auto error = checkLayout(state, window);
             if (!error.isEmpty()) {
                 finish(QString("%1 at %2x%3, font %4")
@@ -119,7 +148,6 @@ static void startLayoutSmoke(Bridge *state, QQuickWindow *window) {
                            .arg(fonts[scenario / sizes.size()]));
                 return;
             }
-            window->grabWindow().save(dir + QString("/layout-%1.png").arg(scenario));
             if (scenario == 2)
                 window->grabWindow().save(dir + "/gui.png");
             QTest::keyClick(window, Qt::Key_F1);
@@ -166,6 +194,15 @@ void startSmoke(Bridge *state, QQuickWindow *window) {
         timer->stop();
         QGuiApplication::exit(pass ? 0 : 2);
     };
+    if (!qEnvironmentVariableIsEmpty("SLATE_GUI_CAPTION_SMOKE")) {
+        QTimer::singleShot(500, state, [=]() {
+            state->refresh();
+            const auto error = checkCaptions(state, window);
+            finish(error.isEmpty(),
+                   error.isEmpty() ? "Pane tabs have a single caption renderer" : error);
+        });
+        return;
+    }
     auto key = [=](Qt::Key key, Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
         QTest::keyClick(window, key, modifiers);
     };

@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Controls.Basic as Basic
 import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
 import Slate.Native
@@ -354,7 +355,10 @@ Kirigami.ApplicationWindow {
                         ScrollBar.horizontal: ScrollBar {
                             policy: ScrollBar.AsNeeded
                         }
-                        delegate: Button {
+                        // KDE's native Button background also paints its caption.
+                        // Own both visuals so the elided label is drawn only once.
+                        delegate: Basic.Button {
+                            id: tabButton
                             required property var modelData
                             required property int index
                             objectName: "tab_" + panel.paneId + "_" + index
@@ -363,12 +367,23 @@ Kirigami.ApplicationWindow {
                             width: Math.max(0, Math.min(tabs.width, 240, implicitWidth))
                             highlighted: modelData.active
                             font.bold: modelData.active
-                            contentItem: Label {
-                                text: parent.text
-                                font: parent.font
+                            Kirigami.Theme.colorSet: Kirigami.Theme.Button
+                            Kirigami.Theme.inherit: false
+                            contentItem: Text {
+                                text: tabButton.text
+                                font: tabButton.font
+                                color: !tabButton.enabled ? Kirigami.Theme.disabledTextColor : tabButton.highlighted || tabButton.down ? Kirigami.Theme.highlightedTextColor : Kirigami.Theme.textColor
                                 horizontalAlignment: Text.AlignLeft
                                 verticalAlignment: Text.AlignVCenter
                                 elide: Text.ElideMiddle
+                            }
+                            background: Rectangle {
+                                implicitWidth: 80
+                                implicitHeight: 32
+                                radius: Kirigami.Units.smallSpacing
+                                color: tabButton.highlighted || tabButton.down ? Kirigami.Theme.highlightColor : tabButton.hovered ? Qt.tint(Kirigami.Theme.backgroundColor, Qt.alpha(Kirigami.Theme.hoverColor, 0.2)) : Kirigami.Theme.backgroundColor
+                                border.width: tabButton.visualFocus ? 2 : 1
+                                border.color: tabButton.visualFocus || tabButton.highlighted ? Kirigami.Theme.highlightColor : Kirigami.Theme.disabledTextColor
                             }
                             ToolTip.visible: hovered
                             ToolTip.text: modelData.title
@@ -427,13 +442,15 @@ Kirigami.ApplicationWindow {
                         event.accepted = true;
                     }
                     delegate: ItemDelegate {
+                        id: fileDelegate
                         required property var modelData
                         required property int index
                         height: root.fileRowHeight
                         width: browser.width
                         contentItem: Label {
-                            text: parent.text
-                            font: parent.font
+                            text: fileDelegate.text
+                            font: fileDelegate.font
+                            color: !fileDelegate.enabled ? Kirigami.Theme.disabledTextColor : fileDelegate.highlighted || fileDelegate.down ? Kirigami.Theme.highlightedTextColor : Kirigami.Theme.textColor
                             elide: Text.ElideMiddle
                             verticalAlignment: Text.AlignVCenter
                         }

@@ -23,6 +23,20 @@ cargo build --release
 ./target/release/slate src/main.rs        # open a file
 ```
 
+Development launchers build the release executable before starting it:
+
+```bash
+python3 DevUtils/RunGui.py                # GUI
+python3 DevUtils/RunTui.py                # TUI in a new terminal window
+python3 DevUtils/RunGui.py src/main.rs    # open a file; either launcher accepts a path
+```
+
+The launchers find the repository relative to their own location, default to
+opening it, and accept Slate flags such as `--fresh`. Explicit relative paths
+refer to the directory where the script was invoked. `RunTui.py` requires a
+graphical desktop and an installed terminal emulator; it prefers Konsole and
+never runs Slate in the terminal used to invoke the script.
+
 Install the one executable and its GUI alias:
 
 ```bash
@@ -247,7 +261,9 @@ compatible packages without exact runtime version constraints.
 
 Smoke tests drive actual GUI/TUI input, saves, editing prompts, shell execution,
 clipboard interactions, named layouts, installed entry points and forced-crash
-recovery. For a Qt-free installation, use
+recovery. GUI layout checks cover Basic and Fusion, plus a duplicate-caption
+regression check for KDE's desktop style when that QML style is installed.
+For a Qt-free installation, use
 `./scripts/install.sh "$HOME/.local" --tui-only`. The GUI installation also installs
 a desktop launcher and scalable icon; put the selected prefix's `bin` in PATH.
 
