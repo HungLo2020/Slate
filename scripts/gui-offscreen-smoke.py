@@ -6,7 +6,7 @@ with tempfile.TemporaryDirectory(prefix='slate-gui-offscreen-') as tmp:
     root=pathlib.Path(tmp);workspace=root/'workspace';workspace.mkdir()
     (workspace/'edit.txt').write_text('original\n');(workspace/'second.txt').write_text('second original')
     (root/'runtime').mkdir(mode=0o700)
-    env={**os.environ,'SLATE_GUI_SMOKE_DIR':tmp,'QT_QPA_PLATFORM':'offscreen','QT_QUICK_BACKEND':'software','SHELL':'/bin/sh','XDG_CONFIG_HOME':str(root/'config'),'XDG_RUNTIME_DIR':str(root/'runtime')}
+    env={**os.environ,'SLATE_GUI_SMOKE_DIR':tmp,'QT_QPA_PLATFORM':'offscreen','QT_QUICK_BACKEND':'software','SHELL':'/bin/sh','XDG_CONFIG_HOME':str(root/'config'),'XDG_STATE_HOME':str(root/'state'),'XDG_RUNTIME_DIR':str(root/'runtime')}
     result=subprocess.run([binary,'--gui',str(workspace)],env=env,capture_output=True,text=True,timeout=25)
     report=json.loads((root/'report.json').read_text()) if (root/'report.json').exists() else {}
     screenshot=os.environ.get('SLATE_SCREENSHOT')

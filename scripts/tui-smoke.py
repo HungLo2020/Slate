@@ -6,7 +6,7 @@ with tempfile.TemporaryDirectory(prefix='slate-tui-') as tmp:
     root=pathlib.Path(tmp); file=root/'edit.txt'; file.write_text('original\n')
     master,slave=pty.openpty()
     fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',40,160,0,0))
-    env={**os.environ,'TERM':'xterm-256color','SHELL':'/bin/sh','XDG_CONFIG_HOME':str(root/'config')}
+    env={**os.environ,'TERM':'xterm-256color','SHELL':'/bin/sh','XDG_CONFIG_HOME':str(root/'config'),'XDG_STATE_HOME':str(root/'state')}
     process=subprocess.Popen([binary,'--tui',str(file)],stdin=slave,stdout=slave,stderr=slave,env=env,start_new_session=True)
     os.close(slave);output=bytearray()
     def pump(seconds=.25):
@@ -25,13 +25,19 @@ with tempfile.TemporaryDirectory(prefix='slate-tui-') as tmp:
         assert b'files #1' in output and b'editor #2' in output and b'terminal #3' in output,'Default panes missing'
         send(b'\x01');send(b'TUI edited\rsecond line');send(b'\x13')
         assert file.read_text()=='TUI edited\nsecond line',file.read_text()
+        command('set indent-width 2')
+        send(b'\x06');send(b'second');send(b'\r');send(b'\x1b')
+        send(b'\x08');send(b'\t');send(b'REPLACED');send(b'\r');send(b'\x1b');send(b'\x13')
+        assert file.read_text()=='TUI edited\nREPLACED line',file.read_text()
+        send(b'\x07');send(b'2');send(b'\r');send(b'\t');send(b'\x13')
+        assert file.read_text()=='TUI edited\n  REPLACED line',file.read_text()
         command('split-down');command('terminal')
         send(b"printf 'PTY_OK' > terminal.txt\r");pump(.4)
         assert (root/'terminal.txt').read_text()=='PTY_OK'
         command('layout-save smoke');command('preset minimal');command('layout-load smoke')
         assert (root/'config/slate/layouts.toml').exists()
         command('quit');process.wait(timeout=5);assert process.returncode==0
-        print('PASS TUI: three panes, edit/save, split, terminal command, layout persistence, clean exit')
+        print('PASS TUI: three panes, edit/save, find/replace, go-to-line, indentation settings, split, terminal command, layout persistence, clean exit')
     finally:
         if process.poll() is None: process.terminate();process.wait(timeout=5)
         os.close(master)

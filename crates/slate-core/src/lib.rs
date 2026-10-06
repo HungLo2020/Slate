@@ -1,13 +1,21 @@
 pub mod document;
+mod editing;
+mod highlight;
 pub mod layout;
+pub mod preferences;
+pub mod search;
 mod services;
 pub mod terminal;
+pub mod workspace;
 
 use anyhow::{bail, Context, Result};
-use document::{at_line_col, line_col, line_end, line_start, next, previous, Document};
+use document::{at_line_col, line_end, line_start, next, previous, Document};
 use layout::{Axis, Handle, Node, Rect, View};
+use preferences::Preferences;
+use search::{Prompt, Search};
 use serde::{Deserialize, Serialize};
-use services::{Entry, GitEntry, Job, Reply, Services};
+use services::{Entry, GitEntry, IoJob, Job, Reply, Services};
+use std::time::{Duration, Instant};
 use std::{
     collections::BTreeMap,
     fs,
@@ -16,8 +24,9 @@ use std::{
 use terminal::{Cell, Screen, TerminalSession};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+use workspace::WorkspaceStore;
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct EditorView {
     pub document: u64,
     pub cursor: usize,
@@ -43,6 +52,79 @@ pub struct Key {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Command {
+    SetClipboard {
+        text: String,
+    },
+    Search {
+        query: String,
+        #[serde(default)]
+        case_sensitive: bool,
+        #[serde(default)]
+        whole_word: bool,
+        #[serde(default)]
+        backward: bool,
+    },
+    Replace {
+        query: String,
+        replacement: String,
+        #[serde(default)]
+        all: bool,
+        #[serde(default)]
+        case_sensitive: bool,
+        #[serde(default)]
+        whole_word: bool,
+    },
+    GoToLine {
+        line: usize,
+    },
+    Indent {
+        #[serde(default)]
+        outdent: bool,
+    },
+    Prompt {
+        kind: String,
+    },
+    UpdatePrompt {
+        input: String,
+        #[serde(default)]
+        replacement: String,
+        #[serde(default)]
+        case_sensitive: bool,
+        #[serde(default)]
+        whole_word: bool,
+    },
+    SubmitPrompt {
+        #[serde(default)]
+        all: bool,
+    },
+    DismissPrompt,
+    Theme {
+        foreground: String,
+        background: String,
+        selection: String,
+        accent: String,
+        #[serde(default)]
+        selection_foreground: String,
+    },
+    ReloadSettings,
+    Configure {
+        name: String,
+        value: String,
+    },
+    Pointer {
+        pane: u64,
+        row: usize,
+        col: usize,
+        kind: String,
+        #[serde(default)]
+        button: u8,
+        #[serde(default)]
+        shift: bool,
+        #[serde(default)]
+        ctrl: bool,
+        #[serde(default)]
+        alt: bool,
+    },
     Key {
         #[serde(flatten)]
         key: Key,
@@ -163,6 +245,12 @@ pub struct Snapshot {
     pub quit: bool,
     pub clipboard: String,
     pub layouts: Vec<String>,
+    pub prompt: Option<Prompt>,
+    pub location: String,
+    pub hints: String,
+    pub background: String,
+    pub foreground: String,
+    pub accent: String,
 }
 #[derive(Serialize, Deserialize)]
 struct Settings {
@@ -187,6 +275,18 @@ pub struct App {
     services: Services,
     ids: u64,
     presets: BTreeMap<String, Node>,
+    pub preferences: Preferences,
+    pub prompt: Option<Prompt>,
+    search: Search,
+    tokens: BTreeMap<u64, (u64, bool, Vec<highlight::Token>)>,
+    highlight_pending: BTreeMap<u64, (u64, bool)>,
+    pending_open: BTreeMap<u64, u64>,
+    pending_save: Vec<u64>,
+    store: Option<WorkspaceStore>,
+    workspace_dirty: bool,
+    checkpoint_at: Instant,
+    colors: (String, String, String, String),
+    selection_foreground: String,
 }
 impl App {
     pub fn new(path: &Path) -> Result<Self> {
@@ -238,8 +338,26 @@ impl App {
             services: Services::new(),
             ids: 20,
             presets: BTreeMap::new(),
+            preferences: Preferences::default(),
+            prompt: None,
+            search: Search::default(),
+            tokens: BTreeMap::new(),
+            highlight_pending: BTreeMap::new(),
+            pending_open: BTreeMap::new(),
+            pending_save: vec![],
+            store: None,
+            workspace_dirty: false,
+            checkpoint_at: Instant::now(),
+            selection_foreground: "#ffffff".into(),
+            colors: (
+                "#d8dee9".into(),
+                "#20242c".into(),
+                "#425b78".into(),
+                "#88c0d0".into(),
+            ),
         };
         app.read_settings();
+        app.load_preferences();
         app.refresh();
         Ok(app)
     }
@@ -293,13 +411,191 @@ impl App {
         }
     }
     pub fn dispatch(&mut self, cmd: Command) {
+        if !matches!(cmd, Command::Theme { .. }) {
+            self.workspace_dirty = true;
+        }
         if let Err(e) = self.execute(cmd) {
             self.status = format!("Error: {e:#}");
         }
     }
     fn execute(&mut self, cmd: Command) -> Result<()> {
         match cmd {
+            Command::SetClipboard { text } => self.clipboard = text,
+            Command::Search {
+                query,
+                case_sensitive,
+                whole_word,
+                backward,
+            } => {
+                self.search = Search {
+                    query,
+                    case_sensitive,
+                    whole_word,
+                };
+                self.find(backward)?;
+            }
+            Command::Replace {
+                query,
+                replacement,
+                all,
+                case_sensitive,
+                whole_word,
+            } => {
+                self.search = Search {
+                    query,
+                    case_sensitive,
+                    whole_word,
+                };
+                self.replace_matches(&replacement, all)?;
+            }
+            Command::GoToLine { line } => {
+                let id = self.active_editor().context("Focus an editor first")?;
+                let text = &self.documents[&self.views[&id].document].text;
+                let count = text.bytes().filter(|b| *b == b'\n').count() + 1;
+                if line == 0 || line > count {
+                    bail!("Line must be between 1 and {count}");
+                }
+                let v = self.views.get_mut(&id).unwrap();
+                v.cursor = at_line_col(text, line - 1, 0);
+                v.anchor = None;
+                v.manual_scroll = false;
+            }
+            Command::Indent { outdent } => self.indent(outdent)?,
+            Command::Prompt { kind } => {
+                if !["find", "replace", "goto"].contains(&kind.as_str()) {
+                    bail!("Unknown prompt");
+                }
+                let id = self.active_editor().context("Focus an editor first")?;
+                let v = &self.views[&id];
+                let input = if kind == "goto" {
+                    String::new()
+                } else {
+                    v.anchor
+                        .map(|a| {
+                            self.documents[&v.document].text[a.min(v.cursor)..a.max(v.cursor)]
+                                .to_string()
+                        })
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| self.search.query.clone())
+                };
+                self.prompt = Some(Prompt {
+                    kind,
+                    input,
+                    replacement: String::new(),
+                    field: 0,
+                    case_sensitive: self.search.case_sensitive,
+                    whole_word: self.search.whole_word,
+                });
+            }
+            Command::UpdatePrompt {
+                input,
+                replacement,
+                case_sensitive,
+                whole_word,
+            } => {
+                if let Some(p) = &mut self.prompt {
+                    p.input = input;
+                    p.replacement = replacement;
+                    p.case_sensitive = case_sensitive;
+                    p.whole_word = whole_word;
+                }
+            }
+            Command::SubmitPrompt { all } => {
+                let p = self.prompt.clone().context("No active prompt")?;
+                match p.kind.as_str() {
+                    "goto" => {
+                        self.execute(Command::GoToLine {
+                            line: p.input.parse().context("Enter a line number")?,
+                        })?;
+                        self.prompt = None;
+                    }
+                    "replace" => self.execute(Command::Replace {
+                        query: p.input,
+                        replacement: p.replacement,
+                        all,
+                        case_sensitive: p.case_sensitive,
+                        whole_word: p.whole_word,
+                    })?,
+                    _ => self.execute(Command::Search {
+                        query: p.input,
+                        case_sensitive: p.case_sensitive,
+                        whole_word: p.whole_word,
+                        backward: false,
+                    })?,
+                }
+            }
+            Command::DismissPrompt => self.prompt = None,
+            Command::Theme {
+                foreground,
+                background,
+                selection,
+                accent,
+                selection_foreground,
+            } => {
+                let valid = |s: &str| {
+                    s.len() == 7
+                        && s.starts_with('#')
+                        && s[1..].bytes().all(|b| b.is_ascii_hexdigit())
+                };
+                if ![&foreground, &background, &selection, &accent]
+                    .iter()
+                    .all(|s| valid(s))
+                {
+                    bail!("Invalid theme color");
+                }
+                if self.preferences.theme == "auto" {
+                    self.colors = (foreground, background, selection, accent);
+                    if valid(&selection_foreground) {
+                        self.selection_foreground = selection_foreground;
+                    }
+                }
+            }
+            Command::ReloadSettings => self.load_preferences(),
+            Command::Configure { name, value } => self.configure(&name, &value)?,
+            Command::Pointer {
+                pane,
+                row,
+                col,
+                kind,
+                button,
+                shift,
+                ctrl,
+                alt,
+            } => {
+                if kind == "press" {
+                    self.focus = pane;
+                }
+                if let Some(View::Terminal(id)) = self.layout.view(pane).cloned() {
+                    self.terminals
+                        .get_mut(&id)
+                        .unwrap()
+                        .pointer(terminal::Pointer {
+                            row,
+                            col,
+                            kind: &kind,
+                            button,
+                            shift,
+                            ctrl,
+                            alt,
+                        })?;
+                } else if kind == "press" || kind == "drag" {
+                    self.execute(Command::Click {
+                        pane,
+                        row,
+                        col,
+                        shift: shift || kind == "drag",
+                    })?;
+                }
+            }
             Command::Key { key } => self.key(key)?,
+            Command::Paste { text } if self.prompt.is_some() => {
+                let p = self.prompt.as_mut().unwrap();
+                if p.field == 0 {
+                    p.input.push_str(&text);
+                } else {
+                    p.replacement.push_str(&text);
+                }
+            }
             Command::Paste { text } => match self.focused() {
                 Some(View::Terminal(id)) => self
                     .terminals
@@ -321,7 +617,13 @@ impl App {
                         let v = self.views.get_mut(&id).unwrap();
                         let text = &self.documents[&v.document].text;
                         v.manual_scroll = false;
-                        let cursor = at_line_col(text, v.top + row, v.left + col.saturating_sub(6));
+                        let gutter = if self.preferences.line_numbers { 6 } else { 0 };
+                        let cursor = document::at_line_col_with_tabs(
+                            text,
+                            v.top + row,
+                            v.left + col.saturating_sub(gutter),
+                            self.preferences.indent_width,
+                        );
                         if shift {
                             v.anchor.get_or_insert(v.cursor);
                         } else {
@@ -334,6 +636,9 @@ impl App {
                     }
                     Some(View::Git) => {
                         self.git_selected = row.min(self.git.len().saturating_sub(1))
+                    }
+                    Some(View::Terminal(id)) => {
+                        self.terminals.get_mut(&id).unwrap().select(row, col, shift)
                     }
                     _ => {}
                 }
@@ -353,43 +658,10 @@ impl App {
                 } else {
                     self.root.join(path)
                 };
-                if path.is_dir() {
-                    self.browse(path)?;
-                } else {
-                    let path = path.canonicalize()?;
-                    let doc = if let Some((id, _)) = self
-                        .documents
-                        .iter()
-                        .find(|(_, d)| d.path.as_ref() == Some(&path))
-                    {
-                        *id
-                    } else {
-                        let id = self.id();
-                        self.documents.insert(id, Document::open(&path)?);
-                        id
-                    };
-                    let pane = if self.active_editor().is_some() {
-                        self.focus
-                    } else {
-                        let _ = self.editor_target();
-                        self.focus
-                    };
-                    let existing=self.layout.pane_mut(pane).and_then(|(tabs,_)|tabs.iter().position(|v|matches!(v,View::Editor(id) if self.views.get(id).map(|v|v.document)==Some(doc))));
-                    if let Some(index) = existing {
-                        *self.layout.pane_mut(pane).unwrap().1 = index;
-                    } else {
-                        let id = self.id();
-                        self.views.insert(
-                            id,
-                            EditorView {
-                                document: doc,
-                                ..Default::default()
-                            },
-                        );
-                        self.add_tab(View::Editor(id));
-                    }
-                    self.status = format!("Opened {}", path.display());
-                }
+                let token = self.id();
+                self.pending_open.insert(token, self.focus);
+                self.services.io.send(IoJob::Open(token, path))?;
+                self.status = "Opening file…".into();
             }
             Command::Browse { path } => self.browse(path)?,
             Command::New => {
@@ -418,16 +690,23 @@ impl App {
                 };
                 let id = self.active_editor().context("Focus an editor to save")?;
                 let doc = self.views[&id].document;
-                self.documents
-                    .get_mut(&doc)
-                    .unwrap()
-                    .save(destination.as_deref())?;
-                self.status = "Saved".into();
-                self.refresh();
+                if self.pending_save.contains(&doc) {
+                    bail!("A save is already in progress for this document");
+                }
+                self.pending_save.push(doc);
+                self.services.io.send(IoJob::Save(
+                    doc,
+                    self.documents[&doc].checkpoint(),
+                    destination,
+                ))?;
+                self.status = "Saving…".into();
             }
             Command::CloseDocument { force } => {
                 let id = self.active_editor().context("Focus an editor first")?;
                 let doc = self.views[&id].document;
+                if self.pending_save.contains(&doc) {
+                    bail!("Wait for the pending save before closing this document");
+                }
                 if self.documents[&doc].dirty() && !force {
                     bail!("Unsaved document. Save it or explicitly discard it from the command palette");
                 }
@@ -449,18 +728,27 @@ impl App {
                     );
                 }
                 self.documents.remove(&doc);
+                self.tokens.remove(&doc);
+                self.highlight_pending.remove(&doc);
             }
             Command::Undo | Command::Redo => {
                 let id = self.active_editor().context("Focus an editor first")?;
                 let view = self.views[&id].clone();
                 let d = self.documents.get_mut(&view.document).unwrap();
+                let change = if matches!(cmd, Command::Undo) {
+                    d.undo_change()
+                } else {
+                    d.redo_change()
+                };
                 let cursor = if matches!(cmd, Command::Undo) {
                     d.undo(view.cursor)
                 } else {
                     d.redo(view.cursor)
                 };
                 if let Some(cursor) = cursor {
-                    self.clamp_views(view.document);
+                    if let Some((start, old, new)) = change {
+                        self.rebase_views(view.document, start, start + old, new);
+                    }
                     let v = self.views.get_mut(&id).unwrap();
                     v.cursor = cursor;
                     v.anchor = None;
@@ -474,6 +762,9 @@ impl App {
                 }
             }
             Command::Copy | Command::Cut => {
+                if let Some(View::Terminal(id)) = self.focused() {
+                    self.clipboard = self.terminals[&id].selection_text();
+                }
                 if let Some(id) = self.active_editor() {
                     let v = &self.views[&id];
                     if let Some(anchor) = v.anchor {
@@ -602,6 +893,20 @@ impl App {
                 if self.dirty() && !force {
                     bail!("Unsaved documents. Save them or explicitly discard and quit");
                 }
+                if !self.pending_save.is_empty() {
+                    bail!("Wait for pending file saves before quitting");
+                }
+                if force {
+                    for d in self.documents.values_mut() {
+                        d.discard_changes();
+                    }
+                    let docs = self.documents.keys().copied().collect::<Vec<_>>();
+                    for doc in docs {
+                        self.clamp_views(doc);
+                    }
+                }
+                self.pending_open.clear();
+                self.prompt = None;
                 self.quit = true;
             }
         }
@@ -651,6 +956,54 @@ impl App {
     pub fn poll(&mut self) {
         while let Ok(reply) = self.services.rx.try_recv() {
             match reply {
+                Reply::OpenedDirectory(token, path) => {
+                    if let Some(pane) = self.pending_open.remove(&token) {
+                        if self.layout.view(pane).is_some() {
+                            self.focus = pane;
+                        }
+                        if let Err(e) = self.browse(path) {
+                            self.status = format!("Browse failed: {e:#}");
+                        }
+                    }
+                }
+                Reply::Opened(token, result) => {
+                    if let Some(pane) = self.pending_open.remove(&token) {
+                        match result {
+                            Ok(d) => self.finish_open(pane, d),
+                            Err(e) => self.status = format!("Open failed: {e}"),
+                        }
+                    }
+                }
+                Reply::Saved(id, result) => {
+                    self.pending_save.retain(|d| *d != id);
+                    match result {
+                        Ok(d) => {
+                            if let Some(doc) = self.documents.get_mut(&id) {
+                                doc.accept_save(d);
+                                self.status = if doc.dirty() {
+                                    "Saved snapshot; newer edits remain unsaved"
+                                } else {
+                                    "Saved"
+                                }
+                                .into();
+                                self.workspace_dirty = true;
+                                self.refresh();
+                            }
+                        }
+                        Err(e) => self.status = format!("Save failed: {e}"),
+                    }
+                }
+                Reply::Highlighted(id, generation, light, tokens) => {
+                    self.highlight_pending.remove(&id);
+                    if self
+                        .documents
+                        .get(&id)
+                        .is_some_and(|d| d.generation == generation)
+                        && light == self.light_theme()
+                    {
+                        self.tokens.insert(id, (generation, light, tokens));
+                    }
+                }
                 Reply::Files(path, Ok(entries)) if path == self.browser => {
                     self.files = entries;
                     self.selected = self.selected.min(self.files.len().saturating_sub(1));
@@ -662,6 +1015,7 @@ impl App {
                 }
                 Reply::Git(Err(e)) | Reply::Error(e) => self.status = e,
                 Reply::Message(message) => self.status = message,
+                Reply::Output(_) if self.quit => {}
                 Reply::Output(text) => {
                     let doc = self.id();
                     let mut d = Document::scratch();
@@ -855,7 +1209,14 @@ impl App {
             while !text.is_char_boundary(v.cursor) {
                 v.cursor -= 1;
             }
-            v.anchor = None;
+            v.anchor = v.anchor.map(|a| {
+                let mut a = a.min(text.len());
+                while !text.is_char_boundary(a) {
+                    a -= 1;
+                }
+                a
+            });
+            v.top = v.top.min(text.bytes().filter(|b| *b == b'\n').count());
         }
     }
     fn edit(&mut self, id: u64, value: &str) -> Result<()> {
@@ -863,40 +1224,90 @@ impl App {
         let anchor = v.anchor.unwrap_or(v.cursor);
         let start = v.cursor.min(anchor);
         let end = v.cursor.max(anchor);
-        self.documents
-            .get_mut(&v.document)
-            .unwrap()
-            .replace(start, end, value, v.cursor)?;
-        for other in self.views.values_mut().filter(|o| o.document == v.document) {
-            other.cursor = if other.cursor <= start {
-                other.cursor
-            } else if other.cursor >= end {
-                other.cursor - end + start + value.len()
+        self.edit_range(id, start, end, value, v.cursor)
+    }
+    fn rebase_views(&mut self, doc: u64, start: usize, end: usize, length: usize) {
+        let position = |p: usize| {
+            if p <= start {
+                p
+            } else if p >= end {
+                p - end + start + length
             } else {
-                start + value.len()
-            };
-            other.anchor = None;
+                start + length
+            }
+        };
+        for other in self.views.values_mut().filter(|o| o.document == doc) {
+            other.cursor = position(other.cursor);
+            other.anchor = other.anchor.map(position);
         }
-        self.views.get_mut(&id).unwrap().cursor = start + value.len();
-        self.views.get_mut(&id).unwrap().manual_scroll = false;
+    }
+    fn edit_range(
+        &mut self,
+        id: u64,
+        start: usize,
+        end: usize,
+        value: &str,
+        before: usize,
+    ) -> Result<()> {
+        let doc = self.views[&id].document;
+        self.documents
+            .get_mut(&doc)
+            .unwrap()
+            .replace(start, end, value, before)?;
+        self.rebase_views(doc, start, end, value.len());
+        let view = self.views.get_mut(&id).unwrap();
+        view.cursor = start + value.len();
+        view.anchor = None;
+        view.manual_scroll = false;
         Ok(())
     }
     fn key(&mut self, k: Key) -> Result<()> {
-        match k.key.as_str() {
-            "F6" => return self.execute(Command::FocusNext),
-            "F7" => return self.execute(Command::NextTab),
-            "F8" => return self.execute(Command::NewTerminal),
-            "F9" => {
-                return self.execute(Command::Split {
-                    axis: if k.shift {
-                        Axis::Vertical
+        if let Some(p) = &mut self.prompt {
+            match k.key.as_str() {
+                _ if k.alt && k.key.eq_ignore_ascii_case("c") => {
+                    p.case_sensitive = !p.case_sensitive
+                }
+                _ if k.alt && k.key.eq_ignore_ascii_case("w") => p.whole_word = !p.whole_word,
+                "Escape" => self.prompt = None,
+                "Enter" => self.execute(Command::SubmitPrompt { all: k.ctrl })?,
+                "Tab" if p.kind == "replace" => p.field = 1 - p.field,
+                "Backspace" => {
+                    let value = if p.field == 0 {
+                        &mut p.input
                     } else {
-                        Axis::Horizontal
-                    },
-                    kind: None,
-                })
+                        &mut p.replacement
+                    };
+                    let at = previous(value, value.len());
+                    value.truncate(at);
+                }
+                _ if !k.ctrl && !k.alt => {
+                    if p.field == 0 {
+                        p.input.push_str(&k.text);
+                    } else {
+                        p.replacement.push_str(&k.text);
+                    }
+                }
+                _ => {}
             }
-            _ => {}
+            return Ok(());
+        }
+        let chord = key_chord(&k);
+        let binding = self
+            .preferences
+            .global_keys
+            .get(&chord)
+            .or_else(|| match self.focused_kind() {
+                "editor" => self.preferences.editor_keys.get(&chord),
+                "terminal" => self.preferences.terminal_keys.get(&chord),
+                _ => None,
+            })
+            .cloned();
+        if let Some(command) = binding {
+            self.command_line(&command);
+            return Ok(());
+        }
+        if k.key == "F6" {
+            return self.execute(Command::FocusNext);
         }
         match self.focused() {
             Some(View::Terminal(id)) => {
@@ -940,33 +1351,25 @@ impl App {
                 }
             }
             Some(View::Editor(id)) => {
-                let lower = k.key.to_lowercase();
-                if k.ctrl {
-                    match lower.as_str() {
-                        "s" => return self.execute(Command::Save),
-                        "z" => {
-                            return self.execute(if k.shift {
-                                Command::Redo
-                            } else {
-                                Command::Undo
-                            })
-                        }
-                        "y" => return self.execute(Command::Redo),
-                        "a" => return self.execute(Command::SelectAll),
-                        "c" => return self.execute(Command::Copy),
-                        "x" => return self.execute(Command::Cut),
-                        "v" => return self.edit(id, &self.clipboard.clone()),
-                        _ => {}
-                    }
-                }
                 let v = self.views[&id].clone();
                 let text = &self.documents[&v.document].text;
-                let (row, col) = line_col(text, v.cursor);
+                let (row, col) =
+                    document::line_col_with_tabs(text, v.cursor, self.preferences.indent_width);
                 let movement = match k.key.as_str() {
                     "Left" => Some(previous(text, v.cursor)),
                     "Right" => Some(next(text, v.cursor)),
-                    "Up" => Some(at_line_col(text, row.saturating_sub(1), col)),
-                    "Down" => Some(at_line_col(text, row + 1, col)),
+                    "Up" => Some(document::at_line_col_with_tabs(
+                        text,
+                        row.saturating_sub(1),
+                        col,
+                        self.preferences.indent_width,
+                    )),
+                    "Down" => Some(document::at_line_col_with_tabs(
+                        text,
+                        row + 1,
+                        col,
+                        self.preferences.indent_width,
+                    )),
                     "Home" => Some(if k.ctrl {
                         0
                     } else {
@@ -1015,10 +1418,40 @@ impl App {
                         }
                     }
                     "Enter" => {
-                        let value = if text.contains("\r\n") { "\r\n" } else { "\n" };
-                        self.edit(id, value)?;
+                        let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+                        let leading = text[line_start(text, v.cursor)..v.cursor]
+                            .chars()
+                            .take_while(|c| *c == ' ' || *c == '\t')
+                            .collect::<String>();
+                        let value = format!(
+                            "{newline}{}",
+                            if self.preferences.auto_indent {
+                                leading.as_str()
+                            } else {
+                                ""
+                            }
+                        );
+                        self.edit(id, &value)?;
                     }
-                    "Tab" => self.edit(id, "\t")?,
+                    "Tab" => {
+                        if k.shift
+                            || v.anchor.is_some_and(|a| {
+                                text[a.min(v.cursor)..a.max(v.cursor)].contains('\n')
+                            })
+                        {
+                            self.indent(k.shift)?;
+                        } else {
+                            let value = if self.preferences.insert_spaces {
+                                " ".repeat(
+                                    self.preferences.indent_width
+                                        - col % self.preferences.indent_width,
+                                )
+                            } else {
+                                "\t".into()
+                            };
+                            self.edit(id, &value)?;
+                        }
+                    }
                     "Escape" => self.views.get_mut(&id).unwrap().anchor = None,
                     _ if !k.ctrl && !k.alt && !k.text.is_empty() => self.edit(id, &k.text)?,
                     _ => {}
@@ -1038,6 +1471,10 @@ impl App {
         header: u16,
     ) -> Snapshot {
         self.poll();
+        self.schedule_highlight();
+        if self.workspace_dirty && self.checkpoint_at.elapsed() >= Duration::from_secs(1) {
+            self.checkpoint();
+        }
         let cw = cell_width.max(1);
         let ch = cell_height.max(1);
         let area = Rect {
@@ -1136,6 +1573,12 @@ impl App {
             quit: self.quit,
             clipboard: self.clipboard.clone(),
             layouts: self.presets.keys().cloned().collect(),
+            prompt: self.prompt.clone(),
+            location: self.location(),
+            hints: self.hints(),
+            foreground: self.colors.0.clone(),
+            background: self.colors.1.clone(),
+            accent: self.colors.3.clone(),
         }
     }
     fn editor_screen(&mut self, id: u64, rows: u16, cols: u16) -> Screen {
@@ -1143,8 +1586,13 @@ impl App {
         v.rows = rows;
         v.cols = cols;
         let text = &self.documents[&v.document].text;
-        let (row, col) = line_col(text, v.cursor);
-        let gutter = 6usize.min(cols as usize);
+        let (row, col) =
+            document::line_col_with_tabs(text, v.cursor, self.preferences.indent_width);
+        let gutter = if self.preferences.line_numbers {
+            6usize.min(cols as usize)
+        } else {
+            0
+        };
         if !v.manual_scroll {
             if row < v.top {
                 v.top = row;
@@ -1159,22 +1607,42 @@ impl App {
             v.left = col + 1 - usable;
         }
         let selection = v.anchor.map(|a| (a.min(v.cursor), a.max(v.cursor)));
-        let mut cells = vec![vec![Cell::text(" "); cols as usize]; rows as usize];
+        let mut blank = Cell::text(" ");
+        blank.fg = self.colors.0.clone();
+        blank.bg = self.colors.1.clone();
+        let mut cells = vec![vec![blank; cols as usize]; rows as usize];
+        let token_data = self
+            .tokens
+            .get(&v.document)
+            .filter(|(generation, _, _)| *generation == self.documents[&v.document].generation);
+        let tokens = token_data.map(|(_, _, t)| t.as_slice()).unwrap_or(&[]);
+        let mut token_index = tokens.partition_point(|t| t.end <= at_line_col(text, v.top, 0));
+        let matches = self.search.regex().ok();
         let start = at_line_col(text, v.top, 0);
         let mut byte = start;
         for (y, line) in text[start..].split('\n').take(rows as usize).enumerate() {
             let number = format!("{:>4}  ", v.top + y + 1);
             for (x, c) in number.chars().take(gutter).enumerate() {
                 cells[y][x] = Cell::text(c.to_string());
-                cells[y][x].fg = "#68778d".into();
+                cells[y][x].fg = self.colors.0.clone();
+                cells[y][x].bg = self.colors.1.clone();
             }
+            let ranges = matches
+                .as_ref()
+                .map(|r| {
+                    r.find_iter(line)
+                        .map(|m| (m.start(), m.end()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let mut match_index = 0;
             let mut x = 0;
             for (i, g) in line.grapheme_indices(true) {
                 if g == "\r" {
                     continue;
                 }
                 let width = if g == "\t" {
-                    4 - x % 4
+                    self.preferences.indent_width - x % self.preferences.indent_width
                 } else {
                     UnicodeWidthStr::width(g).max(1)
                 };
@@ -1188,13 +1656,36 @@ impl App {
                                 .map(|c| if c.is_control() { '�' } else { c })
                                 .collect()
                         });
+                        c.fg = self.colors.0.clone();
+                        c.bg = self.colors.1.clone();
+                        while token_index < tokens.len() && tokens[token_index].end <= byte + i {
+                            token_index += 1;
+                        }
+                        if let Some(token) = tokens.get(token_index).filter(|t| t.start <= byte + i)
+                        {
+                            c.fg = token.fg.clone();
+                            c.bold = token.bold;
+                            c.italic = token.italic;
+                        }
+                        while match_index < ranges.len() && ranges[match_index].1 <= i {
+                            match_index += 1;
+                        }
+                        if ranges
+                            .get(match_index)
+                            .is_some_and(|(a, b)| i >= *a && i < *b)
+                        {
+                            c.bg = self.colors.2.clone();
+                            c.fg = self.selection_foreground.clone();
+                            c.underline = true;
+                        }
                         c.wide = width == 2 && g != "\t" && offset == 0;
                         c.continuation = width == 2 && g != "\t" && offset == 1;
                         if selection
                             .map(|(a, b)| byte + i >= a && byte + i < b)
                             .unwrap_or(false)
                         {
-                            c.bg = "#425b78".into();
+                            c.bg = self.colors.2.clone();
+                            c.fg = self.selection_foreground.clone();
                         }
                         cells[y][column - v.left + gutter] = c;
                     }
@@ -1297,13 +1788,49 @@ pub fn terminal_key(k: &Key, application_cursor: bool) -> Vec<u8> {
     bytes
 }
 
-pub const COMMAND_HELP:&str="open PATH | save | save-as PATH | new | close | discard-document | quit | discard-quit | undo | redo | copy | cut | paste | select-all | split-right | split-down | split-terminal-right | split-terminal-down | terminal | terminate-terminal | files | git | editor | close-pane | move-pane ID | next-pane | next-tab | resize ID RATIO | preset development|minimal|bottom_terminal | layout-save NAME | layout-load NAME | refresh | stage | unstage | diff | commit MESSAGE";
+pub const COMMAND_HELP:&str="find TEXT | find-next | find-previous | replace TEXT => VALUE | replace-all TEXT => VALUE | goto LINE | indent | outdent | set OPTION VALUE | settings-reload | open PATH | save | save-as PATH | new | close | discard-document | quit | discard-quit | undo | redo | copy | cut | paste | select-all | split-right | split-down | split-terminal-right | split-terminal-down | terminal | terminate-terminal | files | git | editor | close-pane | move-pane ID | next-pane | next-tab | resize ID RATIO | preset development|minimal|bottom_terminal | layout-save NAME | layout-load NAME | refresh | stage | unstage | diff | commit MESSAGE";
 impl App {
     pub fn command_line(&mut self, line: &str) {
         let (verb, args) = line.trim().split_once(' ').unwrap_or((line.trim(), ""));
         let args = args.trim();
         let selected = || self.selected_path().unwrap_or_default();
         let cmd = match verb {
+            "prompt-find" | "prompt-replace" | "prompt-goto" => Some(Command::Prompt {
+                kind: verb.trim_start_matches("prompt-").into(),
+            }),
+            "find" => Some(Command::Search {
+                query: args.into(),
+                case_sensitive: false,
+                whole_word: false,
+                backward: false,
+            }),
+            "find-next" | "find-previous" => Some(Command::Search {
+                query: self.search.query.clone(),
+                case_sensitive: self.search.case_sensitive,
+                whole_word: self.search.whole_word,
+                backward: verb == "find-previous",
+            }),
+            "replace" | "replace-all" => {
+                args.split_once(" => ")
+                    .map(|(query, replacement)| Command::Replace {
+                        query: query.into(),
+                        replacement: replacement.into(),
+                        all: verb == "replace-all",
+                        case_sensitive: false,
+                        whole_word: false,
+                    })
+            }
+            "goto" => args.parse().ok().map(|line| Command::GoToLine { line }),
+            "indent" | "outdent" => Some(Command::Indent {
+                outdent: verb == "outdent",
+            }),
+            "settings-reload" => Some(Command::ReloadSettings),
+            "set" => args
+                .split_once(' ')
+                .map(|(name, value)| Command::Configure {
+                    name: name.into(),
+                    value: value.into(),
+                }),
             "open" => Some(Command::Open { path: args.into() }),
             "save" => Some(Command::Save),
             "save-as" => Some(Command::SaveAs { path: args.into() }),
@@ -1368,5 +1895,93 @@ impl App {
         } else {
             self.status = format!("Unknown/incomplete command. {COMMAND_HELP}");
         }
+    }
+}
+
+pub fn key_chord(k: &Key) -> String {
+    format!(
+        "{}{}{}{}",
+        if k.ctrl { "Ctrl+" } else { "" },
+        if k.alt { "Alt+" } else { "" },
+        if k.shift { "Shift+" } else { "" },
+        k.key.to_lowercase()
+    )
+}
+impl App {
+    fn finish_open(&mut self, pane: u64, d: Document) {
+        let path = d.path.clone();
+        let doc = if let Some((id, _)) = self.documents.iter().find(|(_, old)| old.path == path) {
+            *id
+        } else {
+            let id = self.id();
+            self.documents.insert(id, d);
+            id
+        };
+        if matches!(self.layout.view(pane), Some(View::Editor(_))) {
+            self.focus = pane;
+        } else {
+            self.editor_target();
+        }
+        let existing=self.layout.pane_mut(self.focus).and_then(|(tabs,_)|tabs.iter().position(|v|matches!(v,View::Editor(id) if self.views.get(id).is_some_and(|v|v.document==doc))));
+        if let Some(index) = existing {
+            *self.layout.pane_mut(self.focus).unwrap().1 = index;
+        } else {
+            let id = self.id();
+            self.views.insert(
+                id,
+                EditorView {
+                    document: doc,
+                    ..Default::default()
+                },
+            );
+            self.add_tab(View::Editor(id));
+        }
+        self.status = format!("Opened {}", path.unwrap().display());
+        self.workspace_dirty = true;
+    }
+    fn location(&self) -> String {
+        if let Some(id) = self.active_editor() {
+            let v = &self.views[&id];
+            let (line, col) = document::line_col_with_tabs(
+                &self.documents[&v.document].text,
+                v.cursor,
+                self.preferences.indent_width,
+            );
+            format!(
+                "Ln {}, Col {} · {} {}",
+                line + 1,
+                col + 1,
+                if self.preferences.insert_spaces {
+                    "Spaces"
+                } else {
+                    "Tabs"
+                },
+                self.preferences.indent_width
+            )
+        } else {
+            self.focused_kind().into()
+        }
+    }
+    fn hints(&self) -> String {
+        let map = match self.focused_kind() {
+            "editor" => &self.preferences.editor_keys,
+            "terminal" => &self.preferences.terminal_keys,
+            _ => &self.preferences.global_keys,
+        };
+        let verbs = match self.focused_kind() {
+            "editor" => vec!["save", "prompt-find", "prompt-replace", "prompt-goto"],
+            "terminal" => vec!["copy", "paste"],
+            _ => vec!["next-pane", "next-tab"],
+        };
+        let mut hints = vec!["F1 commands".to_string(), "F6 pane".to_string()];
+        for verb in verbs {
+            if let Some((key, _)) = map.iter().find(|(_, v)| v.as_str() == verb) {
+                hints.push(format!("{key} {}", verb.trim_start_matches("prompt-")));
+            }
+        }
+        if self.focused_kind() == "terminal" {
+            hints.push("Shift-drag selects · Shift-wheel scrollback".into());
+        }
+        hints.join(" · ")
     }
 }

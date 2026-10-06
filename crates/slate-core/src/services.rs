@@ -1,3 +1,8 @@
+use crate::{
+    document::Document,
+    highlight::{self, Token},
+    workspace::{self, Workspace},
+};
 use serde::Serialize;
 use std::{
     fs,
@@ -21,7 +26,24 @@ pub enum Job {
     Browse(PathBuf),
     Git(PathBuf, Vec<String>, bool),
 }
+pub enum IoJob {
+    Open(u64, PathBuf),
+    Save(u64, Document, Option<PathBuf>),
+    Checkpoint(PathBuf, Workspace),
+    Flush(mpsc::SyncSender<()>),
+}
+pub struct HighlightJob {
+    pub id: u64,
+    pub generation: u64,
+    pub text: String,
+    pub path: Option<PathBuf>,
+    pub light: bool,
+}
 pub enum Reply {
+    Opened(u64, Result<Document, String>),
+    OpenedDirectory(u64, PathBuf),
+    Saved(u64, Result<Document, String>),
+    Highlighted(u64, u64, bool, Vec<Token>),
     Files(PathBuf, Result<Vec<Entry>, String>),
     Git(Result<Vec<GitEntry>, String>),
     Output(String),
@@ -31,11 +53,66 @@ pub enum Reply {
 pub struct Services {
     pub tx: Sender<Job>,
     pub rx: Receiver<Reply>,
+    pub io: Sender<IoJob>,
+    pub highlight: mpsc::SyncSender<HighlightJob>,
 }
 impl Services {
     pub fn new() -> Self {
         let (tx, jobs) = mpsc::channel();
         let (output, rx) = mpsc::channel();
+        let (io, io_jobs) = mpsc::channel();
+        let io_output = output.clone();
+        thread::spawn(move || {
+            while let Ok(job) = io_jobs.recv() {
+                let reply = match job {
+                    IoJob::Open(id, path) => {
+                        if path.is_dir() {
+                            Reply::OpenedDirectory(id, path)
+                        } else {
+                            Reply::Opened(id, Document::open(&path).map_err(|e| format!("{e:#}")))
+                        }
+                    }
+                    IoJob::Save(id, mut doc, destination) => Reply::Saved(
+                        id,
+                        doc.save(destination.as_deref())
+                            .map(|()| doc)
+                            .map_err(|e| format!("{e:#}")),
+                    ),
+                    IoJob::Checkpoint(path, w) => {
+                        if let Err(e) = workspace::write_checkpoint(&path, &w) {
+                            let _ = io_output
+                                .send(Reply::Error(format!("Recovery checkpoint failed: {e:#}")));
+                        }
+                        continue;
+                    }
+                    IoJob::Flush(done) => {
+                        let _ = done.send(());
+                        continue;
+                    }
+                };
+                if io_output.send(reply).is_err() {
+                    break;
+                }
+            }
+        });
+        let (highlight, requests) = mpsc::sync_channel::<HighlightJob>(1);
+        let highlight_output = output.clone();
+        thread::spawn(move || {
+            while let Ok(job) = requests.recv() {
+                let tokens = highlight::highlight(&job.text, job.path.as_deref(), job.light);
+                if highlight_output
+                    .send(Reply::Highlighted(
+                        job.id,
+                        job.generation,
+                        job.light,
+                        tokens,
+                    ))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         thread::spawn(move || {
             while let Ok(job) = jobs.recv() {
                 let reply = match job {
@@ -148,6 +225,11 @@ impl Services {
                 }
             }
         });
-        Self { tx, rx }
+        Self {
+            tx,
+            rx,
+            io,
+            highlight,
+        }
     }
 }

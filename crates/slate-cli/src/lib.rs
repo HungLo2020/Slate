@@ -43,6 +43,7 @@ pub fn run(mut app: App) -> Result<()> {
     let mut palette: Option<String> = None;
     let mut drag = None;
     let mut selecting = None;
+    let mut terminal_capture = None;
     let mut clipboard = String::new();
     while !app.quit {
         let size = terminal.size()?;
@@ -99,6 +100,49 @@ pub fn run(mut app: App) -> Result<()> {
             Event::Mouse(m) => {
                 let x = m.column;
                 let y = m.row;
+                let target = snapshot.panes.iter().find(|p| {
+                    p.kind == "terminal"
+                        && (terminal_capture == Some(p.id)
+                            || inside(x, y, p.rect) && y > p.rect.y + 1)
+                });
+                if drag.is_none() {
+                    if let Some(p) = target {
+                        let (kind, button) = match m.kind {
+                            MouseEventKind::Down(b) => ("press", b),
+                            MouseEventKind::Up(b) => ("release", b),
+                            MouseEventKind::Drag(b) => ("drag", b),
+                            MouseEventKind::Moved => ("move", event::MouseButton::Left),
+                            MouseEventKind::ScrollUp => ("wheel_up", event::MouseButton::Left),
+                            MouseEventKind::ScrollDown => ("wheel_down", event::MouseButton::Left),
+                            _ => continue,
+                        };
+                        if kind == "press" {
+                            terminal_capture = Some(p.id);
+                        } else if kind == "release" {
+                            terminal_capture = None;
+                        }
+                        let button = if kind == "move" {
+                            3
+                        } else {
+                            match button {
+                                event::MouseButton::Left => 0,
+                                event::MouseButton::Middle => 1,
+                                event::MouseButton::Right => 2,
+                            }
+                        };
+                        app.dispatch(Command::Pointer {
+                            pane: p.id,
+                            row: y.saturating_sub(p.rect.y + 2) as usize,
+                            col: x.saturating_sub(p.rect.x + 1) as usize,
+                            kind: kind.into(),
+                            button,
+                            shift: m.modifiers.contains(KeyModifiers::SHIFT),
+                            ctrl: m.modifiers.contains(KeyModifiers::CONTROL),
+                            alt: m.modifiers.contains(KeyModifiers::ALT),
+                        });
+                        continue;
+                    }
+                }
                 if matches!(m.kind, MouseEventKind::Down(_)) {
                     drag = snapshot
                         .handles
@@ -242,6 +286,11 @@ fn render(frame: &mut Frame, s: &Snapshot, palette: Option<&str>) {
         let focus = p.id == s.focus;
         let block = Block::default()
             .borders(Borders::ALL)
+            .style(
+                Style::default()
+                    .bg(parse_color(&s.background))
+                    .fg(parse_color(&s.foreground)),
+            )
             .title(format!(" {} #{} ", p.kind, p.id))
             .border_style(Style::default().fg(if focus { Color::Cyan } else { Color::DarkGray }));
         frame.render_widget(block, area);
@@ -302,14 +351,57 @@ fn render(frame: &mut Frame, s: &Snapshot, palette: Option<&str>) {
     }
     let size = frame.area();
     frame.render_widget(
-        Paragraph::new(clean(&s.status))
+        Paragraph::new(clean(&format!("{} · {}", s.status, s.location)))
             .style(Style::default().fg(Color::White).bg(Color::DarkGray)),
         Rect::new(0, size.height.saturating_sub(2), size.width, 1),
     );
     frame.render_widget(
-        Paragraph::new("F1 commands · F6 pane · F7 tab · F8 terminal · F9 split · Ctrl-S save"),
+        Paragraph::new(s.hints.as_str()),
         Rect::new(0, size.height.saturating_sub(1), size.width, 1),
     );
+    if let Some(prompt) = &s.prompt {
+        let height = if prompt.kind == "replace" { 8 } else { 6 };
+        let area = Rect::new(
+            1,
+            size.height.saturating_sub(height + 1),
+            size.width.saturating_sub(2),
+            height,
+        );
+        frame.render_widget(Clear, area);
+        let text = if prompt.kind == "replace" {
+            format!("Find: {}\nWith: {}\nTab switches fields · Enter replaces next · Ctrl-Enter replaces all\nEscape closes",clean(&prompt.input),clean(&prompt.replacement))
+        } else {
+            format!(
+                "> {}\nEnter finds next / goes to line · Escape closes",
+                clean(&prompt.input)
+            )
+        };
+        let text = format!(
+            "{text}\nAlt-C case: {} · Alt-W whole word: {}",
+            if prompt.case_sensitive { "on" } else { "off" },
+            if prompt.whole_word { "on" } else { "off" }
+        );
+        frame.render_widget(
+            Paragraph::new(text).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(prompt.kind.as_str()),
+            ),
+            area,
+        );
+        let value = if prompt.field == 0 {
+            &prompt.input
+        } else {
+            &prompt.replacement
+        };
+        let prefix = if prompt.kind == "replace" { 6 } else { 3 };
+        frame.set_cursor_position((
+            area.x
+                + (prefix + slate_core::document::display_width(value) as u16)
+                    .min(area.width.saturating_sub(2)),
+            area.y + 1 + prompt.field as u16,
+        ));
+    }
     if let Some(text) = palette {
         let area = Rect::new(
             1,

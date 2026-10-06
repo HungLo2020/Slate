@@ -1,7 +1,7 @@
 # Slate
 
 A Rust workspace editor with a Kirigami GUI and a terminal UI sharing the same
-editor core. This repository contains an initial Linux prototype.
+editor core. This repository contains a Linux prototype with recoverable workspaces.
 
 ## Build and launch
 
@@ -42,7 +42,15 @@ explicit TUI-only build is also available with `cargo build --no-default-feature
 - Lazy directory browsing (including parent navigation); open UTF-8 files,
   create untitled buffers, save, and save as a new file.
 - Grapheme-aware cursor movement, selection, mouse selection, copy/cut/paste,
-  line numbers, undo/redo, and multiple documents.
+  configurable line numbers, incremental undo/redo, and multiple documents.
+- Unicode literal search, forward/backward wrapping, match-case and whole-word
+  options, match highlighting, replace-next and undoable replace-all.
+- Go-to-line, configurable tab width/spaces, automatic indentation and selected
+  line indentation/outdent. Syntax highlighting is shared by both frontends and
+  runs on a separate worker using Syntect's bundled language definitions.
+- Shared configurable shortcuts, context-sensitive hints and cursor position.
+  The GUI editor follows the desktop palette and uses scrollable tabs/toolbars;
+  the TUI has explicit focus borders and interactive editing prompts.
 - Split views of the same document share text/history and keep independent
   cursors and scroll positions.
 - Nested horizontal/vertical splits, resizing, selectable view groups,
@@ -51,12 +59,18 @@ explicit TUI-only build is also available with `cargo build --no-default-feature
   `~/.config/slate/layouts.toml`), usable from either frontend. Across launches,
   saved layouts restore shape and view kinds; editor views bind to the opened
   document and terminal views start new shells.
+- Automatic workspace checkpoints restore open documents, unsaved buffers,
+  split/tab arrangements, focus, cursor/scroll positions and browser directory.
+  Terminal shells restart in their remembered directory.
 - Real PTY shells with shared VT screen emulation, colors, alternate screens,
-  cursor keys, bracketed paste, bounded scrollback, and window-size propagation.
+  cursor keys, bracketed paste, bounded scrollback, window-size propagation,
+  application mouse reporting and frozen viewport selection/copy.
 - Multiple terminal sessions remain alive when their view is hidden. Closing
   a pane leaves sessions running; `terminate-terminal` explicitly stops one.
 - Git status, stage/unstage, diff, and commit actions. Directory listing and Git
-  commands run on a background worker. Git operations use the workspace root.
+  commands run on a background worker. File opens/saves have their own worker;
+  saving a snapshot leaves edits made during the save dirty. Git operations use
+  the workspace root.
 - Atomic saves preserve ordinary file permissions and symlink targets; external
   disk edits and unintended Save As overwrites are refused. Unsaved documents
   block normal close/quit.
@@ -73,18 +87,45 @@ explicit TUI-only build is also available with `cargo build --no-default-feature
 | F9 / Shift+F9 | Split right / below |
 | Ctrl+S in an editor | Save |
 | Ctrl+Z / Ctrl+Y | Undo / redo |
+| Ctrl+F | Find prompt |
+| Ctrl+H or Alt+R in an editor | Replace prompt |
+| Ctrl+G | Go to line |
+| F3 / Shift+F3 | Find next / previous |
+| Tab / Shift+Tab; Ctrl+] / Ctrl+[ | Indent / outdent |
+| Ctrl+Shift+C / Ctrl+Shift+V in a terminal | Copy selection / paste |
+| Alt+C / Alt+V in a terminal | Copy/paste when the outer terminal cannot distinguish shifted control keys |
 | Shift+arrows; mouse drag | Select text |
 | Ctrl+A / C / X / V in an editor | Select all / copy / cut / paste |
 
 GUI: double-click a file to open it, drag dividers to resize, and right-click a
 pane for view and Git actions. TUI: Enter or click opens the selected entry;
-mouse dragging resizes dividers. TUI copy uses OSC 52 when the outer terminal
+mouse dragging resizes dividers. In a TUI editing prompt, Tab switches find and
+replacement fields, Enter finds/replaces next, Ctrl+Enter replaces all when the
+outer terminal distinguishes that key, and Alt+C / Alt+W toggle case/whole-word.
+`replace-all` also works through the palette. Escape closes the prompt. Legacy
+terminals can encode Ctrl+H as Backspace; Alt+R opens replace reliably.
+
+Terminal applications that request mouse input receive it. Hold Shift to select
+text or scroll the terminal's history instead. Selection freezes the displayed
+viewport while output continues; typing, pasting, resizing or scrolling returns
+to the current terminal view. The GUI uses the system clipboard. TUI copy uses
+OSC 52 when the outer terminal
 supports it; pasting from the outer terminal works through bracketed paste.
 
 Commands accept a verb followed by its argument. Paths and commit messages can
 contain spaces without quoting. Useful examples:
 
 ```text
+find some text
+replace some text => replacement
+replace-all some text => replacement
+goto 42
+indent
+outdent
+set indent-width 2
+set insert-spaces true
+set theme auto
+settings-reload
 open /path/to/code.rs
 save-as /path/to/new-file.rs
 split-right
@@ -115,10 +156,48 @@ untitled buffer. `close` closes the focused document, whereas `close-pane`
 removes its presentation. Explicit `discard-document` and `discard-quit`
 commands discard unsaved work. GUI window closure asks before discarding.
 
+## Settings and recovery
+
+`set` writes `$XDG_CONFIG_HOME/slate/settings.toml` (normally
+`~/.config/slate/settings.toml`). Supported options: `indent-width` (1–16),
+`insert-spaces`, `auto-indent`, `line-numbers` (booleans), and `theme`
+(`auto`, `dark`, `light`). Run `set indent-width 4` to create a complete settings
+file, edit its `global_keys`, `editor_keys` and `terminal_keys` tables, then run
+`settings-reload`. Chords use the order `Ctrl+Alt+Shift+key` with lowercase key
+names, such as `Ctrl+s`, `Shift+f3`, or `Alt+r`. A supplied key table replaces that
+scope's defaults; removing an entry disables it. F1/Ctrl+Shift+P remain frontend
+palette shortcuts; F6 remains a reserved route out of terminal input capture.
+
+Each canonical workspace directory has a private, atomic checkpoint under
+`$XDG_STATE_HOME/slate/workspaces/` (normally `~/.local/state/slate/workspaces/`).
+Checkpoints run at most once a second when state changes, and are flushed on
+normal exit. A forced crash can lose edits newer than the last completed
+checkpoint; this is recovery, not file autosave. Checkpoint files contain buffer
+contents and original save baselines and are mode 0600 on Unix. A per-workspace
+lock prevents a second instance from overwriting the first instance's state.
+The second instance can still edit, with recovery disabled and a status message.
+Malformed/oversized checkpoints remain untouched and recovery is disabled for
+that launch; `--fresh` explicitly starts a new workspace state.
+
+Restoring clean files reads current disk content; restoring dirty files preserves
+unsaved text and its original disk baseline, so external changes are still
+rejected on save. Missing clean files are retained as recoverable dirty buffers.
+Explicit discard-and-quit discards buffer changes in the checkpoint too. Undo
+history is not restored. Checkpoints are limited to 128 MiB; failures are reported
+without replacing the previous checkpoint. Startup restoration runs before the
+UI opens; interactive file operations run on the worker.
+
+Terminals restart fresh shells, rather than replaying commands or restoring
+running processes. On Linux, the shell's directory is read through `/proc` when
+permitted; OSC 7 shell integration is also supported. Without either source,
+the terminal's launch directory is retained. A shell can report its directory
+with `printf '\033]7;file://localhost%s\007' "$PWD"` in its prompt hook.
+
 ## Architecture and dependency policy
 
 - `slate-core`: editing, documents/views, commands, layout tree, file/Git
-  services, terminal processes, and VT emulator state.
+  services, preferences/search/highlighting, workspace recovery, terminal processes,
+  and VT emulator state.
 - `slate-cli`: Ratatui/Crossterm presentation and terminal input.
 - `slate-gui`: Kirigami QML and a thin Qt C++ presentation adapter. A small
   JSON/C ABI connects it to the Rust core; editing and PTY logic remain Rust.
@@ -137,19 +216,36 @@ Qt/Kirigami runtime version. Major ABI/API changes may require rebuilding.
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 python3 scripts/tui-smoke.py target/debug/slate
+python3 scripts/recovery-smoke.py target/debug/slate
+python3 scripts/install-smoke.py target/release/slate
+python3 scripts/dependency-policy.py
 cargo build --features gui-smoke
 python3 scripts/gui-offscreen-smoke.py target/debug/slate  # Qt Test + Kirigami 6
 python3 scripts/gui-smoke.py target/debug/slate   # optional X11: Xvfb + xdotool
 ```
 
-Core tests cover Unicode editing, shared split documents, undo/redo, save
-conflicts/permissions/symlinks, layout geometry, PTY colors/resizing/alternate
-screens, and unsaved-work protection. Smoke tests exercise actual frontend
-input, file writes, shell execution, and layout persistence.
+Core tests cover Unicode editing/search/replacement, shared views, incremental
+history, save conflicts/permissions/symlinks, asynchronous saves during editing,
+recovery/disk baselines, layout geometry, syntax colors, PTY mouse/paste/selection,
+terminal directories and unsaved-work protection. Optional Vim/htop/SSH/tmux
+integration checks run when tools are available; `SLATE_REQUIRE_TERMINAL_TOOLS=1`
+makes SSH/tmux availability and execution mandatory. CI installs those tools,
+checks the Qt 6.4 adapter API, and runs GUI workflows with distro-provided Qt and
+Kirigami in Fedora and Debian containers. Container jobs exercise their current
+compatible packages without exact runtime version constraints.
 
-This is a prototype: buffers are UTF-8, limited to 16 MiB, backed by strings,
-and keep bounded snapshot-based undo history. File open/save runs synchronously;
-large-file optimization and fully asynchronous document I/O remain follow-up
-work. Terminals implement conventional VT behavior, not Sixel/Kitty graphics or
-all xterm extensions. Keybindings are currently fixed. Syntax highlighting,
-LSP, debugging, and agent integration remain future features in [GOALS.md](GOALS.md).
+Smoke tests drive actual GUI/TUI input, saves, editing prompts, shell execution,
+clipboard interactions, named layouts, installed entry points and forced-crash
+recovery. For a Qt-free installation, use
+`./scripts/install.sh "$HOME/.local" --tui-only`. The GUI installation also installs
+a desktop launcher and scalable icon; put the selected prefix's `bin` in PATH.
+
+Buffers remain UTF-8 strings with a 16 MiB per-buffer limit. Undo stores inserted
+and removed spans with a 32 MiB payload budget and up to 10,000 edits, rather than
+whole-buffer copies; full-buffer replacement still needs a full edit payload.
+Syntax parsing is background work and caches generation-tagged results; it is not
+an incremental parser. Terminals support conventional VT behavior, not
+Sixel/Kitty graphics or every xterm extension. LSP, debugging and agent integration
+remain future work in [GOALS.md](GOALS.md).
+
+See [DESIGN.md](DESIGN.md) for the implementation decisions and validation scope.

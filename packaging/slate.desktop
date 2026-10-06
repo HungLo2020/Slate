@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Slate
+Comment=Edit code with shared graphical and terminal workflows
+Exec=slate-gui %f
+TryExec=slate-gui
+Icon=slate
+Terminal=false
+Categories=Development;TextEditor;
+MimeType=text/plain;
+StartupNotify=true
+StartupWMClass=Slate

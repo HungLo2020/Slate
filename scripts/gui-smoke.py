@@ -4,7 +4,7 @@ import os, pathlib, subprocess, sys, tempfile, time
 binary=str(pathlib.Path(sys.argv[1] if len(sys.argv)>1 else 'target/debug/slate').resolve())
 with tempfile.TemporaryDirectory(prefix='slate-gui-') as tmp:
     root=pathlib.Path(tmp);file=root/'edit.txt';file.write_text('original\n')
-    env={**os.environ,'SHELL':'/bin/sh','XDG_CONFIG_HOME':str(root/'config'),'QT_QUICK_BACKEND':'software','QT_QPA_PLATFORM':'xcb','DISPLAY':':93','XDG_RUNTIME_DIR':str(root/'runtime')}
+    env={**os.environ,'SHELL':'/bin/sh','XDG_CONFIG_HOME':str(root/'config'),'XDG_STATE_HOME':str(root/'state'),'QT_QUICK_BACKEND':'software','QT_QPA_PLATFORM':'xcb','DISPLAY':':93','XDG_RUNTIME_DIR':str(root/'runtime')}
     (root/'runtime').mkdir(mode=0o700)
     xvfb=subprocess.Popen(['Xvfb',env['DISPLAY'],'-screen','0','1600x1000x24','-nolisten','tcp'],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
     log=open(root/'gui.log','w+');process=None

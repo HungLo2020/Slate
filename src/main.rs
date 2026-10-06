@@ -8,12 +8,14 @@ fn main() -> Result<()> {
         .map(|n| n == "slate-gui")
         .unwrap_or(false);
     let mut path = None;
+    let mut recover = true;
     for arg in args {
         match arg.to_str() {
+            Some("--fresh") => recover = false,
             Some("--gui") => gui = true,
             Some("--tui") => gui = false,
             Some("--help") | Some("-h") => {
-                println!("Slate — shared Rust editor\n\nslate [--tui|--gui] [FILE|DIRECTORY]\nslate-gui [FILE|DIRECTORY]\n\nF1: commands  F6: next pane  F7: next tab  F8: new terminal\nF9: split right  Shift-F9: split below\nEditor: Ctrl-S save, Ctrl-Z undo, Ctrl-Y redo\nCtrl-Shift-P: commands (also works from terminal panes)");
+                println!("Slate — shared Rust editor\n\nslate [--tui|--gui] [--fresh] [FILE|DIRECTORY]\nslate-gui [FILE|DIRECTORY]\n\nF1: commands  F6: next pane  F7: next tab  F8: new terminal\nF9: split right  Shift-F9: split below\nEditor: Ctrl-S save, Ctrl-Z undo, Ctrl-Y redo, Ctrl-F find, Ctrl-H replace, Ctrl-G line\n--fresh: start without restoring this workspace\nCtrl-Shift-P: commands (also works from terminal panes)");
                 return Ok(());
             }
             Some("--version") => {
@@ -29,7 +31,10 @@ fn main() -> Result<()> {
         }
     }
     let path = path.unwrap_or(std::env::current_dir()?);
-    let app = slate_core::App::new(&path)?;
+    let mut app = slate_core::App::new(&path)?;
+    if let Err(e) = app.enable_workspace(recover) {
+        app.status = format!("Workspace recovery disabled: {e:#}");
+    }
     if gui {
         #[cfg(feature = "gui")]
         {
