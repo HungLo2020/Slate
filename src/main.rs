@@ -31,9 +31,19 @@ fn main() -> Result<()> {
         }
     }
     let path = path.unwrap_or(std::env::current_dir()?);
+    let smoke = std::env::var_os("SLATE_GUI_SMOKE_DIR").is_some();
+    if smoke {
+        eprintln!("Smoke startup: constructing shared core");
+    }
     let mut app = slate_core::App::new(&path)?;
+    if smoke {
+        eprintln!("Smoke startup: core constructed");
+    }
     if let Err(e) = app.enable_workspace(recover) {
         app.status = format!("Workspace recovery disabled: {e:#}");
+    }
+    if smoke {
+        eprintln!("Smoke startup: workspace ready");
     }
     if gui {
         #[cfg(feature = "gui")]

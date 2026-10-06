@@ -18,6 +18,7 @@
 #include <QTimer>
 #include <QWheelEvent>
 #include <cmath>
+#include <cstdio>
 extern "C" char *slate_request(void *, const char *);
 extern "C" void slate_response_free(char *);
 static Bridge *bridge = nullptr;
@@ -303,7 +304,16 @@ extern "C" int slate_qt_run(void *context) {
     int argc = 1;
     char name[] = "slate-gui";
     char *argv[] = {name, nullptr};
+#ifdef SLATE_SMOKE_TEST
+    const bool tracing = !qEnvironmentVariableIsEmpty("SLATE_GUI_SMOKE_DIR");
+    if (tracing)
+        std::fprintf(stderr, "Smoke startup: constructing QApplication\n");
+#endif
     QApplication app(argc, argv);
+#ifdef SLATE_SMOKE_TEST
+    if (tracing)
+        std::fprintf(stderr, "Smoke startup: QApplication ready\n");
+#endif
     app.setApplicationName("Slate");
     app.setOrganizationName("Slate");
     initializeResources();
@@ -312,7 +322,15 @@ extern "C" int slate_qt_run(void *context) {
     qmlRegisterType<CellView>("Slate.Native", 1, 0, "CellView");
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty("slate", &state);
+#ifdef SLATE_SMOKE_TEST
+    if (tracing)
+        std::fprintf(stderr, "Smoke startup: loading QML\n");
+#endif
     engine.load(QUrl("qrc:/slate/Main.qml"));
+#ifdef SLATE_SMOKE_TEST
+    if (tracing)
+        std::fprintf(stderr, "Smoke startup: QML loaded\n");
+#endif
     if (engine.rootObjects().isEmpty()) {
         bridge = nullptr;
         return 1;
@@ -325,6 +343,10 @@ extern "C" int slate_qt_run(void *context) {
 #ifdef SLATE_SMOKE_TEST
     if (!qEnvironmentVariableIsEmpty("SLATE_GUI_SMOKE_DIR"))
         startSmoke(&state, qobject_cast<QQuickWindow *>(engine.rootObjects().first()));
+#endif
+#ifdef SLATE_SMOKE_TEST
+    if (tracing)
+        std::fprintf(stderr, "Smoke startup: entering event loop\n");
 #endif
     const int result = app.exec();
     bridge = nullptr;
