@@ -97,8 +97,18 @@ explicit TUI-only build is also available with `cargo build --no-default-feature
 | Shift+arrows; mouse drag | Select text |
 | Ctrl+A / C / X / V in an editor | Select all / copy / cut / paste |
 
-GUI: double-click a file to open it, drag dividers to resize, and right-click a
-pane for view and Git actions. TUI: Enter or click opens the selected entry;
+GUI: double-click a file to open it and drag dividers to resize. The top **Menu**
+contains File, Edit, and Workspace commands; Open and Save appear as space allows.
+Each pane has a **⋮** action menu for splits, view changes, and relevant document,
+terminal, or Git actions. Right-click also opens the pane menu outside terminals.
+Tabs scroll horizontally, keep the active tab visible, and show complete names
+in tooltips. Headers and file rows grow with the interface font. Pane minimum
+sizes constrain displayed split ratios without changing saved preferences. When
+the layout cannot fit, only the focused pane is displayed; F6 changes focus and
+expanding the window restores the full arrangement. Dialog contents scroll when
+the window is too short.
+
+TUI: Enter or click opens the selected entry;
 mouse dragging resizes dividers. In a TUI editing prompt, Tab switches find and
 replacement fields, Enter finds/replaces next, Ctrl+Enter replaces all when the
 outer terminal distinguishes that key, and Alt+C / Alt+W toggle case/whole-word.
@@ -220,7 +230,8 @@ python3 scripts/recovery-smoke.py target/debug/slate
 python3 scripts/install-smoke.py target/release/slate
 python3 scripts/dependency-policy.py
 cargo build --features gui-smoke
-python3 scripts/gui-offscreen-smoke.py target/debug/slate  # Qt Test + Kirigami 6
+python3 scripts/gui-offscreen-smoke.py target/debug/slate
+python3 scripts/gui-layout-smoke.py target/debug/slate  # Qt Test + Kirigami 6
 python3 scripts/gui-smoke.py target/debug/slate   # optional X11: Xvfb + xdotool
 ```
 
@@ -249,3 +260,8 @@ Sixel/Kitty graphics or every xterm extension. LSP, debugging and agent integrat
 remain future work in [GOALS.md](GOALS.md).
 
 See [DESIGN.md](DESIGN.md) for the implementation decisions and validation scope.
+
+Build validation note: the standard release build passed with Rust 1.94. Rust
+1.99 produced undefined-symbol linker errors with thin LTO in the validation
+environment; its release build passed with `CARGO_PROFILE_RELEASE_LTO=false`.
+This does not change Slate's compiler or runtime dependency requirements.

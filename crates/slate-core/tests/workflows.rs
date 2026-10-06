@@ -917,3 +917,83 @@ fn corrupt_workspace_is_preserved_until_an_explicit_fresh_start() {
     app.flush_workspace().unwrap();
     assert!(serde_json::from_slice::<serde_json::Value>(&fs::read(path).unwrap()).is_ok());
 }
+
+#[test]
+fn constrained_layout_keeps_nested_panes_usable_without_changing_saved_ratios() {
+    let mut layout = Node::default_layout(10, 20);
+    // Extreme requested ratios must not squeeze pane chrome out of existence.
+    if let Node::Split { ratio, .. } = &mut layout {
+        *ratio = 0.1;
+    }
+    assert!(layout.split(2, Axis::Vertical, 6, 7, View::Editor(10)));
+    let before = serde_json::to_string(&layout).unwrap();
+    let minimum = (180, 100);
+    let (width, height) = layout.minimum_size(6, minimum);
+    let (panes, handles) = layout.arrange_constrained(
+        Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        },
+        6,
+        minimum,
+    );
+    assert_eq!(panes.len(), 4);
+    assert_eq!(handles.len(), 3);
+    for pane in &panes {
+        assert!(pane.rect.width >= 180 && pane.rect.height >= 100);
+        assert!(pane.rect.x + pane.rect.width <= width);
+        for other in &panes {
+            if pane.id != other.id {
+                assert!(
+                    pane.rect.x + pane.rect.width <= other.rect.x
+                        || other.rect.x + other.rect.width <= pane.rect.x
+                        || pane.rect.y + pane.rect.height <= other.rect.y
+                        || other.rect.y + other.rect.height <= pane.rect.y
+                );
+            }
+        }
+    }
+    assert_eq!(serde_json::to_string(&layout).unwrap(), before);
+}
+
+#[test]
+fn compact_gui_preserves_layout_and_reserves_measured_header_space() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = App::new(dir.path()).unwrap();
+    let before = serde_json::to_string(&app.layout).unwrap();
+    let small = app.snapshot_with_minimum(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        },
+        6,
+        (9, 18),
+        63,
+        (300, 117),
+    );
+    assert_eq!(small.panes.len(), 1);
+    assert_eq!(small.panes[0].id, app.focus);
+    let large = app.snapshot_with_minimum(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 1360,
+            height: 820,
+        },
+        6,
+        (9, 18),
+        63,
+        (300, 117),
+    );
+    assert_eq!(large.panes.len(), 3);
+    assert_eq!(serde_json::to_string(&app.layout).unwrap(), before);
+    for pane in large.panes {
+        if let Some(screen) = pane.screen {
+            assert!(screen.cells.len() * 18 <= usize::from(pane.rect.height - 63));
+        }
+    }
+}

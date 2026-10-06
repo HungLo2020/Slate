@@ -18,7 +18,9 @@ unsafe extern "C" fn slate_request(context: *mut c_void, request: *const c_char)
         let request:serde_json::Value=serde_json::from_slice(CStr::from_ptr(request).to_bytes()).unwrap_or_default();
         if request["action"]=="snapshot" {
             let number=|key:&str,default:u16|request[key].as_u64().map(|n|n.min(u16::MAX as u64)as u16).unwrap_or(default);
-            serde_json::to_string(&app.snapshot(number("width",1280),number("height",720),6,number("cell_width",9),number("cell_height",18),32)).unwrap()
+            let area = slate_core::layout::Rect { x:0, y:0, width:number("width",1280), height:number("height",720) };
+            let header = number("header_height",43);
+            serde_json::to_string(&app.snapshot_with_minimum(area,6,(number("cell_width",9),number("cell_height",18)),header,(number("minimum_width",160),header.saturating_add(number("cell_height",18).saturating_mul(3))))).unwrap()
         }else if request["action"]=="command" {
             app.command_line(request["text"].as_str().unwrap_or(""));
             serde_json::json!({"status":app.status,"quit":app.quit}).to_string()

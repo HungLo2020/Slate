@@ -25,7 +25,133 @@ static QByteArray read(const QString &path) {
         return {};
     return file.readAll();
 }
+static QString checkLayout(Bridge *state, QQuickWindow *window) {
+    auto actions = findItem(window->contentItem(), "mainActions");
+    if (!actions)
+        return "Missing toolbar";
+    QList<QRectF> controls;
+    for (auto item : actions->childItems()) {
+        if (!item->isVisible() || item->objectName().isEmpty())
+            continue;
+        const QRectF rect(item->x(), item->y(), item->width(), item->height());
+        if (rect.left() < -1 || rect.top() < -1 || rect.right() > actions->width() + 1 ||
+            rect.bottom() > actions->height() + 1)
+            return "Toolbar control outside its layout: " + item->objectName();
+        if (item->height() + 1 < item->implicitHeight() ||
+            item->width() + 1 < item->implicitWidth())
+            return "Toolbar label clipped: " + item->objectName();
+        for (const auto &other : controls)
+            if (rect.intersects(other))
+                return "Toolbar controls overlap";
+        controls.append(rect);
+    }
+    const auto panes = state->frame().value("panes").toList();
+    const int header = window->property("paneHeaderHeight").toInt();
+    for (const auto &entry : panes) {
+        const auto pane = entry.toMap();
+        const auto id = pane.value("id").toString();
+        auto tabs = findItem(window->contentItem(), "tabs_" + id);
+        auto button = findItem(window->contentItem(), "paneActions_" + id);
+        auto chrome = findItem(window->contentItem(), "paneHeader_" + id);
+        if (!tabs || !button || !chrome || tabs->width() < 0 ||
+            tabs->x() + tabs->width() > button->x() + 1 ||
+            button->x() + button->width() > chrome->width() + 1)
+            return "Pane tabs/actions overlap or escape their header";
+        if (chrome->height() != header || button->height() < button->implicitHeight() - 1)
+            return "Pane header clips its controls";
+        auto grid = findItem(window->contentItem(), "cells_" + id);
+        if (grid && grid->isVisible()) {
+            if (grid->y() < chrome->y() + chrome->height() || grid->height() < 0)
+                return "Text grid overlaps pane header";
+            const auto screen = pane.value("screen").toMap();
+            if (screen.value("rows").toInt() * state->cellHeight() > grid->height())
+                return "Editor/PTY rows extend behind the pane boundary";
+        }
+    }
+    return {};
+}
+static void startLayoutSmoke(Bridge *state, QQuickWindow *window) {
+    const QString dir = qEnvironmentVariable("SLATE_GUI_SMOKE_DIR");
+    const auto longPath =
+        dir + "/workspace/a_very_long_document_name_that_requires_tab_elision_and_a_tooltip.rs";
+    QFile longFile(longPath);
+    longFile.open(QIODevice::WriteOnly);
+    longFile.write("// layout test\n");
+    longFile.close();
+    state->command("open " + longPath);
+    const QList<QSize> sizes{{480, 320}, {800, 600}, {1360, 820}, {1920, 1080}};
+    const QList<int> fonts{10, 16, 24};
+    auto timer = new QTimer(state);
+    auto phase = new int(0);
+    auto finish = [=](const QString &error) {
+        QFile report(dir + "/report.json");
+        report.open(QIODevice::WriteOnly);
+        report.write(
+            QJsonDocument(
+                QJsonObject{{"pass", error.isEmpty()},
+                            {"detail", error.isEmpty()
+                                           ? "12 window/font combinations: toolbar bounds, pane "
+                                             "actions, measured headers and PTY geometry"
+                                           : error}})
+                .toJson());
+        timer->stop();
+        QGuiApplication::exit(error.isEmpty() ? 0 : 2);
+    };
+    QObject::connect(timer, &QTimer::timeout, state, [=]() {
+        const int scenario = *phase / 4;
+        if (scenario >= sizes.size() * fonts.size()) {
+            finish({});
+            return;
+        }
+        if (*phase % 4 == 0) {
+            QFont font = QGuiApplication::font();
+            font.setPointSize(fonts[scenario / sizes.size()]);
+            window->setProperty("font", font);
+            window->resize(sizes[scenario % sizes.size()]);
+        } else if (*phase % 4 == 1) {
+            state->refresh();
+            const auto error = checkLayout(state, window);
+            if (!error.isEmpty()) {
+                finish(QString("%1 at %2x%3, font %4")
+                           .arg(error)
+                           .arg(window->width())
+                           .arg(window->height())
+                           .arg(fonts[scenario / sizes.size()]));
+                return;
+            }
+            window->grabWindow().save(dir + QString("/layout-%1.png").arg(scenario));
+            if (scenario == 2)
+                window->grabWindow().save(dir + "/gui.png");
+            QTest::keyClick(window, Qt::Key_F1);
+        } else {
+            const auto name = *phase % 4 == 2 ? "commandPalette" : "editPrompt";
+            auto popup = window->findChild<QObject *>(name);
+            if (!popup || !popup->property("visible").toBool() ||
+                popup->property("height").toReal() > window->height() - 39 ||
+                popup->property("width").toReal() > window->width() - 39 ||
+                popup->property("availableHeight").toReal() <= 0) {
+                finish(QString("Dialog bounds/visibility failed for %1 at scenario %2")
+                           .arg(name)
+                           .arg(scenario));
+                return;
+            }
+            window->grabWindow().save(dir + QString("/dialog-%1-%2.png").arg(scenario).arg(name));
+            QTest::keyClick(window, Qt::Key_Escape);
+            if (*phase % 4 == 2) {
+                state->send({{"action", "prompt"}, {"kind", "replace"}});
+                state->refresh();
+            }
+        }
+        ++*phase;
+    });
+    timer->start(150);
+}
+
 void startSmoke(Bridge *state, QQuickWindow *window) {
+    if (!qEnvironmentVariableIsEmpty("SLATE_GUI_LAYOUT_SMOKE")) {
+        startLayoutSmoke(state, window);
+        return;
+    }
     const QString dir = qEnvironmentVariable("SLATE_GUI_SMOKE_DIR");
     auto timer = new QTimer(state);
     auto step = new int(0);
@@ -81,7 +207,7 @@ void startSmoke(Bridge *state, QQuickWindow *window) {
                 finish(false, "Missing file browser");
                 return;
             }
-            click(browser, QPointF(60, 28 + 14), true);
+            click(browser, QPointF(60, window->property("fileRowHeight").toInt() * 1.5), true);
             break;
         }
         case 1: {
@@ -173,7 +299,8 @@ void startSmoke(Bridge *state, QQuickWindow *window) {
                     index = i;
             if (index < 0)
                 return;
-            click(browser, QPointF(60, index * 28 + 14), true);
+            click(browser, QPointF(60, (index + 0.5) * window->property("fileRowHeight").toInt()),
+                  true);
             break;
         }
         case 9: {

@@ -172,10 +172,49 @@ impl Node {
     pub fn arrange(&self, rect: Rect, gap: u16) -> (Vec<Placement>, Vec<Handle>) {
         let mut panes = vec![];
         let mut handles = vec![];
-        self.walk(rect, gap, &mut panes, &mut handles);
+        self.walk(rect, gap, (0, 0), &mut panes, &mut handles);
         (panes, handles)
     }
-    fn walk(&self, r: Rect, gap: u16, p: &mut Vec<Placement>, h: &mut Vec<Handle>) {
+    /// Minimum size of the complete split tree, including its handles.
+    pub fn minimum_size(&self, gap: u16, minimum: (u16, u16)) -> (u16, u16) {
+        match self {
+            Self::Pane { .. } => minimum,
+            Self::Split {
+                axis,
+                first,
+                second,
+                ..
+            } => {
+                let a = first.minimum_size(gap, minimum);
+                let b = second.minimum_size(gap, minimum);
+                match axis {
+                    Axis::Horizontal => (a.0.saturating_add(b.0).saturating_add(gap), a.1.max(b.1)),
+                    Axis::Vertical => (a.0.max(b.0), a.1.saturating_add(b.1).saturating_add(gap)),
+                }
+            }
+        }
+    }
+    /// Constrain displayed ratios without changing the user's saved preferences.
+    /// Callers must provide an area at least as large as `minimum_size`.
+    pub fn arrange_constrained(
+        &self,
+        rect: Rect,
+        gap: u16,
+        minimum: (u16, u16),
+    ) -> (Vec<Placement>, Vec<Handle>) {
+        let mut panes = vec![];
+        let mut handles = vec![];
+        self.walk(rect, gap, minimum, &mut panes, &mut handles);
+        (panes, handles)
+    }
+    fn walk(
+        &self,
+        r: Rect,
+        gap: u16,
+        minimum: (u16, u16),
+        p: &mut Vec<Placement>,
+        h: &mut Vec<Handle>,
+    ) {
         match self {
             Self::Pane { id, .. } => p.push(Placement { id: *id, rect: r }),
             Self::Split {
@@ -191,7 +230,16 @@ impl Node {
                     r.height
                 };
                 let gap = gap.min(length);
-                let size = ((length - gap) as f32 * ratio.clamp(0.1, 0.9)).round() as u16;
+                let desired = ((length - gap) as f32 * ratio.clamp(0.1, 0.9)).round() as u16;
+                let a_min = first.minimum_size(gap, minimum);
+                let b_min = second.minimum_size(gap, minimum);
+                let (low, reserved) = if *axis == Axis::Horizontal {
+                    (a_min.0, b_min.0)
+                } else {
+                    (a_min.1, b_min.1)
+                };
+                let high = (length - gap).saturating_sub(reserved);
+                let size = desired.clamp(low.min(high), high);
                 let (a, b, handle) = if *axis == Axis::Horizontal {
                     (
                         Rect { width: size, ..r },
@@ -227,8 +275,8 @@ impl Node {
                     rect: handle,
                     parent: r,
                 });
-                first.walk(a, gap, p, h);
-                second.walk(b, gap, p, h);
+                first.walk(a, gap, minimum, p, h);
+                second.walk(b, gap, minimum, p, h);
             }
         }
     }

@@ -53,6 +53,7 @@ void Bridge::viewport(int width, int height) {
     m_height = qBound(1, height, 65535);
     refresh();
 }
+void Bridge::paneHeader(int height) { m_headerHeight = qBound(1, height, 65535); }
 void Bridge::refresh() {
     const auto palette = QGuiApplication::palette();
     send({{"action", "theme"},
@@ -65,7 +66,9 @@ void Bridge::refresh() {
                              {"width", m_width},
                              {"height", m_height},
                              {"cell_width", cellWidth()},
-                             {"cell_height", cellHeight()}});
+                             {"cell_height", cellHeight()},
+                             {"header_height", m_headerHeight},
+                             {"minimum_width", qMax(160, m_headerHeight * 4)}});
     if (frame != m_frame) {
         QVariantList panes, handles;
         for (const auto &p : frame.value("panes").toList())
@@ -95,7 +98,9 @@ void Bridge::copyClipboard() {
                                 {"width", m_width},
                                 {"height", m_height},
                                 {"cell_width", cellWidth()},
-                                {"cell_height", cellHeight()}});
+                                {"cell_height", cellHeight()},
+                                {"header_height", m_headerHeight},
+                                {"minimum_width", qMax(160, m_headerHeight * 4)}});
     QGuiApplication::clipboard()->setText(response.value("clipboard").toString());
     refresh();
 }

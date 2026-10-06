@@ -27,6 +27,7 @@ class Bridge : public QObject {
     Q_INVOKABLE void command(const QString &text);
     Q_INVOKABLE void viewport(int width, int height);
     Q_INVOKABLE void refresh();
+    Q_INVOKABLE void paneHeader(int height);
     Q_INVOKABLE void copyClipboard();
     Q_INVOKABLE void pasteClipboard();
     Q_INVOKABLE void exit();
@@ -41,6 +42,7 @@ class Bridge : public QObject {
     void *m_context;
     QVariantMap m_frame;
     QVariantList m_paneIds, m_handleIds;
+    int m_headerHeight = 43;
     int m_width = 1280, m_height = 700;
 };
 

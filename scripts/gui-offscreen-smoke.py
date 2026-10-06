@@ -36,4 +36,5 @@ with tempfile.TemporaryDirectory(prefix='slate-gui-offscreen-') as temporary:
     logs = (root/'stdout.log').read_text()+(root/'stderr.log').read_text()
     assert not timed_out, f'GUI process timeout: {report}\n{logs}'
     assert result.returncode==0 and report.get('pass'), f'{report}\n{logs}'
+    assert not any(error in logs for error in ('ReferenceError:', 'TypeError:', 'Binding loop detected', 'Unable to assign')), logs
     print('PASS GUI:',report['detail'])

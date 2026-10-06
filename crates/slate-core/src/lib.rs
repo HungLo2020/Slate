@@ -1470,6 +1470,29 @@ impl App {
         cell_height: u16,
         header: u16,
     ) -> Snapshot {
+        self.snapshot_with_minimum(
+            Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+            gap,
+            (cell_width, cell_height),
+            header,
+            (0, 0),
+        )
+    }
+    pub fn snapshot_with_minimum(
+        &mut self,
+        area: Rect,
+        gap: u16,
+        cell: (u16, u16),
+        header: u16,
+        minimum: (u16, u16),
+    ) -> Snapshot {
+        let Rect { width, height, .. } = area;
+        let (cell_width, cell_height) = cell;
         self.poll();
         self.schedule_highlight();
         if self.workspace_dirty && self.checkpoint_at.elapsed() >= Duration::from_secs(1) {
@@ -1477,23 +1500,19 @@ impl App {
         }
         let cw = cell_width.max(1);
         let ch = cell_height.max(1);
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        };
-        let (placements, handles) = if width / cw < 70 || height / ch < 10 {
-            (
-                vec![layout::Placement {
-                    id: self.focus,
-                    rect: area,
-                }],
-                vec![],
-            )
-        } else {
-            self.layout.arrange(area, gap)
-        };
+        let required = self.layout.minimum_size(gap, minimum);
+        let (placements, handles) =
+            if width / cw < 70 || height / ch < 10 || width < required.0 || height < required.1 {
+                (
+                    vec![layout::Placement {
+                        id: self.focus,
+                        rect: area,
+                    }],
+                    vec![],
+                )
+            } else {
+                self.layout.arrange_constrained(area, gap, minimum)
+            };
         let mut panes = vec![];
         for placement in placements {
             let id = placement.id;
