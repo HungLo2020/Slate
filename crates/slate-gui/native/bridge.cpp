@@ -14,6 +14,7 @@
 #include <QJsonObject>
 #include <QKeyEvent>
 #include <QMouseEvent>
+#include <QMessageBox>
 #include <QPainter>
 #include <QPalette>
 #include <QQmlApplicationEngine>
@@ -59,7 +60,41 @@ Bridge::Bridge(void *context, QObject *parent) : QObject(parent), m_context(cont
     m_refreshTimer.setTimerType(Qt::PreciseTimer);
     connect(&m_refreshTimer, &QTimer::timeout, this, &Bridge::refresh);
 }
-Bridge::~Bridge() { delete m_pathDialog.data(); }
+Bridge::~Bridge() {
+    delete m_pathDialog.data();
+    delete m_closeDialog.data();
+}
+void Bridge::confirmCloseTab(QObject *windowObject) {
+    auto window = qobject_cast<QWindow *>(windowObject);
+    const auto prompt = m_frame.value("prompt").toMap();
+    if (!window || m_closeDialog || prompt.value("kind") != "close-tab") return;
+    auto dialog = new QMessageBox(QMessageBox::Warning, tr("Unsaved Changes"),
+        tr("Discard unsaved changes in “%1” and close this tab?").arg(prompt.value("input").toString()),
+        QMessageBox::Discard | QMessageBox::Cancel);
+    m_closeDialog = dialog;
+    dialog->setObjectName("closeTabDialog");
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->setTextFormat(Qt::PlainText);
+    dialog->setInformativeText(tr("Cancel to keep editing or save the document first."));
+    dialog->setDefaultButton(QMessageBox::Cancel);
+    dialog->setEscapeButton(QMessageBox::Cancel);
+    dialog->setWindowModality(Qt::WindowModal);
+    dialog->winId();
+    dialog->windowHandle()->setTransientParent(window);
+    connect(window, &QObject::destroyed, dialog, &QWidget::close);
+    connect(dialog, &QDialog::finished, this, [this, parent = QPointer<QWindow>(window)](int result) {
+        m_closeDialog.clear();
+        if (result == QMessageBox::Discard)
+            send({{"action", "submit_prompt"}, {"all", true}});
+        else
+            send({{"action", "dismiss_prompt"}});
+        if (parent) parent->requestActivate();
+        refresh();
+        emit closeDialogOpenChanged();
+    });
+    emit closeDialogOpenChanged();
+    dialog->open();
+}
 void Bridge::pickPath(const QString &kind, QObject *windowObject) {
     auto window = qobject_cast<QWindow *>(windowObject);
     if (!window || (kind != "open" && kind != "open-folder" && kind != "save-as"))

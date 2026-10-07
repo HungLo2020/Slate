@@ -65,6 +65,7 @@ impl Default for Preferences {
             editor_keys: keys(&[
                 ("Ctrl+s", "save"),
                 ("Ctrl+Shift+s", "save-as"),
+                ("Ctrl+w", "close"),
                 ("Ctrl+z", "undo"),
                 ("Ctrl+Shift+z", "redo"),
                 ("Ctrl+y", "redo"),
@@ -146,6 +147,10 @@ impl Preferences {
             .editor_keys
             .entry("Ctrl+Shift+s".into())
             .or_insert_with(|| "save-as".into());
+        settings
+            .editor_keys
+            .entry("Ctrl+w".into())
+            .or_insert_with(|| "close".into());
         settings.validate()?;
         Ok(settings)
     }

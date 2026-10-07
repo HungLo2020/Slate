@@ -16,6 +16,14 @@ packages and Kirigami 6 QML package. Package names vary with distro release;
 older distributions may only package Kirigami for Qt 5, which is insufficient.
 Slate does not download or vendor Qt or Kirigami.
 
+Editor file tabs have a **×** close button in the GUI and a clickable **[x]**
+in the TUI. **Ctrl+W** closes the active editor tab in either frontend. Closing
+a shared document's tab leaves its other views intact; closing its last view
+asks before discarding unsaved changes. Cancel to save first. In the TUI, press
+**D** to discard or **Escape / Enter** to cancel. Closing the final editor tab
+leaves an empty editor. On narrow tab bars, use the GUI's tab menu or **F7** in
+the TUI to select hidden tabs.
+
 The GUI uses Qt's native file dialogs for **Open File**, **Open Folder**, and
 **Save As**. On Plasma, the desktop's Qt platform integration (`plasma-integration`
 on Debian/Ubuntu) supplies KDE's file picker, Places sidebar and overwrite
@@ -308,7 +316,7 @@ quit
 
 `stage`, `unstage`, and `diff` use the selected Git entry.
 `stage-all` and `unstage-all` operate on the entire repository. A diff opens as a
-named read-only inspection view. Inspecting a diff does not mark the workspace dirty. `close` closes the focused document, whereas `close-pane`
+named read-only inspection view. Inspecting a diff does not mark the workspace dirty. `close` closes the focused editor tab, whereas `close-pane`
 removes its presentation. Explicit `discard-document` and `discard-quit`
 commands discard unsaved work. GUI window closure asks before discarding.
 
@@ -372,6 +380,7 @@ Qt/Kirigami runtime version. Major ABI/API changes may require rebuilding.
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 python3 scripts/tui-smoke.py target/debug/slate
+python3 scripts/tab-close-smoke.py target/debug/slate
 python3 scripts/recovery-smoke.py target/debug/slate
 python3 scripts/install-smoke.py target/release/slate
 python3 scripts/dependency-policy.py
@@ -380,6 +389,7 @@ python3 scripts/gui-offscreen-smoke.py target/debug/slate
 python3 scripts/gui-layout-smoke.py target/debug/slate  # Qt Test + Kirigami 6
 SLATE_GUI_FEATURE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
 SLATE_GUI_FILE_DIALOG_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
+SLATE_GUI_TAB_CLOSE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
 QT_QPA_PLATFORMTHEME=kde SLATE_GUI_PLATFORM=wayland SLATE_GUI_REQUIRE_KDE_DIALOGS=1 SLATE_GUI_FILE_DIALOG_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate # running Plasma desktop
 SLATE_GUI_GIT_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
 cargo build --release --features gui-smoke

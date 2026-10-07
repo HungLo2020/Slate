@@ -37,6 +37,7 @@ class EntryModel : public QAbstractListModel {
 };
 class CellView;
 class QFileDialog;
+class QMessageBox;
 class Bridge : public QObject {
     Q_OBJECT
     Q_PROPERTY(QVariantMap frame READ frame NOTIFY frameChanged)
@@ -47,6 +48,7 @@ class Bridge : public QObject {
     Q_PROPERTY(int cellWidth READ cellWidth CONSTANT)
     Q_PROPERTY(int cellHeight READ cellHeight CONSTANT)
     Q_PROPERTY(bool pathDialogOpen READ pathDialogOpen NOTIFY pathDialogOpenChanged)
+    Q_PROPERTY(bool closeDialogOpen READ closeDialogOpen NOTIFY closeDialogOpenChanged)
   public:
     Bridge(void *context, QObject *parent = nullptr);
     ~Bridge() override;
@@ -75,7 +77,10 @@ class Bridge : public QObject {
     Q_INVOKABLE void key(int code, const QString &text, int modifiers);
     bool pathDialogOpen() const { return !m_pathDialog.isNull(); }
     Q_INVOKABLE void pickPath(const QString &kind, QObject *window);
+    bool closeDialogOpen() const { return !m_closeDialog.isNull(); }
+    Q_INVOKABLE void confirmCloseTab(QObject *window);
   signals:
+    void closeDialogOpenChanged();
     void pathDialogOpenChanged();
     void frameChanged();
     void structureChanged();
@@ -86,6 +91,7 @@ class Bridge : public QObject {
   private:
     EntryModel m_files, m_git;
     QPointer<QFileDialog> m_pathDialog;
+    QPointer<QMessageBox> m_closeDialog;
     QTimer m_refreshTimer;
     bool m_refreshing = false;
     QHash<int, CellView *> m_views;

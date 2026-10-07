@@ -37,7 +37,7 @@ Kirigami.ApplicationWindow {
         font: root.font
     }
     readonly property int paneHeaderHeight: Math.ceil(Math.max(40, uiMetrics.height + 20))
-    readonly property int uiTabMinimum: Math.ceil(Math.max(90, uiMetrics.averageCharacterWidth * 10 + 20))
+    readonly property int uiTabMinimum: Math.ceil(Math.max(122, uiMetrics.averageCharacterWidth * 10 + 52))
     readonly property int fileRowHeight: Math.ceil(Math.max(28, uiMetrics.height + 12))
     function syncViewport() {
         slate.paneHeader(paneHeaderHeight + 3);
@@ -47,7 +47,7 @@ Kirigami.ApplicationWindow {
     function send(action) {
         slate.send(action);
         slate.refresh();
-        if (!frame.prompt && !slate.pathDialogOpen && !palette.visible && !quitDialog.visible && !settingsDialog.visible && !confirmDiscard.visible)
+        if (!frame.prompt && !slate.pathDialogOpen && !slate.closeDialogOpen && !palette.visible && !quitDialog.visible && !settingsDialog.visible && !confirmDiscard.visible)
             Qt.callLater(root.focusPane);
     }
     function pane(id) {
@@ -90,7 +90,7 @@ Kirigami.ApplicationWindow {
             });
     }
     function focusPane() {
-        if (slate.pathDialogOpen || palette.visible || editPrompt.visible || settingsDialog.visible || confirmDiscard.visible || quitDialog.visible)
+        if (slate.pathDialogOpen || slate.closeDialogOpen || palette.visible || editPrompt.visible || settingsDialog.visible || confirmDiscard.visible || quitDialog.visible)
             return;
         for (var i = 0; i < panes.count; i++) {
             var item = panes.itemAt(i);
@@ -131,6 +131,10 @@ Kirigami.ApplicationWindow {
             if (!slate.pathDialogOpen)
                 Qt.callLater(root.focusPane);
         }
+        function onCloseDialogOpenChanged() {
+            if (!slate.closeDialogOpen)
+                Qt.callLater(root.focusPane);
+        }
         function onFrameChanged() {
             if (root.gitCommitting)
                 Qt.callLater(function () {
@@ -144,6 +148,13 @@ Kirigami.ApplicationWindow {
                 Qt.callLater(function () {
                     settingsDialog.open();
                     root.send({"action": "dismiss_prompt"});
+                });
+                return;
+            }
+            if (root.frame.prompt && root.frame.prompt.kind === "close-tab") {
+                Qt.callLater(function () {
+                    if (root.frame.prompt && root.frame.prompt.kind === "close-tab")
+                        slate.confirmCloseTab(root);
                 });
                 return;
             }
@@ -437,7 +448,8 @@ Kirigami.ApplicationWindow {
                             spacing: 4
                             Repeater {
                                 model: tabs.entries
-                                delegate: ActionButton {
+                                delegate: Item {
+                                    id: fileTab
                                     required property var modelData
                                     required property int index
                                     objectName: "tab_" + panel.paneId + "_" + index
@@ -445,15 +457,51 @@ Kirigami.ApplicationWindow {
                                     Layout.fillWidth: true
                                     Layout.minimumWidth: 0
                                     Layout.maximumWidth: tabs.crowded ? Infinity : 240
-                                    text: modelData.title
-                                    tip: modelData.title
-                                    highlighted: modelData.active
-                                    font.bold: modelData.active
-                                    onClicked: root.send({
-                                        "action": "switch_tab",
-                                        "pane": panel.paneId,
-                                        "index": index
-                                    })
+                                    implicitWidth: tabSelect.implicitWidth
+                                    implicitHeight: tabSelect.implicitHeight
+                                    ActionButton {
+                                        id: tabSelect
+                                        objectName: "tabSelect_" + panel.paneId + "_" + fileTab.index
+                                        anchors.fill: parent
+                                        rightPadding: tabClose.visible ? tabClose.width + 8 : leftPadding
+                                        text: fileTab.modelData.title
+                                        tip: fileTab.modelData.title
+                                        highlighted: fileTab.modelData.active
+                                        font.bold: fileTab.modelData.active
+                                        onClicked: root.send({
+                                            "action": "switch_tab",
+                                            "pane": panel.paneId,
+                                            "index": fileTab.index
+                                        })
+                                    }
+                                    ActionButton {
+                                        id: tabClose
+                                        objectName: "tabClose_" + panel.paneId + "_" + fileTab.modelData.editor_id
+                                        visible: fileTab.modelData.editor_id !== null && fileTab.modelData.editor_id !== undefined
+                                        anchors.right: parent.right
+                                        anchors.rightMargin: 4
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        compact: true
+                                        text: "×"
+                                        horizontalPadding: 5
+                                        width: Math.max(implicitWidth, implicitHeight)
+                                        height: implicitHeight
+                                        flat: true
+                                        foregroundColor: fileTab.modelData.active ? Kirigami.Theme.highlightedTextColor : Kirigami.Theme.textColor
+                                        background: Rectangle {
+                                            radius: 4
+                                            color: tabClose.down ? Qt.alpha(tabClose.foregroundColor, 0.24) : tabClose.hovered ? Qt.alpha(tabClose.foregroundColor, 0.12) : "transparent"
+                                            border.width: tabClose.visualFocus ? 2 : 0
+                                            border.color: tabClose.foregroundColor
+                                        }
+                                        tip: "Close " + fileTab.modelData.title
+                                        Accessible.name: tip
+                                        onClicked: root.send({
+                                            "action": "close_tab",
+                                            "pane": panel.paneId,
+                                            "view": fileTab.modelData.editor_id
+                                        })
+                                    }
                                 }
                             }
                             Item {
@@ -463,8 +511,12 @@ Kirigami.ApplicationWindow {
                             ActionButton {
                                 objectName: "tabOverflow_" + panel.paneId
                                 visible: tabs.crowded && tabs.entries.length > 1
-                                iconName: "arrow-down"
+                                text: "▾"
+                                horizontalPadding: 6
+                                Layout.minimumWidth: implicitHeight
+                                Layout.preferredWidth: implicitHeight
                                 tip: "All tabs (" + tabs.entries.length + ")"
+                                Accessible.name: tip
                                 flat: true
                                 onClicked: tabMenu.popup()
                                 Menu {

@@ -34,7 +34,7 @@ Basic.Button {
     padding: compact ? 5 : 8
     horizontalPadding: iconOnly ? padding : 10
     implicitHeight: minimumExtent
-    implicitWidth: iconOnly ? minimumExtent : Math.ceil(caption.implicitWidth + 2 * horizontalPadding + (iconName.length ? iconExtent + 6 : 0))
+    implicitWidth: iconOnly ? minimumExtent : Math.ceil(caption.implicitWidth + leftPadding + rightPadding + (iconName.length ? iconExtent + 6 : 0))
     hoverEnabled: true
     Accessible.name: text.length ? text : tip
     Hint {

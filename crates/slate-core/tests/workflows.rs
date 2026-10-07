@@ -182,6 +182,143 @@ fn real_pty_shell_color_resize_and_alternate_screen() {
     term.write(b"printf '\\033[?1049l'\r").unwrap();
 }
 #[test]
+fn closing_background_tabs_keeps_the_active_document_and_last_tab_leaves_an_editor() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first.txt");
+    let second = dir.path().join("second.txt");
+    fs::write(&first, "first").unwrap();
+    fs::write(&second, "second").unwrap();
+    let mut app = App::new(&first).unwrap();
+    app.dispatch(Command::Open {
+        path: second.clone(),
+    });
+    wait_app(&mut app, |a| a.status.starts_with("Opened"));
+    let active = app.layout.view(2).unwrap().clone();
+    app.dispatch(Command::CloseTab {
+        pane: 2,
+        view: 11,
+        force: false,
+    });
+    assert_eq!(app.layout.view(2), Some(&active));
+    assert_eq!(app.layout.pane_mut(2).unwrap().0.len(), 1);
+    assert!(!app.documents.contains_key(&10));
+    app.dispatch(Command::Paste {
+        text: " changed".into(),
+    });
+    app.dispatch(Command::CloseDocument { force: false });
+    assert_eq!(app.prompt.as_ref().unwrap().kind, "close-tab");
+    key(&mut app, "Enter"); // Default is cancellation, never discard.
+    assert!(app.prompt.is_none());
+    assert!(app.dirty());
+    app.dispatch(Command::CloseDocument { force: false });
+    key(&mut app, "d");
+    let View::Editor(view) = app.layout.view(2).unwrap() else {
+        panic!("No editor after close")
+    };
+    assert!(app.documents[&app.views[view].document].text().is_empty());
+    assert!(!app.dirty());
+    assert_eq!(fs::read_to_string(second).unwrap(), "second");
+}
+
+#[test]
+fn closing_one_shared_view_keeps_dirty_edits_and_last_view_prompts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shared.txt");
+    fs::write(&path, "original").unwrap();
+    let mut app = App::new(&path).unwrap();
+    app.dispatch(Command::Split {
+        axis: Axis::Vertical,
+        kind: None,
+    });
+    let pane = app.focus;
+    let View::Editor(other) = app.layout.view(pane).unwrap().clone() else {
+        panic!()
+    };
+    app.dispatch(Command::Paste {
+        text: "dirty ".into(),
+    });
+    app.dispatch(Command::CloseTab {
+        pane: 2,
+        view: 11,
+        force: false,
+    });
+    assert!(app.prompt.is_none());
+    assert_eq!(app.focus, pane);
+    assert_eq!(app.documents[&10].text(), "dirty original");
+    app.dispatch(Command::CloseTab {
+        pane,
+        view: other,
+        force: false,
+    });
+    assert_eq!(app.prompt.as_ref().unwrap().kind, "close-tab");
+    app.dispatch(Command::DismissPrompt);
+    assert!(app.views.contains_key(&other));
+    app.dispatch(Command::CloseTab {
+        pane,
+        view: other,
+        force: false,
+    });
+    app.dispatch(Command::SubmitPrompt { all: true });
+    assert!(!app.documents.contains_key(&10));
+    assert!(!app.dirty());
+}
+
+#[test]
+fn closing_last_live_tab_prompts_even_if_a_removed_pane_has_a_cached_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shared.txt");
+    fs::write(&path, "original").unwrap();
+    let mut app = App::new(&path).unwrap();
+    app.dispatch(Command::Split {
+        axis: Axis::Vertical,
+        kind: None,
+    });
+    app.dispatch(Command::Paste {
+        text: "dirty".into(),
+    });
+    app.dispatch(Command::ClosePane);
+    app.dispatch(Command::CloseTab {
+        pane: 2,
+        view: 11,
+        force: false,
+    });
+    assert_eq!(app.prompt.as_ref().unwrap().kind, "close-tab");
+    app.dispatch(Command::SubmitPrompt { all: true });
+    assert!(!app.documents.contains_key(&10));
+    assert!(app.views.values().all(|v| v.document != 10));
+}
+
+#[test]
+fn close_tab_rejects_stale_targets_and_pending_saves() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("file.txt");
+    fs::write(&path, "original").unwrap();
+    let mut app = App::new(&path).unwrap();
+    app.dispatch(Command::Save);
+    app.dispatch(Command::CloseTab {
+        pane: 2,
+        view: 11,
+        force: true,
+    });
+    assert!(app.status.contains("pending save"));
+    assert!(app.views.contains_key(&11));
+    wait_app(&mut app, |a| a.status == "Saved");
+    app.dispatch(Command::CloseTab {
+        pane: 2,
+        view: 11,
+        force: false,
+    });
+    let replacement = app.layout.view(2).unwrap().clone();
+    app.dispatch(Command::CloseTab {
+        pane: 2,
+        view: 11,
+        force: true,
+    });
+    assert!(app.status.contains("no longer open"));
+    assert_eq!(app.layout.view(2), Some(&replacement));
+}
+
+#[test]
 fn close_and_quit_protect_unsaved_work() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = App::new(dir.path()).unwrap();

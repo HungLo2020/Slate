@@ -185,6 +185,12 @@ pub enum Command {
         #[serde(default)]
         force: bool,
     },
+    CloseTab {
+        pane: u64,
+        view: u64,
+        #[serde(default)]
+        force: bool,
+    },
     Undo,
     Redo,
     SelectAll,
@@ -256,6 +262,7 @@ pub enum Command {
 pub struct Tab {
     pub title: String,
     pub active: bool,
+    pub editor_id: Option<u64>,
 }
 #[derive(Serialize)]
 pub struct PaneSnapshot {
@@ -342,6 +349,7 @@ pub struct App {
     pub preferences: Preferences,
     pub prompt: Option<Prompt>,
     search: Search,
+    pending_close: Option<(u64, u64)>,
     tokens: BTreeMap<u64, (u64, bool, Vec<highlight::Token>)>,
     highlight_pending: BTreeMap<u64, (u64, bool)>,
     pending_open: BTreeMap<u64, u64>,
@@ -438,6 +446,7 @@ impl App {
             pending_save: vec![],
             store: None,
             workspace_dirty: false,
+            pending_close: None,
             checkpoint_at: Instant::now(),
             selection_foreground: "#ffffff".into(),
             colors: (
@@ -517,6 +526,80 @@ impl App {
         );
         self.add_tab(View::Editor(id));
         id
+    }
+    fn close_tab(&mut self, pane: u64, view: u64, force: bool) -> Result<()> {
+        let index = self
+            .layout
+            .pane_mut(pane)
+            .and_then(|(tabs, _)| tabs.iter().position(|v| *v == View::Editor(view)))
+            .context("This editor tab is no longer open")?;
+        let doc = self
+            .views
+            .get(&view)
+            .context("Missing editor view")?
+            .document;
+        if self.pending_save.contains(&doc) {
+            bail!("Wait for the pending save before closing this tab");
+        }
+        // Closed panes can leave cached views behind. Only tabs still present
+        // in the layout count as another open view of this document.
+        let mut shared = false;
+        for pane in self.layout.panes() {
+            for tab in self.layout.pane_mut(pane).unwrap().0.iter() {
+                if let View::Editor(id) = tab {
+                    shared |= *id != view && self.views.get(id).is_some_and(|v| v.document == doc);
+                }
+            }
+        }
+        let title = self.documents[&doc].title();
+        if !shared && self.documents[&doc].dirty() && !force {
+            self.pending_close = Some((pane, view));
+            self.prompt = Some(Prompt {
+                kind: "close-tab".into(),
+                input: title,
+                replacement: String::new(),
+                field: 0,
+                case_sensitive: false,
+                whole_word: false,
+            });
+            return Ok(());
+        }
+        let (tabs, active) = self.layout.pane_mut(pane).unwrap();
+        tabs.remove(index);
+        if index < *active {
+            *active -= 1;
+        }
+        *active = (*active).min(tabs.len().saturating_sub(1));
+        if tabs.is_empty() {
+            // Keep an editor available when its final file tab is closed.
+            let scratch = self.id();
+            let editor = self.id();
+            self.documents.insert(scratch, Document::scratch());
+            self.views.insert(
+                editor,
+                EditorView {
+                    document: scratch,
+                    ..Default::default()
+                },
+            );
+            self.layout
+                .pane_mut(pane)
+                .unwrap()
+                .0
+                .push(View::Editor(editor));
+        }
+        self.views.remove(&view);
+        if !shared {
+            self.views.retain(|_, v| v.document != doc);
+            self.documents.remove(&doc);
+            self.tokens.remove(&doc);
+            self.highlight_pending.remove(&doc);
+        }
+        if self.editor_only && !matches!(self.focused(), Some(View::Editor(_))) {
+            self.expand_workspace()?;
+        }
+        self.status = format!("Closed {title}");
+        Ok(())
     }
     fn add_tab(&mut self, view: View) {
         if let Some((tabs, active)) = self.layout.pane_mut(self.focus) {
@@ -722,6 +805,15 @@ impl App {
             Command::SubmitPrompt { all } => {
                 let p = self.prompt.clone().context("No active prompt")?;
                 match p.kind.as_str() {
+                    "close-tab" => {
+                        let target = self.pending_close.take();
+                        self.prompt = None;
+                        if all {
+                            if let Some((pane, view)) = target {
+                                self.close_tab(pane, view, true)?;
+                            }
+                        }
+                    }
                     "open" | "open-folder" | "save-as" | "commit" | "layout-save"
                     | "layout-load" | "move-pane" | "settings" => {
                         if p.input.trim().is_empty() {
@@ -758,7 +850,10 @@ impl App {
                     })?,
                 }
             }
-            Command::DismissPrompt => self.prompt = None,
+            Command::DismissPrompt => {
+                self.prompt = None;
+                self.pending_close = None;
+            }
             Command::Theme {
                 foreground,
                 background,
@@ -960,34 +1055,9 @@ impl App {
             }
             Command::CloseDocument { force } => {
                 let id = self.active_editor().context("Focus an editor first")?;
-                let doc = self.views[&id].document;
-                if self.pending_save.contains(&doc) {
-                    bail!("Wait for the pending save before closing this document");
-                }
-                if self.documents[&doc].dirty() && !force {
-                    bail!("Unsaved document. Save it or explicitly discard it from the command palette");
-                }
-                let affected: Vec<_> = self
-                    .views
-                    .iter()
-                    .filter(|(_, v)| v.document == doc)
-                    .map(|(id, _)| *id)
-                    .collect();
-                let replacement = self.id();
-                self.documents.insert(replacement, Document::scratch());
-                for id in affected {
-                    self.views.insert(
-                        id,
-                        EditorView {
-                            document: replacement,
-                            ..Default::default()
-                        },
-                    );
-                }
-                self.documents.remove(&doc);
-                self.tokens.remove(&doc);
-                self.highlight_pending.remove(&doc);
+                self.close_tab(self.focus, id, force)?;
             }
+            Command::CloseTab { pane, view, force } => self.close_tab(pane, view, force)?,
             Command::Undo | Command::Redo => {
                 let id = self.active_editor().context("Focus an editor first")?;
                 let view = self.views[&id].clone();
@@ -1646,6 +1716,15 @@ impl App {
             .map(String::as_str)
     }
     fn key(&mut self, k: Key) -> Result<()> {
+        if self.prompt.as_ref().is_some_and(|p| p.kind == "close-tab") {
+            return match k.key.as_str() {
+                "Escape" | "Enter" => self.execute(Command::DismissPrompt),
+                _ if !k.ctrl && !k.alt && k.key.eq_ignore_ascii_case("d") => {
+                    self.execute(Command::SubmitPrompt { all: true })
+                }
+                _ => Ok(()),
+            };
+        }
         if self.prompt.as_ref().is_some_and(|p| p.kind == "settings") {
             return self.settings_key(&k);
         }
@@ -1973,6 +2052,10 @@ impl App {
                                 View::Terminal(id) => format!("Terminal {id}"),
                             },
                             active: index == active,
+                            editor_id: match v {
+                                View::Editor(id) => Some(*id),
+                                _ => None,
+                            },
                         })
                         .collect()
                 }

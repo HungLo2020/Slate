@@ -50,8 +50,8 @@ const ACTIONS: &[(&str, &str, &str, &str, &str)] = &[
     ),
     (
         "close",
-        "Close document",
-        "Close the active document; preserve unsaved work",
+        "Close tab",
+        "Close the active editor tab; preserve unsaved work",
         "",
         "editor",
     ),

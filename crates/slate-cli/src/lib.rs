@@ -32,6 +32,42 @@ impl Drop for InputReader {
     }
 }
 struct Guard;
+// Rendering and mouse hit testing share terminal-column geometry, including
+// wide Unicode filenames and the space reserved for each close button.
+struct TabRegion {
+    index: usize,
+    x: u16,
+    width: u16,
+    close: Option<u16>,
+}
+fn tab_regions(tabs: &[slate_core::Tab], width: u16) -> Vec<TabRegion> {
+    let widths: Vec<usize> = tabs
+        .iter()
+        .map(|tab| {
+            Span::raw(clean(&tab.title)).width() + 2 + if tab.editor_id.is_some() { 3 } else { 0 }
+        })
+        .collect();
+    let crowded = widths.iter().sum::<usize>() > width as usize;
+    let mut x = 0u16;
+    let mut regions = Vec::new();
+    for (index, tab) in tabs.iter().enumerate() {
+        if crowded && !tab.active {
+            continue;
+        }
+        let size = widths[index].min(width.saturating_sub(x) as usize) as u16;
+        if size == 0 {
+            break;
+        }
+        regions.push(TabRegion {
+            index,
+            x,
+            width: size,
+            close: (tab.editor_id.is_some() && size >= 3).then(|| x + size - 3),
+        });
+        x += size;
+    }
+    regions
+}
 impl Drop for Guard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
@@ -149,6 +185,10 @@ pub fn run(mut app: App) -> Result<()> {
         redraw = true;
         match input {
             Event::Key(k) if k.kind != KeyEventKind::Release => {
+                if app.prompt.as_ref().is_some_and(|p| p.kind == "close-tab") {
+                    app.dispatch(Command::Key { key: translate(k) });
+                    continue;
+                }
                 if let Some(line) = palette.as_mut() {
                     match k.code {
                         KeyCode::Esc => palette = None,
@@ -194,6 +234,9 @@ pub fn run(mut app: App) -> Result<()> {
                 }
             }
             Event::Paste(text) => {
+                if app.prompt.as_ref().is_some_and(|p| p.kind == "close-tab") {
+                    continue;
+                }
                 if let Some(line) = palette.as_mut() {
                     line.push_str(&text.replace(['\n', '\r'], " "));
                 } else {
@@ -201,6 +244,9 @@ pub fn run(mut app: App) -> Result<()> {
                 }
             }
             Event::Mouse(m) => {
+                if app.prompt.is_some() || palette.is_some() {
+                    continue;
+                }
                 let x = m.column;
                 let y = m.row;
                 let target = snapshot.panes.iter().find(|p| {
@@ -254,21 +300,34 @@ pub fn run(mut app: App) -> Result<()> {
                         .cloned();
                     if drag.is_none() {
                         if let Some(pane) = snapshot.panes.iter().find(|p| inside(x, y, p.rect)) {
-                            app.dispatch(Command::Focus { pane: pane.id });
                             if y == pane.rect.y + 1 {
-                                let mut offset = pane.rect.x + 1;
-                                for (index, tab) in pane.tabs.iter().enumerate() {
-                                    let width = tab.title.chars().count() as u16 + 3;
-                                    if x >= offset && x < offset + width {
-                                        app.dispatch(Command::SwitchTab {
-                                            pane: pane.id,
-                                            index,
-                                        });
+                                let column = x.saturating_sub(pane.rect.x + 1);
+                                for region in
+                                    tab_regions(&pane.tabs, pane.rect.width.saturating_sub(2))
+                                {
+                                    if column >= region.x && column < region.x + region.width {
+                                        if region.close.is_some_and(|close| column >= close)
+                                            && m.kind
+                                                == MouseEventKind::Down(event::MouseButton::Left)
+                                        {
+                                            if let Some(view) = pane.tabs[region.index].editor_id {
+                                                app.dispatch(Command::CloseTab {
+                                                    pane: pane.id,
+                                                    view,
+                                                    force: false,
+                                                });
+                                            }
+                                        } else {
+                                            app.dispatch(Command::SwitchTab {
+                                                pane: pane.id,
+                                                index: region.index,
+                                            });
+                                        }
                                         break;
                                     }
-                                    offset += width;
                                 }
                             } else if y > pane.rect.y + 1 {
+                                app.dispatch(Command::Focus { pane: pane.id });
                                 if pane.kind == "editor" {
                                     selecting = Some(pane.id);
                                     app.dispatch(Command::Click {
@@ -415,20 +474,24 @@ fn render(
             })
             .border_style(Style::default().fg(if focus { Color::Cyan } else { Color::DarkGray }));
         frame.render_widget(block, area);
-        let tabs = p
-            .tabs
-            .iter()
-            .map(|t| {
-                Span::styled(
-                    format!(" {} ", clean(&t.title)),
-                    Style::default().fg(if t.active { Color::Cyan } else { Color::Gray }),
-                )
-            })
-            .collect::<Vec<_>>();
-        frame.render_widget(
-            Paragraph::new(Line::from(tabs)),
-            Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), 1),
-        );
+        for region in tab_regions(&p.tabs, area.width.saturating_sub(2)) {
+            let tab = &p.tabs[region.index];
+            let label_width =
+                region
+                    .width
+                    .saturating_sub(if region.close.is_some() { 3 } else { 0 });
+            frame.render_widget(
+                Paragraph::new(format!(" {} ", clean(&tab.title)))
+                    .style(Style::default().fg(if tab.active { Color::Cyan } else { Color::Gray })),
+                Rect::new(area.x + 1 + region.x, area.y + 1, label_width, 1),
+            );
+            if let Some(close) = region.close {
+                frame.render_widget(
+                    Paragraph::new("[x]").style(Style::default().fg(Color::Gray)),
+                    Rect::new(area.x + 1 + close, area.y + 1, 3, 1),
+                );
+            }
+        }
         let content = Rect::new(
             area.x + 1,
             area.y + 2,
@@ -531,7 +594,9 @@ fn render(
                 ),
             );
         } else {
-            let text = if prompt.kind == "replace" {
+            let text = if prompt.kind == "close-tab" {
+                format!("Discard unsaved changes in {}?\nD: discard and close · Escape / Enter: cancel\nCancel to save the document first.", clean(&prompt.input))
+            } else if prompt.kind == "replace" {
                 format!("Find: {}\nWith: {}\nTab switches fields · Enter replaces next · Ctrl-Enter replaces all\nEscape closes",clean(&prompt.input),clean(&prompt.replacement))
             } else {
                 format!("> {}\nEnter confirms · Escape closes", clean(&prompt.input))
@@ -550,6 +615,7 @@ fn render(
                     match prompt.kind.as_str() {
                         "open" => "Open file or directory",
                         "save-as" => "Save to a new file path",
+                        "close-tab" => "Unsaved changes",
                         "commit" => "Commit message",
                         "settings" => "Settings: option value (indent-width, theme, line-numbers…)",
                         "layout-save" => "Save layout name",

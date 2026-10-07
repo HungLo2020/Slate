@@ -14,7 +14,9 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLineEdit>
+#include <QMessageBox>
 #include <QPointer>
+#include <QPushButton>
 #include <QQuickWindow>
 #include <QSignalSpy>
 #include <QTest>
@@ -111,7 +113,7 @@ static QString checkCaptions(Bridge *state, QQuickWindow *window) {
             return "Missing pane tabs";
         const auto entries = pane.value("tabs").toList();
         for (int index = 0; index < entries.size(); ++index) {
-            auto tab = findItem(tabs, "tab_" + id + "_" + QString::number(index));
+            auto tab = findItem(tabs, "tabSelect_" + id + "_" + QString::number(index));
             // ListView may not instantiate tabs outside the visible viewport.
             if (!tab)
                 continue;
@@ -172,6 +174,29 @@ static QString checkLayout(Bridge *state, QQuickWindow *window) {
             if (rect.left() < -1 || rect.top() < -1 || rect.right() > tabs->width() + 1 ||
                 rect.bottom() > tabs->height() + 1 || tab->height() + 1 < tab->implicitHeight())
                 return "A tab button is clipped by its header";
+            const auto editor = entries[index].toMap().value("editor_id");
+            if (!editor.isNull()) {
+                auto close = findItem(tab, "tabClose_" + id + "_" + editor.toString());
+                if (!close || !close->isVisible() || close->width() < close->implicitWidth() - 1 ||
+                    close->mapRectToItem(tab, close->boundingRect()).right() > tab->width() + 1)
+                    return "An editor tab's close button is missing or clipped";
+                auto select = findItem(tab, "tabSelect_" + id + "_" + QString::number(index));
+                if (!select)
+                    return "Missing editor tab selection button";
+                const auto closeRect = close->mapRectToItem(select, close->boundingRect());
+                if (closeRect.left() < 0 || closeRect.top() < 0 ||
+                    closeRect.right() > select->width() || closeRect.bottom() > select->height())
+                    return "An editor tab's close button is outside its tab background";
+                auto content = select->property("contentItem").value<QQuickItem *>();
+                if (!content || content->mapRectToItem(select, content->boundingRect()).right() >
+                                    closeRect.left())
+                    return "An editor tab's caption overlaps its close button";
+                auto background = close->property("background").value<QQuickItem *>();
+                if (background && !close->property("hovered").toBool() &&
+                    !close->property("down").toBool() &&
+                    background->property("color").value<QColor>().alpha() != 0)
+                    return "An editor tab's close button has a separate resting background";
+            }
         }
         auto grid = findItem(window->contentItem(), "cells_" + id);
         auto browser = findItem(window->contentItem(), "browser_" + id);
@@ -1155,6 +1180,106 @@ static void startFileDialogSmoke(Bridge *state, QQuickWindow *window) {
     timer->start(150);
 }
 
+static void startTabCloseSmoke(Bridge *state, QQuickWindow *window) {
+    const QString dir = qEnvironmentVariable("SLATE_GUI_SMOKE_DIR");
+    auto timer = new QTimer(state);
+    auto step = new int(0), ticks = new int(0);
+    auto target = new QString;
+    auto tabs = [=]() {
+        for (const auto &value : state->frame().value("panes").toList())
+            if (value.toMap().value("id").toInt() == 2)
+                return value.toMap().value("tabs").toList();
+        return QVariantList{};
+    };
+    auto finish = [=](bool pass, const QString &detail) {
+        QFile report(dir + "/report.json"); report.open(QIODevice::WriteOnly);
+        report.write(QJsonDocument(QJsonObject{{"pass", pass}, {"detail", detail}, {"steps", *step}}).toJson());
+        window->grabWindow().save(dir + "/gui.png");
+        timer->stop(); QGuiApplication::exit(pass ? 0 : 2);
+    };
+    auto clickClose = [=](const QString &editor) {
+        auto button = findItem(window->contentItem(), "tabClose_2_" + editor);
+        if (!button || !button->isVisible()) {
+            finish(false, "Visible editor tab has no close button"); return false;
+        }
+        QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+            button->mapToScene(QPointF(button->width()/2, button->height()/2)).toPoint());
+        return true;
+    };
+    auto answer = [=](QMessageBox::StandardButton choice) {
+        for (auto widget : QApplication::topLevelWidgets())
+            if (auto dialog = qobject_cast<QMessageBox *>(widget))
+                if (dialog->objectName() == "closeTabDialog") {
+                    if (dialog->defaultButton() != dialog->button(QMessageBox::Cancel) ||
+                        dialog->textFormat() != Qt::PlainText ||
+                        dialog->windowHandle()->transientParent() != window) {
+                        finish(false, "Close confirmation defaults or parent are incorrect"); return false;
+                    }
+                    dialog->button(choice)->click(); return true;
+                }
+        finish(false, "Unsaved close did not show a standard confirmation dialog"); return false;
+    };
+    QObject::connect(timer, &QTimer::timeout, state, [=]() {
+        if (++*ticks > 150) { finish(false, QString("Tab close timeout at %1: %2").arg(*step).arg(state->frame().value("status").toString())); return; }
+        const auto entries = tabs();
+        switch (*step) {
+        case 0:
+            state->send({{"action", "open"}, {"path", dir + "/workspace/edit.txt"}}); state->refresh(); break;
+        case 1:
+            if (state->send({{"action", "file_dialog_context"}}).value("path") != dir + "/workspace/edit.txt") return;
+            state->send({{"action", "close_tab"}, {"pane", 2}, {"view", 11}});
+            state->send({{"action", "open"}, {"path", dir + "/workspace/second.txt"}}); state->refresh(); break;
+        case 2:
+            if (entries.size() != 2) return;
+            *target = entries.last().toMap().value("editor_id").toString();
+            if (!clickClose(entries.first().toMap().value("editor_id").toString())) return;
+            break;
+        case 3:
+            if (entries.size() != 1 || entries.first().toMap().value("editor_id").toString() != *target ||
+                state->send({{"action", "file_dialog_context"}}).value("path") != dir + "/workspace/second.txt") {
+                finish(false, "Closing a background tab changed the active document"); return;
+            }
+            state->send({{"action", "paste"}, {"text", "EDIT"}}); state->refresh();
+            if (!clickClose(*target)) return;
+            break;
+        case 4:
+            if (!state->closeDialogOpen() || !answer(QMessageBox::Cancel)) return;
+            break;
+        case 5:
+            if (!state->frame().value("dirty").toBool() || entries.size() != 1 || state->closeDialogOpen()) {
+                finish(false, "Cancelling close lost the edited tab"); return;
+            }
+            if (!clickClose(*target)) return;
+            break;
+        case 6:
+            if (!state->closeDialogOpen() || !answer(QMessageBox::Discard)) return;
+            break;
+        case 7:
+            if (entries.size() != 1 || entries.first().toMap().value("editor_id").toString() == *target ||
+                state->frame().value("dirty").toBool() || read(dir + "/workspace/second.txt") != "second original") {
+                finish(false, "Discard did not remove the selected tab and leave an empty editor"); return;
+            }
+            for (int i = 0; i < 6; ++i) state->send({{"action", "new"}});
+            state->refresh(); window->resize(480, 320); break;
+        case 8: {
+            const auto error = checkLayout(state, window);
+            if (!error.isEmpty()) { finish(false, error); return; }
+            *target = entries.last().toMap().value("editor_id").toString();
+            if (!clickClose(*target)) return;
+            break;
+        }
+        case 9:
+            if (entries.size() != 6) { finish(false, "Crowded tab close removed the wrong tab"); return; }
+            QTest::keyClick(window, Qt::Key_W, Qt::ControlModifier); break;
+        case 10:
+            if (entries.size() != 5) { finish(false, "Ctrl+W did not close the active tab"); return; }
+            finish(true, "GUI tab close buttons, background tabs, native unsaved/cancel/discard confirmation, final-tab editor, crowded headers and Ctrl+W"); return;
+        }
+        ++*step;
+    });
+    timer->start(150);
+}
+
 void startPerformanceSmoke(Bridge *, QQuickWindow *);
 void startSmoke(Bridge *state, QQuickWindow *window) {
     if (QGuiApplication::desktopFileName() != "slate" ||
@@ -1169,6 +1294,10 @@ void startSmoke(Bridge *state, QQuickWindow *window) {
     }
     if (!qEnvironmentVariableIsEmpty("SLATE_GUI_FILE_DIALOG_SMOKE")) {
         startFileDialogSmoke(state, window);
+        return;
+    }
+    if (!qEnvironmentVariableIsEmpty("SLATE_GUI_TAB_CLOSE_SMOKE")) {
+        startTabCloseSmoke(state, window);
         return;
     }
     if (!qEnvironmentVariableIsEmpty("SLATE_GUI_STARTUP_SMOKE")) {
