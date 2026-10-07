@@ -1502,7 +1502,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slate"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "slate-cli",
@@ -1512,7 +1512,7 @@ dependencies = [
 
 [[package]]
 name = "slate-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1523,7 +1523,7 @@ dependencies = [
 
 [[package]]
 name = "slate-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "fs2",
@@ -1543,7 +1543,7 @@ dependencies = [
 
 [[package]]
 name = "slate-gui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "cmake",
  "pkg-config",
