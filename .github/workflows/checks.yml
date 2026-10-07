@@ -6,7 +6,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install minimum Qt API build environment and terminal tools
-        run: sudo apt-get update && sudo apt-get install -y cmake pkg-config qt6-base-dev qt6-declarative-dev vim-tiny htop tmux openssh-client openssh-server aspell aspell-en
+        run: sudo apt-get update && sudo apt-get install -y cmake pkg-config qt6-base-dev qt6-declarative-dev vim-tiny htop tmux openssh-client openssh-server aspell aspell-en gdb
       - name: Install current stable Rust
         run: rustup update stable && rustup default stable && rustup component add rustfmt clippy
       - run: python3 scripts/dependency-policy.py
@@ -52,6 +52,7 @@ jobs:
       - run: SLATE_GUI_TAB_CLOSE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: SLATE_GUI_GIT_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: SLATE_GUI_DESKTOP_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
+      - run: SLATE_GUI_IDE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: SLATE_GUI_FILE_DIALOG_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: python3 scripts/single-instance-smoke.py target/debug/slate-gui
       - run: python3 scripts/gui-layout-smoke.py target/debug/slate

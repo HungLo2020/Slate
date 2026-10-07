@@ -268,3 +268,71 @@ itself. A signal thread turns SIGTERM/SIGHUP/SIGINT into an orderly Qt quit, so
 recovery state is flushed and the socket removed. Other platforms wake the Qt
 loop through a callback instead of the Unix event descriptor, and CMake reports
 the Qt libraries for Cargo to link.
+
+## Text model and highlighting
+
+Documents are `ropey` ropes; searching walks the rope directly
+(`regex-cursor`), and line, column and UTF-16 conversions come from the rope's
+indexes, so large files and long lines stay cheap. Each edit appends to two
+bounded feeds. One records line-level changes, which the highlighter uses. The
+other records LSP `TextChange`s in the coordinates the server expects. An
+overflowing feed turns into "everything changed".
+
+The highlight worker keeps syntect parse states every 32 lines per document.
+A request names the visible rows and the first edited line; the worker resumes
+from the nearest valid checkpoint and drops work superseded by a newer
+request. The core shifts its per-line span cache with each edit; stale colours
+stay visible until fresh ones arrive.
+
+## IDE services
+
+`ide::Event` is the bus between the core and its services. Language servers,
+debug adapters and tasks are child processes; reader threads parse their
+output and post typed events on the reply channel, and the main loop applies
+them. Language servers and debug adapters share `rpc.rs`, which handles
+Content-Length framing with separate reader and writer threads.
+
+The LSP client starts servers per (language, project root) and opens
+documents when they first appear. It syncs incrementally when the server
+supports it and falls back to full text when the feed overflowed or the
+document was replaced (reload, recovery). Diagnostics are kept per file. They
+move with local edits until the server publishes again, and task problem
+matchers add their own (`source = "task"`). Completion results are filtered
+locally with `nucleo-matcher` while typing; incomplete lists ask again.
+WorkspaceEdits change open documents through `Document::replace_many`, which
+groups its revisions so one undo reverts the whole edit, and rewrite closed
+files on disk.
+
+The debugger client speaks DAP to `gdb -i dap` by default. It sends
+breakpoints and `configurationDone` after `initialized`. On `stopped` it
+requests the stack, scopes and variables and moves the editor to the paused
+line; expressions are evaluated in the `watch` context, because GDB's `repl`
+context runs commands.
+
+Workspace trust gates every service that runs code from the folder: language
+servers, formatters, tasks, debugging, project tools and Git staging. A
+restricted Git still reads status with `core.fsmonitor=false` and hooks
+disabled.
+
+## Layout integrity
+
+Closing a pane moves its documents and terminals into the remaining layout.
+Applying a preset or a saved layout rebinds the running shells and open
+editors to the new slots, and anything left over is placed in it. No document
+or shell is ever hidden without a tab. The saved-layout limits (32 tabs per
+pane, depth 12) hold while editing: full panes spill into others or a new
+split. A checkpoint that fails validation is salvaged (every buffer that still
+parses, views clamped, a plain layout if needed), and the damaged file is kept
+beside it.
+
+## Terminals and Git workers
+
+vt100 callbacks answer cursor and device queries in order, take window titles
+and OSC 52 copies, and follow OSC 7 directories. Terminal input is written by
+its own thread, so a stalled program never blocks typing elsewhere. Exited
+shells are reaped and their tabs closed.
+
+Git runs on two workers: reads (status, diff) and writes (stage, commit). The
+app keeps at most one status read in flight and coalesces requests. Every git
+process has a timeout and its own process group. Paths keep their raw bytes,
+so files with non-UTF-8 names can be staged.

@@ -154,6 +154,164 @@ out keeps unsaved work (recovery checkpoints or `NAME.save` files); SIGTERM and
 SIGHUP quit through the same path. Qt options such as `-platform`, `-style` and
 `-reverse` pass through to Qt.
 
+## Using Slate as an IDE
+
+The IDE features work the same way in both interfaces. Every action is also in
+the command palette (F1).
+
+### Workspace trust
+
+Opening a folder never runs code from it. Language servers, tasks, formatters,
+debugging, project tools and Git hooks wait until you trust the folder. The
+first action that needs trust asks; you can also use **Trust workspace** and
+**Restrict workspace** from the palette. The status bar shows **Restricted**
+until you do. Trusted folders, and everything inside them, are listed one per
+line in `~/.config/slate/trusted-folders`. In restricted mode Git still shows
+status and diffs, with `core.fsmonitor` and hooks disabled; staging and commits
+ask first.
+
+### Language servers
+
+Slate starts a language server for each document whose language has one
+installed: rust-analyzer, pyright/pylsp/jedi, typescript-language-server,
+clangd, gopls, bash-language-server, lua-language-server, marksman, zls,
+jdtls, solargraph, taplo, nil and the vscode-* JSON/HTML/CSS servers. Add or
+override servers and formatters in `~/.config/slate/languages.toml`:
+
+```toml
+[[language]]
+name = "Python"                   # syntax name shown in the status bar
+extensions = ["py"]               # optional: match by extension instead
+server = ["pyright-langserver", "--stdio"]
+formatter = ["black", "-q", "-"]  # reads standard input, writes standard output
+roots = ["pyproject.toml"]
+```
+
+Edits are sent to the server as they happen. Errors and warnings are underlined
+in the editor, marked in the gutter and counted in the status bar; the message
+under the caret is shown there too. Completion opens while you type: Up/Down to
+choose, Tab or Enter to accept, Escape to close. Snippet completions put the
+caret in their first field. You can also show hover information, go to a
+definition, find references, rename a symbol across the workspace (closed
+files are rewritten on disk; open ones change in the editor, undoable), apply
+code actions, format the document, and list the document's or workspace's
+symbols. **Format on save** is a setting. Files without a server get an outline
+from their syntax grammar.
+
+### Finding things
+
+| Key | Action |
+| --- | --- |
+| Ctrl+P | Go to file (fuzzy, respects `.gitignore`) |
+| Ctrl+Shift+F | Search in files; Alt+C case, Alt+W whole word, Alt+R regex, Ctrl+H replace |
+| Ctrl+R | Go to symbol in the document |
+| Ctrl+T | Workspace symbols |
+| Ctrl+E | Open documents |
+| Alt+Left / Alt+Right | Go back / forward after a jump |
+| F12 / Shift+F12 | Go to definition / find references |
+| Ctrl+K | Hover information |
+| F2 | Rename symbol |
+| Ctrl+. | Code actions |
+| Ctrl+Shift+I | Format document |
+| Ctrl+Space | Complete |
+| Ctrl+F8 / Ctrl+Shift+F8 | Next / previous problem |
+
+Project search runs in the background as you type, searches unsaved documents
+as edited, and skips binary and ignored files. Replace in files changes open
+documents in the editor and rewrites the others.
+
+These keys are in the default keymap. The finding keys also work from the file
+and Git panes, but never in a terminal, so shells keep Ctrl+P, Ctrl+E and
+Alt+arrows.
+
+### Editing
+
+| Key | Action |
+| --- | --- |
+| Ctrl+D | Select the word, then add its next occurrence as another caret |
+| Ctrl+Shift+L | A caret on every occurrence |
+| Ctrl+Alt+Up / Down | Add a caret above / below |
+| Alt+click | Add or remove a caret |
+| Escape | Back to one caret |
+| Ctrl+Shift+[ / Ctrl+Shift+] | Fold / unfold the indented region (or click ▸ in the gutter) |
+| Ctrl+6 | Go to the matching bracket |
+| Tab after a snippet prefix | Expand a snippet; Tab / Shift+Tab move between its fields |
+
+With several carets, typing, deleting, Enter, Tab, paste (one line per caret when
+the counts match), copy and cut act at every caret and undo as one step.
+Brackets and quotes close automatically (setting **Close brackets and quotes**),
+and a selection typed over with a bracket is wrapped. Enter keeps the
+indentation and indents after an opening bracket or a trailing colon. A
+closing bracket typed on a blank line lines up with its opener. The bracket
+pair at the caret is highlighted. Built-in snippets cover Rust, Python,
+JavaScript, TypeScript, C, C++, Go and shell. Add your own in
+`~/.config/slate/snippets.toml`:
+
+```toml
+[[snippet]]
+prefix = "todo"
+body = "// TODO($1): $0"
+language = "Rust"      # optional
+```
+
+### Tasks and problems
+
+**Run build task** (Ctrl+Shift+B) and **Run task…** run tasks. Tasks come from
+`.slate/tasks.toml`, or are detected for Cargo, Make, CMake, Go, npm scripts
+and pytest. Output streams into a read-only document, and a problem matcher
+(`gcc`, `rustc`, `tsc`, `python`, `generic`) adds the errors and warnings to
+**Problems**.
+
+```toml
+[[task]]
+name = "build"
+command = "make -j"
+group = "build"
+matcher = "gcc"
+```
+
+### Debugging
+
+**Start debugging** (F5) runs a program under GDB's Debug Adapter Protocol
+mode (`gdb -i dap`), or another adapter. Configure programs in
+`.slate/launch.toml`:
+
+```toml
+[[launch]]
+name = "app"
+program = "build/app"
+args = ["--verbose"]
+```
+
+**Toggle breakpoint** is Ctrl+F9. While debugging, F9 toggles breakpoints, F10
+steps over, F11 steps in, Shift+F11 steps out, F5 continues and Shift+F5
+stops. The editor follows the paused line (▶ in the gutter). A Debug document
+shows the call stack, local variables and program output; **Evaluate…**
+evaluates an expression in the paused frame.
+
+### External tools
+
+Commands in `~/.config/slate/tools.toml` (and, in trusted folders,
+`.slate/tools.toml`) appear in the palette as "Tool: NAME":
+
+```toml
+[[tool]]
+name = "Sort lines"
+command = "sort"
+input = "selection"   # selection, document or none
+output = "replace"    # replace, insert, document, status or none
+key = "Alt+s"
+```
+
+Tools run with `sh -c` and get `SLATE_FILE`, `SLATE_LINE`, `SLATE_COLUMN`,
+`SLATE_SELECTION` and `SLATE_ROOT`.
+
+### Terminals
+
+A terminal whose shell exits closes its tab, and the exit code is shown when
+it is not zero. Programs can set the tab title and copy to the clipboard (OSC
+52). The **Terminal scrollback lines** setting controls history.
+
 ## Startup and settings
 
 Opening a file defaults to just the editor; opening a directory, or launching
@@ -478,7 +636,11 @@ with `printf '\033]7;file://localhost%s\007' "$PWD"` in its prompt hook.
 
 - `slate-core`: editing, documents/views, commands, layout tree, file/Git
   services, preferences/search/highlighting, workspace recovery, terminal processes,
-  and VT emulator state.
+  and VT emulator state. IDE services keep their own state in their own modules:
+  the language-server client (`lsp`), debug adapter client (`dap`), tasks, project
+  index/search, pickers and external tools. They run their processes and reader
+  threads and report to the main loop as typed `ide::Event`s, so editor state is
+  changed in one place.
 - `slate-cli`: Ratatui/Crossterm presentation and terminal input.
 - `slate-gui`: Qt Quick QML and a thin Qt C++ presentation adapter (editor and
   terminal surfaces, minimap, accessibility, printing). A small JSON/C ABI
@@ -499,6 +661,9 @@ Qt runtime version. Major ABI/API changes may require rebuilding.
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p slate --test tui_nano      # nano workflows in a real PTY
+cargo test -p slate --test tui_ide       # pickers, carets, folds, language server in a PTY
+cargo test -p slate-core --test lsp      # LSP client against tests/fixtures/fake_lsp.py
+cargo test -p slate-core --test debug    # gdb -i dap on a compiled C program
 python3 scripts/tui-smoke.py target/debug/slate
 python3 scripts/tab-close-smoke.py target/debug/slate
 python3 scripts/recovery-smoke.py target/debug/slate
@@ -508,6 +673,7 @@ cargo build -p slate -p slate-gui --features slate-gui/smoke
 python3 scripts/gui-offscreen-smoke.py target/debug/slate
 python3 scripts/gui-layout-smoke.py target/debug/slate  # Qt Test, Basic/Fusion/KDE styles
 SLATE_GUI_DESKTOP_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
+SLATE_GUI_IDE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
 python3 scripts/single-instance-smoke.py target/debug/slate-gui
 SLATE_GUI_FEATURE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
 SLATE_GUI_FILE_DIALOG_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
@@ -546,13 +712,13 @@ For a Qt-free installation, use
 `./scripts/install.sh "$HOME/.local" --tui-only`. The GUI installation also installs
 a desktop launcher and scalable icon; put the selected prefix's `bin` in PATH.
 
-Buffers remain UTF-8 strings with a 16 MiB per-buffer limit. Undo stores inserted
-and removed spans with a 32 MiB payload budget and up to 10,000 edits, rather than
-whole-buffer copies; full-buffer replacement still needs a full edit payload.
-Syntax parsing is background work and caches generation-tagged results; it is not
-an incremental parser. Terminals support conventional VT behavior, not
-Sixel/Kitty graphics or every xterm extension. LSP, debugging and agent integration
-remain future work in [GOALS.md](GOALS.md).
+Documents are ropes (up to 1 GiB). Undo stores inserted and removed spans,
+with a 32 MiB payload budget and up to 10,000 edits, never whole-buffer
+copies. Several edits from one action (carets, rename, formatting) undo as one
+step. Syntax highlighting is incremental: it is checkpointed every 32 lines,
+resumes from the line an edit touched, and does the visible rows first.
+Terminals support conventional VT behavior, not Sixel/Kitty graphics or every
+xterm extension. Agent integration remains future work in [GOALS.md](GOALS.md).
 
 See [DESIGN.md](DESIGN.md) for the implementation decisions and validation scope.
 

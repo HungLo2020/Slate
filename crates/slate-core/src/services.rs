@@ -1,6 +1,6 @@
 use crate::{
     document::Document,
-    highlight::{self, Token},
+    highlight,
     workspace::{self, Workspace},
 };
 use serde::Serialize;
@@ -17,36 +17,10 @@ pub struct Entry {
     pub path: String,
     pub directory: bool,
 }
-#[derive(Clone, Serialize, PartialEq)]
-pub struct GitEntry {
-    pub status: String,
-    pub path: String,
-    pub original_path: Option<String>,
-    pub staged: bool,
-    pub untracked: bool,
-    pub group: String,
-}
-impl GitEntry {
-    pub(crate) fn staging_paths(&self) -> impl Iterator<Item = String> {
-        // An index rename already removed the source. Passing that missing
-        // source to `git add` rejects a later edit to the destination. Include
-        // both paths only when the rename still belongs to the working tree.
-        let source = self.original_path.clone().filter(|_| {
-            self.status.as_bytes().get(1) == Some(&b'R') && !self.status.starts_with('R')
-        });
-        std::iter::once(self.path.clone()).chain(source)
-    }
-}
-pub struct GitState {
-    pub entries: Vec<GitEntry>,
-    pub branch: String,
-    pub repository: bool,
-}
+pub use crate::git::{GitEntry, GitState};
 pub enum Job {
     Browse(PathBuf),
-    Git(PathBuf, Vec<String>),
-    GitStatus(PathBuf),
-    GitDiff(PathBuf, String, bool, bool),
+    Git(crate::git::GitJob),
     /// List misspelled words with aspell, hunspell or enchant.
     Spell(String),
 }
@@ -77,13 +51,6 @@ pub enum IoJob {
     Checkpoint(PathBuf, Workspace),
     Flush(mpsc::SyncSender<()>),
 }
-pub struct HighlightJob {
-    pub id: u64,
-    pub generation: u64,
-    pub text: String,
-    pub path: Option<PathBuf>,
-    pub light: bool,
-}
 pub struct SaveFailure {
     pub kind: crate::fsio::SaveErrorKind,
     pub message: String,
@@ -93,7 +60,7 @@ pub enum Reply {
     Reloaded(u64, Result<Document, String>),
     OpenedDirectory(u64, PathBuf),
     Saved(u64, Result<Document, SaveFailure>),
-    Highlighted(u64, u64, bool, Vec<Token>),
+    Highlighted(highlight::Response),
     Files(PathBuf, Result<Vec<Entry>, String>),
     Git(Result<GitState, String>),
     GitOperation(Result<String, String>),
@@ -101,45 +68,77 @@ pub enum Reply {
     Error(String),
     Spelling(Result<Vec<String>, String>),
     Disk(Vec<(u64, crate::document::DiskChange)>),
+    /// The workspace file index for a root.
+    Index(PathBuf, Vec<String>),
+    SearchHits(u64, Vec<crate::project::Hit>),
+    SearchDone(u64, Result<usize, String>),
+    /// Grammar-based symbols of a document.
+    Outline(u64, Vec<crate::outline::Symbol>),
+    /// Files rewritten by replace-in-files: (files, matches, failures).
+    Replaced(usize, usize, Vec<String>),
+    /// A formatter's output: (document, content version, then save, text).
+    Formatted(u64, u64, bool, Result<String, String>),
+    /// An external tool finished: (name, output mode, target, result).
+    #[allow(clippy::type_complexity)]
+    ToolDone(
+        String,
+        String,
+        Option<(u64, u64, (usize, usize))>,
+        Result<String, String>,
+    ),
+    /// A message from an IDE service (language server, debugger, task).
+    Ide(crate::ide::Event),
 }
 #[derive(Clone)]
-struct ReplySender {
+pub struct ReplySender {
     sender: Sender<Reply>,
     events: crate::events::Events,
 }
 impl ReplySender {
-    fn send(&self, reply: Reply) -> Result<(), ()> {
+    pub fn send(&self, reply: Reply) -> Result<(), ()> {
         self.sender.send(reply).map_err(|_| ())?;
         self.events.notify();
         Ok(())
     }
 }
 pub struct JobSender {
-    git: Sender<Job>,
+    /// Status and diffs; a slow status never delays staging or commits.
+    git_read: Sender<Job>,
+    git_write: Sender<Job>,
     files: Sender<Job>,
 }
 impl JobSender {
     pub fn send(&self, job: Job) -> Result<(), mpsc::SendError<Job>> {
-        if matches!(job, Job::Browse(_) | Job::Spell(_)) {
-            self.files.send(job)
-        } else {
-            self.git.send(job)
+        use crate::git::GitJob;
+        match job {
+            Job::Git(GitJob::Run(..)) => self.git_write.send(job),
+            Job::Git(_) => self.git_read.send(job),
+            _ => self.files.send(job),
         }
     }
 }
 pub struct Services {
+    output: ReplySender,
     pub tx: JobSender,
     pub rx: Receiver<Reply>,
     pub io: Sender<IoJob>,
-    pub highlight: mpsc::SyncSender<HighlightJob>,
+    pub highlight: mpsc::SyncSender<highlight::Request>,
+    /// The newest requested highlight generation per document.
+    pub highlight_latest: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, u64>>>,
 }
 impl Services {
     pub fn new(events: crate::events::Events) -> Self {
-        let (git, jobs) = mpsc::channel();
+        let (git_read, read_jobs) = mpsc::channel();
+        let (git_write, write_jobs) = mpsc::channel();
         let (files, file_jobs) = mpsc::channel();
-        let tx = JobSender { git, files };
+        let tx = JobSender {
+            git_read,
+            git_write,
+            files,
+        };
         let (sender, rx) = mpsc::channel();
         let output = ReplySender { sender, events };
+        let output_root = output.clone();
         let (io, io_jobs) = mpsc::channel();
         let io_output = output.clone();
         thread::spawn(move || {
@@ -209,25 +208,16 @@ impl Services {
                 }
             }
         });
-        let (highlight, requests) = mpsc::sync_channel::<HighlightJob>(1);
+        let (highlight, requests) = mpsc::sync_channel::<highlight::Request>(64);
+        let highlight_latest = std::sync::Arc::new(std::sync::Mutex::new(Default::default()));
         let highlight_output = output.clone();
+        let latest = highlight_latest.clone();
         thread::spawn(move || {
-            while let Ok(job) = requests.recv() {
-                let tokens = highlight::highlight(&job.text, job.path.as_deref(), job.light);
-                if highlight_output
-                    .send(Reply::Highlighted(
-                        job.id,
-                        job.generation,
-                        job.light,
-                        tokens,
-                    ))
-                    .is_err()
-                {
-                    break;
-                }
-            }
+            highlight::worker(requests, latest, |response| {
+                highlight_output.send(Reply::Highlighted(response)).is_ok()
+            });
         });
-        for jobs in [jobs, file_jobs] {
+        for jobs in [read_jobs, write_jobs, file_jobs] {
             let output = output.clone();
             thread::spawn(move || {
                 while let Ok(job) = jobs.recv() {
@@ -261,105 +251,12 @@ impl Services {
                             })();
                             Reply::Files(path, entries.map_err(|e| e.to_string()))
                         }
-                        Job::GitStatus(root) => Reply::Git(git_status(&root)),
                         Job::Spell(text) => Reply::Spelling(spell(&text)),
-                        Job::GitDiff(root, path, staged, untracked) => {
-                            let root = git_root(&root);
-                            let mut args = vec![
-                                "diff".to_string(),
-                                "--no-ext-diff".into(),
-                                "--no-textconv".into(),
-                            ];
-                            if untracked {
-                                args.extend([
-                                    "--no-index".into(),
-                                    "--".into(),
-                                    "/dev/null".into(),
-                                    path.clone(),
-                                ]);
-                            } else {
-                                if staged {
-                                    args.push("--cached".into());
-                                }
-                                args.extend(["--".into(), path.clone()]);
-                            }
-                            match git_output(&root, &args) {
-                                Ok(result)
-                                    if result.status.success()
-                                        || (untracked && result.status.code() == Some(1)) =>
-                                {
-                                    let mut text =
-                                        String::from_utf8_lossy(&result.stdout).into_owned();
-                                    if text.is_empty() {
-                                        text = "No changes in this comparison. Refresh Git if the file changed externally.\n".into();
-                                    }
-                                    if text.len() > 2 * 1024 * 1024 {
-                                        let mut end = 2 * 1024 * 1024;
-                                        while !text.is_char_boundary(end) {
-                                            end -= 1;
-                                        }
-                                        text.truncate(end);
-                                        text.push_str("\n[Diff preview truncated at 2 MiB]\n");
-                                    }
-                                    Reply::Output(
-                                        format!(
-                                            "{} · {}",
-                                            if untracked {
-                                                "Untracked"
-                                            } else if staged {
-                                                "Staged diff"
-                                            } else {
-                                                "Working diff"
-                                            },
-                                            path
-                                        ),
-                                        text,
-                                    )
-                                }
-                                Ok(result) => Reply::GitOperation(Err(String::from_utf8_lossy(
-                                    &result.stderr,
-                                )
-                                .trim()
-                                .into())),
-                                Err(e) => Reply::GitOperation(Err(e)),
-                            }
-                        }
-                        Job::Git(root, mut args) => {
-                            let root = git_root(&root);
-                            if args.first().map(String::as_str) == Some("reset")
-                                && !git_output(
-                                    &root,
-                                    &["rev-parse".into(), "--verify".into(), "HEAD".into()],
-                                )
-                                .is_ok_and(|r| r.status.success())
-                            {
-                                let paths = args
-                                    .iter()
-                                    .position(|a| a == "--")
-                                    .map(|i| args[i + 1..].to_vec())
-                                    .unwrap_or_default();
-                                // An unborn index has no HEAD to reset to. Remove
-                                // its entries only, including nested paths and
-                                // entries whose working copy has changed again.
-                                args = vec![
-                                    "rm".into(),
-                                    "--cached".into(),
-                                    "-r".into(),
-                                    "--force".into(),
-                                    "--".into(),
-                                ];
-                                args.extend(paths);
-                            }
-                            Reply::GitOperation(match git_output(&root, &args) {
-                                Ok(result) if result.status.success() => {
-                                    Ok(String::from_utf8_lossy(&result.stdout).trim().to_string())
-                                }
-                                Ok(result) => {
-                                    Err(String::from_utf8_lossy(&result.stderr).trim().to_string())
-                                }
-                                Err(e) => Err(e),
-                            })
-                        }
+                        Job::Git(job) => match crate::git::handle(job) {
+                            crate::git::GitReply::Status(state) => Reply::Git(state),
+                            crate::git::GitReply::Operation(result) => Reply::GitOperation(result),
+                            crate::git::GitReply::Output(title, text) => Reply::Output(title, text),
+                        },
                     };
                     if output.send(reply).is_err() {
                         break;
@@ -368,11 +265,27 @@ impl Services {
             });
         }
         Self {
+            output: output_root,
             tx,
             rx,
             io,
             highlight,
+            highlight_latest,
         }
+    }
+}
+
+impl Services {
+    /// Run `work` on its own thread and deliver its reply.
+    pub fn background(&self, work: impl FnOnce() -> Reply + Send + 'static) {
+        let output = self.output.clone();
+        thread::spawn(move || {
+            let _ = output.send(work());
+        });
+    }
+    /// A handle for threads that deliver several replies.
+    pub fn reply_sender(&self) -> ReplySender {
+        self.output.clone()
     }
 }
 
@@ -412,112 +325,4 @@ fn spell(text: &str) -> Result<Vec<String>, String> {
         .filter(|w| !w.is_empty() && seen.insert(w.to_string()))
         .map(String::from)
         .collect())
-}
-
-fn git_output(root: &std::path::Path, args: &[String]) -> Result<std::process::Output, String> {
-    Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .map_err(|e| e.to_string())
-}
-fn git_root(root: &std::path::Path) -> PathBuf {
-    git_output(root, &["rev-parse".into(), "--show-toplevel".into()])
-        .ok()
-        .filter(|r| r.status.success())
-        .map(|r| PathBuf::from(String::from_utf8_lossy(&r.stdout).trim()))
-        .unwrap_or_else(|| root.to_path_buf())
-}
-fn git_status(root: &std::path::Path) -> Result<GitState, String> {
-    let root = git_root(root);
-    let result = git_output(
-        &root,
-        &[
-            "status".into(),
-            "--porcelain=v1".into(),
-            "--untracked-files=all".into(),
-            "-z".into(),
-        ],
-    )?;
-    if !result.status.success() {
-        let error = String::from_utf8_lossy(&result.stderr).trim().to_string();
-        if error.contains("not a git repository") {
-            return Ok(GitState {
-                entries: vec![],
-                branch: String::new(),
-                repository: false,
-            });
-        }
-        return Err(error);
-    }
-    let branch = git_output(
-        &root,
-        &["symbolic-ref".into(), "--short".into(), "HEAD".into()],
-    )
-    .ok()
-    .filter(|r| r.status.success())
-    .map(|r| String::from_utf8_lossy(&r.stdout).trim().to_string())
-    .unwrap_or_else(|| "Detached HEAD".into());
-    let mut records = result.stdout.split(|b| *b == 0);
-    let mut entries = vec![];
-    while let Some(record) = records.next() {
-        if record.len() < 4 {
-            continue;
-        }
-        let status = String::from_utf8_lossy(&record[..2]).into_owned();
-        let path = String::from_utf8_lossy(&record[3..]).into_owned();
-        let original_path = if status.contains(['R', 'C']) {
-            records
-                .next()
-                .map(|p| String::from_utf8_lossy(p).into_owned())
-        } else {
-            None
-        };
-        let conflict = status.contains('U') || status == "AA" || status == "DD";
-        let untracked = status == "??";
-        for staged in [true, false] {
-            if conflict || untracked {
-                if staged {
-                    continue;
-                }
-            } else if record[usize::from(!staged)] == b' ' {
-                continue;
-            }
-            entries.push(GitEntry {
-                status: status.clone(),
-                path: path.clone(),
-                original_path: original_path.clone(),
-                staged,
-                untracked,
-                group: if conflict {
-                    "Conflicts"
-                } else if untracked {
-                    "Untracked"
-                } else if staged {
-                    "Staged"
-                } else {
-                    "Unstaged"
-                }
-                .into(),
-            });
-        }
-    }
-    entries.sort_by_key(|e| {
-        (
-            match e.group.as_str() {
-                "Conflicts" => 0,
-                "Staged" => 1,
-                "Unstaged" => 2,
-                _ => 3,
-            },
-            e.path.clone(),
-        )
-    });
-    Ok(GitState {
-        entries,
-        branch,
-        repository: true,
-    })
 }

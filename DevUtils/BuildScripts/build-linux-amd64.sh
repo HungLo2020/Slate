@@ -63,11 +63,12 @@ Maintainer: Slate Maintainers
 Installed-Size: $installed_size
 Depends: $shlib_depends
 Recommends: $gui_depends, $qml_depends, git, plasma-integration, qml6-module-org-kde-desktop, breeze-icon-theme, fonts-dejavu-core
-Suggests: aspell | hunspell, wl-clipboard | xclip, breeze-icon-theme | adwaita-icon-theme
+Suggests: aspell | hunspell, wl-clipboard | xclip, breeze-icon-theme | adwaita-icon-theme, gdb, clangd, python3-pylsp
 Homepage: https://github.com/HungLo2020/Slate
 Description: Shared graphical and terminal text editor
- Slate provides a Kirigami graphical editor and a terminal editor using the
- same Rust core, with configurable layouts, recovery, Git and PTY terminals.
+ Slate provides a Qt Quick graphical editor and a terminal editor using the
+ same Rust core, with configurable layouts, recovery, Git, PTY terminals and
+ IDE features: language servers, debugging (gdb), tasks and project search.
  Invoke slate for the terminal interface or slate-gui for the graphical one.
  The terminal interface does not need Qt; install with --no-install-recommends
  on servers to omit the graphical components.

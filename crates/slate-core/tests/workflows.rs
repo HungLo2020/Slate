@@ -120,9 +120,9 @@ fn nested_layout_geometry_resize_remove_and_validation() {
     layout.resize(4, 0.3);
     assert!(layout.validate());
     assert!(layout.swap(1, 6));
-    assert!(layout.remove(6));
+    assert!(layout.remove(6).is_some());
     assert_eq!(layout.panes().len(), 3);
-    assert!(!layout.remove(999));
+    assert!(layout.remove(999).is_none());
 }
 fn wait_for(term: &TerminalSession, needle: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -469,6 +469,7 @@ fn git_status_stage_diff_commit_and_unstage_in_nested_workspace() {
     fs::create_dir(dir.path().join("nested")).unwrap();
     fs::write(dir.path().join("nested/code.rs"), "old\n").unwrap();
     let mut app = App::new(&dir.path().join("nested")).unwrap();
+    app.set_session_trust(true);
     fn wait_status(app: &mut App, needle: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -611,12 +612,13 @@ fn search_replace_unicode_whole_words_literal_replacement_and_indentation() {
     app.dispatch(Command::GoToLine { line: 2 });
     key(&mut app, "End");
     key(&mut app, "Enter");
+    // Enter after an opening brace indents one level deeper.
     assert!(app.documents[&10]
         .text()
-        .contains("    fn main() {\n    \n}"));
+        .contains("    fn main() {\n        \n}"));
     app.preferences.indent_width = 2;
     key(&mut app, "Tab");
-    assert!(app.documents[&10].text().contains("{\n      \n}"));
+    assert!(app.documents[&10].text().contains("{\n          \n}"));
     app.dispatch(Command::GoToLine { line: 2 });
     app.dispatch(Command::Indent { outdent: false });
     assert!(app.documents[&10].text().contains("      fn main()"));
@@ -1240,6 +1242,73 @@ fn corrupt_workspace_is_preserved_until_an_explicit_fresh_start() {
     assert!(serde_json::from_slice::<serde_json::Value>(&fs::read(path).unwrap()).is_ok());
 }
 
+#[test]
+fn damaged_checkpoints_still_recover_unsaved_buffers() {
+    use slate_core::workspace::WorkspaceStore;
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let path = dir.path().join("notes.txt");
+    fs::write(&path, "disk").unwrap();
+    let mut app = App::new(&path).unwrap();
+    let store = WorkspaceStore::acquire_in(dir.path(), state.path()).unwrap();
+    let session = store.path.clone();
+    app.attach_workspace(store, false).unwrap();
+    app.dispatch(Command::Paste {
+        text: "precious ".into(),
+    });
+    app.flush_workspace().unwrap();
+    drop(app);
+    // Damage the checkpoint the way a buggy older build or a partial edit
+    // might: a cursor past the end, a tab naming a missing view, a bad focus,
+    // and one buffer that no longer parses.
+    let mut json: serde_json::Value = serde_json::from_slice(&fs::read(&session).unwrap()).unwrap();
+    for view in json["views"].as_object_mut().unwrap().values_mut() {
+        view["cursor"] = 9999.into();
+    }
+    json["layout"] = serde_json::json!({"type": "pane", "id": 1, "tabs": [{"kind": "editor", "id": 777}], "active": 0});
+    json["focus"] = 42.into();
+    json["documents"]["999"] = serde_json::json!({"nonsense": true});
+    let damaged = serde_json::to_vec(&json).unwrap();
+    fs::write(&session, &damaged).unwrap();
+
+    let mut restored = App::new(dir.path()).unwrap();
+    restored
+        .attach_workspace(
+            WorkspaceStore::acquire_in(dir.path(), state.path()).unwrap(),
+            true,
+        )
+        .unwrap();
+    assert!(
+        restored.status.contains("damaged checkpoint"),
+        "{}",
+        restored.status
+    );
+    let doc = restored
+        .documents
+        .values()
+        .find(|d| d.text() == "precious disk")
+        .expect("the unsaved buffer survives");
+    assert!(doc.dirty());
+    assert!(restored.layout.validate());
+    let shown = restored.layout.views();
+    assert!(shown.iter().any(|v| matches!(v, View::Editor(id)
+        if restored.documents[&restored.views[id].document].text() == "precious disk")));
+    for v in restored.views.values() {
+        assert!(v.cursor <= restored.documents[&v.document].len());
+    }
+    // The damaged original is kept for inspection.
+    let kept: Vec<_> = fs::read_dir(session.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("session.damaged-")
+        })
+        .collect();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(fs::read(kept[0].path()).unwrap(), damaged);
+}
 #[test]
 fn constrained_layout_keeps_nested_panes_usable_without_changing_saved_ratios() {
     let mut layout = Node::default_layout(10, 20);

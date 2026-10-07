@@ -55,10 +55,10 @@ impl Workspace {
             if d.reference {
                 continue;
             }
-            if v.cursor > d.text.len()
-                || !d.text.is_char_boundary(v.cursor)
+            if v.cursor > d.len()
+                || !d.is_char_boundary(v.cursor)
                 || v.anchor
-                    .is_some_and(|a| a > d.text.len() || !d.text.is_char_boundary(a))
+                    .is_some_and(|a| a > d.len() || !d.is_char_boundary(a))
             {
                 bail!("Invalid recovery cursor");
             }
@@ -103,6 +103,143 @@ impl Workspace {
             bail!("Invalid recovery ID counter");
         }
         Ok(())
+    }
+}
+impl Workspace {
+    /// Rebuild what can be trusted from a checkpoint that failed validation:
+    /// every buffer that still parses and fits the limits, views clamped to
+    /// their text, and the layout (or a plain one when the saved layout is
+    /// unusable). Returns `None` when nothing worth keeping is left.
+    pub fn salvage(bytes: &[u8], root: &Path) -> Option<Self> {
+        use serde_json::Value;
+        let value: Value = serde_json::from_slice(bytes).ok()?;
+        if value.get("version")?.as_u64()? != 1
+            || value
+                .get("root")
+                .and_then(|r| serde_json::from_value::<PathBuf>(r.clone()).ok())?
+                != root
+        {
+            return None;
+        }
+        let entries = |key: &str| -> Vec<(u64, Value)> {
+            value
+                .get(key)
+                .and_then(Value::as_object)
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| Some((k.parse().ok()?, v.clone())))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let mut documents = BTreeMap::new();
+        for (id, v) in entries("documents") {
+            if documents.len() == 128 {
+                break;
+            }
+            if let Ok(d) = serde_json::from_value::<Document>(v) {
+                if d.valid_recovery() {
+                    documents.insert(id, d);
+                }
+            }
+        }
+        if documents.is_empty() {
+            return None;
+        }
+        let mut views = BTreeMap::new();
+        for (id, v) in entries("views") {
+            let Ok(mut view) = serde_json::from_value::<EditorView>(v) else {
+                continue;
+            };
+            let Some(d) = documents.get(&view.document) else {
+                continue;
+            };
+            if views.len() == 512 {
+                break;
+            }
+            if !d.reference {
+                view.cursor = d.floor_boundary(view.cursor.min(d.len()));
+                view.anchor = view.anchor.map(|a| d.floor_boundary(a.min(d.len())));
+            }
+            views.insert(id, view);
+        }
+        let terminals: BTreeMap<u64, PathBuf> = entries("terminals")
+            .into_iter()
+            .filter_map(|(id, v)| Some((id, serde_json::from_value(v).ok()?)))
+            .take(128)
+            .collect();
+        let browser = value
+            .get("browser")
+            .and_then(|b| serde_json::from_value(b.clone()).ok())
+            .unwrap_or_else(|| root.to_path_buf());
+        let mut ids = documents
+            .keys()
+            .chain(views.keys())
+            .chain(terminals.keys())
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .max(value.get("ids").and_then(Value::as_u64).unwrap_or(0))
+            .min(u64::MAX - 20_000);
+        let mut w = Workspace {
+            version: 1,
+            root: root.to_path_buf(),
+            documents,
+            views,
+            terminals,
+            layout: Node::pane(0, View::Files),
+            focus: 0,
+            browser,
+            ids,
+        };
+        let saved = value
+            .get("layout")
+            .and_then(|l| serde_json::from_value::<Node>(l.clone()).ok());
+        let focus = value.get("focus").and_then(Value::as_u64);
+        if let Some(layout) = saved {
+            w.layout = layout;
+            w.focus = focus.unwrap_or(0);
+            w.ids = w.ids.max(w.layout.panes().into_iter().max().unwrap_or(0));
+            if w.validate(root).is_ok() {
+                return Some(w);
+            }
+            if w.layout.validate() && !w.layout.panes().contains(&w.focus) {
+                w.focus = w.layout.panes()[0];
+                if w.validate(root).is_ok() {
+                    return Some(w);
+                }
+            }
+        }
+        // A plain layout: one pane with the first editor of each document.
+        // The application moves any further views and shells into it.
+        let mut tabs = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for (id, v) in &w.views {
+            if seen.insert(v.document) && tabs.len() < crate::layout::MAX_TABS {
+                tabs.push(View::Editor(*id));
+            }
+        }
+        if tabs.is_empty() {
+            ids += 1;
+            w.views.insert(
+                ids,
+                EditorView {
+                    document: *w.documents.keys().next()?,
+                    ..Default::default()
+                },
+            );
+            tabs.push(View::Editor(ids));
+        }
+        ids = ids.max(w.ids) + 1;
+        w.layout = Node::Pane {
+            id: ids,
+            tabs,
+            active: 0,
+        };
+        w.focus = ids;
+        w.ids = ids;
+        w.validate(root).ok()?;
+        Some(w)
     }
 }
 pub struct WorkspaceStore {
@@ -154,15 +291,38 @@ impl WorkspaceStore {
         })
     }
     pub fn load(&self, root: &Path) -> Result<Option<Workspace>> {
+        Ok(self.load_tolerant(root)?.map(|(w, _)| w))
+    }
+    /// Load the checkpoint. One that fails validation is salvaged when any
+    /// buffer can be kept; the original file is then preserved next to it and
+    /// its path returned so the user can inspect it.
+    pub fn load_tolerant(&self, root: &Path) -> Result<Option<(Workspace, Option<PathBuf>)>> {
         if !self.path.exists() {
             return Ok(None);
         }
         if fs::metadata(&self.path)?.len() > 128 * 1024 * 1024 {
             bail!("Recovery checkpoint is too large");
         }
-        let w: Workspace = serde_json::from_slice(&fs::read(&self.path)?)?;
-        w.validate(root)?;
-        Ok(Some(w))
+        let bytes = fs::read(&self.path)?;
+        let error = match serde_json::from_slice::<Workspace>(&bytes) {
+            Ok(w) => match w.validate(root) {
+                Ok(()) => return Ok(Some((w, None))),
+                Err(e) => e,
+            },
+            Err(e) => e.into(),
+        };
+        let Some(w) = Workspace::salvage(&bytes, root) else {
+            return Err(error);
+        };
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let kept = self
+            .path
+            .with_file_name(format!("session.damaged-{stamp}.json"));
+        fs::copy(&self.path, &kept)?;
+        Ok(Some((w, Some(kept))))
     }
 }
 pub fn write_checkpoint(path: &Path, workspace: &Workspace) -> Result<()> {
@@ -200,7 +360,7 @@ pub fn write_checkpoint(path: &Path, workspace: &Workspace) -> Result<()> {
     Ok(())
 }
 
-use crate::{services::IoJob, terminal::TerminalSession, App, Command};
+use crate::{services::IoJob, App, Command};
 
 impl App {
     pub fn enable_workspace(&mut self, recover: bool) -> Result<()> {
@@ -210,7 +370,11 @@ impl App {
     pub fn attach_workspace(&mut self, store: WorkspaceStore, recover: bool) -> Result<()> {
         let requested = self.documents.values().find_map(|d| d.path.clone());
         if recover {
-            if let Some(mut w) = store.load(&self.root)? {
+            if let Some((mut w, damaged)) = store.load_tolerant(&self.root)? {
+                // Content versions are not stored; dirty means text differs.
+                for d in w.documents.values_mut() {
+                    d.restore_versions();
+                }
                 let recovered = w
                     .documents
                     .values()
@@ -240,14 +404,7 @@ impl App {
                 let mut terminals = BTreeMap::new();
                 if !self.editor_only {
                     for (id, cwd) in &w.terminals {
-                        let mut terminal = TerminalSession::spawn(
-                            if cwd.is_dir() { cwd } else { &self.root },
-                            None,
-                            24,
-                            80,
-                        )?;
-                        terminal.set_events(self.events.clone());
-                        terminals.insert(*id, terminal);
+                        terminals.insert(*id, self.spawn_shell(cwd)?);
                     }
                 }
                 self.documents = w.documents;
@@ -270,7 +427,15 @@ impl App {
                 for doc in docs {
                     self.clamp_views(doc);
                 }
-                self.status=format!("Restored workspace · {recovered} recovered unsaved buffers · fresh terminal shells");
+                // Salvaged checkpoints may have lost tabs for some views.
+                self.adopt_orphans();
+                self.status = match damaged {
+                    None => format!("Restored workspace · {recovered} recovered unsaved buffers · fresh terminal shells"),
+                    Some(kept) => format!(
+                        "Recovered {recovered} unsaved buffers from a damaged checkpoint · original kept at {}",
+                        kept.display()
+                    ),
+                };
                 if let Some(path) = requested {
                     self.dispatch(Command::Open { path });
                 }

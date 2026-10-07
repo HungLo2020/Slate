@@ -233,6 +233,21 @@ pub fn normalize_input(text: &str) -> Cow<'_, str> {
     }
 }
 
+/// Encode a document rope. UTF-8 with LF line endings copies chunks directly.
+pub fn encode_rope(text: &ropey::Rope, format: &TextFormat) -> Result<Vec<u8>> {
+    if format.encoding == "UTF-8" && format.line_ending == LineEnding::Lf {
+        let mut bytes = Vec::with_capacity(text.len_bytes() + 3);
+        if format.bom {
+            bytes.extend_from_slice(b"\xEF\xBB\xBF");
+        }
+        for chunk in text.chunks() {
+            bytes.extend_from_slice(chunk.as_bytes());
+        }
+        return Ok(bytes);
+    }
+    encode(&text.to_string(), format)
+}
+
 pub fn encode(text: &str, format: &TextFormat) -> Result<Vec<u8>> {
     let text: Cow<str> = if format.line_ending == LineEnding::Lf {
         Cow::Borrowed(text)

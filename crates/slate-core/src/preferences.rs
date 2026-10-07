@@ -56,6 +56,12 @@ pub struct Preferences {
     pub font_family: String,
     /// GUI editor font size in points.
     pub font_size: usize,
+    /// Lines of history kept by each terminal.
+    pub terminal_scrollback: usize,
+    /// Typing an opening bracket or quote inserts its closer.
+    pub auto_close_brackets: bool,
+    /// Format documents before saving them (trusted workspaces only).
+    pub format_on_save: bool,
     pub global_keys: BTreeMap<String, String>,
     pub editor_keys: BTreeMap<String, String>,
     pub terminal_keys: BTreeMap<String, String>,
@@ -120,6 +126,34 @@ pub fn keymap(
                 ("Ctrl+]", "indent"),
                 ("Ctrl+[", "outdent"),
                 ("Alt+z", "toggle-soft-wrap"),
+                ("Ctrl+d", "add-next-occurrence"),
+                ("Ctrl+Shift+l", "select-all-occurrences"),
+                ("Ctrl+Alt+up", "add-cursor-above"),
+                ("Ctrl+Alt+down", "add-cursor-below"),
+                ("Ctrl+6", "go-to-bracket"),
+                ("Ctrl+{", "fold"),
+                ("Ctrl+}", "unfold"),
+                ("Ctrl+r", "go-to-symbol"),
+                ("Ctrl+k", "hover"),
+                ("f12", "go-to-definition"),
+                ("Shift+f12", "find-references"),
+                ("f2", "rename-symbol"),
+                ("Ctrl+.", "code-actions"),
+                ("Ctrl+Shift+i", "format-document"),
+                ("Ctrl+ ", "trigger-completion"),
+                ("Ctrl+t", "workspace-symbols"),
+                ("Ctrl+f8", "next-problem"),
+                ("Ctrl+Shift+f8", "previous-problem"),
+                // Workbench keys: also from the file and Git panes, never
+                // from terminals (shells use Ctrl+P, Ctrl+E, Alt+arrows).
+                ("Ctrl+p", "quick-open"),
+                ("Ctrl+Shift+f", "search-in-files"),
+                ("Ctrl+e", "open-documents"),
+                ("Alt+left", "go-back"),
+                ("Alt+right", "go-forward"),
+                ("Ctrl+Shift+b", "run-build-task"),
+                ("f5", "debug-start"),
+                ("Ctrl+f9", "toggle-breakpoint"),
             ])
         }
         // GNU nano's default bindings (nano 7), mapped onto Slate's actions.
@@ -200,6 +234,9 @@ impl Default for Preferences {
             minimap: true,
             font_family: String::new(),
             font_size: 11,
+            terminal_scrollback: crate::terminal::DEFAULT_SCROLLBACK,
+            auto_close_brackets: true,
+            format_on_save: false,
             global_keys,
             editor_keys,
             terminal_keys,
@@ -299,6 +336,21 @@ pub const SETTINGS: &[Setting] = &[
         label: "Reload files changed on disk",
         kind: SettingKind::Bool,
     },
+    Setting {
+        name: "auto-close-brackets",
+        label: "Close brackets and quotes",
+        kind: SettingKind::Bool,
+    },
+    Setting {
+        name: "format-on-save",
+        label: "Format on save",
+        kind: SettingKind::Bool,
+    },
+    Setting {
+        name: "terminal-scrollback",
+        label: "Terminal scrollback lines",
+        kind: SettingKind::Number(0, 100_000),
+    },
 ];
 
 impl Preferences {
@@ -324,6 +376,9 @@ impl Preferences {
             "tui-mouse" => self.tui_mouse.to_string(),
             "show-whitespace" => self.show_whitespace.to_string(),
             "auto-reload" => self.auto_reload.to_string(),
+            "terminal-scrollback" => self.terminal_scrollback.to_string(),
+            "auto-close-brackets" => self.auto_close_brackets.to_string(),
+            "format-on-save" => self.format_on_save.to_string(),
             "minimap" => self.minimap.to_string(),
             "font-family" => self.font_family.clone(),
             "font-size" => self.font_size.to_string(),
@@ -384,6 +439,9 @@ impl Preferences {
         }
         if !(10..=500).contains(&self.wrap_column) {
             bail!("wrap_column must be 10–500");
+        }
+        if self.terminal_scrollback > 100_000 {
+            bail!("terminal_scrollback must be 0–100000");
         }
         if !(6..=72).contains(&self.font_size) {
             bail!("font_size must be 6–72");
@@ -509,7 +567,8 @@ impl App {
                 "#88c0d0".into(),
             );
         }
-        self.tokens.clear();
+        self.highlights.clear();
+        self.highlight_pending.clear();
     }
     pub(super) fn configure(&mut self, name: &str, value: &str) -> Result<()> {
         let mut settings = self.preferences.clone();
@@ -541,6 +600,9 @@ impl App {
             "tui-mouse" | "mouse" => settings.tui_mouse = flag(value)?,
             "show-whitespace" => settings.show_whitespace = flag(value)?,
             "auto-reload" => settings.auto_reload = flag(value)?,
+            "terminal-scrollback" => settings.terminal_scrollback = value.parse()?,
+            "auto-close-brackets" => settings.auto_close_brackets = flag(value)?,
+            "format-on-save" => settings.format_on_save = flag(value)?,
             "minimap" => settings.minimap = flag(value)?,
             "font-family" => settings.font_family = value.trim().into(),
             "font-size" => settings.font_size = value.parse()?,

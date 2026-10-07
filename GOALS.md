@@ -121,11 +121,12 @@ open a workspace, browse files, edit and save, undo/redo, resize and focus the
 three panes, and run an interactive shell. Add configurable layouts, multiple
 editor views, multiple terminals, and a shared Git viewer incrementally.
 
-Language-server integration, syntax parsing/highlighting, diagnostics,
-formatting, debugging, build tasks, and external agent integration are future
-extensions. Keep the core boundaries suitable for them without making them
-prerequisites for the first milestone. Any agent harness remains a separate
-system that Slate can integrate with.
+Language servers, incremental syntax highlighting, diagnostics, formatting,
+debugging (DAP), build tasks with problem matching, project search, and
+external tools are in place. Each is a service with its own state that reports
+to the main loop as typed events, and none of them runs until the user trusts
+the workspace. External agent integration is still future work; any agent
+harness remains a separate system that Slate can integrate with.
 
 ## Quality goals
 

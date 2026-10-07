@@ -1,27 +1,47 @@
 mod actions;
 pub mod cli;
 pub mod commands;
+mod cursors;
+pub mod dap;
 pub mod desktop;
 pub mod document;
 mod editing;
 pub mod events;
+mod folding;
+pub mod format;
 pub mod fsio;
+pub mod git;
 mod highlight;
+pub mod ide;
 pub mod instance;
+pub mod languages;
 pub mod layout;
+mod lsp;
+pub mod navigation;
+pub mod outline;
+mod panes;
 pub mod paths;
+pub mod picker;
 pub mod preferences;
 mod presentation;
+pub mod project;
+mod render;
+pub mod rpc;
 pub mod search;
 mod services;
+mod smart;
+mod snippets;
+pub mod tasks;
 pub mod terminal;
 pub mod text_format;
 pub mod text_presentation;
+pub mod tools;
+pub mod trust;
 pub mod workspace;
 mod wrap;
 
 use anyhow::{bail, Context, Result};
-use document::{line_start, next, previous, Document};
+use document::{previous, Document};
 use layout::{Axis, Handle, Node, Rect, View};
 use preferences::{Preferences, StartupMode};
 use search::{Prompt, Search};
@@ -57,6 +77,19 @@ pub struct EditorView {
     /// Preferred display column for vertical movement.
     #[serde(default, skip)]
     pub goal: Option<usize>,
+    /// Carets beyond the primary one.
+    #[serde(default, skip)]
+    pub extra: Vec<cursors::Selection>,
+    /// Folded regions, by the byte offset of their header line's start.
+    #[serde(default)]
+    pub folds: Vec<usize>,
+    /// Snippet tab stops still to visit, the current one, and visited ones.
+    #[serde(default, skip)]
+    pub stops: Vec<Vec<(usize, usize)>>,
+    #[serde(default, skip)]
+    pub current_stop: Vec<(usize, usize)>,
+    #[serde(default, skip)]
+    pub visited: Vec<Vec<(usize, usize)>>,
 }
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]
 pub struct Key {
@@ -70,7 +103,7 @@ pub struct Key {
     #[serde(default)]
     pub shift: bool,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Command {
     ScrollTo {
@@ -283,6 +316,32 @@ pub enum Command {
         #[serde(default)]
         quit: bool,
     },
+    /// Open a picker: files, symbols, documents, search, diagnostics.
+    OpenPicker {
+        kind: String,
+        #[serde(default)]
+        query: String,
+    },
+    PickerQuery {
+        query: String,
+    },
+    PickerMove {
+        delta: i32,
+    },
+    /// Accept the selected item, or `index` within the items sent.
+    PickerAccept {
+        #[serde(default)]
+        index: Option<usize>,
+    },
+    /// Toggle a search option: case, word or regex.
+    PickerOption {
+        name: String,
+    },
+    PickerClose,
+    /// Accept a completion by its index in the list sent.
+    CompletionAccept {
+        index: usize,
+    },
     /// A named editor or application action (see `actions.rs`).
     Action {
         name: String,
@@ -362,6 +421,15 @@ pub struct Snapshot {
     pub git_error: String,
     pub files_revision: u64,
     pub git_revision: u64,
+    pub picker: Option<picker::PickerView>,
+    /// Restricted mode: project tools do not run.
+    pub trusted: bool,
+    pub completion: Option<lsp::CompletionView>,
+    pub hover: Option<lsp::HoverView>,
+    /// Errors and warnings in the workspace.
+    pub problems: (usize, usize),
+    /// The diagnostic under the caret.
+    pub problem: String,
 }
 #[derive(Serialize, Deserialize)]
 struct Settings {
@@ -382,9 +450,9 @@ pub struct App {
     pub clipboard: String,
     browser: PathBuf,
     files: Vec<Entry>,
-    git: Vec<GitEntry>,
+    /// The Git pane: entries, branch and running jobs.
+    git: git::Panel,
     selected: usize,
-    git_selected: usize,
     services: Services,
     ids: u64,
     presets: BTreeMap<String, Node>,
@@ -392,7 +460,7 @@ pub struct App {
     pub prompt: Option<Prompt>,
     search: Search,
     pending_close: Option<(u64, u64)>,
-    tokens: BTreeMap<u64, (u64, bool, Vec<highlight::Token>)>,
+    highlights: BTreeMap<u64, highlight::LineCache>,
     highlight_pending: BTreeMap<u64, (u64, bool)>,
     pending_open: BTreeMap<u64, u64>,
     pending_save: Vec<u64>,
@@ -405,14 +473,9 @@ pub struct App {
     events: events::Events,
     revision: u64,
     files_revision: u64,
-    git_revision: u64,
     render_cache: BTreeMap<u64, (String, u64, std::sync::Arc<Screen>)>,
     pub screen_builds: u64,
     typing: bool,
-    git_branch: String,
-    git_repository: bool,
-    git_jobs: usize,
-    git_error: String,
     /// Launched with files (or standard input) rather than a directory.
     pub file_mode: bool,
     /// The path whose recovery checkpoint this session uses.
@@ -434,6 +497,9 @@ pub struct App {
     checkpoint_key: u64,
     /// The terminal interface hosts this session (enables suspend, mouse toggle).
     pub terminal_frontend: bool,
+    /// Search matches by (document, generation, query).
+    #[allow(clippy::type_complexity)]
+    match_cache: Option<(u64, u64, String, std::sync::Arc<Vec<(usize, usize)>>)>,
     disk_check_at: Instant,
     disk_check_pending: bool,
     disk_conflicts: std::collections::VecDeque<(u64, Document)>,
@@ -443,7 +509,40 @@ pub struct App {
     frontend_requests: Vec<String>,
     inbox: Option<instance::Inbox>,
     /// Cursor positions (line, column) for files whose open is in flight.
-    pending_positions: BTreeMap<PathBuf, (usize, usize)>,
+    pending_positions: BTreeMap<PathBuf, (usize, navigation::Column)>,
+    /// Positions before jumps, for go-back and go-forward.
+    back: Vec<(u64, usize)>,
+    forward: Vec<(u64, usize)>,
+    /// The open picker (files, symbols, search…).
+    picker: Option<picker::Picker>,
+    /// Workspace files for quick open, and when they were listed.
+    index: std::sync::Arc<Vec<String>>,
+    index_at: Option<Instant>,
+    index_pending: bool,
+    /// The current project search generation; older searches stop.
+    search_cancel: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The search that replace-in-files repeats, and the files it matched.
+    last_search: Option<project::SearchOptions>,
+    last_search_files: Vec<PathBuf>,
+    /// Replacements made in open documents while files are rewritten.
+    pending_replace: Option<(usize, usize)>,
+    /// Language servers, their documents and diagnostics.
+    lsp: lsp::Lsp,
+    /// Documents being formatted.
+    formatting: std::collections::BTreeSet<u64>,
+    /// Running tasks.
+    tasks: BTreeMap<u64, tasks::Running>,
+    /// The debug session and breakpoints.
+    debug: dap::Debug,
+    /// External tools from tools.toml.
+    tools: Vec<tools::Tool>,
+    /// Project tools (language servers, tasks, formatters, Git hooks) may run.
+    trusted: bool,
+    /// A command waiting for the user to trust the workspace.
+    pending_trust: Option<Command>,
+    /// Hidden line ranges per view, keyed by what they were computed from.
+    #[allow(clippy::type_complexity)]
+    fold_cache: std::sync::Mutex<BTreeMap<u64, ((u64, Vec<usize>, usize), folding::Hidden)>>,
 }
 /// A privileged write the terminal frontend performs with `sudo`, after
 /// handing it the terminal for a password prompt.
@@ -574,27 +673,21 @@ impl App {
             quit: false,
             clipboard: String::new(),
             files: vec![],
-            git: vec![],
+            git: git::Panel::default(),
             selected: 0,
-            git_selected: 0,
             services: Services::new(events.clone()),
             events,
             revision: 1,
             files_revision: 1,
-            git_revision: 1,
             render_cache: BTreeMap::new(),
             screen_builds: 0,
             typing: false,
-            git_branch: String::new(),
-            git_repository: false,
-            git_jobs: 0,
-            git_error: String::new(),
             ids,
             presets: BTreeMap::new(),
             preferences: Preferences::default(),
             prompt: None,
             search: Search::default(),
-            tokens: BTreeMap::new(),
+            highlights: BTreeMap::new(),
             highlight_pending: BTreeMap::new(),
             pending_open: BTreeMap::new(),
             pending_save: vec![],
@@ -621,6 +714,7 @@ impl App {
             suspend_requested: false,
             checkpoint_key: 0,
             terminal_frontend: true,
+            match_cache: None,
             disk_check_at: Instant::now(),
             disk_check_pending: false,
             disk_conflicts: Default::default(),
@@ -629,9 +723,28 @@ impl App {
             frontend_requests: vec![],
             inbox: None,
             pending_positions: BTreeMap::new(),
+            back: Vec::new(),
+            forward: Vec::new(),
+            picker: None,
+            index: Default::default(),
+            index_at: None,
+            index_pending: false,
+            search_cancel: Default::default(),
+            last_search: None,
+            last_search_files: Vec::new(),
+            pending_replace: None,
+            lsp: Default::default(),
+            formatting: Default::default(),
+            tasks: BTreeMap::new(),
+            debug: Default::default(),
+            tools: Vec::new(),
+            trusted: trust::is_trusted(&root),
+            pending_trust: None,
+            fold_cache: Default::default(),
         };
         app.read_settings();
         app.load_preferences();
+        app.reload_tools();
         app.editor_only = launch.startup.unwrap_or(if file_mode {
             app.preferences.file_startup
         } else {
@@ -671,6 +784,8 @@ impl App {
         self.events.drain();
         self.poll();
         self.drain_inbox();
+        self.reap_terminals();
+        self.lsp_sync();
         self.watch_files();
         self.schedule_highlight();
         if self.workspace_dirty && self.checkpoint_at.elapsed() >= Duration::from_secs(1) {
@@ -795,7 +910,7 @@ impl App {
         if !shared {
             self.views.retain(|_, v| v.document != doc);
             self.documents.remove(&doc);
-            self.tokens.remove(&doc);
+            self.highlights.remove(&doc);
             self.highlight_pending.remove(&doc);
         }
         if self.editor_only && !matches!(self.focused(), Some(View::Editor(_))) {
@@ -805,18 +920,17 @@ impl App {
         Ok(())
     }
     fn add_tab(&mut self, view: View) {
-        if let Some((tabs, active)) = self.layout.pane_mut(self.focus) {
-            // Files and Git are singleton views within a pane. Reopening them
-            // should reveal the existing tab instead of crowding the tab bar.
-            if matches!(view, View::Files | View::Git) {
+        // Files and Git are singleton views within a pane. Reopening them
+        // should reveal the existing tab instead of crowding the tab bar.
+        if matches!(view, View::Files | View::Git) {
+            if let Some((tabs, active)) = self.layout.pane_mut(self.focus) {
                 if let Some(index) = tabs.iter().position(|tab| *tab == view) {
                     *active = index;
                     return;
                 }
             }
-            tabs.push(view);
-            *active = tabs.len() - 1;
         }
+        self.show_view(view);
     }
     pub fn dispatch(&mut self, cmd: Command) {
         // Passive pointer motion has no editing effect. Only terminals requesting
@@ -898,26 +1012,18 @@ impl App {
                 } else {
                     let view = &self.views[&id];
                     let document = &self.documents[&view.document];
-                    let cursor = document.text[..view.cursor].encode_utf16().count();
+                    let cursor = document.utf16_offset(view.cursor);
                     let start = cursor
                         .checked_add_signed(replace_start as isize)
                         .context("Invalid input-method range")?;
                     let end = start
                         .checked_add(replace_length)
                         .context("Invalid input-method range")?;
-                    let byte = |units: usize| -> Option<usize> {
-                        let mut n = 0;
-                        for (i, c) in document.text.char_indices() {
-                            if n == units {
-                                return Some(i);
-                            }
-                            n += c.len_utf16();
-                        }
-                        (n == units).then_some(document.text.len())
-                    };
                     let (start, end) = (
-                        byte(start).context("Invalid UTF-16 start")?,
-                        byte(end).context("Invalid UTF-16 end")?,
+                        document
+                            .byte_of_utf16(start)
+                            .context("Invalid UTF-16 start")?,
+                        document.byte_of_utf16(end).context("Invalid UTF-16 end")?,
                     );
                     self.edit_range(id, start, end, &text, view.cursor)?;
                 }
@@ -986,7 +1092,8 @@ impl App {
                     } else {
                         v.anchor
                             .map(|a| {
-                                self.documents[&v.document].text[a.min(v.cursor)..a.max(v.cursor)]
+                                self.documents[&v.document]
+                                    .slice(a.min(v.cursor), a.max(v.cursor))
                                     .to_string()
                             })
                             .filter(|s| !s.is_empty())
@@ -1027,6 +1134,22 @@ impl App {
                         self.confirm_pending(&p.kind)?;
                     }
                     "file-changed" => self.resolve_disk_conflict(!all),
+                    "trust" => self.answer_trust(true)?,
+                    "project-replace" => {
+                        let files = self.last_search_files.len();
+                        self.prompt = Some(search::Prompt {
+                            kind: "confirm-replace".into(),
+                            input: format!("{files} file{}", if files == 1 { "" } else { "s" }),
+                            replacement: p.input,
+                            field: 0,
+                            case_sensitive: false,
+                            whole_word: false,
+                        });
+                    }
+                    "confirm-replace" => {
+                        self.prompt = None;
+                        self.replace_in_files(&p.replacement)?;
+                    }
                     "quit" => {
                         self.prompt = None;
                         if all {
@@ -1060,7 +1183,7 @@ impl App {
                         }
                     }
                     "insert-file" | "set-encoding" | "reopen-encoding" | "set-line-ending"
-                    | "open-recent" => {
+                    | "open-recent" | "rename-symbol" | "debug-evaluate" | "debug-program" => {
                         if p.input.trim().is_empty() {
                             bail!("Enter a value");
                         }
@@ -1095,6 +1218,7 @@ impl App {
                 let kind = self.prompt.take().map(|p| p.kind).unwrap_or_default();
                 self.pending_close = None;
                 match kind.as_str() {
+                    "trust" => self.answer_trust(false)?,
                     "save-read-only" | "save-elevated" | "reload-changed" => {
                         self.pending_retry = None;
                         self.quit_after_save = false;
@@ -1144,7 +1268,11 @@ impl App {
                     self.selection_foreground = selection_foreground;
                 }
             }
-            Command::ReloadSettings => self.load_preferences(),
+            Command::ReloadSettings => {
+                self.load_preferences();
+                self.reload_tools();
+                self.lsp_restart();
+            }
             Command::Configure { name, value } => self.configure(&name, &value)?,
             Command::Pointer {
                 pane,
@@ -1172,6 +1300,12 @@ impl App {
                             ctrl,
                             alt,
                         })?;
+                } else if let (true, "press", Some(View::Editor(id))) =
+                    (alt, kind.as_str(), self.layout.view(pane).cloned())
+                {
+                    // Alt+click adds (or removes) a caret.
+                    let offset = self.click_offset(id, row, col);
+                    self.toggle_cursor_at(id, offset);
                 } else if kind == "press" || kind == "drag" {
                     self.execute(Command::Click {
                         pane,
@@ -1192,6 +1326,26 @@ impl App {
                 }
             }
             Command::Key { key } => self.key(key)?,
+            Command::OpenPicker { kind, query } => self.open_picker(&kind, &query)?,
+            Command::PickerQuery { query } => self.picker_query(query)?,
+            Command::PickerMove { delta } => self.picker_move(delta),
+            Command::PickerAccept { index } => {
+                if self.picker.as_ref().is_some_and(|p| p.kind == "search") {
+                    self.remember_search();
+                }
+                self.picker_accept(index)?
+            }
+            Command::PickerOption { name } => self.picker_option(&name)?,
+            Command::PickerClose => self.picker = None,
+            Command::CompletionAccept { index } => self.completion_select(index)?,
+            Command::Paste { text } if self.picker.is_some() => {
+                let query = format!(
+                    "{}{}",
+                    self.picker.as_ref().unwrap().query,
+                    text.replace(['\n', '\r'], " ")
+                );
+                self.picker_query(query)?;
+            }
             Command::Paste { text } if self.prompt.is_some() => {
                 // Prompts hold a single line.
                 let text = text_format::normalize_input(&text).replace('\n', " ");
@@ -1209,6 +1363,9 @@ impl App {
                     .context("Terminal missing")?
                     .paste(&text)?,
                 // Terminals paste carriage returns; documents store `\n` lines.
+                Some(View::Editor(id)) if !self.views[&id].extra.is_empty() => {
+                    self.multi_paste(id, &text_format::normalize_input(&text))?
+                }
                 Some(View::Editor(id)) => self.edit(id, &text_format::normalize_input(&text))?,
                 _ => {}
             },
@@ -1221,10 +1378,27 @@ impl App {
                 self.focus = pane;
                 match self.focused() {
                     Some(View::Editor(id)) => {
+                        let v = &self.views[&id];
+                        if col < self.gutter_width(v.document, v.cols.max(1)) {
+                            let shown = self.visible_rows(id, row + 1);
+                            if let Some((line, 0, _)) = shown.get(row).copied() {
+                                if self.folded_header(id, line) {
+                                    let start = self.documents[&v.document].line_offset(line);
+                                    self.views
+                                        .get_mut(&id)
+                                        .unwrap()
+                                        .folds
+                                        .retain(|f| *f != start);
+                                    return Ok(());
+                                }
+                            }
+                        }
                         let cursor = self.click_offset(id, row, col);
                         let v = self.views.get_mut(&id).unwrap();
                         v.manual_scroll = false;
                         v.goal = None;
+                        v.extra.clear();
+                        v.stops.clear();
                         if shift || v.mark {
                             v.anchor.get_or_insert(v.cursor);
                         } else {
@@ -1236,7 +1410,7 @@ impl App {
                         self.selected = row.min(self.files.len().saturating_sub(1))
                     }
                     Some(View::Git) => {
-                        self.git_selected = row.min(self.git.len().saturating_sub(1))
+                        self.git.selected = row.min(self.git.entries.len().saturating_sub(1))
                     }
                     Some(View::Terminal(id)) => {
                         self.terminals.get_mut(&id).unwrap().select(row, col, shift)
@@ -1298,6 +1472,16 @@ impl App {
                         kind: "save-as".into(),
                     });
                 }
+                if self.formatting.contains(&doc) {
+                    bail!("Wait for formatting to finish");
+                }
+                if destination.is_none()
+                    && self.preferences.format_on_save
+                    && self.documents[&doc].dirty()
+                    && self.format_document(doc, true)?
+                {
+                    return Ok(());
+                }
                 self.start_save(doc, destination, overwrite, false)?;
             }
             Command::SaveAll { quit } => self.save_all(quit)?,
@@ -1314,10 +1498,10 @@ impl App {
                 let id = self.active_editor().context("Focus an editor first")?;
                 let view = self.views[&id].clone();
                 let d = self.documents.get_mut(&view.document).unwrap();
-                let change = if matches!(cmd, Command::Undo) {
-                    d.undo_change()
+                let changes = if matches!(cmd, Command::Undo) {
+                    d.undo_changes()
                 } else {
-                    d.redo_change()
+                    d.redo_changes()
                 };
                 let cursor = if matches!(cmd, Command::Undo) {
                     d.undo(view.cursor)
@@ -1325,31 +1509,48 @@ impl App {
                     d.redo(view.cursor)
                 };
                 if let Some(cursor) = cursor {
-                    if let Some((start, old, new)) = change {
+                    for (start, old, new) in changes {
                         self.rebase_views(view.document, start, start + old, new);
                     }
                     let v = self.views.get_mut(&id).unwrap();
                     v.cursor = cursor;
                     v.anchor = None;
+                    v.extra.clear();
                 }
             }
             Command::SelectAll => {
                 if let Some(id) = self.active_editor() {
                     let v = self.views.get_mut(&id).unwrap();
                     v.anchor = Some(0);
-                    v.cursor = self.documents[&v.document].text.len();
+                    v.cursor = self.documents[&v.document].len();
                 }
             }
             Command::Copy | Command::Cut => {
                 if let Some(View::Terminal(id)) = self.focused() {
                     self.clipboard = self.terminals[&id].selection_text();
                 }
-                if let Some(id) = self.active_editor() {
+                if let Some(id) = self
+                    .active_editor()
+                    .filter(|id| !self.views[id].extra.is_empty())
+                {
+                    self.clipboard = self.selections_text(id);
+                    if matches!(cmd, Command::Cut) {
+                        let typed = self
+                            .selections(id)
+                            .iter()
+                            .map(|s| {
+                                let (a, b) = s.range();
+                                smart::Typed::plain(a, b, "")
+                            })
+                            .collect();
+                        self.apply_typed(id, typed)?;
+                    }
+                } else if let Some(id) = self.active_editor() {
                     let v = &self.views[&id];
                     if let Some(anchor) = v.anchor {
-                        self.clipboard = self.documents[&v.document].text
-                            [v.cursor.min(anchor)..v.cursor.max(anchor)]
-                            .to_string();
+                        self.clipboard = self.documents[&v.document]
+                            .slice(v.cursor.min(anchor), v.cursor.max(anchor))
+                            .into_owned();
                         if matches!(cmd, Command::Cut) {
                             self.edit(id, "")?;
                         }
@@ -1419,6 +1620,9 @@ impl App {
             }
             Command::Split { axis, kind } => {
                 self.expand_workspace()?;
+                if !self.can_split() {
+                    bail!("This pane is nested too deeply to split again");
+                }
                 let v = if let Some(kind) = kind {
                     self.create_view(&kind)?
                 } else {
@@ -1442,11 +1646,22 @@ impl App {
                 if self.editor_only {
                     bail!("Expand the workspace before closing a pane");
                 }
-                if self.layout.remove(self.focus) {
-                    self.focus = self.layout.panes()[0];
-                } else {
+                let Some(tabs) = self.layout.remove(self.focus) else {
                     bail!("Cannot close the final pane");
-                }
+                };
+                // Closing a pane never closes its documents or shells: its
+                // tabs move to a remaining pane.
+                self.focus = self.layout.panes()[0];
+                self.adopt_orphans();
+                let moved = tabs
+                    .iter()
+                    .filter(|v| matches!(v, View::Editor(_) | View::Terminal(_)))
+                    .count();
+                self.status = match moved {
+                    0 => "Closed pane".into(),
+                    1 => "Closed pane · moved 1 tab".into(),
+                    n => format!("Closed pane · moved {n} tabs"),
+                };
             }
             Command::MovePane { target } => {
                 self.expand_workspace()?;
@@ -1479,62 +1694,13 @@ impl App {
                 self.refresh_git();
             }
             Command::Refresh => self.refresh(),
-            Command::GitStage { path } => {
-                let mut args = vec!["add".into(), "--all".into(), "--".into()];
-                if let Some(entry) = self.git.iter().find(|e| e.path == path) {
-                    args.extend(entry.staging_paths());
-                } else {
-                    args.push(path);
-                }
-                self.git_action(args)?;
-            }
-            Command::GitUnstage { path } => {
-                let mut args = vec!["reset".into(), "HEAD".into(), "--".into(), path.clone()];
-                if let Some(old) = self
-                    .git
-                    .iter()
-                    .find(|e| e.path == path)
-                    .and_then(|e| e.original_path.clone())
-                {
-                    args.push(old);
-                }
-                self.git_action(args)?;
-            }
-            Command::GitStageAll => {
-                self.git_action(vec!["add".into(), "--all".into(), "--".into(), ".".into()])?;
-            }
-            Command::GitUnstageAll => {
-                self.git_action(vec!["reset".into(), "HEAD".into(), "--".into(), ".".into()])?;
-            }
-            Command::GitStageGroup { group } => {
-                let paths: std::collections::BTreeSet<String> = self
-                    .git
-                    .iter()
-                    .filter(|entry| entry.group == group && !entry.staged)
-                    .flat_map(GitEntry::staging_paths)
-                    .collect();
-                if paths.is_empty() {
-                    bail!("No unstaged changes in {group}");
-                }
-                let mut args = vec!["add".into(), "--all".into(), "--".into()];
-                args.extend(paths);
-                self.git_action(args)?;
-            }
-            Command::GitDiff { path, staged } => {
-                let untracked = self.git.iter().any(|e| e.path == path && e.untracked);
-                self.services
-                    .tx
-                    .send(Job::GitDiff(self.root.clone(), path, staged, untracked))?;
-                self.git_jobs += 1;
-                self.git_error.clear();
-                self.status = "Loading Git diff…".into();
-            }
-            Command::GitCommit { message } => {
-                if message.trim().is_empty() {
-                    bail!("Commit message is empty");
-                }
-                self.git_action(vec!["commit".into(), "-m".into(), message])?;
-            }
+            cmd @ (Command::GitStage { .. }
+            | Command::GitUnstage { .. }
+            | Command::GitStageAll
+            | Command::GitUnstageAll
+            | Command::GitStageGroup { .. }
+            | Command::GitDiff { .. }
+            | Command::GitCommit { .. }) => self.git_command(cmd)?,
             Command::Quit { force } => {
                 if self.dirty() && !force {
                     let count = self.documents.values().filter(|d| d.dirty()).count();
@@ -1589,24 +1755,6 @@ impl App {
         let _ = self.services.tx.send(Job::Browse(self.browser.clone()));
         self.refresh_git();
     }
-    fn refresh_git(&mut self) {
-        if self
-            .services
-            .tx
-            .send(Job::GitStatus(self.root.clone()))
-            .is_ok()
-        {
-            self.git_jobs += 1;
-        }
-    }
-    fn git_action(&mut self, args: Vec<String>) -> Result<()> {
-        self.services.tx.send(Job::Git(self.root.clone(), args))?;
-        self.git_error.clear();
-        self.git_jobs += 1;
-        self.refresh_git();
-        self.status = "Running Git…".into();
-        Ok(())
-    }
     pub fn poll(&mut self) {
         while let Ok(reply) = self.services.rx.try_recv() {
             self.revision += 1;
@@ -1636,6 +1784,7 @@ impl App {
                             if let Some(path) = d.path.clone() {
                                 self.remember_recent(&path);
                             }
+                            let saved = id;
                             if let Some(doc) = self.documents.get_mut(&id) {
                                 doc.accept_save(d);
                                 self.status = if doc.dirty() {
@@ -1647,6 +1796,7 @@ impl App {
                                 self.workspace_dirty = true;
                                 self.refresh();
                             }
+                            self.lsp_saved(saved);
                             if self.quit_after_save {
                                 if let Err(e) = self.save_all(true) {
                                     self.quit_after_save = false;
@@ -1661,17 +1811,7 @@ impl App {
                     Ok(d) => self.finish_reload(id, d),
                     Err(e) => self.status = format!("Reload failed: {e}"),
                 },
-                Reply::Highlighted(id, generation, light, tokens) => {
-                    self.highlight_pending.remove(&id);
-                    if self
-                        .documents
-                        .get(&id)
-                        .is_some_and(|d| d.generation == generation)
-                        && light == self.light_theme()
-                    {
-                        self.tokens.insert(id, (generation, light, tokens));
-                    }
-                }
+                Reply::Highlighted(response) => self.highlighted(response),
                 Reply::Files(path, Ok(entries)) if path == self.browser => {
                     if self.files != entries {
                         self.files_revision += 1;
@@ -1680,57 +1820,28 @@ impl App {
                     self.selected = self.selected.min(self.files.len().saturating_sub(1));
                 }
                 Reply::Files(_, Err(e)) => self.status = e,
-                Reply::Git(Ok(state)) => {
-                    self.git_jobs = self.git_jobs.saturating_sub(1);
-                    self.git_revision += 1;
-                    self.git_branch = state.branch;
-                    self.git_repository = state.repository;
-                    let selection = self
-                        .git
-                        .get(self.git_selected)
-                        .map(|e| (e.path.clone(), e.staged));
-                    self.git = state.entries;
-                    if let Some((path, staged)) = selection {
-                        if let Some(index) = self
-                            .git
-                            .iter()
-                            .position(|e| e.path == path && e.staged == staged)
-                            .or_else(|| self.git.iter().position(|e| e.path == path))
-                        {
-                            self.git_selected = index;
-                        }
-                    }
-                    self.git_selected = self.git_selected.min(self.git.len().saturating_sub(1));
-                }
-                Reply::Git(Err(e)) => {
-                    self.git_jobs = self.git_jobs.saturating_sub(1);
-                    self.git_error = e.clone();
-                    self.status = format!("Git: {e}");
-                }
-                Reply::GitOperation(result) => {
-                    self.git_jobs = self.git_jobs.saturating_sub(1);
-                    match result {
-                        Ok(message) => {
-                            self.status = if message.is_empty() {
-                                "Git operation completed".into()
-                            } else {
-                                message.lines().next().unwrap_or_default().into()
-                            }
-                        }
-                        Err(e) => {
-                            self.git_error = e.clone();
-                            self.status = format!("Git: {e}");
-                        }
-                    }
-                }
+                Reply::Git(state) => self.git_status(state),
+                Reply::GitOperation(result) => self.git_operation_done(result),
                 Reply::Error(e) => self.status = e,
+                Reply::Index(root, files) => self.index_ready(root, files),
+                Reply::SearchHits(generation, hits) => self.search_hits(generation, hits),
+                Reply::SearchDone(generation, result) => self.search_done(generation, result),
+                Reply::Outline(doc, symbols) => self.symbols_ready(doc, symbols),
+                Reply::Replaced(files, total, errors) => self.replaced(files, total, errors),
+                Reply::Ide(event) => self.ide_event(event),
+                Reply::ToolDone(name, output, target, result) => {
+                    self.tool_done(name, output, target, result)
+                }
+                Reply::Formatted(doc, content, then_save, result) => {
+                    self.formatted(doc, content, then_save, result)
+                }
                 Reply::Spelling(result) => self.spelling_result(result),
                 Reply::Disk(changes) => self.disk_changes(changes),
                 Reply::Output(_, _) if self.quit => {
-                    self.git_jobs = self.git_jobs.saturating_sub(1);
+                    self.git.jobs = self.git.jobs.saturating_sub(1);
                 }
                 Reply::Output(title, text) => {
-                    self.git_jobs = self.git_jobs.saturating_sub(1);
+                    self.git.jobs = self.git.jobs.saturating_sub(1);
                     let doc = self.id();
                     let d = Document::inspection(format!("{title} · read-only"), text);
                     self.documents.insert(doc, d);
@@ -1752,8 +1863,7 @@ impl App {
     }
     fn new_terminal(&mut self) -> Result<u64> {
         let id = self.id();
-        let mut terminal = TerminalSession::spawn(&self.root, None, 24, 80)?;
-        terminal.set_events(self.events.clone());
+        let terminal = self.spawn_shell(&self.root.clone())?;
         self.terminals.insert(id, terminal);
         Ok(id)
     }
@@ -1841,6 +1951,7 @@ impl App {
             }
             _ => bail!("Unknown preset"),
         }
+        self.adopt_orphans();
         self.focus = self
             .layout
             .panes()
@@ -1882,26 +1993,63 @@ impl App {
         if !node.validate() {
             bail!("Invalid saved layout");
         }
-        // Saved layouts persist shape and view kinds; processes/documents are rebound for this launch.
-        let doc = self.views.values().next().unwrap().document;
-        fn rebind(app: &mut App, n: &mut Node, doc: u64) -> Result<()> {
+        // Saved layouts persist shape and view kinds. The open editors and
+        // shells fill its slots in order; extra slots get new views, and
+        // anything left over is moved into the new layout.
+        let current = self.layout.views();
+        let editors: std::collections::VecDeque<u64> = current
+            .iter()
+            .filter_map(|v| match v {
+                View::Editor(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        let shells: std::collections::VecDeque<u64> = current
+            .iter()
+            .filter_map(|v| match v {
+                View::Terminal(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        let doc = self
+            .active_editor()
+            .or_else(|| editors.front().copied())
+            .and_then(|id| self.views.get(&id))
+            .or_else(|| self.views.values().next())
+            .map(|v| v.document)
+            .context("Missing document")?;
+        struct Pool {
+            editors: std::collections::VecDeque<u64>,
+            shells: std::collections::VecDeque<u64>,
+            doc: u64,
+        }
+        fn rebind(app: &mut App, n: &mut Node, pool: &mut Pool) -> Result<()> {
             match n {
                 Node::Pane { id, tabs, .. } => {
                     *id = app.id();
                     for v in tabs {
                         match v {
                             View::Editor(id) => {
-                                *id = app.id();
-                                app.views.insert(
-                                    *id,
-                                    EditorView {
-                                        document: doc,
-                                        ..Default::default()
-                                    },
-                                );
+                                *id = match pool.editors.pop_front() {
+                                    Some(existing) => existing,
+                                    None => {
+                                        let new = app.id();
+                                        app.views.insert(
+                                            new,
+                                            EditorView {
+                                                document: pool.doc,
+                                                ..Default::default()
+                                            },
+                                        );
+                                        new
+                                    }
+                                };
                             }
                             View::Terminal(id) => {
-                                *id = app.new_terminal()?;
+                                *id = match pool.shells.pop_front() {
+                                    Some(existing) => existing,
+                                    None => app.new_terminal()?,
+                                };
                             }
                             _ => {}
                         }
@@ -1911,33 +2059,37 @@ impl App {
                     id, first, second, ..
                 } => {
                     *id = app.id();
-                    rebind(app, first, doc)?;
-                    rebind(app, second, doc)?;
+                    rebind(app, first, pool)?;
+                    rebind(app, second, pool)?;
                 }
             }
             Ok(())
         }
-        rebind(self, &mut node, doc)?;
+        let mut pool = Pool {
+            editors,
+            shells,
+            doc,
+        };
+        rebind(self, &mut node, &mut pool)?;
+        self.ensure_terminals()?;
         self.editor_only = false;
         self.layout = node;
         self.focus = self.layout.panes()[0];
+        self.adopt_orphans();
         Ok(())
     }
     fn clamp_views(&mut self, doc: u64) {
-        let text = &self.documents[&doc].text;
+        let d = &self.documents[&doc];
+        let lines = d.line_count();
         for v in self.views.values_mut().filter(|v| v.document == doc) {
-            v.cursor = v.cursor.min(text.len());
-            while !text.is_char_boundary(v.cursor) {
-                v.cursor -= 1;
-            }
-            v.anchor = v.anchor.map(|a| {
-                let mut a = a.min(text.len());
-                while !text.is_char_boundary(a) {
-                    a -= 1;
-                }
-                a
-            });
-            v.top = v.top.min(text.bytes().filter(|b| *b == b'\n').count());
+            v.cursor = d.floor_boundary(v.cursor);
+            v.anchor = v.anchor.map(|a| d.floor_boundary(a));
+            v.extra.clear();
+            v.stops.clear();
+            v.visited.clear();
+            v.current_stop.clear();
+            v.folds.retain(|f| *f <= d.len());
+            v.top = v.top.min(lines.saturating_sub(1));
         }
     }
     fn edit(&mut self, id: u64, value: &str) -> Result<()> {
@@ -1960,7 +2112,40 @@ impl App {
         for other in self.views.values_mut().filter(|o| o.document == doc) {
             other.cursor = position(other.cursor);
             other.anchor = other.anchor.map(position);
+            for s in &mut other.extra {
+                s.cursor = position(s.cursor);
+                s.anchor = s.anchor.map(position);
+            }
+            for stop in other
+                .stops
+                .iter_mut()
+                .chain(other.visited.iter_mut())
+                .chain(std::iter::once(&mut other.current_stop))
+            {
+                for (a, b) in stop.iter_mut() {
+                    // A stop grows with text typed at its end.
+                    let grows = *b == start && *a <= start;
+                    *a = position(*a);
+                    *b = if grows { start + length } else { position(*b) };
+                }
+            }
+            // A fold whose header line was replaced is dropped.
+            other
+                .folds
+                .retain(|f| *f < start || *f >= end || *f == start);
+            for f in &mut other.folds {
+                *f = position(*f);
+            }
         }
+    }
+    /// Apply one smart replacement at the primary caret.
+    fn apply_single(&mut self, id: u64, typed: smart::Typed) -> Result<()> {
+        let before = self.views[&id].cursor;
+        self.edit_range(id, typed.start, typed.end, &typed.text, before)?;
+        let v = self.views.get_mut(&id).unwrap();
+        v.cursor = typed.start + typed.caret;
+        v.anchor = typed.anchor.map(|a| typed.start + a);
+        Ok(())
     }
     fn edit_range(
         &mut self,
@@ -1991,13 +2176,45 @@ impl App {
             return None;
         }
         let chord = key_chord(key);
+        // Tools with keys.
+        if let Some(tool) = self.tools.iter().find(|t| {
+            !t.key.is_empty()
+                && key_chord(&Key {
+                    key: t.key.rsplit('+').next().unwrap_or_default().to_string(),
+                    ctrl: t.key.contains("Ctrl+"),
+                    alt: t.key.contains("Alt+"),
+                    shift: t.key.contains("Shift+"),
+                    ..Default::default()
+                }) == chord
+        }) {
+            return Some(&tool.id);
+        }
+        // Debugger keys take over F9–F11 while a session runs.
+        if self.debugging() {
+            let action = match chord.as_str() {
+                "f9" => Some("toggle-breakpoint"),
+                "f10" => Some("debug-step-over"),
+                "f11" => Some("debug-step-into"),
+                "Shift+f11" => Some("debug-step-out"),
+                "Shift+f5" => Some("debug-stop"),
+                _ => None,
+            };
+            if action.is_some() {
+                return action;
+            }
+        }
         self.preferences
             .global_keys
             .get(&chord)
             .or_else(|| match self.focused_kind() {
                 "editor" => self.preferences.editor_keys.get(&chord),
                 "terminal" => self.preferences.terminal_keys.get(&chord),
-                _ => None,
+                // Workbench actions also work from the file and Git panes.
+                _ => self
+                    .preferences
+                    .editor_keys
+                    .get(&chord)
+                    .filter(|action| WORKBENCH_ACTIONS.contains(&action.as_str())),
             })
             .map(String::as_str)
     }
@@ -2013,6 +2230,22 @@ impl App {
         };
         let cancel = k.key == "Escape" || letter == "c";
         match kind.as_str() {
+            "confirm-replace" => {
+                if letter == "y" || letter == "r" {
+                    let replacement = self.prompt.take().unwrap().replacement;
+                    self.replace_in_files(&replacement)?;
+                } else if letter == "n" || cancel || k.key == "Enter" {
+                    self.prompt = None;
+                    self.status = "Replace cancelled".into();
+                }
+            }
+            "trust" => {
+                if letter == "y" || letter == "t" {
+                    self.answer_trust(true)?;
+                } else if letter == "n" || cancel || k.key == "Enter" {
+                    self.answer_trust(false)?;
+                }
+            }
             "close-tab" => match k.key.as_str() {
                 "Escape" | "Enter" => self.execute(Command::DismissPrompt)?,
                 _ if letter == "d" => self.execute(Command::SubmitPrompt { all: true })?,
@@ -2056,6 +2289,16 @@ impl App {
     }
     fn key(&mut self, k: Key) -> Result<()> {
         if self.choice_key(&k)? {
+            return Ok(());
+        }
+        if self.prompt.is_none() && self.picker_key(&k)? {
+            return Ok(());
+        }
+        // A hover closes on the next key; Escape only closes it.
+        if self.dismiss_hover() && k.key == "Escape" {
+            return Ok(());
+        }
+        if self.prompt.is_none() && self.completion_key(&k)? {
             return Ok(());
         }
         if self.prompt.as_ref().is_some_and(|p| p.kind == "settings") {
@@ -2131,12 +2374,12 @@ impl App {
             Some(View::Files) | Some(View::Git) => {
                 let git = matches!(self.focused(), Some(View::Git));
                 let length = if git {
-                    self.git.len()
+                    self.git.entries.len()
                 } else {
                     self.files.len()
                 };
                 let selected = if git {
-                    &mut self.git_selected
+                    &mut self.git.selected
                 } else {
                     &mut self.selected
                 };
@@ -2147,7 +2390,7 @@ impl App {
                     "End" => *selected = length.saturating_sub(1),
                     "Enter" => {
                         if git {
-                            if self.git.get(*selected).is_some() {
+                            if self.git.entries.get(*selected).is_some() {
                                 return self.invoke_action("diff", "");
                             }
                         } else if let Some(e) = self.files.get(*selected) {
@@ -2175,58 +2418,80 @@ impl App {
                     "PageDown" => Some("page-down"),
                     _ => None,
                 };
+                let multi = !self.views[&id].extra.is_empty();
                 if let Some(name) = name {
-                    return self.move_cursor(id, name, k.shift);
+                    return if multi {
+                        self.multi_move(id, name, k.shift)
+                    } else {
+                        self.move_cursor(id, name, k.shift)
+                    };
+                }
+                if k.key == "Tab" && !k.ctrl && !k.alt && self.snippet_tab(id, k.shift)? {
+                    return Ok(());
+                }
+                if k.key == "Escape" {
+                    let v = self.views.get_mut(&id).unwrap();
+                    v.stops.clear();
+                    v.visited.clear();
+                    v.current_stop.clear();
+                }
+                if multi && self.multi_key(id, &k)? {
+                    return Ok(());
                 }
                 let v = self.views[&id].clone();
-                let text = &self.documents[&v.document].text;
-                let (_, col) =
-                    self.documents[&v.document].line_col(v.cursor, self.preferences.indent_width);
+                let d = &self.documents[&v.document];
+                let (_, col) = d.line_col(v.cursor, self.preferences.indent_width);
                 match k.key.as_str() {
                     "Backspace" if k.ctrl && v.anchor.is_none() => {
-                        let start = actions::word_boundary(text, v.cursor, false);
+                        let start = actions::document_word_boundary(d, v.cursor, false);
                         self.edit_range(id, start, v.cursor, "", v.cursor)?;
                     }
                     "Delete" if k.ctrl && v.anchor.is_none() => {
-                        let end = actions::word_boundary(text, v.cursor, true);
+                        let end = actions::document_word_boundary(d, v.cursor, true);
                         self.edit_range(id, v.cursor, end, "", v.cursor)?;
+                    }
+                    "Backspace"
+                        if v.anchor.is_none()
+                            && self.preferences.auto_close_brackets
+                            && smart::pair_around(d.rope(), v.cursor).is_some() =>
+                    {
+                        let (a, b) = smart::pair_around(d.rope(), v.cursor).unwrap();
+                        self.edit_range(id, a, b, "", v.cursor)?;
                     }
                     "Backspace" => {
                         if v.anchor.is_none() && v.cursor > 0 {
-                            self.views.get_mut(&id).unwrap().anchor =
-                                Some(previous(text, v.cursor));
+                            let previous = d.previous_boundary(v.cursor);
+                            self.views.get_mut(&id).unwrap().anchor = Some(previous);
                         }
                         if self.views[&id].anchor.is_some() {
                             self.edit(id, "")?;
                         }
                     }
                     "Delete" => {
-                        if v.anchor.is_none() && v.cursor < text.len() {
-                            self.views.get_mut(&id).unwrap().anchor = Some(next(text, v.cursor));
+                        if v.anchor.is_none() && v.cursor < d.len() {
+                            let next = d.next_boundary(v.cursor);
+                            self.views.get_mut(&id).unwrap().anchor = Some(next);
                         }
                         if self.views[&id].anchor.is_some() {
                             self.edit(id, "")?;
                         }
                     }
                     "Enter" => {
-                        let leading = text[line_start(text, v.cursor)..v.cursor]
-                            .chars()
-                            .take_while(|c| *c == ' ' || *c == '\t')
-                            .collect::<String>();
-                        let value = format!(
-                            "\n{}",
-                            if self.preferences.auto_indent {
-                                leading.as_str()
-                            } else {
-                                ""
-                            }
+                        let anchor = v.anchor.unwrap_or(v.cursor);
+                        let unit = self.indent_unit();
+                        let typed = smart::enter(
+                            d.rope(),
+                            v.cursor.min(anchor),
+                            v.cursor.max(anchor),
+                            &unit,
+                            self.preferences.auto_indent,
                         );
-                        self.edit(id, &value)?;
+                        self.apply_single(id, typed)?;
                     }
                     "Tab" => {
                         if k.shift
                             || v.anchor.is_some_and(|a| {
-                                text[a.min(v.cursor)..a.max(v.cursor)].contains('\n')
+                                d.slice(a.min(v.cursor), a.max(v.cursor)).contains('\n')
                             })
                         {
                             self.indent(k.shift)?;
@@ -2246,10 +2511,22 @@ impl App {
                         let v = self.views.get_mut(&id).unwrap();
                         v.anchor = None;
                         v.mark = false;
+                        v.extra.clear();
                     }
                     _ if !k.ctrl && !k.alt && !k.text.is_empty() => {
                         let typed = text_format::normalize_input(&k.text).into_owned();
-                        self.edit(id, &typed)?;
+                        let selection = cursors::Selection {
+                            cursor: v.cursor,
+                            anchor: v.anchor,
+                        };
+                        let (start, end) = selection.range();
+                        let smart = self.typed_at(id, selection, &typed);
+                        if smart == smart::Typed::plain(start, end, &typed) {
+                            self.edit(id, &typed)?;
+                        } else {
+                            self.apply_single(id, smart)?;
+                        }
+                        self.after_typing(&typed);
                         if self.preferences.hard_wrap && !typed.contains('\n') {
                             self.hard_wrap(id)?;
                         }
@@ -2261,572 +2538,6 @@ impl App {
         }
         Ok(())
     }
-    pub fn snapshot(
-        &mut self,
-        width: u16,
-        height: u16,
-        gap: u16,
-        cell_width: u16,
-        cell_height: u16,
-        header: u16,
-    ) -> Snapshot {
-        self.snapshot_with_minimum(
-            Rect {
-                x: 0,
-                y: 0,
-                width,
-                height,
-            },
-            gap,
-            (cell_width, cell_height),
-            header,
-            (0, 0),
-        )
-    }
-    pub fn snapshot_with_minimum(
-        &mut self,
-        area: Rect,
-        gap: u16,
-        cell: (u16, u16),
-        header: u16,
-        minimum: (u16, u16),
-    ) -> Snapshot {
-        self.snapshot_with_revisions(area, gap, cell, header, minimum, None)
-    }
-    pub fn snapshot_with_revisions(
-        &mut self,
-        area: Rect,
-        gap: u16,
-        cell: (u16, u16),
-        header: u16,
-        minimum: (u16, u16),
-        known: Option<(u64, u64)>,
-    ) -> Snapshot {
-        self.snapshot_presentation(area, gap, cell, header, minimum, known, false)
-    }
-    pub fn gui_snapshot(
-        &mut self,
-        area: Rect,
-        gap: u16,
-        cell: (u16, u16),
-        header: u16,
-        minimum: (u16, u16),
-        known: Option<(u64, u64)>,
-    ) -> Snapshot {
-        self.snapshot_presentation(area, gap, cell, header, minimum, known, true)
-    }
-    #[allow(clippy::too_many_arguments)]
-    fn snapshot_presentation(
-        &mut self,
-        area: Rect,
-        gap: u16,
-        cell: (u16, u16),
-        header: u16,
-        minimum: (u16, u16),
-        known: Option<(u64, u64)>,
-        graphical: bool,
-    ) -> Snapshot {
-        let Rect { width, height, .. } = area;
-        let (cell_width, cell_height) = cell;
-        self.process_events();
-        self.render_cache
-            .retain(|id, _| self.views.contains_key(id) || self.terminals.contains_key(id));
-        let cw = cell_width.max(1);
-        let ch = cell_height.max(1);
-        let required = self.layout.minimum_size(gap, minimum);
-        let (placements, handles) = if self.editor_only
-            || width / cw < 70
-            || height / ch < 10
-            || width < required.0
-            || height < required.1
-        {
-            (
-                vec![layout::Placement {
-                    id: self.focus,
-                    rect: area,
-                }],
-                vec![],
-            )
-        } else {
-            self.layout.arrange_constrained(area, gap, minimum)
-        };
-        let mut panes = vec![];
-        for placement in placements {
-            let id = placement.id;
-            let r = placement.rect;
-            let Some(view) = self.layout.view(id).cloned() else {
-                continue;
-            };
-            let tabs = match self.layout.pane_mut(id) {
-                Some((tabs, active)) => {
-                    let active = *active;
-                    tabs.clone()
-                        .iter()
-                        .enumerate()
-                        .map(|(index, v)| Tab {
-                            title: match v {
-                                View::Files => "Files".into(),
-                                View::Git => "Git".into(),
-                                View::Editor(id) => self
-                                    .views
-                                    .get(id)
-                                    .and_then(|v| self.documents.get(&v.document))
-                                    .map(Document::title)
-                                    .unwrap_or_else(|| "Editor".into()),
-                                View::Terminal(id) => format!("Terminal {id}"),
-                            },
-                            active: index == active,
-                            editor_id: match v {
-                                View::Editor(id) => Some(*id),
-                                _ => None,
-                            },
-                            close_id: match v {
-                                View::Editor(id) | View::Terminal(id) => Some(*id),
-                                _ => None,
-                            },
-                        })
-                        .collect()
-                }
-                None => vec![],
-            };
-            let rows = r
-                .height
-                .saturating_sub(header)
-                .checked_div(ch)
-                .unwrap_or(1)
-                .max(1);
-            let cols = r
-                .width
-                .saturating_sub(2)
-                .checked_div(cw)
-                .unwrap_or(1)
-                .max(1);
-            let mut text = None;
-            let (kind, screen, selected) = match view {
-                View::Editor(view) => {
-                    if graphical {
-                        text = Some(self.editor_text(view, rows, cols));
-                        ("editor", None, 0)
-                    } else {
-                        let screen = self.cached_editor_screen(view, rows, cols);
-                        ("editor", Some(screen), 0)
-                    }
-                }
-                View::Terminal(term) => {
-                    let screen = self.terminals.get_mut(&term).map(|t| {
-                        let _ = t.resize(rows, cols);
-                        // The signature is checked below before the parser grid is copied.
-                        t.revision()
-                    });
-                    let screen = screen.map(|revision| self.cached_terminal_screen(term, revision));
-                    ("terminal", screen, 0)
-                }
-                View::Files => ("files", None, self.selected),
-                View::Git => ("git", None, self.git_selected),
-            };
-            panes.push(PaneSnapshot {
-                id,
-                rect: r,
-                kind: kind.into(),
-                tabs,
-                revision: self
-                    .render_cache
-                    .get(&match view {
-                        View::Editor(v) | View::Terminal(v) => v,
-                        _ => 0,
-                    })
-                    .map(|(_, revision, _)| *revision)
-                    .unwrap_or(0),
-                focused: id == self.focus,
-                terminal_mouse_motion: match view {
-                    View::Terminal(v) => self.terminals[&v].mouse_motion(),
-                    _ => false,
-                },
-                read_only: match view {
-                    View::Editor(v) => self.documents[&self.views[&v].document].read_only,
-                    _ => false,
-                },
-                editor: match view {
-                    View::Editor(v) => Some(self.editor_presentation(v)),
-                    _ => None,
-                },
-                screen,
-                selected,
-                rows,
-                cols,
-                text,
-            });
-        }
-        Snapshot {
-            panes,
-            handles,
-            focus: self.focus,
-            files: if known.is_some_and(|(files, _)| files == self.files_revision) {
-                vec![]
-            } else {
-                self.files.clone()
-            },
-            git: if known.is_some_and(|(_, git)| git == self.git_revision) {
-                vec![]
-            } else {
-                self.git.clone()
-            },
-            browser: self.browser.to_string_lossy().into_owned(),
-            status: self.status.clone(),
-            dirty: self.dirty(),
-            quit: self.quit,
-            clipboard: if graphical {
-                String::new()
-            } else {
-                self.clipboard.clone()
-            },
-            layouts: self.presets.keys().cloned().collect(),
-            prompt: self.prompt.clone(),
-            location: self.location(),
-            hints: self.hints(),
-            foreground: self.colors.0.clone(),
-            background: self.colors.1.clone(),
-            accent: self.colors.3.clone(),
-            selection: self.colors.2.clone(),
-            commands: if graphical {
-                vec![]
-            } else {
-                self.command_catalog("")
-            },
-            settings: self.preferences.clone(),
-            editor_only: self.editor_only,
-            title: self.window_title(),
-            recent: self.recent.clone(),
-            git_branch: self.git_branch.clone(),
-            git_repository: self.git_repository,
-            git_busy: self.git_jobs > 0,
-            git_error: self.git_error.clone(),
-            files_revision: self.files_revision,
-            git_revision: self.git_revision,
-        }
-    }
-    pub fn editor_input_context(&self, pane: u64) -> Option<EditorPresentation> {
-        match self.layout.view(pane) {
-            Some(View::Editor(id)) if self.views.contains_key(id) => {
-                Some(self.editor_presentation(*id))
-            }
-            _ => None,
-        }
-    }
-    fn editor_presentation(&self, id: u64) -> EditorPresentation {
-        let v = &self.views[&id];
-        let doc = &self.documents[&v.document];
-        let mut start = v.cursor.saturating_sub(2048);
-        while !doc.text.is_char_boundary(start) {
-            start += 1;
-        }
-        let mut end = (v.cursor + 2048).min(doc.text.len());
-        while !doc.text.is_char_boundary(end) {
-            end -= 1;
-        }
-        let anchor = v.anchor.unwrap_or(v.cursor).clamp(start, end);
-        let selected = v
-            .anchor
-            .map(|a| &doc.text[a.min(v.cursor)..a.max(v.cursor)])
-            .unwrap_or("");
-        EditorPresentation {
-            surrounding: doc.text[start..end].into(),
-            cursor: doc.text[start..v.cursor].encode_utf16().count(),
-            anchor: doc.text[start..anchor].encode_utf16().count(),
-            selection: selected.chars().take(2048).collect(),
-            line_count: doc.line_count(),
-            top: v.top,
-            left: v.left,
-            document: v.document,
-            generation: doc.generation,
-        }
-    }
-    fn editor_signature(&self, id: u64) -> String {
-        let v = &self.views[&id];
-        serde_json::to_string(&(
-            v,
-            self.documents[&v.document].generation,
-            self.tokens
-                .get(&v.document)
-                .map(|(generation, light, _)| (*generation, *light)),
-            &self.colors,
-            &self.selection_foreground,
-            &self.search,
-            self.preferences.line_numbers,
-            self.preferences.indent_width,
-            self.preferences.soft_wrap,
-            self.preferences.show_whitespace,
-        ))
-        .unwrap()
-    }
-    fn cached_editor_screen(&mut self, id: u64, rows: u16, cols: u16) -> std::sync::Arc<Screen> {
-        let v = self.views.get_mut(&id).unwrap();
-        v.rows = rows;
-        v.cols = cols;
-        let key = self.editor_signature(id);
-        if let Some((prior, _, screen)) = self.render_cache.get(&id) {
-            if *prior == key {
-                return screen.clone();
-            }
-        }
-        let screen = std::sync::Arc::new(self.editor_screen(id, rows, cols));
-        self.screen_builds += 1;
-        self.render_cache.insert(
-            id,
-            (
-                self.editor_signature(id),
-                self.screen_builds,
-                screen.clone(),
-            ),
-        );
-        screen
-    }
-    fn cached_terminal_screen(&mut self, id: u64, revision: u64) -> std::sync::Arc<Screen> {
-        let key = format!("terminal:{revision}:{}:{}", self.colors.0, self.colors.1);
-        if let Some((prior, _, screen)) = self.render_cache.get(&id) {
-            if *prior == key {
-                return screen.clone();
-            }
-        }
-        let screen =
-            std::sync::Arc::new(self.terminals[&id].screen_with(&self.colors.0, &self.colors.1));
-        self.screen_builds += 1;
-        self.render_cache
-            .insert(id, (key, self.screen_builds, screen.clone()));
-        screen
-    }
-    fn editor_screen(&mut self, id: u64, rows: u16, cols: u16) -> Screen {
-        self.render_editor(id, rows, cols, false).0
-    }
-    fn render_editor(
-        &mut self,
-        id: u64,
-        rows: u16,
-        cols: u16,
-        graphical: bool,
-    ) -> (Screen, Vec<Vec<text_presentation::TextSpan>>) {
-        let tab = self.preferences.indent_width;
-        let wrapping = self.preferences.soft_wrap;
-        {
-            let v = self.views.get_mut(&id).unwrap();
-            v.rows = rows;
-            v.cols = cols;
-        }
-        let doc_id = self.views[&id].document;
-        let gutter = self.gutter_width(doc_id, cols);
-        let usable = (cols as usize).saturating_sub(gutter).max(1);
-        self.ensure_visible(id);
-        let (cursor_line, cursor_row, cursor_col) =
-            self.visual_position(id, self.views[&id].cursor);
-        if !wrapping {
-            // Horizontal scrolling keeps the cursor column visible, unless the
-            // user scrolled away deliberately (wheel or scrollbar).
-            let v = self.views.get_mut(&id).unwrap();
-            if v.manual_scroll {
-            } else if cursor_col < v.left {
-                v.left = cursor_col;
-            } else if cursor_col >= v.left + usable {
-                v.left = cursor_col + 1 - usable;
-            }
-        } else {
-            self.views.get_mut(&id).unwrap().left = 0;
-        }
-        // Graphical views draw one extra row for pixel-smooth scrolling.
-        let render_rows = rows as usize + usize::from(graphical);
-        let visible = self.visible_rows(id, render_rows);
-        let show_whitespace = self.preferences.show_whitespace;
-        let whitespace_color = desktop::blend(&self.colors.0, &self.colors.1, 0.6);
-        let v = &self.views[&id];
-        let document = &self.documents[&doc_id];
-        let text = &document.text;
-        let left = if wrapping { 0 } else { v.left };
-        let selection = v.anchor.map(|a| (a.min(v.cursor), a.max(v.cursor)));
-        let mut blank = Cell::text(" ");
-        blank.fg = self.colors.0.clone();
-        blank.bg = self.colors.1.clone();
-        let mut cells = if graphical {
-            vec![vec![]; render_rows]
-        } else {
-            vec![vec![blank; cols as usize]; rows as usize]
-        };
-        let mut decorations = vec![vec![]; render_rows];
-        let token_data = self
-            .tokens
-            .get(&doc_id)
-            .filter(|(generation, _, _)| *generation == document.generation);
-        let tokens = token_data.map(|(_, _, t)| t.as_slice()).unwrap_or(&[]);
-        let matches = self.search.regex().ok();
-        let match_margin = self.search.query.len() * 4 + 4;
-        let mut cursor = None;
-        for (y, (line, row_index, row)) in visible.iter().enumerate() {
-            let (line_start_byte, line_end_byte) = document.line_range(*line);
-            let line_text = &text[line_start_byte..line_end_byte];
-            if graphical {
-                cells[y].resize_with(gutter, || Cell::text(" "));
-            }
-            if gutter > 0 {
-                let number = if row.start == 0 {
-                    format!("{:>width$}  ", line + 1, width = gutter.saturating_sub(2))
-                } else {
-                    " ".repeat(gutter)
-                };
-                for (x, c) in number.chars().take(gutter).enumerate() {
-                    cells[y][x] = Cell::text(c.to_string());
-                    cells[y][x].fg = self.colors.0.clone();
-                    cells[y][x].bg = self.colors.1.clone();
-                }
-            }
-            // The first byte to draw: the row start, or the horizontal scroll column.
-            let first = if wrapping {
-                row.start
-            } else {
-                document::column_offset(line_text, left, tab)
-            };
-            let mut x = if wrapping {
-                row.col
-            } else {
-                document::display_width_with_tabs(&line_text[..first], tab)
-            };
-            let origin = if wrapping { row.col } else { left };
-            let segment_end = if wrapping { row.end } else { line_text.len() };
-            // Search only near the visible part of very long lines.
-            let window_end = {
-                let mut end = (first + usable * 4 + match_margin).min(segment_end);
-                while !line_text.is_char_boundary(end) {
-                    end += 1;
-                }
-                end
-            };
-            let window_start = {
-                let mut start = first.saturating_sub(match_margin);
-                while !line_text.is_char_boundary(start) {
-                    start -= 1;
-                }
-                start
-            };
-            let ranges = matches
-                .as_ref()
-                .map(|r| {
-                    r.find_iter(&line_text[window_start..window_end])
-                        .map(|m| (window_start + m.start(), window_start + m.end()))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let mut match_index = 0;
-            let mut token_index = tokens.partition_point(|t| t.end <= line_start_byte + first);
-            for (offset_in_segment, g) in line_text[first..segment_end].grapheme_indices(true) {
-                let i = first + offset_in_segment;
-                if g == "\r" || g == "\r\n" {
-                    continue;
-                }
-                let width = document::grapheme_width(g, x, tab);
-                for offset in 0..width {
-                    let column = x + offset;
-                    if column >= origin && column - origin + gutter < cols as usize {
-                        let mut c = Cell::text(if g == "\t" || offset > 0 {
-                            " ".to_string()
-                        } else {
-                            g.chars()
-                                .map(|c| if c.is_control() { '\u{fffd}' } else { c })
-                                .collect()
-                        });
-                        c.fg = self.colors.0.clone();
-                        c.bg = self.colors.1.clone();
-                        let absolute = line_start_byte + i;
-                        while token_index < tokens.len() && tokens[token_index].end <= absolute {
-                            token_index += 1;
-                        }
-                        if let Some(token) = tokens.get(token_index).filter(|t| t.start <= absolute)
-                        {
-                            c.fg = token.fg.clone();
-                            c.bold = token.bold;
-                            c.italic = token.italic;
-                        }
-                        while match_index < ranges.len() && ranges[match_index].1 <= i {
-                            match_index += 1;
-                        }
-                        let matched = ranges
-                            .get(match_index)
-                            .is_some_and(|(a, b)| i >= *a && i < *b);
-                        if show_whitespace && (g == " " || g == "\t") {
-                            c.text = match (g, offset) {
-                                (" ", _) => "·",
-                                (_, 0) => "→",
-                                _ => " ",
-                            }
-                            .into();
-                            c.fg = whitespace_color.clone();
-                        }
-                        c.wide = width == 2 && g != "\t" && offset == 0;
-                        c.continuation = width == 2 && g != "\t" && offset == 1;
-                        let selected = selection
-                            .map(|(a, b)| absolute >= a && absolute < b)
-                            .unwrap_or(false);
-                        let position = column - origin + gutter;
-                        if matched || selected {
-                            if graphical {
-                                let mut decoration = c.clone();
-                                decoration.bg = self.colors.2.clone();
-                                decoration.fg = self.selection_foreground.clone();
-                                decoration.underline = matched;
-                                let row: &mut Vec<text_presentation::TextSpan> =
-                                    &mut decorations[y];
-                                if let Some(last) = row.last_mut().filter(|s| {
-                                    s.start + s.length == position && s.underline == matched
-                                }) {
-                                    last.length += 1;
-                                } else {
-                                    row.push(text_presentation::TextSpan::cell(
-                                        position,
-                                        1,
-                                        &decoration,
-                                    ));
-                                }
-                            } else {
-                                c.bg = self.colors.2.clone();
-                                c.fg = self.selection_foreground.clone();
-                                c.underline = matched;
-                            }
-                        }
-                        if graphical && cells[y].len() <= position {
-                            cells[y].resize_with(position + 1, || Cell::text(" "));
-                        }
-                        cells[y][position] = c;
-                    }
-                }
-                x += width;
-                if x >= origin + usable {
-                    break;
-                }
-            }
-            if *line == cursor_line && *row_index == cursor_row {
-                let column = if wrapping {
-                    cursor_col
-                } else {
-                    cursor_col.saturating_sub(left)
-                };
-                if wrapping || cursor_col >= left {
-                    cursor = Some((
-                        y as u16,
-                        (column + gutter).min((cols as usize).saturating_sub(1)) as u16,
-                    ));
-                }
-            }
-        }
-        if graphical {
-            cells.truncate(visible.len());
-            decorations.truncate(visible.len());
-        }
-        (
-            Screen {
-                cells,
-                cursor,
-                rows,
-                cols,
-            },
-            decorations,
-        )
-    }
     pub fn focused_kind(&self) -> &str {
         match self.focused() {
             Some(View::Editor(_)) => "editor",
@@ -2837,7 +2548,10 @@ impl App {
     }
     pub fn selected_path(&self) -> Option<String> {
         if self.focused_kind() == "git" {
-            self.git.get(self.git_selected).map(|e| e.path.clone())
+            self.git
+                .entries
+                .get(self.git.selected)
+                .map(|e| e.path.clone())
         } else {
             self.files.get(self.selected).map(|e| e.path.clone())
         }
@@ -2922,6 +2636,10 @@ impl App {
         let args = args.trim();
         let selected = || self.selected_path().unwrap_or_default();
         match verb {
+            tool if tool.starts_with("tool:") => Some(Command::Action {
+                name: "run-tool".into(),
+                argument: tool["tool:".len()..].to_string(),
+            }),
             "prompt-find" | "prompt-replace" | "prompt-goto" => Some(Command::Prompt {
                 kind: verb.trim_start_matches("prompt-").into(),
             }),
@@ -3028,7 +2746,11 @@ impl App {
             "stage-group" => Some(Command::GitStageGroup { group: args.into() }),
             "diff" => Some(Command::GitDiff {
                 path: selected(),
-                staged: self.git.get(self.git_selected).is_some_and(|e| e.staged),
+                staged: self
+                    .git
+                    .entries
+                    .get(self.git.selected)
+                    .is_some_and(|e| e.staged),
             }),
             "commit" => Some(Command::GitCommit {
                 message: args.into(),
@@ -3090,6 +2812,64 @@ const ACTION_VERBS: &[&str] = &[
     "clear-recent",
     "new-window",
     "print",
+    "trust-workspace",
+    "restrict-workspace",
+    "add-cursor-above",
+    "add-cursor-below",
+    "add-next-occurrence",
+    "select-all-occurrences",
+    "go-to-bracket",
+    "fold",
+    "unfold",
+    "toggle-fold",
+    "fold-all",
+    "unfold-all",
+    "quick-open",
+    "go-to-symbol",
+    "search-in-files",
+    "replace-in-files",
+    "open-documents",
+    "problems",
+    "go-back",
+    "go-forward",
+    "hover",
+    "go-to-definition",
+    "find-references",
+    "rename-symbol",
+    "code-actions",
+    "apply-code-action",
+    "format-document",
+    "trigger-completion",
+    "workspace-symbols",
+    "next-problem",
+    "previous-problem",
+    "restart-language-servers",
+    "run-task",
+    "run-build-task",
+    "stop-task",
+    "debug-start",
+    "debug-continue",
+    "debug-step-over",
+    "debug-step-into",
+    "debug-step-out",
+    "debug-pause",
+    "debug-stop",
+    "debug-evaluate",
+    "toggle-breakpoint",
+    "run-tool",
+];
+/// Editor-table actions that are not about the focused text, so their keys
+/// also work while the file or Git pane has focus.
+const WORKBENCH_ACTIONS: &[&str] = &[
+    "quick-open",
+    "search-in-files",
+    "open-documents",
+    "go-back",
+    "go-forward",
+    "run-build-task",
+    "debug-start",
+    "workspace-symbols",
+    "problems",
 ];
 pub fn key_chord(k: &Key) -> String {
     // Shift is implied by shifted punctuation such as `}` or `_`, and
@@ -3143,11 +2923,7 @@ impl App {
         if let Some((line, column)) = self.pending_positions.remove(&path) {
             if let Some(View::Editor(view)) = self.layout.view(self.focus).cloned() {
                 let doc = self.views[&view].document;
-                let cursor = self.documents[&doc].at_line_col(
-                    line.saturating_sub(1),
-                    column.saturating_sub(1),
-                    self.preferences.indent_width,
-                );
+                let cursor = self.offset_for(doc, line, column);
                 let v = self.views.get_mut(&view).unwrap();
                 v.cursor = cursor;
                 v.anchor = None;

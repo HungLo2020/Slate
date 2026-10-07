@@ -22,4 +22,8 @@ sha2 = "0.10"
 
 regex = "1"
 encoding_rs = "0.8"
+ropey = { version = "1.6", default-features = false, features = ["simd"] }
+regex-cursor = "0.1"
 two-face = { version = "0.5", default-features = false, features = ["syntect-default-fancy"] }
+ignore = "0.4"
+nucleo-matcher = "0.3"

@@ -84,14 +84,14 @@ fn indexed_positions_follow_edits_and_history() {
                 for col in 0..12 {
                     assert_eq!(
                         doc.at_line_col(row, col, 4),
-                        document::at_line_col_with_tabs(doc.text(), row, col, 4)
+                        document::at_line_col_with_tabs(&doc.text(), row, col, 4)
                     );
                 }
             }
             for (byte, _) in doc.text().char_indices() {
                 assert_eq!(
                     doc.line_col(byte, 4),
-                    document::line_col_with_tabs(doc.text(), byte, 4)
+                    document::line_col_with_tabs(&doc.text(), byte, 4)
                 );
             }
         }
@@ -371,6 +371,7 @@ fn git_handles_initial_commits_renames_and_failed_operations() {
     fs::write(dir.path().join("original name.txt"), "initial content\n").unwrap();
     git(dir.path(), &["add", "."]);
     let mut app = App::new(dir.path()).unwrap();
+    app.set_session_trust(true);
     git_ready(&mut app);
     app.dispatch(Command::GitDiff {
         path: "original name.txt".into(),
@@ -440,6 +441,7 @@ fn blocked_git_hook_does_not_block_file_browsing_or_editing() {
     fs::write(&hook, "#!/bin/sh\ntouch hook-entered\nn=0\nwhile [ ! -f hook-release ] && [ $n -lt 200 ]; do sleep 0.02; n=$((n+1)); done\n").unwrap();
     fs::set_permissions(hook, fs::Permissions::from_mode(0o700)).unwrap();
     let mut app = App::new(dir.path()).unwrap();
+    app.set_session_trust(true);
     git_ready(&mut app);
     app.dispatch(Command::GitCommit {
         message: "Slow hook".into(),
@@ -514,6 +516,7 @@ fn bulk_git_actions_cover_the_repository_and_preserve_working_files() {
     // The application can be opened below the repository root. Bulk actions
     // still include outside.txt, the rename, the deletion and untracked files.
     let mut app = App::new(&root.join("nested")).unwrap();
+    app.set_session_trust(true);
     git_ready(&mut app);
     app.command_line("stage-all");
     let view = git_ready(&mut app);
@@ -564,6 +567,7 @@ fn staging_a_section_does_not_stage_other_sections() {
     fs::write(root.join("tracked.txt"), "working\n").unwrap();
     fs::write(root.join("new file.txt"), "new\n").unwrap();
     let mut app = App::new(root).unwrap();
+    app.set_session_trust(true);
     git_ready(&mut app);
     app.dispatch(Command::GitStageGroup {
         group: "Untracked".into(),
@@ -604,6 +608,7 @@ fn unstage_all_handles_an_unborn_index_with_new_working_edits() {
     git(root, &["add", "."]);
     fs::write(root.join("nested/new file.txt"), "working\n").unwrap();
     let mut app = App::new(root).unwrap();
+    app.set_session_trust(true);
     git_ready(&mut app);
     app.dispatch(Command::GitUnstageAll);
     let view = git_ready(&mut app);
@@ -656,6 +661,7 @@ fn restaging_a_staged_rename_preserves_its_source_removal() {
     git(root, &["mv", "old name.txt", "new name.txt"]);
     fs::write(root.join("new name.txt"), format!("{base}working\n")).unwrap();
     let mut app = App::new(root).unwrap();
+    app.set_session_trust(true);
     let view = git_ready(&mut app);
     assert!(view
         .git

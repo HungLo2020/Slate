@@ -64,7 +64,7 @@ ApplicationWindow {
     }
     onPaneHeaderHeightChanged: Qt.callLater(syncViewport)
     function anyDialogOpen() {
-        return slate.pathDialogOpen || slate.closeDialogOpen || commandPalette.visible || editPrompt.visible || settingsDialog.visible || confirmDiscard.visible || quitDialog.visible || choiceDialog.visible;
+        return slate.pathDialogOpen || slate.closeDialogOpen || commandPalette.visible || editPrompt.visible || settingsDialog.visible || confirmDiscard.visible || quitDialog.visible || choiceDialog.visible || pickerDialog.visible;
     }
     function send(action) {
         slate.send(action);
@@ -240,6 +240,17 @@ ApplicationWindow {
                         root.gitCommitting = false;
                     }
                 });
+            // The core owns the picker; the dialog follows it.
+            if (root.frame.picker && !root.frame.prompt) {
+                if (!pickerDialog.visible) {
+                    pickerDialog.open();
+                    pickerQuery.text = root.frame.picker.query;
+                }
+            } else if (pickerDialog.visible) {
+                pickerDialog.closing = true;
+                pickerDialog.close();
+                pickerDialog.closing = false;
+            }
             var prompt = root.frame.prompt;
             if (prompt && prompt.kind === "settings") {
                 Qt.callLater(function () {
@@ -787,6 +798,89 @@ ApplicationWindow {
                         })
                     Accessible.name: "Horizontal scroll position"
                 }
+                // Completions and hover text sit at their editor cell.
+                Rectangle {
+                    id: completionBox
+                    objectName: "completion_" + panel.paneId
+                    readonly property var info: root.frame.completion && root.frame.completion.pane === panel.paneId ? root.frame.completion : null
+                    readonly property real rowHeight: Math.max(slate.cellHeight + 4, uiMetrics.height + 6)
+                    readonly property real anchorY: grid.y + ((info ? info.row : 0) + 1) * slate.cellHeight - grid.scrollPixels
+                    visible: !!info && panel.isEditor
+                    z: 20
+                    width: Math.min(panel.width - 8, 420)
+                    height: Math.min(info ? info.items.length : 0, 10) * rowHeight + 4
+                    x: Math.max(2, Math.min(grid.x + (info ? info.col : 0) * slate.cellWidth, panel.width - width - 4))
+                    y: anchorY + height <= panel.height - 4 ? anchorY : Math.max(grid.y, anchorY - slate.cellHeight - height)
+                    color: Theme.viewBackgroundColor
+                    border.color: Theme.disabledTextColor
+                    radius: 3
+                    ListView {
+                        id: completionList
+                        objectName: "completionList_" + panel.paneId
+                        anchors.fill: parent
+                        anchors.margins: 2
+                        clip: true
+                        model: completionBox.info ? completionBox.info.items : []
+                        currentIndex: completionBox.info ? completionBox.info.selected : -1
+                        onCurrentIndexChanged: positionViewAtIndex(currentIndex, ListView.Contain)
+                        delegate: Rectangle {
+                            required property var modelData
+                            required property int index
+                            width: completionList.width
+                            height: completionBox.rowHeight
+                            color: index === completionList.currentIndex ? Theme.highlightColor : "transparent"
+                            RowLayout {
+                                anchors.fill: parent
+                                anchors.leftMargin: Theme.smallSpacing
+                                anchors.rightMargin: Theme.smallSpacing
+                                Label {
+                                    textFormat: Text.PlainText
+                                    text: modelData.label
+                                    color: index === completionList.currentIndex ? Theme.highlightedTextColor : Theme.textColor
+                                    Layout.fillWidth: true
+                                    elide: Text.ElideRight
+                                }
+                                Label {
+                                    textFormat: Text.PlainText
+                                    text: modelData.detail || modelData.kind
+                                    color: index === completionList.currentIndex ? Theme.highlightedTextColor : Theme.disabledTextColor
+                                    Layout.maximumWidth: completionList.width * 0.45
+                                    elide: Text.ElideRight
+                                }
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: root.send({"action": "completion_accept", "index": index})
+                            }
+                        }
+                    }
+                }
+                Rectangle {
+                    id: hoverBox
+                    objectName: "hover_" + panel.paneId
+                    readonly property var info: root.frame.hover && root.frame.hover.pane === panel.paneId ? root.frame.hover : null
+                    readonly property real anchorY: grid.y + ((info ? info.row : 0) + 1) * slate.cellHeight - grid.scrollPixels
+                    visible: !!info && panel.isEditor
+                    z: 20
+                    width: Math.min(panel.width - 8, hoverText.implicitWidth + 2 * Theme.largeSpacing, 560)
+                    height: Math.min(panel.height / 2, hoverText.implicitHeight + 2 * Theme.largeSpacing)
+                    x: Math.max(2, Math.min(grid.x + (info ? info.col : 0) * slate.cellWidth, panel.width - width - 4))
+                    y: anchorY + height <= panel.height - 4 ? anchorY : Math.max(grid.y, anchorY - slate.cellHeight - height)
+                    color: Theme.viewBackgroundColor
+                    border.color: Theme.disabledTextColor
+                    radius: 3
+                    clip: true
+                    Label {
+                        id: hoverText
+                        objectName: "hoverText_" + panel.paneId
+                        x: Theme.largeSpacing
+                        y: Theme.largeSpacing
+                        width: Math.min(implicitWidth, 560 - 2 * Theme.largeSpacing)
+                        textFormat: Text.PlainText
+                        wrapMode: Text.Wrap
+                        text: hoverBox.info ? hoverBox.info.text : ""
+                    }
+                }
                 GitPane {
                     id: gitView
                     objectName: "gitView_" + panel.paneId
@@ -1118,6 +1212,32 @@ ApplicationWindow {
                 }
             }
             Label {
+                objectName: "problemHere"
+                textFormat: Text.PlainText
+                text: root.frame.problem || ""
+                visible: text.length > 0
+                color: text.indexOf("error") === 0 ? Theme.negativeTextColor : Theme.neutralTextColor
+                Layout.maximumWidth: root.width * 0.3
+                elide: Text.ElideRight
+            }
+            ActionButton {
+                objectName: "problemCount"
+                readonly property var counts: root.frame.problems || [0, 0]
+                visible: counts[0] + counts[1] > 0
+                text: "✖ " + counts[0] + "  ⚠ " + counts[1]
+                tip: "Problems"
+                flat: true
+                onClicked: root.invokeAction("problems")
+            }
+            ActionButton {
+                objectName: "restrictedMode"
+                visible: root.frame.trusted === false
+                text: "Restricted"
+                tip: "Project tools do not run in this folder. Click to trust it."
+                flat: true
+                onClicked: root.invokeAction("trust-workspace")
+            }
+            Label {
                 textFormat: Text.PlainText
                 text: root.frame.location || ""
                 visible: text.length > 0
@@ -1160,7 +1280,11 @@ ApplicationWindow {
                 "set-encoding": "Save with encoding",
                 "reopen-encoding": "Reopen with encoding",
                 "set-line-ending": "Line endings",
-                "open-recent": "Open recent file"
+                "open-recent": "Open recent file",
+                "rename-symbol": "Rename symbol",
+                "project-replace": "Replace in files",
+                "debug-evaluate": "Evaluate expression",
+                "debug-program": "Start debugging"
             })[prompt.kind] || "Input"
         anchors.centerIn: parent
         width: Math.min(root.width - 40, 560)
@@ -1205,7 +1329,11 @@ ApplicationWindow {
                             "set-encoding": "utf-8, utf-16le, windows-1252, shift_jis…",
                             "reopen-encoding": "utf-8, latin1, shift_jis…",
                             "set-line-ending": "lf, crlf or cr",
-                            "open-recent": "Path or list number"
+                            "open-recent": "Path or list number",
+                            "rename-symbol": "New name",
+                            "project-replace": "Replacement text",
+                            "debug-evaluate": "Expression, e.g. count * 2",
+                            "debug-program": "Path of the program to debug"
                         })[editPrompt.prompt.kind] || "Find text"
                     onTextEdited: editPrompt.update()
                     onAccepted: root.send({
@@ -1281,14 +1409,16 @@ ApplicationWindow {
         objectName: "choiceDialog"
         enter: Transition {}
         exit: Transition {}
-        readonly property var kinds: ["save-read-only", "save-elevated", "reload-changed", "file-changed", "quit"]
+        readonly property var kinds: ["save-read-only", "save-elevated", "reload-changed", "file-changed", "quit", "trust", "confirm-replace"]
         readonly property var prompt: root.frame.prompt || ({ "kind": "", "input": "" })
         readonly property var copy: ({
                 "save-read-only": ["Read-only file", "%1 is read-only. Overwrite it anyway?", "Overwrite", ""],
                 "save-elevated": ["Permission denied", "You do not have permission to write %1. Save it with administrator rights?", "Save as Administrator", ""],
                 "reload-changed": ["Reload from disk", "Reload %1 from disk and discard your unsaved changes?", "Reload", ""],
                 "file-changed": ["File changed on disk", "%1 changed on disk while you have unsaved changes.", "Reload from Disk", "Keep My Version"],
-                "quit": ["Unsaved changes", "Save changes before quitting? (%1)", "Save All and Quit", "Discard and Quit"]
+                "quit": ["Unsaved changes", "Save changes before quitting? (%1)", "Save All and Quit", "Discard and Quit"],
+                "confirm-replace": ["Replace in files", "Replace every search result in %1? Open documents change in the editor and stay unsaved.", "Replace All", ""],
+                "trust": ["Trust this folder?", "%1. Trusting lets this folder's language servers, tasks, formatters and Git hooks run.", "Trust Folder", ""]
             })[prompt.kind] || ["", "", "OK", ""]
         title: copy[0]
         anchors.centerIn: parent
@@ -1333,6 +1463,131 @@ ApplicationWindow {
                     text: choiceDialog.prompt.kind === "file-changed" ? "Decide Later" : "Cancel"
                     onClicked: choiceDialog.reject()
                 }
+            }
+        }
+    }
+    // Files, symbols, search results, problems: lists the core filters.
+    Dialog {
+        id: pickerDialog
+        enter: Transition {}
+        exit: Transition {}
+        objectName: "pickerDialog"
+        readonly property var info: root.frame.picker || ({"title": "", "items": [], "selected": 0, "total": 0, "message": "", "kind": ""})
+        property bool closing: false
+        title: info.title
+        anchors.centerIn: parent
+        width: Math.min(root.width - 40, 760)
+        height: Math.min(root.height - 40, 520)
+        modal: true
+        onOpened: pickerQuery.forceActiveFocus()
+        onClosed: {
+            if (!closing && root.frame.picker)
+                root.send({"action": "picker_close"});
+            Qt.callLater(root.focusPane);
+        }
+        contentItem: ColumnLayout {
+            TextField {
+                id: pickerQuery
+                objectName: "pickerQuery"
+                Layout.fillWidth: true
+                placeholderText: pickerDialog.info.kind === "search" ? "Search the workspace…" : "Type to filter…"
+                onTextEdited: root.send({"action": "picker_query", "query": text})
+                onAccepted: root.send({"action": "picker_accept"})
+                Keys.onDownPressed: root.send({"action": "picker_move", "delta": 1})
+                Keys.onUpPressed: root.send({"action": "picker_move", "delta": -1})
+                Keys.onPressed: function (event) {
+                    if (event.key === Qt.Key_PageDown) {
+                        root.send({"action": "picker_move", "delta": 10});
+                        event.accepted = true;
+                    } else if (event.key === Qt.Key_PageUp) {
+                        root.send({"action": "picker_move", "delta": -10});
+                        event.accepted = true;
+                    } else if (event.key === Qt.Key_H && (event.modifiers & Qt.ControlModifier) && pickerDialog.info.kind === "search") {
+                        root.send({"action": "action", "name": "replace-in-files", "argument": ""});
+                        event.accepted = true;
+                    }
+                }
+            }
+            Flow {
+                Layout.fillWidth: true
+                spacing: Theme.smallSpacing
+                visible: pickerDialog.info.kind === "search"
+                CheckBox {
+                    objectName: "pickerCase"
+                    text: "Match case"
+                    checked: !!pickerDialog.info.case_sensitive
+                    onClicked: root.send({"action": "picker_option", "name": "case"})
+                }
+                CheckBox {
+                    objectName: "pickerWord"
+                    text: "Whole word"
+                    checked: !!pickerDialog.info.whole_word
+                    onClicked: root.send({"action": "picker_option", "name": "word"})
+                }
+                CheckBox {
+                    objectName: "pickerRegex"
+                    text: "Regular expression"
+                    checked: !!pickerDialog.info.regex
+                    onClicked: root.send({"action": "picker_option", "name": "regex"})
+                }
+                ActionButton {
+                    text: "Replace…"
+                    onClicked: root.send({"action": "action", "name": "replace-in-files", "argument": ""})
+                }
+            }
+            ListView {
+                id: pickerResults
+                objectName: "pickerResults"
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                model: pickerDialog.info.items
+                currentIndex: pickerDialog.info.selected
+                onCurrentIndexChanged: positionViewAtIndex(currentIndex, ListView.Contain)
+                ScrollBar.vertical: ScrollBar {}
+                delegate: Basic.ItemDelegate {
+                    id: pickerItem
+                    required property var modelData
+                    required property int index
+                    width: pickerResults.width
+                    highlighted: index === pickerResults.currentIndex
+                    contentItem: RowLayout {
+                        Label {
+                            textFormat: Text.PlainText
+                            text: pickerItem.modelData.label
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 0
+                            elide: Text.ElideMiddle
+                            color: pickerItem.highlighted ? Theme.highlightedTextColor : Theme.textColor
+                        }
+                        Label {
+                            textFormat: Text.PlainText
+                            text: pickerItem.modelData.detail
+                            Layout.maximumWidth: pickerResults.width * 0.45
+                            elide: Text.ElideMiddle
+                            color: pickerItem.highlighted ? Theme.highlightedTextColor : Theme.disabledTextColor
+                        }
+                    }
+                    background: Rectangle {
+                        color: pickerItem.highlighted ? Theme.highlightColor : "transparent"
+                        radius: 4
+                    }
+                    onClicked: root.send({"action": "picker_accept", "index": index})
+                }
+                Label {
+                    textFormat: Text.PlainText
+                    anchors.centerIn: parent
+                    visible: pickerResults.count === 0
+                    text: pickerDialog.info.busy ? "Working…" : (pickerDialog.info.message || "Nothing found")
+                }
+            }
+            Label {
+                objectName: "pickerStatus"
+                textFormat: Text.PlainText
+                Layout.fillWidth: true
+                elide: Text.ElideRight
+                text: (pickerDialog.info.busy ? "Working… · " : "") + (pickerDialog.info.message || (pickerDialog.info.total === 1 ? "1 item" : pickerDialog.info.total + " items")) + " · ↑ ↓ select · Enter opens · Escape closes"
+                color: Theme.disabledTextColor
             }
         }
     }

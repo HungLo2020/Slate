@@ -24,6 +24,7 @@ use std::{
 };
 
 mod colors;
+mod ide;
 use colors::ColorMode;
 
 /// Set by SIGHUP/SIGTERM; the main loop saves unsaved work and exits.
@@ -149,6 +150,8 @@ const CHOICE_PROMPTS: &[&str] = &[
     "save-elevated",
     "reload-changed",
     "file-changed",
+    "trust",
+    "confirm-replace",
 ];
 
 /// Whether the tty's erase character is ^H, making Ctrl+H Backspace.
@@ -551,7 +554,7 @@ pub fn run(mut app: App) -> Result<()> {
                     }
                 }
                 Event::Mouse(m) => {
-                    if app.prompt.is_some() || palette.is_some() {
+                    if app.prompt.is_some() || palette.is_some() || snapshot.picker.is_some() {
                         continue;
                     }
                     let x = m.column;
@@ -818,6 +821,16 @@ fn prompt_view(prompt: &slate_core::search::Prompt) -> (String, &'static str, u1
             "File changed on disk",
             5,
         ),
+        "confirm-replace" => (
+            format!("Replace every search result in {input}?\nY: replace (open documents stay unsaved) · N / Escape: cancel"),
+            "Replace in files",
+            5,
+        ),
+        "trust" => (
+            format!("Trust {input}?\nY: trust this folder (its tools may run) · N / Escape: stay in restricted mode"),
+            "Workspace trust",
+            5,
+        ),
         "reload-changed" => (
             format!("Reload {input} from disk and discard your unsaved changes?\nY: reload · N / Escape: keep editing"),
             "Reload",
@@ -842,6 +855,10 @@ fn prompt_view(prompt: &slate_core::search::Prompt) -> (String, &'static str, u1
                 "reopen-encoding" => "Reopen with encoding (utf-8, latin1, shift_jis…)",
                 "set-line-ending" => "Line endings: lf, crlf or cr",
                 "open-recent" => "Open recent file (path or number)",
+                "rename-symbol" => "Rename symbol to",
+                "project-replace" => "Replace search results with",
+                "debug-evaluate" => "Evaluate expression",
+                "debug-program" => "Program to debug",
                 "goto" => "Go to line",
                 "find" => "Find",
                 _ => "Input",
@@ -912,7 +929,7 @@ fn render(
                 },
                 content,
             );
-            if focus && palette.is_none() && s.prompt.is_none() {
+            if focus && palette.is_none() && s.prompt.is_none() && s.picker.is_none() {
                 if let Some((y, x)) = screen.cursor {
                     if x < content.width && y < content.height {
                         frame.set_cursor_position((content.x + x, content.y + y));
@@ -949,13 +966,24 @@ fn render(
     }
     let size = frame.area();
     frame.render_widget(
-        Paragraph::new(clean(&format!("{} · {}", s.status, s.location))).style(colors.status()),
+        Paragraph::new(clean(&format!(
+            "{} · {}{}",
+            s.status,
+            s.location,
+            ide::status_suffix(s)
+        )))
+        .style(colors.status()),
         Rect::new(0, size.height.saturating_sub(2), size.width, 1),
     );
     frame.render_widget(
         Paragraph::new(s.hints.as_str()),
         Rect::new(0, size.height.saturating_sub(1), size.width, 1),
     );
+    ide::render_hover(frame, s);
+    ide::render_completion(frame, s, colors);
+    if s.prompt.is_none() && palette.is_none() {
+        ide::render_picker(frame, s, colors);
+    }
     if let Some(prompt) = &s.prompt {
         let settings = prompt.kind == "settings";
         let (text, title, height) = prompt_view(prompt);

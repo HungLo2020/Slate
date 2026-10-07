@@ -1,7 +1,7 @@
 //! Named editor actions, cursor movement, soft-wrap navigation and save
 //! orchestration. Both frontends reach these through the shared catalog.
 use crate::{
-    document::{line_end, line_start, next, previous, Document},
+    document::{previous, Document},
     fsio::{SaveErrorKind, WriteOptions},
     layout::View,
     search::{Prompt, Search},
@@ -47,7 +47,22 @@ pub(crate) fn word_boundary(text: &str, cursor: usize, forward: bool) -> usize {
     }
 }
 
-fn prompt(kind: &str, input: String) -> Prompt {
+/// Word movement within a document: the cursor's line is examined, and a
+/// line break is a boundary of its own.
+pub(crate) fn document_word_boundary(d: &Document, cursor: usize, forward: bool) -> usize {
+    let row = d.line_of(cursor);
+    let (start, end) = d.line_range(row);
+    if forward && cursor >= end {
+        return d.next_boundary(cursor);
+    }
+    if !forward && cursor <= start {
+        return d.previous_boundary(cursor);
+    }
+    let line = d.line_text(row);
+    start + word_boundary(&line, cursor - start, forward)
+}
+
+pub(crate) fn prompt(kind: &str, input: String) -> Prompt {
     Prompt {
         kind: kind.into(),
         input,
@@ -81,7 +96,7 @@ impl App {
         let d = &self.documents[&doc];
         let (start, end) = d.line_range(line);
         if self.preferences.soft_wrap {
-            wrap::rows(&d.text[start..end], width, self.preferences.indent_width)
+            wrap::rows(&d.slice(start, end), width, self.preferences.indent_width)
         } else {
             vec![wrap::Row {
                 start: 0,
@@ -113,7 +128,8 @@ impl App {
         let d = &self.documents[&doc];
         let (start, _) = d.line_range(line);
         let tab = self.preferences.indent_width;
-        let text = &d.text[start + row.start..start + row.end];
+        let text = d.slice(start + row.start, start + row.end);
+        let text = text.as_ref();
         let target = row.col + col;
         let mut x = row.col;
         for (i, g) in text.grapheme_indices(true) {
@@ -130,19 +146,18 @@ impl App {
         start + row.end
     }
     /// Move `count` visual rows from a position, keeping the display column.
-    fn vertical(&self, id: u64, cursor: usize, count: isize, goal: usize) -> usize {
+    pub(crate) fn vertical(&self, id: u64, cursor: usize, count: isize, goal: usize) -> usize {
         let v = &self.views[&id];
         let doc = v.document;
         let width = self.text_width(id);
-        let lines = self.documents[&doc].line_count();
         let (mut line, mut row, _) = self.visual_position(id, cursor);
         let mut rows = self.line_rows(doc, line, width);
         for _ in 0..count.unsigned_abs() {
             if count < 0 {
                 if row > 0 {
                     row -= 1;
-                } else if line > 0 {
-                    line -= 1;
+                } else if let Some(previous) = self.previous_shown_line(id, line) {
+                    line = previous;
                     rows = self.line_rows(doc, line, width);
                     row = rows.len() - 1;
                 } else {
@@ -150,12 +165,12 @@ impl App {
                 }
             } else if row + 1 < rows.len() {
                 row += 1;
-            } else if line + 1 < lines {
-                line += 1;
+            } else if let Some(next) = self.next_shown_line(id, line) {
+                line = next;
                 rows = self.line_rows(doc, line, width);
                 row = 0;
             } else {
-                return self.documents[&doc].text.len();
+                return self.documents[&doc].len();
             }
         }
         // `goal` is relative to the row start when wrapping, else to the line.
@@ -164,16 +179,16 @@ impl App {
     pub(crate) fn move_cursor(&mut self, id: u64, name: &str, extend: bool) -> Result<()> {
         let v = self.views[&id].clone();
         let doc = v.document;
-        let text = &self.documents[&doc].text;
+        let d = &self.documents[&doc];
         let (_, _, visual_col) = self.visual_position(id, v.cursor);
         let goal = v.goal.unwrap_or(visual_col);
         let page = v.rows.max(2) as isize - 1;
         let mut keep_goal = false;
         let cursor = match name {
-            "move-left" => previous(text, v.cursor),
-            "move-right" => next(text, v.cursor),
-            "word-left" => word_boundary(text, v.cursor, false),
-            "word-right" => word_boundary(text, v.cursor, true),
+            "move-left" => d.previous_boundary(v.cursor),
+            "move-right" => d.next_boundary(v.cursor),
+            "word-left" => document_word_boundary(d, v.cursor, false),
+            "word-right" => document_word_boundary(d, v.cursor, true),
             "move-up" | "move-down" | "page-up" | "page-down" => {
                 keep_goal = true;
                 let count = match name {
@@ -186,22 +201,21 @@ impl App {
             }
             "line-start" => {
                 // Toggle between the first non-blank character and column zero.
-                let start = line_start(text, v.cursor);
+                let (start, end) = d.line_range(d.line_of(v.cursor));
                 let indent = start
-                    + text[start..]
+                    + d.slice(start, end)
                         .bytes()
                         .take_while(|b| *b == b' ' || *b == b'\t')
                         .count();
-                let indent = indent.min(line_end(text, start));
                 if v.cursor == indent {
                     start
                 } else {
                     indent
                 }
             }
-            "line-end" => line_end(text, v.cursor),
+            "line-end" => d.line_range(d.line_of(v.cursor)).1,
             "document-start" => 0,
-            "document-end" => text.len(),
+            "document-end" => d.len(),
             _ => bail!("Unknown movement: {name}"),
         };
         let view = self.views.get_mut(&id).unwrap();
@@ -217,23 +231,35 @@ impl App {
     }
     /// Scroll so the cursor is visible, in visual rows when wrapping.
     pub(crate) fn ensure_visible(&mut self, id: u64) {
+        // A caret never sits inside a folded region.
+        let cursor_line = {
+            let v = &self.views[&id];
+            self.documents[&v.document].line_of(v.cursor)
+        };
+        self.reveal_line(id, cursor_line);
         let v = self.views[&id].clone();
         let rows = v.rows.max(1) as usize;
         let lines = self.documents[&v.document].line_count();
         if !self.preferences.soft_wrap {
-            let view = self.views.get_mut(&id).unwrap();
-            view.top_row = 0;
+            let mut top = self.shown_at_or_after(id, v.top.min(lines.saturating_sub(1)));
             if !v.manual_scroll {
-                let row = self.documents[&v.document].line_of(v.cursor);
-                let view = self.views.get_mut(&id).unwrap();
-                if row < view.top {
-                    view.top = row;
-                } else if row >= view.top + rows {
-                    view.top = row + 1 - rows;
+                let row = cursor_line;
+                if row < top {
+                    top = row;
+                } else if self.shown_between(id, top, row + 1) > rows {
+                    // Walk back so the caret sits on the last visible row.
+                    top = row;
+                    for _ in 1..rows {
+                        match self.previous_shown_line(id, top) {
+                            Some(previous) => top = previous,
+                            None => break,
+                        }
+                    }
                 }
             }
             let view = self.views.get_mut(&id).unwrap();
-            view.top = view.top.min(lines.saturating_sub(1));
+            view.top_row = 0;
+            view.top = top.min(lines.saturating_sub(1));
             return;
         }
         let width = self.text_width(id);
@@ -253,7 +279,10 @@ impl App {
                     if position.1 + 1 < count {
                         position.1 += 1;
                     } else {
-                        position = (position.0 + 1, 0);
+                        match self.next_shown_line(id, position.0) {
+                            Some(next) => position = (next, 0),
+                            None => break,
+                        }
                     }
                     distance += 1;
                 }
@@ -263,8 +292,8 @@ impl App {
                     for _ in 0..rows - 1 {
                         if position.1 > 0 {
                             position.1 -= 1;
-                        } else if position.0 > 0 {
-                            position.0 -= 1;
+                        } else if let Some(previous) = self.previous_shown_line(id, position.0) {
+                            position.0 = previous;
                             position.1 = self.line_rows(v.document, position.0, width).len() - 1;
                         }
                     }
@@ -282,8 +311,9 @@ impl App {
         let width = self.text_width(id);
         let lines = self.documents[&v.document].line_count();
         let mut result = Vec::with_capacity(count);
-        let mut line = v.top.min(lines.saturating_sub(1));
-        let mut skip = v.top_row;
+        let first = v.top.min(lines.saturating_sub(1));
+        let mut line = self.shown_at_or_after(id, first);
+        let mut skip = if line == first { v.top_row } else { 0 };
         while result.len() < count && line < lines {
             let rows = self.line_rows(v.document, line, width);
             let last = rows.len() - 1;
@@ -294,7 +324,10 @@ impl App {
                 result.push((line, index, row));
             }
             skip = 0;
-            line += 1;
+            match self.next_shown_line(id, line) {
+                Some(next) => line = next,
+                None => break,
+            }
         }
         result
     }
@@ -315,7 +348,7 @@ impl App {
                     *index + 1 == self.line_rows(v.document, *line, self.text_width(id)).len();
                 self.offset_in_row(v.document, *line, *r, col + left, last)
             }
-            None => self.documents[&v.document].text.len(),
+            None => self.documents[&v.document].len(),
         }
     }
     /// Scroll an editor by visual rows without moving the cursor.
@@ -408,29 +441,6 @@ impl App {
             self.start_save(doc, None, false, false)?;
         }
         Ok(())
-    }
-    /// Focus a tab showing a document, creating one if none exists.
-    pub(crate) fn reveal_document(&mut self, doc: u64) {
-        for pane in self.layout.panes() {
-            let (tabs, active) = self.layout.pane_mut(pane).unwrap();
-            if let Some(index) = tabs.iter().position(
-                |t| matches!(t, View::Editor(v) if self.views.get(v).is_some_and(|v| v.document == doc)),
-            ) {
-                *active = index;
-                self.focus = pane;
-                return;
-            }
-        }
-        self.editor_target();
-        let view = self.id();
-        self.views.insert(
-            view,
-            EditorView {
-                document: doc,
-                ..Default::default()
-            },
-        );
-        self.add_tab(View::Editor(view));
     }
     pub(crate) fn save_failed(&mut self, doc: u64, failure: SaveFailure) {
         let name = self
@@ -556,7 +566,7 @@ impl App {
             notice.map(|n| format!(" · {n}")).unwrap_or_default()
         );
         self.documents.insert(doc, fresh);
-        self.tokens.remove(&doc);
+        self.highlights.remove(&doc);
         self.clamp_views(doc);
     }
     /// Write `NAME.save` copies of unsaved buffers, as nano does when it is
@@ -601,7 +611,7 @@ impl App {
         let end = if row + 1 < d.line_count() {
             d.line_offset(row + 1)
         } else {
-            d.text.len()
+            d.len()
         };
         (start, end)
     }
@@ -612,7 +622,7 @@ impl App {
             Some(a) if a != v.cursor => (a.min(v.cursor), a.max(v.cursor)),
             _ => self.current_line(id),
         };
-        let text = self.documents[&doc].text[start..end].to_string();
+        let text = self.documents[&doc].slice(start, end).to_string();
         let chained = !copy_only
             && v.anchor.is_none()
             && self.last_cut.is_some_and(|(view, generation, cursor)| {
@@ -652,7 +662,7 @@ impl App {
         let d = &self.documents[&v.document];
         let blank = |row: usize| {
             let (s, e) = d.line_range(row);
-            d.text[s..e].trim().is_empty()
+            d.slice(s, e).trim().is_empty()
         };
         let (first, last) = match v.anchor {
             Some(a) if a != v.cursor => (d.line_of(a.min(v.cursor)), d.line_of(a.max(v.cursor))),
@@ -674,7 +684,7 @@ impl App {
         };
         let start = d.line_range(first).0;
         let end = d.line_range(last).1;
-        let paragraph = &d.text[start..end];
+        let paragraph = &d.slice(start, end);
         let indent: String = paragraph
             .chars()
             .take_while(|c| *c == ' ' || *c == '\t')
@@ -712,14 +722,15 @@ impl App {
         let d = &self.documents[&v.document];
         let row = d.line_of(v.cursor);
         let (start, end) = d.line_range(row);
-        let line = &d.text[start..end];
+        let line = &d.slice(start, end);
         let tab = self.preferences.indent_width;
         if crate::document::display_width_with_tabs(line, tab) <= self.preferences.wrap_column {
             return Ok(());
         }
         let limit = start + crate::document::column_offset(line, self.preferences.wrap_column, tab);
         let indent_len = line.len() - line.trim_start_matches([' ', '\t']).len();
-        let Some(space) = d.text[start + indent_len..limit.max(start + indent_len)]
+        let Some(space) = d
+            .slice(start + indent_len, limit.max(start + indent_len))
             .rfind(' ')
             .map(|i| start + indent_len + i)
         else {
@@ -740,8 +751,8 @@ impl App {
         let (_, v) = self.editor_view()?;
         let d = &self.documents[&v.document];
         let (text, scope) = match v.anchor {
-            Some(a) if a != v.cursor => (&d.text[a.min(v.cursor)..a.max(v.cursor)], "Selection"),
-            _ => (d.text.as_str(), "Document"),
+            Some(a) if a != v.cursor => (d.slice(a.min(v.cursor), a.max(v.cursor)), "Selection"),
+            _ => (std::borrow::Cow::Owned(d.text()), "Document"),
         };
         Ok(format!(
             "{scope}: {} lines, {} words, {} characters",
@@ -760,10 +771,10 @@ impl App {
         let lines = d.line_count();
         let row = d.line_of(v.cursor);
         let (start, end) = d.line_range(row);
-        let col = d.text[start..v.cursor].chars().count() + 1;
-        let cols = d.text[start..end].chars().count() + 1;
+        let col = d.slice(start, v.cursor).chars().count() + 1;
+        let cols = d.slice(start, end).chars().count() + 1;
         let chars = d.text.chars().count();
-        let char = d.text[..v.cursor].chars().count();
+        let char = d.slice(0, v.cursor).chars().count();
         let pct = |a: usize, b: usize| a * 100 / b.max(1);
         Ok(format!(
             "line {}/{lines} ({}%), col {col}/{cols} ({}%), char {char}/{chars} ({}%)",
@@ -816,7 +827,7 @@ impl App {
     }
     fn spell_check(&mut self) -> Result<()> {
         let (_, v) = self.editor_view()?;
-        let text = self.documents[&v.document].text.clone();
+        let text = self.documents[&v.document].text();
         self.services.tx.send(Job::Spell(text))?;
         self.status = "Checking spelling…".into();
         Ok(())
@@ -845,7 +856,8 @@ impl App {
             bail!("Run spell-check first");
         }
         let (id, v) = self.editor_view()?;
-        let text = &self.documents[&v.document].text;
+        let text = self.documents[&v.document].text();
+        let text = text.as_str();
         let pattern = format!(
             r"\b(?:{})\b",
             self.misspellings
@@ -1076,6 +1088,123 @@ impl App {
                 self.status = "Cleared recent files".into();
             }
             "new-window" | "print" => self.frontend_requests.push(name.to_string()),
+            "add-cursor-above" | "add-cursor-below" => {
+                let (id, _) = self.editor_view()?;
+                self.add_cursor_vertical(id, if name == "add-cursor-above" { -1 } else { 1 })?;
+            }
+            "add-next-occurrence" => {
+                let (id, _) = self.editor_view()?;
+                self.add_next_occurrence(id)?;
+            }
+            "select-all-occurrences" => {
+                let (id, _) = self.editor_view()?;
+                self.select_all_occurrences(id)?;
+            }
+            "go-to-bracket" => {
+                let (id, v) = self.editor_view()?;
+                let rope = self.documents[&v.document].rope();
+                let (a, b) = crate::smart::matching_bracket(rope, v.cursor)
+                    .context("No bracket at the cursor")?;
+                // Jump to the other bracket of the pair.
+                let target = if v.cursor == a || v.cursor == a + 1 {
+                    b
+                } else {
+                    a
+                };
+                let view = self.views.get_mut(&id).unwrap();
+                view.cursor = target;
+                view.anchor = None;
+                view.extra.clear();
+            }
+            "fold" | "unfold" | "toggle-fold" => {
+                let (id, _) = self.editor_view()?;
+                self.fold(
+                    id,
+                    match name {
+                        "fold" => Some(true),
+                        "unfold" => Some(false),
+                        _ => None,
+                    },
+                )?;
+            }
+            "fold-all" | "unfold-all" => {
+                let (id, _) = self.editor_view()?;
+                self.fold_all(id, name == "fold-all");
+            }
+            "quick-open" => self.open_picker("files", argument)?,
+            "go-to-symbol" => self.open_picker("symbols", argument)?,
+            "search-in-files" => {
+                // Start from the selection, as other editors do.
+                let selected = self
+                    .active_editor()
+                    .and_then(|id| {
+                        let v = &self.views[&id];
+                        let (a, b) = (v.anchor?.min(v.cursor), v.anchor?.max(v.cursor));
+                        let text = self.documents[&v.document].slice(a, b).into_owned();
+                        (!text.contains('\n')).then_some(text)
+                    })
+                    .unwrap_or_default();
+                let query = if argument.is_empty() {
+                    &selected
+                } else {
+                    argument
+                };
+                self.open_picker("search", query)?
+            }
+            "replace-in-files" => self.begin_replace_in_files()?,
+            "open-documents" => self.open_picker("documents", argument)?,
+            "problems" => self.open_picker("diagnostics", argument)?,
+            "hover" => self.lsp_hover()?,
+            "go-to-definition" => self.lsp_definition()?,
+            "find-references" => self.lsp_references()?,
+            "rename-symbol" if argument.trim().is_empty() => {
+                let (id, v) = self.editor_view()?;
+                let doc = &self.documents[&v.document];
+                let start = crate::actions::document_word_boundary(doc, v.cursor, false);
+                let end = crate::actions::document_word_boundary(doc, start, true);
+                let word = doc
+                    .slice(start.min(v.cursor), end.max(v.cursor))
+                    .trim()
+                    .to_string();
+                let _ = id;
+                self.prompt = Some(prompt("rename-symbol", word));
+            }
+            "rename-symbol" => self.lsp_rename(argument)?,
+            "code-actions" => self.lsp_code_actions()?,
+            "apply-code-action" => self.apply_code_action(argument)?,
+            "format-document" => {
+                let (_, v) = self.editor_view()?;
+                self.format_document(v.document, false)?;
+            }
+            "trigger-completion" => self.lsp_complete(true)?,
+            "workspace-symbols" => self.open_picker("workspace-symbols", argument)?,
+            "next-problem" => self.next_problem(false)?,
+            "previous-problem" => self.next_problem(true)?,
+            "restart-language-servers" => {
+                self.lsp_restart();
+                self.status = "Restarting language servers…".into();
+            }
+            "debug-start" | "debug-program" => self.debug_start(argument)?,
+            "debug-continue" => self.debug_control("continue")?,
+            "debug-step-over" => self.debug_control("next")?,
+            "debug-step-into" => self.debug_control("stepIn")?,
+            "debug-step-out" => self.debug_control("stepOut")?,
+            "debug-pause" => self.debug_control("pause")?,
+            "debug-stop" => self.debug_control("stop")?,
+            "debug-evaluate" if argument.trim().is_empty() => {
+                self.prompt = Some(prompt("debug-evaluate", String::new()));
+            }
+            "debug-evaluate" => self.debug_evaluate(argument)?,
+            "toggle-breakpoint" => self.toggle_breakpoint()?,
+            "run-tool" => self.run_tool(argument)?,
+            "run-task" if argument.is_empty() => self.task_picker()?,
+            "run-task" => self.run_task(argument)?,
+            "run-build-task" => self.run_task("")?,
+            "stop-task" => self.stop_tasks()?,
+            "go-back" => self.go_back(false)?,
+            "go-forward" => self.go_back(true)?,
+            "trust-workspace" => self.set_workspace_trust(true)?,
+            "restrict-workspace" => self.set_workspace_trust(false)?,
             _ => bail!("Unknown action: {name}"),
         }
         Ok(())

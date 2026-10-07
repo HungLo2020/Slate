@@ -129,8 +129,15 @@ impl App {
                 continue;
             }
             if let (Some(line), true) = (file.line, file.path.exists()) {
-                self.pending_positions
-                    .insert(file.path.clone(), (line, file.column.unwrap_or(1)));
+                self.pending_positions.insert(
+                    file.path.clone(),
+                    (
+                        line.saturating_sub(1),
+                        crate::navigation::Column::Display(
+                            file.column.unwrap_or(1).saturating_sub(1),
+                        ),
+                    ),
+                );
             }
             self.dispatch(Command::Open { path: file.path });
         }

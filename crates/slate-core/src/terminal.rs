@@ -5,8 +5,8 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc, Mutex,
     },
     thread,
 };
@@ -53,22 +53,102 @@ pub struct Pointer<'a> {
     pub ctrl: bool,
     pub alt: bool,
 }
+/// Default lines of history kept per terminal.
+pub const DEFAULT_SCROLLBACK: usize = 5000;
+
+/// Side effects of terminal output that are not drawn on the screen. The
+/// parser calls these while processing output, so replies to queries see
+/// the screen exactly as it was when the query arrived.
+#[derive(Default)]
+struct Hooks {
+    replies: Vec<u8>,
+    title: Option<String>,
+    clipboard: Vec<String>,
+    cwd: Option<PathBuf>,
+}
+impl vt100::Callbacks for Hooks {
+    fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
+        let title: String = String::from_utf8_lossy(title)
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(120)
+            .collect();
+        self.title = Some(title.trim().to_string());
+    }
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, _ty: &[u8], data: &[u8]) {
+        // Programs (tmux, vim, ssh sessions) copy with OSC 52. Reading the
+        // clipboard back is never allowed.
+        if data.len() <= 4 * 1024 * 1024 {
+            if let Some(text) = decode_base64(data).and_then(|b| String::from_utf8(b).ok()) {
+                self.clipboard.push(text);
+            }
+        }
+    }
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut vt100::Screen,
+        i1: Option<u8>,
+        _i2: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        let first = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
+        match (i1, c, first) {
+            // Cursor position report.
+            (None, 'n', 6) => {
+                let (r, c) = screen.cursor_position();
+                self.replies
+                    .extend_from_slice(format!("\x1b[{};{}R", r + 1, c + 1).as_bytes());
+            }
+            // Device status: OK.
+            (None, 'n', 5) => self.replies.extend_from_slice(b"\x1b[0n"),
+            // Primary device attributes: VT100 with advanced video.
+            (None, 'c', 0) => self.replies.extend_from_slice(b"\x1b[?1;2c"),
+            // Secondary device attributes.
+            (Some(b'>'), 'c', 0) => self.replies.extend_from_slice(b"\x1b[>0;10;1c"),
+            _ => {}
+        }
+    }
+    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        // OSC 7 shell integration supplements /proc on systems that restrict
+        // process inspection.
+        if params.first() == Some(&b"7".as_slice()) {
+            let url = params[1..].join(&b';');
+            if let Some(path) = std::str::from_utf8(&url).ok().and_then(cwd_from_url) {
+                self.cwd = Some(path);
+            }
+        }
+    }
+}
+type Parser = vt100::Parser<Hooks>;
+
 pub struct TerminalSession {
     master: Box<dyn MasterPty + Send>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// Bytes for the shell, written by a dedicated thread so a slow or
+    /// stalled program never blocks the interface.
+    input: mpsc::Sender<Vec<u8>>,
     child: Box<dyn Child + Send + Sync>,
-    parser: Arc<Mutex<vt100::Parser>>,
+    parser: Arc<Mutex<Parser>>,
     revision: Arc<AtomicU64>,
     events: Arc<Mutex<Option<crate::events::Events>>>,
+    finished: Arc<AtomicBool>,
     pub title: String,
     size: (u16, u16),
     initial_cwd: PathBuf,
-    reported_cwd: Arc<Mutex<Option<PathBuf>>>,
     selection: Option<((u16, u16), (u16, u16))>,
     selection_screen: Option<vt100::Screen>,
 }
 impl TerminalSession {
     pub fn spawn(cwd: &Path, command: Option<&str>, rows: u16, cols: u16) -> Result<Self> {
+        Self::spawn_with(cwd, command, rows, cols, DEFAULT_SCROLLBACK)
+    }
+    pub fn spawn_with(
+        cwd: &Path,
+        command: Option<&str>,
+        rows: u16,
+        cols: u16,
+        scrollback: usize,
+    ) -> Result<Self> {
         let pair = native_pty_system().openpty(PtySize {
             rows,
             cols,
@@ -89,61 +169,53 @@ impl TerminalSession {
             .context("Cannot spawn terminal shell")?;
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader()?;
-        let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 5000)));
+        let mut writer = pair.master.take_writer()?;
+        let (input, queued) = mpsc::channel::<Vec<u8>>();
+        thread::spawn(move || {
+            for bytes in queued {
+                if writer
+                    .write_all(&bytes)
+                    .and_then(|_| writer.flush())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let parser = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
+            rows,
+            cols,
+            scrollback,
+            Hooks::default(),
+        )));
         let output = parser.clone();
-        let responses = writer.clone();
-        let reported_cwd = Arc::new(Mutex::new(None));
-        let cwd_output = reported_cwd.clone();
+        let responses = input.clone();
         let revision = Arc::new(AtomicU64::new(1));
         let output_revision = revision.clone();
         let events = Arc::new(Mutex::new(None::<crate::events::Events>));
         let output_events = events.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+        let output_finished = finished.clone();
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
-            let mut pending = Vec::new();
-            let mut cwd_pending = Vec::new();
             while let Ok(n) = reader.read(&mut buf) {
                 if n == 0 {
                     break;
                 }
-                update_cwd(&mut cwd_pending, &buf[..n], &cwd_output);
-                let mut p = output.lock().unwrap_or_else(|e| e.into_inner());
-                p.process(&buf[..n]);
-                // Respond to the cursor/device queries commonly used by interactive programs.
-                pending.extend_from_slice(&buf[..n]);
-                let mut replies = Vec::new();
-                for query in [
-                    b"\x1b[6n".as_slice(),
-                    b"\x1b[c".as_slice(),
-                    b"\x1b[0c".as_slice(),
-                ] {
-                    while let Some(i) = pending.windows(query.len()).position(|w| w == query) {
-                        if query == b"\x1b[6n" {
-                            let (r, c) = p.screen().cursor_position();
-                            replies
-                                .extend_from_slice(format!("\x1b[{};{}R", r + 1, c + 1).as_bytes());
-                        } else {
-                            replies.extend_from_slice(b"\x1b[?1;2c");
-                        }
-                        pending.drain(i..i + query.len());
-                    }
-                }
-                if pending.len() > 16 {
-                    pending.drain(..pending.len() - 16);
-                }
-                drop(p);
+                let replies = {
+                    let mut p = output.lock().unwrap_or_else(|e| e.into_inner());
+                    p.process(&buf[..n]);
+                    std::mem::take(&mut p.callbacks_mut().replies)
+                };
                 output_revision.fetch_add(1, Ordering::Release);
+                if !replies.is_empty() {
+                    let _ = responses.send(replies);
+                }
                 if let Some(events) = output_events.lock().unwrap().as_ref() {
                     events.notify();
                 }
-                if !replies.is_empty() {
-                    if let Ok(mut w) = responses.lock() {
-                        let _ = w.write_all(&replies);
-                        let _ = w.flush();
-                    }
-                }
             }
+            output_finished.store(true, Ordering::Release);
             output_revision.fetch_add(1, Ordering::Release);
             if let Some(events) = output_events.lock().unwrap().as_ref() {
                 events.notify();
@@ -152,17 +224,43 @@ impl TerminalSession {
         Ok(Self {
             revision,
             events,
+            finished,
             master: pair.master,
-            writer,
+            input,
             child,
             parser,
             title: shell,
             size: (rows, cols),
             initial_cwd: cwd.to_path_buf(),
-            reported_cwd,
             selection: None,
             selection_screen: None,
         })
+    }
+    /// The title set by the running program (OSC 0/2), if any.
+    pub fn program_title(&self) -> Option<String> {
+        self.parser
+            .lock()
+            .unwrap()
+            .callbacks()
+            .title
+            .clone()
+            .filter(|t| !t.is_empty())
+    }
+    /// Text copied by programs with OSC 52 since the last call.
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        let mut p = self.parser.lock().unwrap();
+        std::mem::take(&mut p.callbacks_mut().clipboard).pop()
+    }
+    /// The exit code once the shell has exited and its output is drained.
+    pub fn exit_code(&mut self) -> Option<u32> {
+        if !self.finished.load(Ordering::Acquire) {
+            return None;
+        }
+        self.child
+            .try_wait()
+            .ok()
+            .flatten()
+            .map(|status| status.exit_code())
     }
     pub fn set_events(&mut self, events: crate::events::Events) {
         *self.events.lock().unwrap() = Some(events);
@@ -200,10 +298,9 @@ impl TerminalSession {
         self.selection_screen = None;
         self.parser.lock().unwrap().screen_mut().set_scrollback(0);
         self.changed();
-        let mut writer = self.writer.lock().unwrap();
-        writer.write_all(bytes)?;
-        writer.flush()?;
-        Ok(())
+        self.input
+            .send(bytes.to_vec())
+            .map_err(|_| anyhow::anyhow!("The terminal has exited"))
     }
     pub fn paste(&mut self, text: &str) -> Result<()> {
         let bracketed = self.parser.lock().unwrap().screen().bracketed_paste();
@@ -239,9 +336,11 @@ impl TerminalSession {
                 return path;
             }
         }
-        self.reported_cwd
+        self.parser
             .lock()
             .unwrap()
+            .callbacks()
+            .cwd
             .clone()
             .unwrap_or_else(|| self.initial_cwd.clone())
     }
@@ -338,6 +437,15 @@ impl TerminalSession {
     }
     pub fn exited(&mut self) -> bool {
         self.child.try_wait().ok().flatten().is_some()
+    }
+    /// Lines of history currently kept above the screen.
+    pub fn scrollback_len(&self) -> usize {
+        let mut p = self.parser.lock().unwrap();
+        let current = p.screen().scrollback();
+        p.screen_mut().set_scrollback(usize::MAX);
+        let len = p.screen().scrollback();
+        p.screen_mut().set_scrollback(current);
+        len
     }
     pub fn screen(&self) -> Screen {
         self.screen_with("#d8dee9", "#20242c")
@@ -436,67 +544,99 @@ fn color(c: vt100::Color, background: bool) -> String {
     }
 }
 
-// OSC 7 shell integration supplements /proc on systems that restrict process inspection.
-fn update_cwd(pending: &mut Vec<u8>, bytes: &[u8], cwd: &Arc<Mutex<Option<PathBuf>>>) {
-    pending.extend_from_slice(bytes);
-    while let Some(start) = pending.windows(4).position(|w| w == b"\x1b]7;") {
-        let body = start + 4;
-        let end = pending[body..]
-            .iter()
-            .position(|b| *b == 7)
-            .map(|i| (body + i, 1))
-            .or_else(|| {
-                pending[body..]
-                    .windows(2)
-                    .position(|w| w == b"\x1b\\")
-                    .map(|i| (body + i, 2))
-            });
-        let Some((end, terminator)) = end else {
-            if pending.len() > 8192 {
-                pending.clear();
-            } else if start > 0 {
-                pending.drain(..start);
-            }
-            return;
-        };
-        if let Ok(url) = std::str::from_utf8(&pending[body..end]) {
-            if let Some(location) = url.strip_prefix("file://") {
-                if let Some(slash) = location.find('/') {
-                    let host = &location[..slash];
-                    if host.is_empty()
-                        || host == "localhost"
-                        || std::env::var("HOSTNAME").is_ok_and(|local| local == host)
-                    {
-                        let encoded = &location.as_bytes()[slash..];
-                        let mut decoded = Vec::new();
-                        let mut i = 0;
-                        while i < encoded.len() {
-                            if encoded[i] == b'%' && i + 2 < encoded.len() {
-                                if let (Some(a), Some(b)) = (
-                                    (encoded[i + 1] as char).to_digit(16),
-                                    (encoded[i + 2] as char).to_digit(16),
-                                ) {
-                                    decoded.push((a * 16 + b) as u8);
-                                    i += 3;
-                                    continue;
-                                }
-                            }
-                            decoded.push(encoded[i]);
-                            i += 1;
-                        }
-                        if let Ok(path) = String::from_utf8(decoded) {
-                            let path = PathBuf::from(path);
-                            if path.is_absolute() && path.is_dir() {
-                                *cwd.lock().unwrap() = Some(path);
-                            }
-                        }
-                    }
-                }
+/// The local directory named by an OSC 7 `file://host/path` URL.
+fn cwd_from_url(url: &str) -> Option<PathBuf> {
+    let location = url.strip_prefix("file://")?;
+    let slash = location.find('/')?;
+    let host = &location[..slash];
+    if !(host.is_empty()
+        || host == "localhost"
+        || std::env::var("HOSTNAME").is_ok_and(|local| local == host))
+    {
+        return None;
+    }
+    let encoded = &location.as_bytes()[slash..];
+    let mut decoded = Vec::new();
+    let mut i = 0;
+    while i < encoded.len() {
+        if encoded[i] == b'%' && i + 2 < encoded.len() {
+            if let (Some(a), Some(b)) = (
+                (encoded[i + 1] as char).to_digit(16),
+                (encoded[i + 2] as char).to_digit(16),
+            ) {
+                decoded.push((a * 16 + b) as u8);
+                i += 3;
+                continue;
             }
         }
-        pending.drain(..end + terminator);
+        decoded.push(encoded[i]);
+        i += 1;
     }
-    if pending.len() > 4 {
-        pending.drain(..pending.len() - 4);
+    let path = PathBuf::from(String::from_utf8(decoded).ok()?);
+    (path.is_absolute() && path.is_dir()).then_some(path)
+}
+
+fn decode_base64(data: &[u8]) -> Option<Vec<u8>> {
+    let value = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32)
+    };
+    let data: Vec<u8> = data
+        .iter()
+        .copied()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    let trimmed = data
+        .strip_suffix(b"==")
+        .or_else(|| data.strip_suffix(b"="))
+        .unwrap_or(&data);
+    let mut out = Vec::with_capacity(trimmed.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0);
+    for c in trimmed {
+        acc = (acc << 6) | value(*c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_and_osc7_urls() {
+        assert_eq!(decode_base64(b"aGVsbG8=").unwrap(), b"hello");
+        assert_eq!(decode_base64(b"aGk=").unwrap(), b"hi");
+        assert_eq!(decode_base64(b"YWJj").unwrap(), b"abc");
+        assert!(decode_base64(b"a$b").is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("file://localhost{}", dir.path().display());
+        assert_eq!(cwd_from_url(&url).unwrap(), dir.path());
+        assert!(cwd_from_url("file://elsewhere.example/tmp").is_none());
+    }
+
+    #[test]
+    fn queries_are_answered_in_order_with_the_screen_at_that_point() {
+        let mut parser = vt100::Parser::new_with_callbacks(5, 20, 0, Hooks::default());
+        // The cursor moves between two position reports in one chunk.
+        parser.process(b"ab\x1b[6n\x1b[3;4H\x1b[6n\x1b[c\x1b[>c\x1b]2;build\x07\x1b]52;c;aGk=\x07");
+        let hooks = parser.callbacks();
+        assert_eq!(
+            String::from_utf8_lossy(&hooks.replies),
+            "\x1b[1;3R\x1b[3;4R\x1b[?1;2c\x1b[>0;10;1c"
+        );
+        assert_eq!(hooks.title.as_deref(), Some("build"));
+        assert_eq!(hooks.clipboard, ["hi"]);
     }
 }

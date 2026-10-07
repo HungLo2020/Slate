@@ -109,11 +109,9 @@ impl App {
             top: view.top,
             left: view.left,
             highlighted: self
-                .tokens
+                .highlights
                 .get(&view.document)
-                .is_some_and(|(generation, _, _)| {
-                    *generation == self.documents[&view.document].generation
-                }),
+                .is_some_and(|cache| cache.current(view.top, view.top + view.rows as usize)),
             cursor: screen.cursor,
             lines,
         }

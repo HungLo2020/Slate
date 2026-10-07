@@ -41,8 +41,21 @@ with tempfile.TemporaryDirectory(prefix='slate-gui-offscreen-') as temporary:
             hook = workspace/'.git/hooks/pre-commit'
             hook.write_text('#!/bin/sh\necho "Fixture hook rejected commit" >&2\nexit 1\n')
             hook.chmod(0o700)
+    if os.environ.get('SLATE_GUI_IDE_SMOKE'):
+        # A scripted language server, trusted, for hover, completion and problems.
+        server = pathlib.Path(__file__).resolve().parent.parent/'crates/slate-core/tests/fixtures/fake_lsp.py'
+        (root/'config/slate').mkdir(parents=True, exist_ok=True)
+        (root/'config/slate/languages.toml').write_text(
+            f'[[language]]\nname = "Fake"\nextensions = ["fk"]\nserver = ["python3", "{server}"]\n')
+        (root/'config/slate/trusted-folders').write_text(f'{workspace.resolve()}\n')
+        (workspace/'main.fk').write_text('def greet\ngreet ERROR\n')
+        (workspace/'notes.md').write_text('# Notes\nsearch me\n')
+    if os.environ.get('SLATE_GUI_FEATURE_SMOKE'):
+        # The feature tour stages files; the trust prompt is covered by the Git smoke.
+        (root/'config/slate').mkdir(parents=True, exist_ok=True)
+        (root/'config/slate/trusted-folders').write_text(f'{workspace.resolve()}\n')
     if command_smoke:
-        (root/'config/slate').mkdir(parents=True)
+        (root/'config/slate').mkdir(parents=True, exist_ok=True)
         (root/'config/slate/settings.toml').write_text(
             '[global_keys]\n"f5" = "quit"\n"f4" = "discard-document"\n"f2" = "settings"\n"f3" = "layout-save"\n')
     (root/'runtime').mkdir(mode=0o700)

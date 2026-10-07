@@ -414,6 +414,8 @@ static void startGitSmoke(Bridge *state, QQuickWindow *window) {
     auto timer = new QTimer(state);
     auto step = new int(0), ticks = new int(0);
     auto rowPath = new QString;
+    // Restricted mode asks once before the first staging; 1 = dialog seen, 2 = trusted.
+    auto trust = new int(0);
     const auto baseFont = window->property("font").value<QFont>();
     auto finish = [=](bool pass, const QString &detail) {
         QFile report(dir + "/report.json");
@@ -479,6 +481,30 @@ static void startGitSmoke(Bridge *state, QQuickWindow *window) {
         const auto frame = state->frame();
         if (frame.value("git_busy").toBool())
             return;
+        if (frame.value("prompt").toMap().value("kind") == "trust") {
+            auto dialog = window->findChild<QObject *>("choiceDialog");
+            if (!dialog || !dialog->property("visible").toBool())
+                return;
+            if (*trust == 0) {
+                // Click once the dialog has been laid out and painted.
+                *trust = 1;
+                return;
+            }
+            QQuickItem *accept = nullptr;
+            for (auto candidate : window->contentItem()->findChildren<QQuickItem *>())
+                if (candidate->objectName() == "choiceAccept" && candidate->isVisible())
+                    accept = candidate;
+            if (!accept) {
+                finish(false, "Missing Trust Folder button");
+                return;
+            }
+            window->grabWindow().save(dir + "/git-trust.png");
+            QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                              accept->mapToScene(QPointF(accept->width() / 2,
+                                                         accept->height() / 2)).toPoint());
+            *trust = 2;
+            return;
+        }
         const auto entries = frame.value("git").toList();
         auto browser = findItem(window->contentItem(), "browser_1");
         auto view = findItem(window->contentItem(), "gitView_1");
@@ -678,7 +704,11 @@ static void startGitSmoke(Bridge *state, QQuickWindow *window) {
         case 19:
             if (!check("git-clean"))
                 return;
-            finish(true, "Populated Git: normal/narrow/short/large fonts, separate scrollbar "
+            if (*trust != 2) {
+                finish(false, "Staging in an untrusted folder did not ask for trust");
+                return;
+            }
+            finish(true, "Populated Git: trust prompt, normal/narrow/short/large fonts, separate scrollbar "
                          "gutter, row/section/bulk staging, compact composer, failed commit draft "
                          "retention and successful retry");
             return;
@@ -1863,6 +1893,169 @@ static void startDesktopSmoke(Bridge *state, QQuickWindow *window) {
     timer->start(100);
 }
 
+// IDE tour: quick open, a language server's hover, completion and problems,
+// and several carets, with screenshots of each overlay.
+static void startIdeSmoke(Bridge *state, QQuickWindow *window) {
+    const QString dir = qEnvironmentVariable("SLATE_GUI_SMOKE_DIR");
+    const QString workspace = dir + "/workspace";
+    auto timer = new QTimer(state);
+    auto step = new int(0), ticks = new int(0);
+    auto finish = [=](bool pass, const QString &detail) {
+        QFile report(dir + "/report.json");
+        report.open(QIODevice::WriteOnly);
+        report.write(QJsonDocument(QJsonObject{{"pass", pass}, {"detail", detail}, {"steps", *step}}).toJson());
+        window->grabWindow().save(dir + "/gui.png");
+        timer->stop();
+        QGuiApplication::exit(pass ? 0 : 2);
+    };
+    auto editorPane = [=]() -> QVariantMap {
+        QVariantMap any;
+        for (const auto &value : state->frame().value("panes").toList()) {
+            const auto pane = value.toMap();
+            if (pane.value("kind") != "editor") continue;
+            if (pane.value("focused").toBool()) return pane;
+            if (any.isEmpty()) any = pane;
+        }
+        return any;
+    };
+    auto grid = [=]() { return findItem(window->contentItem(), "cells_" + editorPane().value("id").toString()); };
+    auto text = [=]() {
+        QStringList lines;
+        for (const auto &line : state->surface(editorPane().value("id").toInt()).value("lines").toList())
+            lines.append(line.toMap().value("layout").toMap().value("text").toString());
+        return lines.join("\n");
+    };
+    auto key = [=](int code, Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
+        QTest::keyClick(window, Qt::Key(code), modifiers);
+    };
+    auto type = [=](const QString &value) {
+        for (auto c : value) QTest::keyClick(window, c.toLatin1());
+    };
+    auto shown = [=](const QString &name) {
+        auto item = findVisibleItem(window->contentItem(), name);
+        return item && item->isVisible() && item->width() > 0 && item->height() > 0 ? item : nullptr;
+    };
+    // An overlay is entirely inside the window.
+    auto inside = [=](QQuickItem *item) {
+        const auto r = item->mapRectToScene(QRectF(0, 0, item->width(), item->height()));
+        return r.left() >= 0 && r.top() >= 0 && r.right() <= window->width() && r.bottom() <= window->height();
+    };
+    auto picker = [=]() { return window->findChild<QObject *>("pickerDialog"); };
+    QObject::connect(timer, &QTimer::timeout, state, [=]() {
+        state->refresh();
+        if (++*ticks > 300) {
+            finish(false, QString("IDE smoke timeout at step %1: %2").arg(*step).arg(state->frame().value("status").toString()));
+            return;
+        }
+        const auto frame = state->frame();
+        const QString pane = editorPane().value("id").toString();
+        switch (*step) {
+        case 0:
+            state->send({{"action", "open"}, {"path", workspace + "/main.fk"}});
+            break;
+        case 1:
+            if (!frame.value("title").toString().contains("main.fk") ||
+                frame.value("problems").toList().value(0).toInt() != 1) return;
+            grid()->forceActiveFocus();
+            key(Qt::Key_P, Qt::ControlModifier);
+            break;
+        case 2: {
+            if (!picker() || !picker()->property("visible").toBool()) return;
+            type("notes");
+            break;
+        }
+        case 3: {
+            const auto items = frame.value("picker").toMap().value("items").toList();
+            if (items.isEmpty() || items[0].toMap().value("label") != "notes.md") return;
+            window->grabWindow().save(dir + "/ide-picker.png");
+            key(Qt::Key_Return);
+            break;
+        }
+        case 4:
+            if (!frame.value("title").toString().contains("notes.md") || !frame.value("picker").isNull()) return;
+            if (picker()->property("visible").toBool()) {
+                finish(false, "The picker stayed open after choosing a file");
+                return;
+            }
+            state->send({{"action", "open"}, {"path", workspace + "/main.fk"}});
+            break;
+        case 5:
+            if (!frame.value("title").toString().contains("main.fk")) return;
+            grid()->forceActiveFocus();
+            key(Qt::Key_Home, Qt::ControlModifier);
+            key(Qt::Key_Right);
+            key(Qt::Key_Right);
+            key(Qt::Key_Right);
+            key(Qt::Key_Right);
+            key(Qt::Key_Right);
+            key(Qt::Key_K, Qt::ControlModifier);
+            break;
+        case 6: {
+            auto hover = shown("hover_" + pane);
+            if (!hover) return;
+            if (!inside(hover) || !shown("hoverText_" + pane)->property("text").toString().contains("hover for greet")) {
+                finish(false, "Hover text missing or outside the window");
+                return;
+            }
+            window->grabWindow().save(dir + "/ide-hover.png");
+            key(Qt::Key_Escape);
+            break;
+        }
+        case 7:
+            if (shown("hover_" + pane)) return;
+            // The end of the second line (the file ends with a newline).
+            key(Qt::Key_End, Qt::ControlModifier);
+            key(Qt::Key_Backspace);
+            type(" gr");
+            break;
+        case 8: {
+            auto box = shown("completion_" + pane);
+            if (!box) return;
+            if (!inside(box)) {
+                finish(false, "Completion list outside the window");
+                return;
+            }
+            window->grabWindow().save(dir + "/ide-completion.png");
+            key(Qt::Key_Tab);
+            break;
+        }
+        case 9: {
+            if (shown("completion_" + pane) || !text().contains("ERROR greet")) return;
+            auto problems = shown("problemCount");
+            if (!problems || !problems->property("text").toString().contains("1")) {
+                finish(false, "Problem count missing from the status bar");
+                return;
+            }
+            const auto center = problems->mapToScene(QPointF(problems->width() / 2, problems->height() / 2)).toPoint();
+            QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, center);
+            break;
+        }
+        case 10: {
+            const auto items = frame.value("picker").toMap().value("items").toList();
+            if (items.isEmpty() || items[0].toMap().value("label") != "an error here") return;
+            window->grabWindow().save(dir + "/ide-problems.png");
+            key(Qt::Key_Escape);
+            break;
+        }
+        case 11:
+            if (!frame.value("picker").isNull()) return;
+            grid()->forceActiveFocus();
+            key(Qt::Key_Home, Qt::ControlModifier);
+            key(Qt::Key_Down, Qt::ControlModifier | Qt::AltModifier);
+            type("X");
+            break;
+        case 12:
+            if (!text().contains("Xdef greet") || !text().contains("Xgreet ERROR")) return;
+            window->grabWindow().save(dir + "/ide-carets.png");
+            finish(true, "Quick open picker, hover, completion, problems list and status count, several carets");
+            return;
+        }
+        ++*step;
+        *ticks = 0;
+    });
+    timer->start(100);
+}
+
 void startSmoke(Bridge *state, QQuickWindow *window) {
     if (QGuiApplication::desktopFileName() != "slate" ||
         QGuiApplication::windowIcon().pixmap(64, 64).isNull()) {
@@ -1876,6 +2069,10 @@ void startSmoke(Bridge *state, QQuickWindow *window) {
     }
     if (!qEnvironmentVariableIsEmpty("SLATE_GUI_DESKTOP_SMOKE")) {
         startDesktopSmoke(state, window);
+        return;
+    }
+    if (!qEnvironmentVariableIsEmpty("SLATE_GUI_IDE_SMOKE")) {
+        startIdeSmoke(state, window);
         return;
     }
     if (!qEnvironmentVariableIsEmpty("SLATE_GUI_FILE_DIALOG_SMOKE")) {

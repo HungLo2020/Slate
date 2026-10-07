@@ -569,6 +569,295 @@ const ACTIONS: &[(&str, &str, &str, &str, &str)] = &[
         "graphical-editor",
     ),
     (
+        "add-cursor-above",
+        "Add cursor above",
+        "Add a caret on the line above",
+        "",
+        "editor",
+    ),
+    (
+        "add-cursor-below",
+        "Add cursor below",
+        "Add a caret on the line below",
+        "",
+        "editor",
+    ),
+    (
+        "add-next-occurrence",
+        "Add next occurrence",
+        "Select the word, then add the next occurrence as another caret",
+        "",
+        "editor",
+    ),
+    (
+        "select-all-occurrences",
+        "Select all occurrences",
+        "Put a caret on every occurrence of the selection",
+        "",
+        "editor",
+    ),
+    (
+        "go-to-bracket",
+        "Go to matching bracket",
+        "Jump to the bracket that pairs with the one at the cursor",
+        "",
+        "editor",
+    ),
+    (
+        "fold",
+        "Fold",
+        "Fold the indented region at the cursor",
+        "",
+        "editor",
+    ),
+    (
+        "unfold",
+        "Unfold",
+        "Unfold the region at the cursor",
+        "",
+        "editor",
+    ),
+    (
+        "toggle-fold",
+        "Toggle fold",
+        "Fold or unfold the region at the cursor",
+        "",
+        "editor",
+    ),
+    (
+        "fold-all",
+        "Fold all",
+        "Fold every top-level region",
+        "",
+        "editor",
+    ),
+    (
+        "unfold-all",
+        "Unfold all",
+        "Unfold every region",
+        "",
+        "editor",
+    ),
+    (
+        "quick-open",
+        "Go to file…",
+        "Find a file in the workspace by name",
+        "",
+        "any",
+    ),
+    (
+        "go-to-symbol",
+        "Go to symbol…",
+        "List functions, types and headings in the document",
+        "",
+        "editor",
+    ),
+    (
+        "search-in-files",
+        "Search in files…",
+        "Search the whole workspace (respects .gitignore)",
+        "",
+        "any",
+    ),
+    (
+        "replace-in-files",
+        "Replace in files…",
+        "Replace project search results",
+        "",
+        "any",
+    ),
+    (
+        "open-documents",
+        "Open documents…",
+        "Switch to another open document",
+        "",
+        "any",
+    ),
+    (
+        "problems",
+        "Problems…",
+        "List errors and warnings reported by language servers and tasks",
+        "",
+        "any",
+    ),
+    (
+        "go-back",
+        "Go back",
+        "Return to the position before the last jump",
+        "",
+        "any",
+    ),
+    ("go-forward", "Go forward", "Redo a go-back", "", "any"),
+    (
+        "hover",
+        "Show hover information",
+        "Show the language server's information for the symbol at the cursor",
+        "",
+        "editor",
+    ),
+    (
+        "go-to-definition",
+        "Go to definition",
+        "Jump to where the symbol at the cursor is defined",
+        "",
+        "editor",
+    ),
+    (
+        "find-references",
+        "Find references",
+        "List every use of the symbol at the cursor",
+        "",
+        "editor",
+    ),
+    (
+        "rename-symbol",
+        "Rename symbol…",
+        "Rename the symbol at the cursor across the workspace",
+        "",
+        "edit",
+    ),
+    (
+        "code-actions",
+        "Code actions…",
+        "Quick fixes and refactorings for the cursor or selection",
+        "",
+        "edit",
+    ),
+    (
+        "format-document",
+        "Format document",
+        "Format with the language server or the language's formatter",
+        "",
+        "edit",
+    ),
+    (
+        "trigger-completion",
+        "Complete",
+        "Suggest completions at the cursor",
+        "",
+        "edit",
+    ),
+    (
+        "workspace-symbols",
+        "Workspace symbols…",
+        "Find a symbol anywhere in the workspace",
+        "",
+        "any",
+    ),
+    (
+        "next-problem",
+        "Next problem",
+        "Move to the next error or warning in the document",
+        "",
+        "editor",
+    ),
+    (
+        "previous-problem",
+        "Previous problem",
+        "Move to the previous error or warning",
+        "",
+        "editor",
+    ),
+    (
+        "restart-language-servers",
+        "Restart language servers",
+        "Stop language servers; they start again for open documents",
+        "",
+        "any",
+    ),
+    (
+        "run-task",
+        "Run task…",
+        "Run a build, test or project task",
+        "",
+        "any",
+    ),
+    (
+        "run-build-task",
+        "Run build task",
+        "Run the default build task and collect its problems",
+        "",
+        "any",
+    ),
+    ("stop-task", "Stop tasks", "Stop running tasks", "", "any"),
+    (
+        "debug-start",
+        "Start debugging",
+        "Debug a program (launch.toml or a path); continues when paused",
+        "",
+        "any",
+    ),
+    (
+        "debug-continue",
+        "Continue",
+        "Resume the paused program",
+        "",
+        "any",
+    ),
+    (
+        "debug-step-over",
+        "Step over",
+        "Run to the next line",
+        "",
+        "any",
+    ),
+    (
+        "debug-step-into",
+        "Step into",
+        "Step into the call on this line",
+        "",
+        "any",
+    ),
+    (
+        "debug-step-out",
+        "Step out",
+        "Run until the current function returns",
+        "",
+        "any",
+    ),
+    (
+        "debug-pause",
+        "Pause",
+        "Pause the running program",
+        "",
+        "any",
+    ),
+    (
+        "debug-stop",
+        "Stop debugging",
+        "End the debug session and the program",
+        "",
+        "any",
+    ),
+    (
+        "debug-evaluate",
+        "Evaluate…",
+        "Evaluate an expression in the paused frame",
+        "",
+        "any",
+    ),
+    (
+        "toggle-breakpoint",
+        "Toggle breakpoint",
+        "Set or remove a breakpoint on the current line",
+        "",
+        "editor",
+    ),
+    (
+        "trust-workspace",
+        "Trust workspace",
+        "Allow language servers, tasks, formatters and Git hooks from this folder to run",
+        "",
+        "untrusted",
+    ),
+    (
+        "restrict-workspace",
+        "Restrict workspace",
+        "Stop running project tools from this folder (restricted mode)",
+        "",
+        "trusted",
+    ),
+    (
         "help",
         "Help",
         "Show the key bindings of the current keymap",
@@ -630,7 +919,7 @@ impl App {
             }
             _ => None,
         };
-        let selected = self.git.get(selection.unwrap_or(self.git_selected));
+        let selected = self.git.entries.get(selection.unwrap_or(self.git.selected));
         let mut results = Vec::new();
         for &(id, name, description, argument, scope) in ACTIONS {
             let haystack = format!("{id} {name} {description}").to_lowercase();
@@ -645,18 +934,24 @@ impl App {
                 "write" => editor.is_some_and(|d| !d.read_only) || kind == "terminal",
                 "terminal" => kind == "terminal",
                 "search" => editor.is_some() && !self.search.query.is_empty(),
-                "git" => kind == "git" && selected.is_some() && self.git_jobs == 0,
+                "git" => kind == "git" && selected.is_some() && self.git.jobs == 0,
                 "repository" => {
-                    self.git_repository && self.git_jobs == 0 && self.git.iter().any(|e| e.staged)
+                    self.git.repository
+                        && self.git.jobs == 0
+                        && self.git.entries.iter().any(|e| e.staged)
                 }
                 "unstaged" => {
-                    self.git_repository && self.git_jobs == 0 && self.git.iter().any(|e| !e.staged)
+                    self.git.repository
+                        && self.git.jobs == 0
+                        && self.git.entries.iter().any(|e| !e.staged)
                 }
                 "pane" => !self.editor_only && self.layout.panes().len() > 1,
                 "file" => editor.is_some_and(|d| d.path.is_some() && d.label.is_none()),
                 "terminal-ui" => self.terminal_frontend,
                 "graphical" => !self.terminal_frontend,
                 "graphical-editor" => !self.terminal_frontend && editor.is_some(),
+                "trusted" => self.trusted(),
+                "untrusted" => !self.trusted(),
                 _ => true,
             };
             if scope == "git" {
@@ -673,7 +968,7 @@ impl App {
                 enabled &= self.pending_save.is_empty();
             }
             if id == "refresh" && kind == "git" {
-                enabled &= self.git_jobs == 0;
+                enabled &= self.git.jobs == 0;
             }
             let shortcut = self
                 .preferences
@@ -704,7 +999,7 @@ impl App {
                 && !self.pending_save.is_empty()
             {
                 "Wait for pending file saves"
-            } else if id == "refresh" && kind == "git" && self.git_jobs != 0 {
+            } else if id == "refresh" && kind == "git" && self.git.jobs != 0 {
                 "Wait for running Git operations"
             } else {
                 match scope {
@@ -723,6 +1018,8 @@ impl App {
                     "terminal-ui" => "Only available in the terminal interface",
                     "graphical" => "Only available in the graphical interface",
                     "graphical-editor" => "Focus a document in the graphical interface",
+                    "trusted" => "The workspace is already restricted",
+                    "untrusted" => "The workspace is already trusted",
                     _ => "Focus an editor or terminal",
                 }
             };
@@ -735,6 +1032,12 @@ impl App {
                 enabled,
                 reason: reason.into(),
             });
+        }
+        for tool in self.tool_catalog() {
+            let haystack = format!("{} {} {}", tool.id, tool.name, tool.description).to_lowercase();
+            if query.split_whitespace().all(|term| haystack.contains(term)) {
+                results.push(tool);
+            }
         }
         // Exact IDs appear first, so keyboard users can retain familiar short commands.
         results.sort_by_key(|c| {

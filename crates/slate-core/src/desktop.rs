@@ -203,7 +203,7 @@ impl App {
                 })
         })?;
         let document = self.documents.get(&self.views.get(&view)?.document)?;
-        Some((document.title(), document.text.clone()))
+        Some((document.title(), document.text()))
     }
     /// Select the word (double click) or line (triple click) at the cursor.
     pub(crate) fn select_unit(&mut self, id: u64, line: bool) {
@@ -215,13 +215,13 @@ impl App {
             let end = if row + 1 < d.line_count() {
                 d.line_offset(row + 1)
             } else {
-                d.text.len()
+                d.len()
             };
             (start, end)
         } else {
             let row = d.line_of(v.cursor);
             let (line_start, line_end) = d.line_range(row);
-            let text = &d.text[line_start..line_end];
+            let text = &d.slice(line_start, line_end);
             let offset = v.cursor - line_start;
             let mut range = (v.cursor, v.cursor);
             for (i, word) in text.split_word_bound_indices() {
@@ -267,11 +267,8 @@ impl App {
         for index in 0..samples {
             let row = index * total / samples.max(1);
             let (start, mut end) = d.line_range(row);
-            end = end.min(start + 4096);
-            while !d.text.is_char_boundary(end) {
-                end -= 1;
-            }
-            let line = &d.text[start..end];
+            end = d.floor_boundary(end.min(start + 4096));
+            let line = &d.slice(start, end);
             let trimmed = line.trim_start_matches([' ', '\t']);
             let indent =
                 crate::document::display_width_with_tabs(&line[..line.len() - trimmed.len()], tab);
@@ -288,7 +285,7 @@ impl App {
             let (start, end) = d.line_range(row);
             if (end - start) * tab.max(1) > widest {
                 widest = widest.max(crate::document::display_width_with_tabs(
-                    &d.text[start..end],
+                    &d.slice(start, end),
                     tab,
                 ));
             }

@@ -66,6 +66,10 @@ pub fn state_dir() -> PathBuf {
     base("XDG_STATE_HOME", ".local/state")
 }
 
+/// Serialises unit tests that change the process environment.
+#[cfg(test)]
+pub(crate) static TEST_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;

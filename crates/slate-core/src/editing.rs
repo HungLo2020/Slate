@@ -1,68 +1,73 @@
-use crate::{
-    document::{line_end, line_start},
-    App,
-};
+use crate::App;
 use anyhow::{bail, Context, Result};
+use std::sync::Arc;
 
 impl App {
+    /// Matches of the current search in a document, cached until the
+    /// document or the query changes; finding next/previous is a lookup.
+    pub(crate) fn search_matches(&mut self, doc: u64) -> Result<Arc<Vec<(usize, usize)>>> {
+        let generation = self.documents[&doc].generation;
+        let key = self.search.key();
+        if let Some((cached_doc, cached_generation, cached_key, matches)) = &self.match_cache {
+            if *cached_doc == doc && *cached_generation == generation && *cached_key == key {
+                return Ok(matches.clone());
+            }
+        }
+        let regex = self.search.rope_regex()?;
+        let matches = Arc::new(crate::search::find_all(&regex, self.documents[&doc].rope()));
+        self.match_cache = Some((doc, generation, key, matches.clone()));
+        Ok(matches)
+    }
     pub(super) fn find(&mut self, backward: bool) -> Result<()> {
         let id = self.active_editor().context("Focus an editor first")?;
-        let v = &self.views[&id];
-        let text = &self.documents[&v.document].text;
-        let matches = self
-            .search
-            .regex()?
-            .find_iter(text)
-            .map(|m| (m.start(), m.end()))
-            .collect::<Vec<_>>();
+        let v = self.views[&id].clone();
+        let matches = self.search_matches(v.document)?;
         let cursor = if backward {
             v.anchor.map(|a| a.min(v.cursor)).unwrap_or(v.cursor)
         } else {
             v.cursor
         };
-        let found = if backward {
-            matches
-                .iter()
-                .rev()
-                .find(|(_, end)| *end <= cursor)
-                .or_else(|| matches.last())
+        let index = if backward {
+            let before = matches.partition_point(|(_, end)| *end <= cursor);
+            before.checked_sub(1).or(matches.len().checked_sub(1))
         } else {
-            matches
-                .iter()
-                .find(|(start, _)| *start >= cursor)
-                .or_else(|| matches.first())
+            let after = matches.partition_point(|(start, _)| *start < cursor);
+            (after < matches.len())
+                .then_some(after)
+                .or((!matches.is_empty()).then_some(0))
         };
-        let &(start, end) = found.context("No matches")?;
-        let number = matches.iter().position(|m| *m == (start, end)).unwrap() + 1;
-        let v = self.views.get_mut(&id).unwrap();
-        v.anchor = Some(start);
-        v.cursor = end;
-        v.manual_scroll = false;
-        self.status = format!("Match {number} of {}", matches.len());
+        let index = index.context("No matches")?;
+        let (start, end) = matches[index];
+        let view = self.views.get_mut(&id).unwrap();
+        view.anchor = Some(start);
+        view.cursor = end;
+        view.manual_scroll = false;
+        self.status = format!("Match {} of {}", index + 1, matches.len());
         Ok(())
     }
     pub(super) fn replace_matches(&mut self, replacement: &str, all: bool) -> Result<()> {
         let id = self.active_editor().context("Focus an editor first")?;
         let v = self.views[&id].clone();
-        let text = &self.documents[&v.document].text;
-        let regex = self.search.regex()?;
+        let matches = self.search_matches(v.document)?;
         if all {
-            let count = regex.find_iter(text).count();
-            if count == 0 {
+            if matches.is_empty() {
                 bail!("No matches");
             }
-            let value = regex
-                .replace_all(text, regex::NoExpand(replacement))
-                .into_owned();
-            self.edit_range(id, 0, text.len(), &value, v.cursor)?;
-            self.status = format!("Replaced {count} matches");
+            // One undoable edit spanning the matches; replacement text is literal.
+            let d = &self.documents[&v.document];
+            let (first, last) = (matches[0].0, matches[matches.len() - 1].1);
+            let mut value = String::with_capacity(last - first);
+            let mut position = first;
+            for (start, end) in matches.iter() {
+                value.push_str(&d.slice(position, *start));
+                value.push_str(replacement);
+                position = *end;
+            }
+            self.edit_range(id, first, last, &value, v.cursor)?;
+            self.status = format!("Replaced {} matches", matches.len());
         } else {
             let selected = v.anchor.map(|a| (a.min(v.cursor), a.max(v.cursor)));
-            let matching = selected.is_some_and(|(a, b)| {
-                regex
-                    .find_at(text, a)
-                    .is_some_and(|m| m.start() == a && m.end() == b)
-            });
+            let matching = selected.is_some_and(|range| matches.binary_search(&range).is_ok());
             if !matching {
                 self.find(false)?;
             }
@@ -74,22 +79,24 @@ impl App {
     pub(super) fn indent(&mut self, outdent: bool) -> Result<()> {
         let id = self.active_editor().context("Focus an editor first")?;
         let v = self.views[&id].clone();
-        let text = &self.documents[&v.document].text;
+        let d = &self.documents[&v.document];
         let a = v.anchor.unwrap_or(v.cursor).min(v.cursor);
         let b = v.anchor.unwrap_or(v.cursor).max(v.cursor);
-        let start = line_start(text, a);
-        let last = if b > a && b == line_start(text, b) {
-            b - 1
-        } else {
-            b
-        };
-        let end = line_end(text, last);
+        let first = d.line_of(a);
+        let mut last = d.line_of(b);
+        // A selection ending at a line start does not include that line.
+        if b > a && last > first && b == d.line_offset(last) {
+            last -= 1;
+        }
+        let start = d.line_offset(first);
+        let end = d.line_range(last).1;
         let unit = if self.preferences.insert_spaces {
             " ".repeat(self.preferences.indent_width)
         } else {
             "\t".into()
         };
-        let value = text[start..end]
+        let value = d
+            .slice(start, end)
             .split('\n')
             .map(|line| {
                 if outdent {

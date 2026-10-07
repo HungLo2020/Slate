@@ -1,5 +1,10 @@
 use serde::{Deserialize, Serialize};
 
+/// Saved layouts beyond these limits are rejected, so they are enforced
+/// while editing too.
+pub const MAX_TABS: usize = 32;
+pub const MAX_DEPTH: usize = 12;
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Axis {
@@ -85,6 +90,13 @@ impl Node {
             _ => None,
         }
     }
+    pub fn tabs(&self, target: u64) -> Option<&[View]> {
+        match self {
+            Self::Pane { id, tabs, .. } if *id == target => Some(tabs),
+            Self::Split { first, second, .. } => first.tabs(target).or_else(|| second.tabs(target)),
+            _ => None,
+        }
+    }
     pub fn view(&self, target: u64) -> Option<&View> {
         match self {
             Self::Pane { id, tabs, active } if *id == target => tabs.get(*active),
@@ -125,19 +137,42 @@ impl Node {
             _ => false,
         }
     }
-    pub fn remove(&mut self, target: u64) -> bool {
-        if let Self::Split { first, second, .. } = self {
-            if matches!(first.as_ref(),Self::Pane{id,..} if *id==target) {
-                *self = *second.clone();
-                return true;
-            }
-            if matches!(second.as_ref(),Self::Pane{id,..} if *id==target) {
-                *self = *first.clone();
-                return true;
-            }
-            return first.remove(target) || second.remove(target);
+    /// Remove a pane, returning its tabs so the caller can rehome them.
+    /// The final pane cannot be removed.
+    pub fn remove(&mut self, target: u64) -> Option<Vec<View>> {
+        let Self::Split { first, second, .. } = self else {
+            return None;
+        };
+        let pane_tabs = |n: &Node| match n {
+            Self::Pane { id, tabs, .. } if *id == target => Some(tabs.clone()),
+            _ => None,
+        };
+        if let Some(tabs) = pane_tabs(first) {
+            *self = *second.clone();
+            return Some(tabs);
         }
-        false
+        if let Some(tabs) = pane_tabs(second) {
+            *self = *first.clone();
+            return Some(tabs);
+        }
+        first.remove(target).or_else(|| second.remove(target))
+    }
+    /// Nesting depth of a pane, where a lone root pane has depth 0.
+    pub fn depth_of(&self, target: u64) -> Option<usize> {
+        match self {
+            Self::Pane { id, .. } => (*id == target).then_some(0),
+            Self::Split { first, second, .. } => first
+                .depth_of(target)
+                .or_else(|| second.depth_of(target))
+                .map(|d| d + 1),
+        }
+    }
+    /// Every tab in the layout, in pane order.
+    pub fn views(&self) -> Vec<View> {
+        match self {
+            Self::Pane { tabs, .. } => tabs.clone(),
+            Self::Split { first, second, .. } => [first.views(), second.views()].concat(),
+        }
     }
     pub fn resize(&mut self, target: u64, value: f32) -> bool {
         match self {
@@ -282,7 +317,7 @@ impl Node {
     }
     pub fn validate(&self) -> bool {
         fn check(n: &Node, depth: usize, ids: &mut Vec<u64>) -> bool {
-            if depth > 12 {
+            if depth > MAX_DEPTH {
                 return false;
             }
             let id = match n {
@@ -294,7 +329,7 @@ impl Node {
             ids.push(id);
             match n {
                 Node::Pane { tabs, active, .. } => {
-                    !tabs.is_empty() && tabs.len() <= 32 && *active < tabs.len()
+                    !tabs.is_empty() && tabs.len() <= MAX_TABS && *active < tabs.len()
                 }
                 Node::Split {
                     ratio,
