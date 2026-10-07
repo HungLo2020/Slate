@@ -185,14 +185,45 @@ fn real_pty_shell_color_resize_and_alternate_screen() {
 fn close_and_quit_protect_unsaved_work() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = App::new(dir.path()).unwrap();
+    app.preferences = Default::default();
     app.dispatch(Command::Paste {
         text: "unsaved".into(),
     });
-    app.dispatch(Command::Quit { force: false });
+    app.dispatch(Command::Key {
+        key: Key {
+            key: "q".into(),
+            ctrl: true,
+            ..Default::default()
+        },
+    });
     assert!(!app.quit);
     app.dispatch(Command::CloseDocument { force: false });
     assert!(app.documents[&10].dirty());
     app.dispatch(Command::Quit { force: true });
+    assert!(app.quit);
+}
+
+#[test]
+fn footer_quit_shortcut_tracks_binding_and_exits_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = App::new(dir.path()).unwrap();
+    app.preferences = Default::default();
+    let hints = app.snapshot(160, 40, 1, 1, 1, 3).hints;
+    assert!(hints.contains("Ctrl+q quit"));
+    assert!(!hints.contains("replace") && !hints.contains("goto"));
+    app.preferences.global_keys.remove("Ctrl+q");
+    app.preferences
+        .global_keys
+        .insert("Alt+q".into(), "quit".into());
+    let hints = app.snapshot(160, 40, 1, 1, 1, 3).hints;
+    assert!(hints.contains("Alt+q quit") && !hints.contains("Ctrl+q quit"));
+    app.dispatch(Command::Key {
+        key: Key {
+            key: "q".into(),
+            alt: true,
+            ..Default::default()
+        },
+    });
     assert!(app.quit);
 }
 

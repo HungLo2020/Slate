@@ -2512,7 +2512,7 @@ impl App {
             _ => &self.preferences.global_keys,
         };
         let verbs = match self.focused_kind() {
-            "editor" => vec!["save", "prompt-find", "prompt-replace", "prompt-goto"],
+            "editor" => vec!["save", "prompt-find"],
             "terminal" => vec!["copy", "paste"],
             _ => vec!["next-pane", "next-tab"],
         };
@@ -2536,6 +2536,14 @@ impl App {
             if let Some((key, _)) = map.iter().find(|(_, v)| v.as_str() == verb) {
                 hints.push(format!("{key} {}", verb.trim_start_matches("prompt-")));
             }
+        }
+        if let Some((key, _)) = self
+            .preferences
+            .global_keys
+            .iter()
+            .find(|(_, v)| v.as_str() == "quit")
+        {
+            hints.push(format!("{key} quit"));
         }
         if self.focused_kind() == "git" {
             hints.push("Enter diff · S stage · U unstage · C commit · R refresh".into());

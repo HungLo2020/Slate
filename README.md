@@ -178,6 +178,7 @@ slate`; subsequent releases arrive through normal APT updates.
 | F8 | New terminal in the current pane |
 | F9 / Shift+F9 | Split right / below |
 | F10 | Expand / collapse workspace |
+| Ctrl+Q | Quit (checks for unsaved changes) |
 | Ctrl+, | Settings (when supported by the outer terminal) |
 | Ctrl+S in an editor | Save |
 | Ctrl+Z / Ctrl+Y | Undo / redo |

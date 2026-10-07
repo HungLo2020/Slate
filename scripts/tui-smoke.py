@@ -44,7 +44,7 @@ with tempfile.TemporaryDirectory(prefix='slate-tui-') as tmp:
         await_file(root/'terminal.txt', 'PTY_OK')
         command('layout-save smoke');command('preset minimal');command('layout-load smoke')
         assert (root/'config/slate/layouts.toml').exists()
-        command('quit');process.wait(timeout=5);assert process.returncode==0
+        send(b'\x11');process.wait(timeout=5);assert process.returncode==0
         print('PASS TUI: three panes, edit/save, find/replace, go-to-line, indentation settings, split, terminal command, layout persistence, clean exit')
     finally:
         if process.poll() is None: process.terminate();process.wait(timeout=5)

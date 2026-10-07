@@ -58,6 +58,7 @@ impl Default for Preferences {
                 ("Shift+f9", "split-down"),
                 ("f10", "toggle-workspace"),
                 ("Ctrl+,", "settings"),
+                ("Ctrl+q", "quit"),
             ]),
             editor_keys: keys(&[
                 ("Ctrl+s", "save"),
@@ -126,7 +127,11 @@ impl Preferences {
             toml::from_str(&fs::read_to_string(path)?).context("Invalid settings.toml")?;
         // Settings saved by older releases contain the old complete key map.
         // Add the new defaults while preserving explicit user assignments.
-        for (key, action) in [("f10", "toggle-workspace"), ("Ctrl+,", "settings")] {
+        for (key, action) in [
+            ("f10", "toggle-workspace"),
+            ("Ctrl+,", "settings"),
+            ("Ctrl+q", "quit"),
+        ] {
             settings
                 .global_keys
                 .entry(key.into())
