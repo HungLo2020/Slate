@@ -45,7 +45,9 @@ editing rules, document history, Git operations, or terminal process ownership.
 
 ## Default workspace
 
-Both frontends start with three panes arranged side by side:
+Opening a file starts with only the editor. Opening a directory (or no path)
+starts with three panes arranged side by side. Both defaults are configurable,
+and `--editor-only` / `--workspace` explicitly override them:
 
 | Position | Default content | Additional capabilities |
 | --- | --- | --- |

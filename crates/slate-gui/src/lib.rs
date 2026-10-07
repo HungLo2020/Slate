@@ -169,7 +169,11 @@ mod tests {
         let file = dir.path().join("edit.txt");
         std::fs::write(&file, "hello\n").unwrap();
         let mut state = GuiContext {
-            app: App::new(&file).unwrap(),
+            app: App::new_with_startup(
+                &file,
+                Some(slate_core::preferences::StartupMode::Workspace),
+            )
+            .unwrap(),
             revision: 0,
             viewport: String::new(),
             panes: BTreeMap::new(),

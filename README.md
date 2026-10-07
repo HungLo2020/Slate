@@ -20,7 +20,9 @@ Slate does not download or vendor Qt or Kirigami.
 cargo build --release
 ./target/release/slate .                  # terminal mode
 ./target/release/slate --gui .            # Kirigami mode
-./target/release/slate src/main.rs        # open a file
+./target/release/slate src/main.rs        # editor only
+./target/release/slate --gui --editor-only .  # GUI editor only
+./target/release/slate --workspace src/main.rs # file in the full TUI workspace
 ```
 
 Development launchers build the release executable before starting it:
@@ -50,9 +52,40 @@ contains both frontends. Terminal mode does not require a graphical session,
 but a combined build still links Qt libraries. For machines without Qt, an
 explicit TUI-only build is also available with `cargo build --no-default-features`.
 
+## Startup and settings
+
+Opening a file defaults to just the editor; opening a directory, or launching
+without a path, defaults to the full workspace. `--editor-only` and `--workspace`
+override those defaults independently of `--gui`/`--tui`. If both layout flags
+are supplied, the last one wins.
+
+Use **Settings** in either command palette, or **Menu → Workspace → Settings** in
+the GUI, to configure **Opening a file** and **Opening a directory** separately.
+Settings are saved automatically to `$XDG_CONFIG_HOME/slate/settings.toml`
+(normally `~/.config/slate/settings.toml`). The equivalent TOML fields are:
+
+```toml
+file_startup = "editor-only"
+directory_startup = "workspace"
+```
+
+Press **F10** to expand/collapse the workspace. The GUI also has a **Workspace** /
+**Editor only** toolbar button. This keeps the complete split layout, open tabs,
+unsaved edits, cursor positions and running shells. Editor-only startup launches
+no hidden shell, even when recovering a previous workspace; expansion starts
+remembered shells in their saved directories. Startup settings apply on the next
+launch, and recovery does not override the chosen startup mode.
+
+GUI Settings offers direct controls; TUI Settings uses ↑/↓ to select and ←/→ or
+Enter to change a value. Ctrl+, opens Settings where the frontend/outer terminal
+supports that shortcut. Keybindings, including F10, remain configurable in
+`settings.toml`. Recovery data stays under `$XDG_STATE_HOME/slate/workspaces`
+(normally `~/.local/state/slate/workspaces`). Empty or relative XDG directory
+values use the standard home-directory defaults.
+
 ## Working prototype features
 
-- Default Files / Editor / Terminal layout in both frontends.
+- File-aware editor-only / workspace startup in both frontends; configurable defaults.
 - Lazy directory browsing (including parent navigation); open UTF-8 files,
   create untitled buffers, save, and save as a new file.
 - Grapheme-aware cursor movement, selection, mouse selection, copy/cut/paste,
@@ -100,6 +133,8 @@ explicit TUI-only build is also available with `cargo build --no-default-feature
 | F7 | Next tab/view in the current pane |
 | F8 | New terminal in the current pane |
 | F9 / Shift+F9 | Split right / below |
+| F10 | Expand / collapse workspace |
+| Ctrl+, | Settings (when supported by the outer terminal) |
 | Ctrl+S in an editor | Save |
 | Ctrl+Z / Ctrl+Y | Undo / redo |
 | Ctrl+F | Find prompt |
@@ -146,8 +181,9 @@ clear it. Hover file controls for explanations, or right-click a file for action
 In the TUI Git pane, S stages, U unstages, C opens the commit form, R refreshes,
 and Enter inspects the selected change.
 
-GUI Settings provides theme, indentation, spaces/tabs, auto-indent and line-number
-controls, plus an action to open the settings file for keybinding customization.
+Settings provides file/directory startup defaults, theme, indentation, spaces/tabs,
+auto-indent and line-number controls in both frontends. GUI Settings also offers
+an action to open the settings file for keybinding customization.
 
 TUI: Enter or click opens the selected entry;
 mouse dragging resizes dividers. In a TUI editing prompt, Tab switches find and
@@ -176,7 +212,13 @@ outdent
 set indent-width 2
 set insert-spaces true
 set theme auto
+set file-startup editor-only
+set directory-startup workspace
+settings
 settings-reload
+editor-only
+workspace
+toggle-workspace
 open /path/to/code.rs
 save-as /path/to/new-file.rs
 split-right

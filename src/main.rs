@@ -9,13 +9,18 @@ fn main() -> Result<()> {
         .unwrap_or(false);
     let mut path = None;
     let mut recover = true;
+    let mut startup = None;
     for arg in args {
         match arg.to_str() {
             Some("--fresh") => recover = false,
+            Some("--editor-only") => {
+                startup = Some(slate_core::preferences::StartupMode::EditorOnly)
+            }
+            Some("--workspace") => startup = Some(slate_core::preferences::StartupMode::Workspace),
             Some("--gui") => gui = true,
             Some("--tui") => gui = false,
             Some("--help") | Some("-h") => {
-                println!("Slate — shared Rust editor\n\nslate [--tui|--gui] [--fresh] [FILE|DIRECTORY]\nslate-gui [FILE|DIRECTORY]\n\nF1: commands  F6: next pane  F7: next tab  F8: new terminal\nF9: split right  Shift-F9: split below\nEditor: Ctrl-S save, Ctrl-Z undo, Ctrl-Y redo, Ctrl-F find, Ctrl-H replace, Ctrl-G line\n--fresh: start without restoring this workspace\nCtrl-Shift-P: commands (also works from terminal panes)");
+                println!("Slate — shared Rust editor\n\nslate [--tui|--gui] [--fresh] [--editor-only|--workspace] [FILE|DIRECTORY]\nslate-gui [FILE|DIRECTORY]\n\nF1: commands  F6: next pane  F7: next tab  F8: new terminal\nF9: split right  Shift-F9: split below  F10: expand/collapse workspace\nEditor: Ctrl-S save, Ctrl-Z undo, Ctrl-Y redo, Ctrl-F find, Ctrl-H replace, Ctrl-G line\n--editor-only: show only the editor, regardless of startup settings\n--workspace: show the full workspace, regardless of startup settings\nFiles default to editor-only; directories (or no path) default to the workspace.\nConfigure file-startup and directory-startup in Settings.\n--fresh: start without restoring this workspace\nCtrl-Shift-P: commands (also works from terminal panes)");
                 return Ok(());
             }
             Some("--version") => {
@@ -35,7 +40,7 @@ fn main() -> Result<()> {
     if smoke {
         eprintln!("Smoke startup: constructing shared core");
     }
-    let mut app = slate_core::App::new(&path)?;
+    let mut app = slate_core::App::new_with_startup(&path, startup)?;
     if smoke {
         eprintln!("Smoke startup: core constructed");
     }

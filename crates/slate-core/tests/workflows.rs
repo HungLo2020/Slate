@@ -649,7 +649,9 @@ fn terminal_cwd_and_workspace_clean_file_refresh() {
     fs::create_dir(dir.path().join("nested")).unwrap();
     let path = dir.path().join("clean.rs");
     fs::write(&path, "old").unwrap();
-    let mut app = App::new(&path).unwrap();
+    let mut app =
+        App::new_with_startup(&path, Some(slate_core::preferences::StartupMode::Workspace))
+            .unwrap();
     app.attach_workspace(
         WorkspaceStore::acquire_in(dir.path(), state.path()).unwrap(),
         false,

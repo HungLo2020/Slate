@@ -7,7 +7,7 @@ with tempfile.TemporaryDirectory(prefix='slate-tui-') as tmp:
     master,slave=pty.openpty()
     fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',40,160,0,0))
     env={**os.environ,'TERM':'xterm-256color','SHELL':'/bin/sh','XDG_CONFIG_HOME':str(root/'config'),'XDG_STATE_HOME':str(root/'state')}
-    process=subprocess.Popen([binary,'--tui',str(file)],stdin=slave,stdout=slave,stderr=slave,env=env,start_new_session=True)
+    process=subprocess.Popen([binary,'--tui','--workspace',str(file)],stdin=slave,stdout=slave,stderr=slave,env=env,start_new_session=True)
     os.close(slave);output=bytearray()
     def pump(seconds=.25):
         deadline=time.monotonic()+seconds

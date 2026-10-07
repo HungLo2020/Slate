@@ -4,7 +4,9 @@ mod editing;
 pub mod events;
 mod highlight;
 pub mod layout;
+pub mod paths;
 pub mod preferences;
+mod presentation;
 pub mod search;
 mod services;
 pub mod terminal;
@@ -13,7 +15,7 @@ pub mod workspace;
 use anyhow::{bail, Context, Result};
 use document::{at_line_col, line_end, line_start, next, previous, Document};
 use layout::{Axis, Handle, Node, Rect, View};
-use preferences::Preferences;
+use preferences::{Preferences, StartupMode};
 use search::{Prompt, Search};
 use serde::{Deserialize, Serialize};
 use services::{Entry, GitEntry, IoJob, Job, Reply, Services};
@@ -59,6 +61,9 @@ pub enum Command {
         line: usize,
     },
     OpenSettings,
+    EditorOnly,
+    ShowWorkspace,
+    ToggleWorkspace,
     InputMethod {
         text: String,
         #[serde(default)]
@@ -294,6 +299,7 @@ pub struct Snapshot {
     pub accent: String,
     pub commands: Vec<commands::CommandInfo>,
     pub settings: Preferences,
+    pub editor_only: bool,
     pub git_branch: String,
     pub git_repository: bool,
     pub git_busy: bool,
@@ -311,6 +317,8 @@ pub struct App {
     pub documents: BTreeMap<u64, Document>,
     pub views: BTreeMap<u64, EditorView>,
     pub terminals: BTreeMap<u64, TerminalSession>,
+    deferred_terminals: BTreeMap<u64, PathBuf>,
+    pub editor_only: bool,
     pub layout: Node,
     pub focus: u64,
     pub status: String,
@@ -351,6 +359,9 @@ pub struct App {
 }
 impl App {
     pub fn new(path: &Path) -> Result<Self> {
+        Self::new_with_startup(path, None)
+    }
+    pub fn new_with_startup(path: &Path, mode: Option<StartupMode>) -> Result<Self> {
         let path = if path.exists() {
             path.canonicalize()?
         } else {
@@ -380,17 +391,14 @@ impl App {
             },
         );
         let events = events::Events::default();
-        let mut terminals = BTreeMap::new();
-        terminals.insert(12, TerminalSession::spawn(&root, None, 24, 80)?);
-        for terminal in terminals.values_mut() {
-            terminal.set_events(events.clone());
-        }
         let mut app = Self {
             browser: root.clone(),
-            root,
+            root: root.clone(),
             documents,
             views,
-            terminals,
+            terminals: BTreeMap::new(),
+            deferred_terminals: BTreeMap::from([(12, root.clone())]),
+            editor_only: false,
             layout: Node::default_layout(11, 12),
             focus: 2,
             status: "F1 commands · F6 focus · Ctrl-S save".into(),
@@ -435,6 +443,14 @@ impl App {
         };
         app.read_settings();
         app.load_preferences();
+        app.editor_only = mode.unwrap_or(if file {
+            app.preferences.file_startup
+        } else {
+            app.preferences.directory_startup
+        }) == StartupMode::EditorOnly;
+        if !app.editor_only {
+            app.ensure_terminals()?;
+        }
         app.refresh();
         Ok(app)
     }
@@ -543,6 +559,15 @@ impl App {
     }
     fn execute(&mut self, cmd: Command) -> Result<()> {
         match cmd {
+            Command::EditorOnly => self.collapse_workspace(),
+            Command::ShowWorkspace => self.expand_workspace()?,
+            Command::ToggleWorkspace => {
+                if self.editor_only {
+                    self.expand_workspace()?;
+                } else {
+                    self.collapse_workspace();
+                }
+            }
             Command::ScrollTo { pane, line } => {
                 if let Some(View::Editor(id)) = self.layout.view(pane) {
                     let v = self.views.get_mut(id).context("Missing editor view")?;
@@ -994,15 +1019,28 @@ impl App {
             }
             Command::Focus { pane } => {
                 if self.layout.view(pane).is_some() {
+                    if self.editor_only && pane != self.focus {
+                        self.expand_workspace()?;
+                    }
                     self.focus = pane;
                 }
             }
+            Command::FocusNext if self.editor_only => {}
             Command::FocusNext => {
                 let panes = self.layout.panes();
                 let current = panes.iter().position(|p| *p == self.focus).unwrap_or(0);
                 self.focus = panes[(current + 1) % panes.len()];
             }
             Command::SwitchTab { pane, index } => {
+                let target = self
+                    .layout
+                    .pane_mut(pane)
+                    .and_then(|(tabs, _)| tabs.get(index).cloned());
+                if self.editor_only
+                    && target.is_some_and(|v| pane != self.focus || !matches!(v, View::Editor(_)))
+                {
+                    self.expand_workspace()?;
+                }
                 if let Some((tabs, active)) = self.layout.pane_mut(pane) {
                     if index < tabs.len() {
                         *active = index;
@@ -1011,11 +1049,19 @@ impl App {
                 }
             }
             Command::NextTab => {
-                if let Some((tabs, active)) = self.layout.pane_mut(self.focus) {
-                    *active = (*active + 1) % tabs.len();
+                let next = self.layout.pane_mut(self.focus).map(|(tabs, active)| {
+                    let index = (*active + 1) % tabs.len();
+                    (index, !matches!(tabs[index], View::Editor(_)))
+                });
+                if let Some((index, tool)) = next {
+                    if self.editor_only && tool {
+                        self.expand_workspace()?;
+                    }
+                    *self.layout.pane_mut(self.focus).unwrap().1 = index;
                 }
             }
             Command::NewTerminal => {
+                self.expand_workspace()?;
                 let id = self.new_terminal()?;
                 self.add_tab(View::Terminal(id));
             }
@@ -1027,10 +1073,14 @@ impl App {
                 self.remove_terminal_views(id);
             }
             Command::AddView { kind } => {
+                if kind != "editor" {
+                    self.expand_workspace()?;
+                }
                 let v = self.create_view(&kind)?;
                 self.add_tab(v);
             }
             Command::Split { axis, kind } => {
+                self.expand_workspace()?;
                 let v = if let Some(kind) = kind {
                     self.create_view(&kind)?
                 } else {
@@ -1051,6 +1101,9 @@ impl App {
                 self.focus = pane;
             }
             Command::ClosePane => {
+                if self.editor_only {
+                    bail!("Expand the workspace before closing a pane");
+                }
                 if self.layout.remove(self.focus) {
                     self.focus = self.layout.panes()[0];
                 } else {
@@ -1058,6 +1111,7 @@ impl App {
                 }
             }
             Command::MovePane { target } => {
+                self.expand_workspace()?;
                 self.layout.swap(self.focus, target);
             }
             Command::ResizeSplit { id, ratio } => {
@@ -1077,6 +1131,7 @@ impl App {
                 self.restore_layout(node)?;
             }
             Command::ToggleGit => {
+                self.expand_workspace()?;
                 let v = if matches!(self.focused(), Some(View::Git)) {
                     View::Files
                 } else {
@@ -1373,13 +1428,18 @@ impl App {
         }
     }
     fn preset(&mut self, name: &str) -> Result<()> {
+        if name == "minimal" {
+            self.collapse_workspace();
+            return Ok(());
+        }
+        if !["development", "bottom_terminal"].contains(&name) {
+            bail!("Unknown preset");
+        }
         let editor = self.editor_target();
+        self.ensure_terminals()?;
+        self.editor_only = false;
         let terminal = self.terminals.keys().next().copied();
         match name {
-            "minimal" => {
-                let id = self.id();
-                self.layout = Node::pane(id, View::Editor(editor));
-            }
             "development" => {
                 let term = if let Some(id) = terminal {
                     id
@@ -1419,12 +1479,7 @@ impl App {
         Ok(())
     }
     fn settings_path() -> PathBuf {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")
-            })
-            .join("slate/layouts.toml")
+        paths::config_dir().join("layouts.toml")
     }
     fn read_settings(&mut self) {
         if let Ok(s) = fs::read_to_string(Self::settings_path()) {
@@ -1492,6 +1547,7 @@ impl App {
             Ok(())
         }
         rebind(self, &mut node, doc)?;
+        self.editor_only = false;
         self.layout = node;
         self.focus = self.layout.panes()[0];
         Ok(())
@@ -1558,6 +1614,9 @@ impl App {
         Ok(())
     }
     fn key(&mut self, k: Key) -> Result<()> {
+        if self.prompt.as_ref().is_some_and(|p| p.kind == "settings") {
+            return self.settings_key(&k);
+        }
         if let Some(p) = &mut self.prompt {
             match k.key.as_str() {
                 _ if k.alt && k.key.eq_ignore_ascii_case("c") => {
@@ -1826,18 +1885,22 @@ impl App {
         let cw = cell_width.max(1);
         let ch = cell_height.max(1);
         let required = self.layout.minimum_size(gap, minimum);
-        let (placements, handles) =
-            if width / cw < 70 || height / ch < 10 || width < required.0 || height < required.1 {
-                (
-                    vec![layout::Placement {
-                        id: self.focus,
-                        rect: area,
-                    }],
-                    vec![],
-                )
-            } else {
-                self.layout.arrange_constrained(area, gap, minimum)
-            };
+        let (placements, handles) = if self.editor_only
+            || width / cw < 70
+            || height / ch < 10
+            || width < required.0
+            || height < required.1
+        {
+            (
+                vec![layout::Placement {
+                    id: self.focus,
+                    rect: area,
+                }],
+                vec![],
+            )
+        } else {
+            self.layout.arrange_constrained(area, gap, minimum)
+        };
         let mut panes = vec![];
         for placement in placements {
             let id = placement.id;
@@ -1956,6 +2019,7 @@ impl App {
             accent: self.colors.3.clone(),
             commands: self.command_catalog(""),
             settings: self.preferences.clone(),
+            editor_only: self.editor_only,
             git_branch: self.git_branch.clone(),
             git_repository: self.git_repository,
             git_busy: self.git_jobs > 0,
@@ -2294,6 +2358,9 @@ impl App {
                 kind: "settings".into(),
             }),
             "settings-reload" => Some(Command::ReloadSettings),
+            "editor-only" => Some(Command::EditorOnly),
+            "workspace" => Some(Command::ShowWorkspace),
+            "toggle-workspace" => Some(Command::ToggleWorkspace),
             "set" => args
                 .split_once(' ')
                 .map(|(name, value)| Command::Configure {
@@ -2450,6 +2517,21 @@ impl App {
             _ => vec!["next-pane", "next-tab"],
         };
         let mut hints = vec!["F1 commands".to_string(), "F6 pane".to_string()];
+        if let Some((key, _)) = self
+            .preferences
+            .global_keys
+            .iter()
+            .find(|(_, v)| v.as_str() == "toggle-workspace")
+        {
+            hints.push(format!(
+                "{key} {}",
+                if self.editor_only {
+                    "expand"
+                } else {
+                    "collapse"
+                }
+            ));
+        }
         for verb in verbs {
             if let Some((key, _)) = map.iter().find(|(_, v)| v.as_str() == verb) {
                 hints.push(format!("{key} {}", verb.trim_start_matches("prompt-")));

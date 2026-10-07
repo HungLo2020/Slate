@@ -17,6 +17,7 @@ jobs:
           SLATE_REQUIRE_TERMINAL_TOOLS: "1"
       - run: cargo build --release
       - run: python3 scripts/install-smoke.py target/release/slate
+      - run: python3 scripts/startup-smoke.py target/release/slate --tui-only
       - run: python3 scripts/recovery-smoke.py target/release/slate
       - name: Verify optional TUI-only installation
         run: cargo build --release --no-default-features && python3 scripts/install-smoke.py target/release/slate --tui-only
@@ -42,6 +43,7 @@ jobs:
           fi
       - uses: actions/checkout@v4
       - run: cargo build --features gui-smoke
+      - run: python3 scripts/startup-smoke.py target/debug/slate
       - run: python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: SLATE_GUI_FEATURE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: SLATE_GUI_GIT_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate

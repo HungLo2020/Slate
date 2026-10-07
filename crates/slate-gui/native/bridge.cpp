@@ -339,6 +339,9 @@ static QString keyName(QKeyEvent *e) {
             return QString("F%1").arg(e->key() - Qt::Key_F1 + 1);
         if (e->key() >= Qt::Key_A && e->key() <= Qt::Key_Z)
             return QChar(e->key()).toLower();
+        // Control punctuation can have empty event text (e.g. Ctrl+,).
+        if (e->key() >= Qt::Key_Space && e->key() <= Qt::Key_AsciiTilde)
+            return QChar(e->key());
         return e->text();
     }
 }

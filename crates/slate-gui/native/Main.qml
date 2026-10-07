@@ -16,6 +16,7 @@ Kirigami.ApplicationWindow {
     title: "Slate"
     property var frame: slate.frame
     property int priorFocus: -1
+    property string priorPaneKey: ""
     // Pane delegates are recreated when compact layouts change their visible
     // pane IDs. Keep the repository draft and pending operation above them.
     property string gitCommitDraft: ""
@@ -135,6 +136,13 @@ Kirigami.ApplicationWindow {
                         root.gitCommitting = false;
                     }
                 });
+            if (root.frame.prompt && root.frame.prompt.kind === "settings") {
+                Qt.callLater(function () {
+                    settingsDialog.open();
+                    root.send({"action": "dismiss_prompt"});
+                });
+                return;
+            }
             if (root.frame.prompt && !editPrompt.visible) {
                 editPrompt.open();
                 promptInput.forceActiveFocus();
@@ -142,8 +150,10 @@ Kirigami.ApplicationWindow {
                 editPrompt.close();
                 Qt.callLater(root.focusPane);
             }
-            if (root.priorFocus !== root.frame.focus && !palette.visible && !settingsDialog.visible && !confirmDiscard.visible && !editPrompt.visible) {
+            var paneKey = (root.frame.panes || []).map(function (pane) { return pane.id; }).join(",");
+            if ((root.priorFocus !== root.frame.focus || root.priorPaneKey !== paneKey) && !palette.visible && !settingsDialog.visible && !confirmDiscard.visible && !editPrompt.visible) {
                 root.priorFocus = root.frame.focus;
+                root.priorPaneKey = paneKey;
                 Qt.callLater(root.focusPane);
             }
         }
@@ -246,6 +256,10 @@ Kirigami.ApplicationWindow {
                     Menu {
                         title: "Workspace"
                         MenuItem {
+                            text: "Expand / collapse workspace"
+                            onTriggered: root.send({"action": "toggle_workspace"})
+                        }
+                        MenuItem {
                             text: "Three panes"
                             onTriggered: root.send({
                                 "action": "preset",
@@ -262,8 +276,7 @@ Kirigami.ApplicationWindow {
                         MenuItem {
                             text: "Editor only"
                             onTriggered: root.send({
-                                "action": "preset",
-                                "name": "minimal"
+                                "action": "editor_only"
                             })
                         }
                         MenuItem {
@@ -306,14 +319,14 @@ Kirigami.ApplicationWindow {
                 id: openButton
                 objectName: "openButton"
                 text: "Open…"
-                visible: mainToolbar.width > implicitWidth + saveButton.implicitWidth + commandsButton.implicitWidth + menuButton.implicitWidth + 6 * Kirigami.Units.smallSpacing
+                visible: mainToolbar.width > implicitWidth + saveButton.implicitWidth + commandsButton.implicitWidth + workspaceToggleButton.implicitWidth + menuButton.implicitWidth + 7 * Kirigami.Units.smallSpacing
                 onClicked: root.invokeAction("open")
             }
             ActionButton {
                 id: saveButton
                 objectName: "saveButton"
                 text: "Save"
-                visible: mainToolbar.width > implicitWidth + commandsButton.implicitWidth + menuButton.implicitWidth + 5 * Kirigami.Units.smallSpacing
+                visible: mainToolbar.width > implicitWidth + commandsButton.implicitWidth + workspaceToggleButton.implicitWidth + menuButton.implicitWidth + 6 * Kirigami.Units.smallSpacing
                 onClicked: root.send({
                     "action": "save"
                 })
@@ -321,6 +334,14 @@ Kirigami.ApplicationWindow {
             Item {
                 Layout.fillWidth: true
                 Layout.minimumWidth: 0
+            }
+            ActionButton {
+                id: workspaceToggleButton
+                objectName: "workspaceToggleButton"
+                text: root.frame.editor_only ? "Workspace" : "Editor only"
+                visible: mainToolbar.width > implicitWidth + commandsButton.implicitWidth + menuButton.implicitWidth + 4 * Kirigami.Units.smallSpacing
+                tip: root.frame.editor_only ? "Expand the workspace (F10)" : "Collapse to the editor (F10)"
+                onClicked: root.send({"action": "toggle_workspace"})
             }
             ActionButton {
                 id: commandsButton
@@ -1101,8 +1122,48 @@ Kirigami.ApplicationWindow {
             id: settingsScroll
             clip: true
             contentWidth: availableWidth
+            leftPadding: Kirigami.Units.largeSpacing
+            rightPadding: Kirigami.Units.largeSpacing
+            topPadding: Kirigami.Units.smallSpacing
+            bottomPadding: Kirigami.Units.smallSpacing
             ColumnLayout {
                 width: settingsScroll.availableWidth
+                Label {
+                    text: "Startup"
+                    font.bold: true
+                }
+                Repeater {
+                    model: [
+                        {"label": "Opening a file", "setting": "file-startup", "field": "file_startup"},
+                        {"label": "Opening a directory", "setting": "directory-startup", "field": "directory_startup"}
+                    ]
+                    delegate: RowLayout {
+                        required property var modelData
+                        Layout.fillWidth: true
+                        Label {
+                            text: modelData.label
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 0
+                            wrapMode: Text.Wrap
+                        }
+                        ComboBox {
+                            objectName: modelData.field === "file_startup" ? "settingsFileStartup" : "settingsDirectoryStartup"
+                            model: ["Editor only", "Full workspace"]
+                            currentIndex: root.frame.settings && root.frame.settings[modelData.field] === "editor-only" ? 0 : 1
+                            onActivated: root.send({"action": "configure", "name": modelData.setting,
+                                "value": currentIndex === 0 ? "editor-only" : "workspace"})
+                        }
+                    }
+                }
+                Label {
+                    Layout.fillWidth: true
+                    text: "Applies the next time Slate starts. F10 expands or collapses the current workspace."
+                    wrapMode: Text.Wrap
+                }
+                Label {
+                    text: "Editor"
+                    font.bold: true
+                }
                 RowLayout {
                     Label {
                         textFormat: Text.PlainText

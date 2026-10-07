@@ -2,6 +2,24 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs, io::Write, path::PathBuf};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StartupMode {
+    EditorOnly,
+    Workspace,
+}
+
+impl std::str::FromStr for StartupMode {
+    type Err = anyhow::Error;
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "editor-only" => Ok(Self::EditorOnly),
+            "workspace" => Ok(Self::Workspace),
+            _ => bail!("Startup mode must be editor-only or workspace"),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {
@@ -10,6 +28,8 @@ pub struct Preferences {
     pub auto_indent: bool,
     pub line_numbers: bool,
     pub theme: String,
+    pub file_startup: StartupMode,
+    pub directory_startup: StartupMode,
     pub global_keys: BTreeMap<String, String>,
     pub editor_keys: BTreeMap<String, String>,
     pub terminal_keys: BTreeMap<String, String>,
@@ -28,12 +48,16 @@ impl Default for Preferences {
             auto_indent: true,
             line_numbers: true,
             theme: "auto".into(),
+            file_startup: StartupMode::EditorOnly,
+            directory_startup: StartupMode::Workspace,
             global_keys: keys(&[
                 ("f6", "next-pane"),
                 ("f7", "next-tab"),
                 ("f8", "terminal"),
                 ("f9", "split-right"),
                 ("Shift+f9", "split-down"),
+                ("f10", "toggle-workspace"),
+                ("Ctrl+,", "settings"),
             ]),
             editor_keys: keys(&[
                 ("Ctrl+s", "save"),
@@ -63,13 +87,23 @@ impl Default for Preferences {
     }
 }
 impl Preferences {
+    pub fn menu_items(&self) -> Vec<(&'static str, String)> {
+        let mode = |value| match value {
+            StartupMode::EditorOnly => "Editor only",
+            StartupMode::Workspace => "Full workspace",
+        };
+        vec![
+            ("Opening a file", mode(self.file_startup).into()),
+            ("Opening a directory", mode(self.directory_startup).into()),
+            ("Indent width", self.indent_width.to_string()),
+            ("Insert spaces", self.insert_spaces.to_string()),
+            ("Auto indent", self.auto_indent.to_string()),
+            ("Line numbers", self.line_numbers.to_string()),
+            ("Theme", self.theme.clone()),
+        ]
+    }
     pub fn path() -> PathBuf {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")
-            })
-            .join("slate/settings.toml")
+        crate::paths::config_dir().join("settings.toml")
     }
     pub fn validate(&self) -> Result<()> {
         if !(1..=16).contains(&self.indent_width) {
@@ -88,8 +122,16 @@ impl Preferences {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let settings: Self =
+        let mut settings: Self =
             toml::from_str(&fs::read_to_string(path)?).context("Invalid settings.toml")?;
+        // Settings saved by older releases contain the old complete key map.
+        // Add the new defaults while preserving explicit user assignments.
+        for (key, action) in [("f10", "toggle-workspace"), ("Ctrl+,", "settings")] {
+            settings
+                .global_keys
+                .entry(key.into())
+                .or_insert_with(|| action.into());
+        }
         settings.validate()?;
         Ok(settings)
     }
@@ -108,6 +150,64 @@ impl Preferences {
 use crate::App;
 
 impl App {
+    pub(super) fn settings_key(&mut self, key: &crate::Key) -> Result<()> {
+        let count = self.preferences.menu_items().len();
+        let prompt = self.prompt.as_mut().unwrap();
+        match key.key.as_str() {
+            "Escape" => self.prompt = None,
+            "Up" => prompt.field = (prompt.field + count - 1) % count,
+            "Down" | "Tab" => prompt.field = (prompt.field + 1) % count,
+            "Left" | "Right" | "Enter" | "Space" | " " => {
+                let backwards = key.key == "Left";
+                let toggle_mode = |mode| {
+                    if mode == StartupMode::EditorOnly {
+                        "workspace"
+                    } else {
+                        "editor-only"
+                    }
+                };
+                let (name, value) = match prompt.field {
+                    0 => (
+                        "file-startup",
+                        toggle_mode(self.preferences.file_startup).into(),
+                    ),
+                    1 => (
+                        "directory-startup",
+                        toggle_mode(self.preferences.directory_startup).into(),
+                    ),
+                    2 => (
+                        "indent-width",
+                        (if backwards {
+                            self.preferences.indent_width.saturating_sub(1).max(1)
+                        } else {
+                            (self.preferences.indent_width + 1).min(16)
+                        })
+                        .to_string(),
+                    ),
+                    3 => (
+                        "insert-spaces",
+                        (!self.preferences.insert_spaces).to_string(),
+                    ),
+                    4 => ("auto-indent", (!self.preferences.auto_indent).to_string()),
+                    5 => ("line-numbers", (!self.preferences.line_numbers).to_string()),
+                    _ => {
+                        let themes = ["auto", "dark", "light"];
+                        let current = themes
+                            .iter()
+                            .position(|t| *t == self.preferences.theme)
+                            .unwrap_or(0);
+                        (
+                            "theme",
+                            themes[(current + if backwards { 2 } else { 1 }) % 3].into(),
+                        )
+                    }
+                };
+                self.configure(name, &value)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
     pub(super) fn load_preferences(&mut self) {
         match Preferences::load() {
             Ok(p) => self.preferences = p,
@@ -150,7 +250,9 @@ impl App {
             "auto-indent" => settings.auto_indent = value.parse()?,
             "line-numbers" => settings.line_numbers = value.parse()?,
             "theme" => settings.theme = value.into(),
-            _ => bail!("Options: indent-width, insert-spaces, auto-indent, line-numbers, theme"),
+            "file-startup" => settings.file_startup = value.parse()?,
+            "directory-startup" => settings.directory_startup = value.parse()?,
+            _ => bail!("Options: indent-width, insert-spaces, auto-indent, line-numbers, theme, file-startup, directory-startup"),
         }
         settings.save()?;
         self.load_preferences();

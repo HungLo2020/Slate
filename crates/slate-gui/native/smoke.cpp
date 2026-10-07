@@ -802,7 +802,120 @@ static void startFeatureSmoke(Bridge *state, QQuickWindow *window) {
     timer->start(100);
 }
 
+static void startStartupSmoke(Bridge *state, QQuickWindow *window) {
+    const QString dir = qEnvironmentVariable("SLATE_GUI_SMOKE_DIR");
+    const bool expected = qEnvironmentVariable("SLATE_GUI_EXPECT_EDITOR_ONLY") == "1";
+    auto timer = new QTimer(state);
+    auto step = new int(0);
+    auto ticks = new int(0);
+    auto finish = [=](bool pass, const QString &detail) {
+        QFile report(dir + "/report.json");
+        report.open(QIODevice::WriteOnly);
+        report.write(QJsonDocument(QJsonObject{{"pass", pass}, {"detail", detail}}).toJson());
+        window->grabWindow().save(dir + "/gui.png");
+        timer->stop();
+        QGuiApplication::exit(pass ? 0 : 2);
+    };
+    QObject::connect(timer, &QTimer::timeout, state, [=]() {
+        state->refresh();
+        if (++*ticks > 80) {
+            finish(false, "Startup smoke timeout at step " + QString::number(*step));
+            return;
+        }
+        const auto frame = state->frame();
+        switch (*step) {
+        case 0:
+            if (frame.value("editor_only").toBool() != expected || state->paneIds().size() != (expected ? 1 : 3)) {
+                finish(false, "Wrong startup mode or visible pane count");
+                return;
+            }
+            window->grabWindow().save(dir + "/startup.png");
+            if (expected && QFile::exists(dir + "/shell-starts")) {
+                finish(false, "Editor-only startup launched a hidden shell");
+                return;
+            }
+            if (auto button = findItem(window->contentItem(), "workspaceToggleButton")) {
+                QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                                  button->mapToScene(QPointF(button->width()/2, button->height()/2)).toPoint());
+            } else {
+                finish(false, "Missing workspace toggle button");
+                return;
+            }
+            break;
+        case 1:
+            if (frame.value("editor_only").toBool() == expected) {
+                finish(false, "Workspace button did not toggle the layout");
+                return;
+            }
+            QTest::keyClick(window, Qt::Key_F10);
+            break;
+        case 2:
+            if (frame.value("editor_only").toBool() != expected) {
+                finish(false, "F10 did not restore startup layout");
+                return;
+            }
+            QTest::keyClick(window, Qt::Key_Comma, Qt::ControlModifier);
+            break;
+        case 3: {
+            auto dialog = window->findChild<QObject *>("settingsDialog");
+            auto setting = findItem(window->contentItem(), "settingsFileStartup");
+            if (!dialog || !dialog->property("visible").toBool() || !setting) {
+                finish(false, QString("Settings shortcut: dialog=%1, control=%2, prompt=%3, focus=%4")
+                    .arg(dialog && dialog->property("visible").toBool()).arg(bool(setting))
+                    .arg(frame.value("prompt").toMap().value("kind").toString())
+                    .arg(window->activeFocusItem() ? window->activeFocusItem()->objectName() : "none"));
+                return;
+            }
+            setting->forceActiveFocus();
+            QTest::keyClick(window, Qt::Key_End);
+            break;
+        }
+        case 4: {
+            if (!read(dir + "/config/slate/settings.toml").contains("file_startup = \"workspace\"")) {
+                finish(false, "File startup control did not save its setting");
+                return;
+            }
+            auto setting = findItem(window->contentItem(), "settingsDirectoryStartup");
+            if (!setting) {
+                finish(false, "Missing directory startup control");
+                return;
+            }
+            setting->forceActiveFocus();
+            QTest::keyClick(window, Qt::Key_Home);
+            break;
+        }
+        case 5:
+            if (!read(dir + "/config/slate/settings.toml").contains("directory_startup = \"editor-only\"")) {
+                finish(false, "Directory startup control did not save its setting");
+                return;
+            }
+            if (frame.value("editor_only").toBool() != expected) {
+                finish(false, "Startup setting changed the current layout");
+                return;
+            }
+            window->grabWindow().save(dir + "/settings.png");
+            QTest::keyClick(window, Qt::Key_Escape);
+            window->resize(480, 320);
+            break;
+        case 6:
+            if (const auto error = checkLayout(state, window); !error.isEmpty()) {
+                finish(false, error);
+                return;
+            }
+            window->grabWindow().save(dir + "/compact.png");
+            finish(true, "Startup mode, lazy shells, workspace button/F10, settings shortcut and persisted startup controls");
+            return;
+        }
+        ++*step;
+    });
+    timer->start(150);
+}
+
 void startSmoke(Bridge *state, QQuickWindow *window) {
+    if (!qEnvironmentVariableIsEmpty("SLATE_GUI_STARTUP_SMOKE")) {
+        startStartupSmoke(state, window);
+        return;
+    }
     if (!qEnvironmentVariableIsEmpty("SLATE_GUI_GIT_SMOKE")) {
         startGitSmoke(state, window);
         return;

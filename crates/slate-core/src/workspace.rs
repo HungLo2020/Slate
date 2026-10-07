@@ -104,13 +104,17 @@ pub struct WorkspaceStore {
     pub path: PathBuf,
     _lock: File,
 }
+impl Drop for WorkspaceStore {
+    fn drop(&mut self) {
+        // A concurrently forked worker can briefly inherit this descriptor.
+        // Release the lock explicitly rather than waiting for every inherited
+        // descriptor to close, so an immediate restart can acquire the store.
+        let _ = FileExt::unlock(&self._lock);
+    }
+}
 impl WorkspaceStore {
     pub fn acquire(root: &Path) -> Result<Self> {
-        let state = std::env::var_os("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state")
-            });
+        let state = crate::paths::state_dir();
         Self::acquire_in(root, &state)
     }
     pub fn acquire_in(root: &Path, state: &Path) -> Result<Self> {
@@ -206,21 +210,29 @@ impl App {
                         }
                     }
                 }
+                // Prepare recovered shells before replacing the live model. A
+                // spawn failure must leave a complete, usable current workspace.
                 let mut terminals = BTreeMap::new();
-                for (id, cwd) in &w.terminals {
-                    terminals.insert(
-                        *id,
-                        TerminalSession::spawn(
+                if !self.editor_only {
+                    for (id, cwd) in &w.terminals {
+                        let mut terminal = TerminalSession::spawn(
                             if cwd.is_dir() { cwd } else { &self.root },
                             None,
                             24,
                             80,
-                        )?,
-                    );
+                        )?;
+                        terminal.set_events(self.events.clone());
+                        terminals.insert(*id, terminal);
+                    }
                 }
                 self.documents = w.documents;
                 self.views = w.views;
                 self.terminals = terminals;
+                self.deferred_terminals = if self.editor_only {
+                    w.terminals
+                } else {
+                    BTreeMap::new()
+                };
                 self.layout = w.layout;
                 self.focus = w.focus;
                 self.ids = w.ids;
@@ -238,6 +250,10 @@ impl App {
                     self.dispatch(Command::Open { path });
                 }
             }
+        }
+        self.select_editor_pane();
+        if !self.editor_only {
+            self.ensure_terminals()?;
         }
         for terminal in self.terminals.values_mut() {
             terminal.set_events(self.events.clone());
@@ -261,6 +277,11 @@ impl App {
                 .terminals
                 .iter()
                 .map(|(id, t)| (*id, t.cwd()))
+                .chain(
+                    self.deferred_terminals
+                        .iter()
+                        .map(|(id, cwd)| (*id, cwd.clone())),
+                )
                 .collect(),
             layout: self.layout.clone(),
             focus: self.focus,
@@ -305,5 +326,24 @@ impl Drop for App {
                 eprintln!("Could not persist Slate workspace: {e:#}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn releasing_the_store_unlocks_even_with_an_inherited_descriptor() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let store = WorkspaceStore::acquire_in(root.path(), state.path()).unwrap();
+        let inherited = store._lock.try_clone().unwrap();
+        assert!(WorkspaceStore::acquire_in(root.path(), state.path()).is_err());
+        drop(store);
+        let reopened = WorkspaceStore::acquire_in(root.path(), state.path()).unwrap();
+        drop(inherited);
+        assert!(WorkspaceStore::acquire_in(root.path(), state.path()).is_err());
+        drop(reopened);
     }
 }

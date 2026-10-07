@@ -437,7 +437,7 @@ fn render(
         );
         if let Some(screen) = &p.screen {
             frame.render_widget(Grid(screen), content);
-            if focus && palette.is_none() {
+            if focus && palette.is_none() && s.prompt.is_none() {
                 if let Some((y, x)) = screen.cursor {
                     if x < content.width && y < content.height {
                         frame.set_cursor_position((content.x + x, content.y + y));
@@ -483,7 +483,13 @@ fn render(
         Rect::new(0, size.height.saturating_sub(1), size.width, 1),
     );
     if let Some(prompt) = &s.prompt {
-        let height = if prompt.kind == "replace" { 8 } else { 6 };
+        let height = if prompt.kind == "settings" {
+            (s.settings.menu_items().len() as u16 + 4).min(size.height.saturating_sub(2))
+        } else if prompt.kind == "replace" {
+            8
+        } else {
+            6
+        };
         let area = Rect::new(
             1,
             size.height.saturating_sub(height + 1),
@@ -491,47 +497,82 @@ fn render(
             height,
         );
         frame.render_widget(Clear, area);
-        let text = if prompt.kind == "replace" {
-            format!("Find: {}\nWith: {}\nTab switches fields · Enter replaces next · Ctrl-Enter replaces all\nEscape closes",clean(&prompt.input),clean(&prompt.replacement))
+        if prompt.kind == "settings" {
+            let items = s
+                .settings
+                .menu_items()
+                .into_iter()
+                .map(|(label, value)| ListItem::new(format!("{label}: {value}")))
+                .collect::<Vec<_>>();
+            frame.render_widget(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Settings · saved automatically"),
+                area,
+            );
+            let mut state = ListState::default().with_selected(Some(prompt.field));
+            frame.render_stateful_widget(
+                List::new(items).highlight_style(Style::default().bg(Color::DarkGray)),
+                Rect::new(
+                    area.x + 1,
+                    area.y + 1,
+                    area.width.saturating_sub(2),
+                    area.height.saturating_sub(4),
+                ),
+                &mut state,
+            );
+            frame.render_widget(
+                Paragraph::new("↑↓ select · ←→ / Enter change · Escape closes"),
+                Rect::new(
+                    area.x + 1,
+                    area.y + area.height.saturating_sub(2),
+                    area.width.saturating_sub(2),
+                    1,
+                ),
+            );
         } else {
-            format!("> {}\nEnter confirms · Escape closes", clean(&prompt.input))
-        };
-        let text = if ["find", "replace"].contains(&prompt.kind.as_str()) {
-            format!(
-                "{text}\nAlt-C case: {} · Alt-W whole word: {}",
-                if prompt.case_sensitive { "on" } else { "off" },
-                if prompt.whole_word { "on" } else { "off" }
-            )
-        } else {
-            text
-        };
-        frame.render_widget(
-            Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(
-                match prompt.kind.as_str() {
-                    "open" => "Open file or directory",
-                    "save-as" => "Save to a new file path",
-                    "commit" => "Commit message",
-                    "settings" => "Settings: option value (indent-width, theme, line-numbers…)",
-                    "layout-save" => "Save layout name",
-                    "layout-load" => "Load layout name",
-                    "move-pane" => "Target pane number",
-                    kind => kind,
-                },
-            )),
-            area,
-        );
-        let value = if prompt.field == 0 {
-            &prompt.input
-        } else {
-            &prompt.replacement
-        };
-        let prefix = if prompt.kind == "replace" { 6 } else { 3 };
-        frame.set_cursor_position((
-            area.x
-                + (prefix + slate_core::document::display_width(value) as u16)
-                    .min(area.width.saturating_sub(2)),
-            area.y + 1 + prompt.field as u16,
-        ));
+            let text = if prompt.kind == "replace" {
+                format!("Find: {}\nWith: {}\nTab switches fields · Enter replaces next · Ctrl-Enter replaces all\nEscape closes",clean(&prompt.input),clean(&prompt.replacement))
+            } else {
+                format!("> {}\nEnter confirms · Escape closes", clean(&prompt.input))
+            };
+            let text = if ["find", "replace"].contains(&prompt.kind.as_str()) {
+                format!(
+                    "{text}\nAlt-C case: {} · Alt-W whole word: {}",
+                    if prompt.case_sensitive { "on" } else { "off" },
+                    if prompt.whole_word { "on" } else { "off" }
+                )
+            } else {
+                text
+            };
+            frame.render_widget(
+                Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(
+                    match prompt.kind.as_str() {
+                        "open" => "Open file or directory",
+                        "save-as" => "Save to a new file path",
+                        "commit" => "Commit message",
+                        "settings" => "Settings: option value (indent-width, theme, line-numbers…)",
+                        "layout-save" => "Save layout name",
+                        "layout-load" => "Load layout name",
+                        "move-pane" => "Target pane number",
+                        kind => kind,
+                    },
+                )),
+                area,
+            );
+            let value = if prompt.field == 0 {
+                &prompt.input
+            } else {
+                &prompt.replacement
+            };
+            let prefix = if prompt.kind == "replace" { 6 } else { 3 };
+            frame.set_cursor_position((
+                area.x
+                    + (prefix + slate_core::document::display_width(value) as u16)
+                        .min(area.width.saturating_sub(2)),
+                area.y + 1 + prompt.field as u16,
+            ));
+        }
     }
     if let Some(text) = palette {
         let height = size.height.saturating_sub(4).min(16);

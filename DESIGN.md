@@ -108,6 +108,30 @@ weight, cursor location and context-sensitive shortcut hints make state explicit
 The TUI presents equivalent prompts with keyboard controls and the same shared
 rendered cells. Settings can force light/dark colors or remap scoped shortcuts.
 
+## Startup presentation
+
+The core chooses editor-only or workspace presentation from persistent file and
+directory defaults, with an optional CLI override. The selection precedes
+recovery and stays authoritative after recovery: requested files do not inherit
+an old session's tool focus. Editor-only presentation projects one editor pane
+from the complete split tree; it does not replace that tree or discard views.
+The shared toggle action therefore preserves tabs, geometry, cursors, history
+and running terminals. Splitting or explicitly opening a tool expands the
+workspace. Pane cycling cannot focus hidden tools while editor-only is active.
+
+Terminal resource IDs and remembered working directories can exist without a
+process. Editor-only startup and recovery defer shell creation until expansion.
+Checkpoints include both live and deferred terminal resources, preserving valid
+layout references. Recovery in workspace mode prepares shells before replacing
+the current model, so a spawn failure leaves the current workspace usable.
+
+GUI startup controls and the TUI settings list use the same preferences and
+configuration commands. Settings changes affect subsequent launches; presentation
+toggles never write startup preferences. Configured key maps from older releases
+receive the new default bindings without replacing explicit assignments.
+Configuration paths and state paths share XDG resolution, rejecting relative
+base paths and treating empty values as unset.
+
 ## History and file I/O
 
 Undo entries store a start offset, removed text, inserted text and cursor

@@ -226,6 +226,27 @@ const ACTIONS: &[(&str, &str, &str, &str, &str)] = &[
         "any",
     ),
     (
+        "toggle-workspace",
+        "Expand / collapse workspace",
+        "Switch between the editor and the full workspace without closing views",
+        "",
+        "any",
+    ),
+    (
+        "editor-only",
+        "Show editor only",
+        "Hide tool panes and keep their tabs and terminal sessions",
+        "",
+        "any",
+    ),
+    (
+        "workspace",
+        "Expand workspace",
+        "Restore the full pane layout",
+        "",
+        "any",
+    ),
+    (
         "preset development",
         "Layout: three panes",
         "Files, editor and terminal side by side",
@@ -370,7 +391,7 @@ impl App {
                 "unstaged" => {
                     self.git_repository && self.git_jobs == 0 && self.git.iter().any(|e| !e.staged)
                 }
-                "pane" => self.layout.panes().len() > 1,
+                "pane" => !self.editor_only && self.layout.panes().len() > 1,
                 _ => true,
             };
             if scope == "git" {
@@ -407,6 +428,7 @@ impl App {
                     "git" => "Select a Git change; wait for running operations",
                     "repository" => "Stage changes in a Git repository first",
                     "unstaged" => "No unstaged changes, or a Git operation is running",
+                    "pane" if self.editor_only => "Expand the workspace first",
                     "pane" => "The final pane cannot be closed",
                     _ => "Focus an editor or terminal",
                 }
