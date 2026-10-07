@@ -1,5 +1,6 @@
 <RCC>
     <qresource prefix="/slate">
+        <file alias="slate.svg">../../../resources/slate.svg</file>
         <file>Main.qml</file>
         <file>ActionButton.qml</file>
         <file>Hint.qml</file>

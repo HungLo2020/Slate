@@ -1,5 +1,6 @@
 // Built only with the gui-smoke Cargo feature. No test machinery in normal builds.
 #include "bridge.h"
+#include <QIcon>
 #include <QClipboard>
 #include <QDir>
 #include <QFile>
@@ -913,6 +914,12 @@ static void startStartupSmoke(Bridge *state, QQuickWindow *window) {
 
 void startPerformanceSmoke(Bridge *, QQuickWindow *);
 void startSmoke(Bridge *state, QQuickWindow *window) {
+    if (QGuiApplication::desktopFileName() != "slate" ||
+        QGuiApplication::windowIcon().pixmap(64, 64).isNull()) {
+        qWarning("Application desktop identity or embedded SVG icon is missing");
+        QGuiApplication::exit(2);
+        return;
+    }
     if (!qEnvironmentVariableIsEmpty("SLATE_GUI_PERF_SMOKE")) {
         startPerformanceSmoke(state, window);
         return;

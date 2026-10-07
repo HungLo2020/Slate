@@ -16,7 +16,7 @@ artifact = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else root / f"builds/sl
 fields = subprocess.check_output(["dpkg-deb", "--show", "--showformat=${Package}\n${Version}\n${Architecture}\n${Depends}\n", str(artifact)], text=True).splitlines()
 assert fields[:3] == ["slate", version, "amd64"], fields
 assert "private-abi" not in fields[3] and " (= " not in fields[3], fields[3]
-for dependency in ("qml6-module-org-kde-kirigami", "qml6-module-qtquick-controls", "qml6-module-qtqml-workerscript", "git"):
+for dependency in ("qml6-module-org-kde-kirigami", "qml6-module-qtquick-controls", "qml6-module-qtqml-workerscript", "qt6-svg-plugins", "git"):
     assert dependency in fields[3], dependency
 contents = subprocess.check_output(["dpkg-deb", "--fsys-tarfile", str(artifact)])
 with tarfile.open(fileobj=io.BytesIO(contents)) as archive:
@@ -33,9 +33,10 @@ with tempfile.TemporaryDirectory(prefix="slate-deb-smoke-") as temporary:
     assert alias.is_symlink() and os.readlink(alias) == "slate" and alias.resolve() == binary
     assert os.access(binary, os.X_OK)
     assert subprocess.check_output([str(binary), "--version"], text=True).strip() == f"Slate {version}"
-    assert (destination / "usr/share/icons/hicolor/scalable/apps/slate.svg").is_file()
+    assert (destination / "usr/share/icons/hicolor/scalable/apps/slate.svg").read_bytes() == (root / "resources/slate.svg").read_bytes()
     desktop = destination / "usr/share/applications/slate.desktop"
     assert "Exec=slate-gui %f" in desktop.read_text()
+    assert "Icon=slate" in desktop.read_text()
     subprocess.run([sys.executable, str(root / "scripts/tui-smoke.py"), str(binary)], check=True)
     subprocess.run([sys.executable, str(root / "scripts/startup-smoke.py"), str(binary), "--tui-only"], check=True)
     if "--tui-only" not in sys.argv[2:]:

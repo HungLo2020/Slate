@@ -35,7 +35,7 @@ if [ "$mode" = gui ]; then
     ln -sfn slate "$prefix/bin/slate-gui"
     repo_dir=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
     install -Dm644 "$repo_dir/packaging/slate.desktop" "$prefix/share/applications/slate.desktop"
-    install -Dm644 "$repo_dir/packaging/slate.svg" "$prefix/share/icons/hicolor/scalable/apps/slate.svg"
+    install -Dm644 "$repo_dir/resources/slate.svg" "$prefix/share/icons/hicolor/scalable/apps/slate.svg"
     if command -v update-desktop-database >/dev/null 2>&1; then update-desktop-database "$prefix/share/applications"; fi
 fi
 printf 'Installed Slate in %s/bin\n' "$prefix"

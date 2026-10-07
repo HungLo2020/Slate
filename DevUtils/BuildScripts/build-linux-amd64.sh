@@ -30,7 +30,7 @@ mkdir -p "$package_root/DEBIAN" "$package_root/usr/bin" "$staging/debian"
 install -m755 "$target_dir/release/slate" "$package_root/usr/bin/slate"
 ln -s slate "$package_root/usr/bin/slate-gui"
 install -Dm644 packaging/slate.desktop "$package_root/usr/share/applications/slate.desktop"
-install -Dm644 packaging/slate.svg "$package_root/usr/share/icons/hicolor/scalable/apps/slate.svg"
+install -Dm644 resources/slate.svg "$package_root/usr/share/icons/hicolor/scalable/apps/slate.svg"
 install -Dm644 README.md "$package_root/usr/share/doc/slate/README.md"
 
 echo "[build] Computing shared-library dependencies" >&2

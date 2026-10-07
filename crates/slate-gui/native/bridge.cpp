@@ -7,6 +7,7 @@
 #include <QHoverEvent>
 #include <QInputMethod>
 #include <QInputMethodEvent>
+#include <QIcon>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QKeyEvent>
@@ -593,7 +594,9 @@ extern "C" int slate_qt_run(void *context) {
 #endif
     app.setApplicationName("Slate");
     app.setOrganizationName("Slate");
+    app.setDesktopFileName("slate");
     initializeResources();
+    app.setWindowIcon(QIcon(":/slate/slate.svg"));
     Bridge state(context);
     bridge = &state;
     qmlRegisterType<CellView>("Slate.Native", 1, 0, "CellView");

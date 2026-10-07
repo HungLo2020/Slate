@@ -91,15 +91,20 @@ with `bash DevUtils/InstallDependencies.sh`, then:
 
 ```bash
 bash DevUtils/Build.sh
-python3 scripts/deb-smoke.py builds/slate_0.1.0_amd64.deb
-sudo apt install ./builds/slate_0.1.0_amd64.deb
+python3 scripts/deb-smoke.py builds/slate_0.1.1_amd64.deb
+sudo apt install ./builds/slate_0.1.1_amd64.deb
 ```
 
 The package includes `/usr/bin/slate`, the `slate-gui` symlink, desktop entry,
 icon and README. Shared-library requirements come from `dpkg-shlibdeps`; QML
 modules, SVG plugins and Git are declared separately. It does not bundle Qt or
-require an exact Qt runtime version. The manual **Build Linux amd64 DEB** workflow
-builds in Ubuntu 26.04, matching Basalt's target distribution, and keeps the
+require an exact Qt runtime version.
+
+The application icon comes from `resources/slate.svg`, embedded in the GUI and
+installed into the standard hicolor icon theme for the desktop launcher.
+
+The manual **Build Linux amd64 DEB** workflow builds in Ubuntu 26.04, matching
+Basalt's target distribution, and keeps the
 package as a workflow artifact. A locally built package targets the libraries on
 that build host, so it may require newer libraries than older distributions have.
 

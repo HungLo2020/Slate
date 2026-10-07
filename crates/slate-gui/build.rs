@@ -1,5 +1,6 @@
 fn main() {
     println!("cargo:rerun-if-changed=native");
+    println!("cargo:rerun-if-changed=../../resources/slate.svg");
     let smoke = std::env::var_os("CARGO_FEATURE_SMOKE").is_some();
     let dst = cmake::Config::new("native")
         .define("SLATE_SMOKE_TEST", if smoke { "ON" } else { "OFF" })
