@@ -840,7 +840,7 @@ Kirigami.ApplicationWindow {
                 textFormat: Text.PlainText
                 Layout.fillWidth: true
                 Layout.minimumWidth: 0
-                text: root.frame.status || ""
+                text: root.frame.hints || ""
                 elide: Text.ElideRight
                 Hint {
                     anchorItem: statusLabel
