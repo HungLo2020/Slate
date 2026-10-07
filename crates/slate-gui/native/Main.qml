@@ -15,8 +15,6 @@ Kirigami.ApplicationWindow {
     visible: true
     title: "Slate"
     property var frame: slate.frame
-    // Fetch action availability and configured shortcuts only when a menu opens.
-    property var menuCommands: []
     property int priorFocus: -1
     property string priorPaneKey: ""
     // Pane delegates are recreated when compact layouts change their visible
@@ -100,36 +98,30 @@ Kirigami.ApplicationWindow {
                 item.focusContent();
         }
     }
-    function invokeAction(id) {
-        if (id === "quit") {
-            root.close();
-            return;
+    function invokeAction(id, argument, paneId, row) {
+        if (paneId) {
+            root.send({"action": "focus", "pane": paneId});
+            if (row !== undefined && row >= 0)
+                root.send({"action": "click", "pane": paneId, "row": row, "col": 0});
         }
-        if (id === "settings") {
-            settingsDialog.open();
-            return;
-        }
-        if (id === "discard-quit" || id === "discard-document") {
-            confirmDiscard.actionId = id;
-            confirmDiscard.open();
-            return;
-        }
-        root.send({
-            "action": "invoke_action",
-            "id": id
-        });
+        root.send({"action": "invoke_action", "id": id, "argument": argument || ""});
     }
-    function menuCommand(id) {
-        return menuCommands.find(function (command) { return command.id === id; }) || {};
+    function commandInfo(id, paneId, row) {
+        // A revision dependency updates bindings; Bridge caches the catalog so
+        // controls share one request for each context until state changes.
+        var revision = root.frame.command_revision;
+        return slate.commandInfo(id, paneId || 0, row === undefined ? -1 : row);
     }
     component CommandMenuItem: Basic.MenuItem {
         id: commandItem
         required property string actionId
         property string label: ""
-        readonly property var commandInfo: root.menuCommand(actionId)
+        property int commandPane: 0
+        readonly property var commandInfo: root.commandInfo(actionId, commandPane)
         objectName: "menuAction_" + actionId
         text: label || commandInfo.name || actionId
         enabled: commandInfo.enabled === true
+        height: visible ? implicitHeight : 0
         font: root.font
         contentItem: RowLayout {
             spacing: 24
@@ -145,7 +137,7 @@ Kirigami.ApplicationWindow {
                 color: Kirigami.Theme.disabledTextColor
             }
         }
-        onTriggered: root.invokeAction(actionId)
+        onTriggered: root.invokeAction(actionId, "", commandPane)
     }
     function paletteWith(text) {
         commandText.text = text || "";
@@ -156,11 +148,17 @@ Kirigami.ApplicationWindow {
     onClosing: function (close) {
         close.accepted = false;
         slate.exit();
-        if (slate.frame.dirty)
-            quitDialog.open();
     }
     Connections {
         target: slate
+        function onConfirmationRequested(id) {
+            if (id === "quit") {
+                quitDialog.open();
+            } else {
+                confirmDiscard.actionId = id;
+                confirmDiscard.open();
+            }
+        }
         function onPathDialogOpenChanged() {
             if (!slate.pathDialogOpen)
                 Qt.callLater(root.focusPane);
@@ -222,6 +220,15 @@ Kirigami.ApplicationWindow {
         sequence: "Ctrl+Shift+P"
         onActivated: root.paletteWith("")
     }
+    Instantiator {
+        model: root.frame.global_shortcuts || []
+        delegate: Shortcut {
+            required property string modelData
+            sequence: modelData
+            enabled: !root.frame.prompt && !palette.visible && !editPrompt.visible && !settingsDialog.visible && !confirmDiscard.visible && !quitDialog.visible && !slate.pathDialogOpen && !slate.closeDialogOpen
+            onActivated: root.send({"action": "shortcut", "chord": modelData})
+        }
+    }
     menuBar: Basic.MenuBar {
         id: mainMenuBar
         objectName: "mainMenuBar"
@@ -238,7 +245,6 @@ Kirigami.ApplicationWindow {
         Menu {
             objectName: "fileMenu"
             title: "&File"
-            onAboutToShow: root.menuCommands = slate.commands("")
             CommandMenuItem { actionId: "new"; label: "New File" }
             CommandMenuItem { actionId: "open"; label: "Open File…" }
             CommandMenuItem { actionId: "open-folder"; label: "Open Folder…" }
@@ -255,7 +261,6 @@ Kirigami.ApplicationWindow {
         Menu {
             objectName: "editMenu"
             title: "&Edit"
-            onAboutToShow: root.menuCommands = slate.commands("")
             CommandMenuItem { actionId: "undo" }
             CommandMenuItem { actionId: "redo" }
             MenuSeparator {}
@@ -273,7 +278,6 @@ Kirigami.ApplicationWindow {
         Menu {
             objectName: "viewMenu"
             title: "&View"
-            onAboutToShow: root.menuCommands = slate.commands("")
             MenuItem {
                 objectName: "menuAction_commands"
                 text: "Command Palette…"
@@ -303,7 +307,6 @@ Kirigami.ApplicationWindow {
         Menu {
             objectName: "goMenu"
             title: "&Go"
-            onAboutToShow: root.menuCommands = slate.commands("")
             CommandMenuItem { actionId: "prompt-goto" }
             CommandMenuItem { actionId: "find-next" }
             CommandMenuItem { actionId: "find-previous" }
@@ -314,7 +317,6 @@ Kirigami.ApplicationWindow {
         Menu {
             objectName: "terminalMenu"
             title: "&Terminal"
-            onAboutToShow: root.menuCommands = slate.commands("")
             CommandMenuItem { actionId: "terminal" }
             CommandMenuItem { actionId: "terminate-terminal"; label: "Close Terminal" }
             MenuSeparator {}
@@ -549,6 +551,7 @@ Kirigami.ApplicationWindow {
                     height: Math.max(0, panel.height - y - 2)
                     visible: panel.paneData.kind === "git"
                     bridge: slate
+                    commandInfoFor: function (id, row) { return root.commandInfo(id, panel.paneId, row); }
                     frame: root.gitFrame
                     paneData: ({
                             "selected": panel.paneData.selected || 0
@@ -562,15 +565,10 @@ Kirigami.ApplicationWindow {
                     onCommitRequested: function (message) {
                         root.gitSubmittedMessage = message;
                         root.gitCommitting = true;
-                        slate.send({
-                            "action": "git_commit",
-                            "message": message
-                        });
-                        slate.refresh();
+                        root.invokeAction("commit", message, panel.paneId);
                     }
                     onActionRequested: function (action) {
-                        slate.send(action);
-                        slate.refresh();
+                        root.send(action);
                     }
                 }
                 ListView {
@@ -679,129 +677,108 @@ Kirigami.ApplicationWindow {
                 }
                 Menu {
                     id: paneMenu
+                    objectName: "paneMenu_" + panel.paneId
                     x: Math.max(0, panel.width - width - 2)
                     y: root.paneHeaderHeight + 2
-                    MenuItem {
-                        text: "Save document"
-                        enabled: !panel.paneData.read_only
+                    CommandMenuItem {
+                        actionId: "save"
+                        commandPane: panel.paneId
+                        label: "Save document"
                         visible: panel.paneData.kind === "editor"
-                        onTriggered: root.send({
-                            "action": "save"
-                        })
                     }
-                    MenuItem {
-                        text: "Find…"
+                    CommandMenuItem {
+                        actionId: "prompt-find"
+                        commandPane: panel.paneId
+                        label: "Find…"
                         visible: panel.paneData.kind === "editor"
-                        onTriggered: root.send({
-                            "action": "prompt",
-                            "kind": "find"
-                        })
                     }
-                    MenuItem {
-                        text: "New terminal"
+                    CommandMenuItem {
+                        actionId: "terminal"
+                        commandPane: panel.paneId
+                        label: "New terminal"
                         visible: panel.paneData.kind === "terminal"
-                        onTriggered: root.send({
-                            "action": "new_terminal"
-                        })
                     }
-                    MenuItem {
-                        text: "Split right"
-                        onTriggered: root.send({
-                            "action": "split",
-                            "axis": "horizontal"
-                        })
+                    CommandMenuItem {
+                        actionId: "split-right"
+                        commandPane: panel.paneId
+                        label: "Split right"
                     }
-                    MenuItem {
-                        text: "Split below"
-                        onTriggered: root.send({
-                            "action": "split",
-                            "axis": "vertical"
-                        })
+                    CommandMenuItem {
+                        actionId: "split-down"
+                        commandPane: panel.paneId
+                        label: "Split below"
                     }
                     MenuSeparator {}
-                    MenuItem {
-                        text: "Copy selection"
-                        onTriggered: slate.copyClipboard()
+                    CommandMenuItem {
+                        actionId: "copy"
+                        commandPane: panel.paneId
+                        label: "Copy selection"
                     }
-                    MenuItem {
-                        text: "Paste"
-                        onTriggered: slate.pasteClipboard()
-                    }
-                    MenuSeparator {}
-                    MenuItem {
-                        text: "Files view"
-                        onTriggered: root.send({
-                            "action": "add_view",
-                            "kind": "files"
-                        })
-                    }
-                    MenuItem {
-                        text: "Git view"
-                        onTriggered: root.send({
-                            "action": "add_view",
-                            "kind": "git"
-                        })
-                    }
-                    MenuItem {
-                        text: "Editor view"
-                        onTriggered: root.send({
-                            "action": "add_view",
-                            "kind": "editor"
-                        })
-                    }
-                    MenuItem {
-                        text: "Terminal view"
-                        onTriggered: root.send({
-                            "action": "new_terminal"
-                        })
+                    CommandMenuItem {
+                        actionId: "paste"
+                        commandPane: panel.paneId
                     }
                     MenuSeparator {}
-                    MenuItem {
-                        text: "Close pane"
-                        onTriggered: root.send({
-                            "action": "close_pane"
-                        })
+                    CommandMenuItem {
+                        actionId: "files"
+                        commandPane: panel.paneId
+                        label: "Files view"
                     }
-                    MenuItem {
-                        text: "Move/swap pane…"
-                        onTriggered: root.invokeAction("move-pane")
+                    CommandMenuItem {
+                        actionId: "git"
+                        commandPane: panel.paneId
+                        label: "Git view"
                     }
-                    MenuItem {
-                        text: "Terminate terminal"
-                        visible: panel.paneData.kind === "terminal"
-                        onTriggered: root.send({
-                            "action": "terminate_terminal"
-                        })
+                    CommandMenuItem {
+                        actionId: "editor"
+                        commandPane: panel.paneId
+                        label: "Editor view"
+                    }
+                    CommandMenuItem {
+                        actionId: "terminal"
+                        commandPane: panel.paneId
+                        label: "Terminal view"
                     }
                     MenuSeparator {}
-                    MenuItem {
-                        text: "Stage selected"
-                        enabled: (root.frame.commands || []).some(function (c) {
-                            return c.id === "stage" && c.enabled;
-                        })
-                        visible: panel.paneData.kind === "git"
-                        onTriggered: root.invokeAction("stage")
+                    CommandMenuItem {
+                        actionId: "close-pane"
+                        commandPane: panel.paneId
+                        label: "Close pane"
                     }
-                    MenuItem {
-                        text: "Unstage selected"
-                        enabled: (root.frame.commands || []).some(function (c) {
-                            return c.id === "unstage" && c.enabled;
-                        })
-                        visible: panel.paneData.kind === "git"
-                        onTriggered: root.invokeAction("unstage")
+                    CommandMenuItem {
+                        actionId: "move-pane"
+                        commandPane: panel.paneId
+                        label: "Move or swap pane…"
                     }
-                    MenuItem {
-                        text: "View diff"
-                        enabled: (root.frame.commands || []).some(function (c) {
-                            return c.id === "diff" && c.enabled;
-                        })
-                        visible: panel.paneData.kind === "git"
-                        onTriggered: root.invokeAction("diff")
+                    CommandMenuItem {
+                        actionId: "toggle-workspace"
+                        commandPane: panel.paneId
+                        label: "Expand/collapse workspace"
                     }
-                    MenuItem {
-                        text: "Commit…"
+                    MenuSeparator {}
+                    CommandMenuItem {
+                        actionId: "stage"
+                        commandPane: panel.paneId
+                        label: "Stage selected"
                         visible: panel.paneData.kind === "git"
-                        onTriggered: root.invokeAction("commit")
+                    }
+                    CommandMenuItem {
+                        actionId: "unstage"
+                        commandPane: panel.paneId
+                        label: "Unstage selected"
+                        visible: panel.paneData.kind === "git"
+                    }
+                    CommandMenuItem {
+                        actionId: "diff"
+                        commandPane: panel.paneId
+                        label: "View diff"
+                        visible: panel.paneData.kind === "git"
+                    }
+                    CommandMenuItem {
+                        actionId: "commit"
+                        commandPane: panel.paneId
+                        label: "Commit…"
+                        visible: panel.paneData.kind === "git"
                     }
                 }
             }
@@ -899,6 +876,7 @@ Kirigami.ApplicationWindow {
                 "layout-save": "Save layout",
                 "layout-load": "Load layout",
                 "move-pane": "Move or swap pane",
+                "stage-group": "Stage a change group",
                 "settings": "Settings"
             })[prompt.kind] || "Input"
         anchors.centerIn: parent
@@ -938,6 +916,7 @@ Kirigami.ApplicationWindow {
                             "layout-save": "Layout name",
                             "layout-load": "Saved layout name",
                             "move-pane": "Target pane number",
+                            "stage-group": "Change group, e.g. Untracked",
                             "settings": "Option and value, e.g. indent-width 4"
                         })[editPrompt.prompt.kind] || "Find text"
                     onTextEdited: editPrompt.update()
@@ -1260,6 +1239,7 @@ Kirigami.ApplicationWindow {
     }
     Dialog {
         id: confirmDiscard
+        objectName: "confirmDiscard"
         enter: Transition {}
         exit: Transition {}
         property string actionId
@@ -1276,8 +1256,10 @@ Kirigami.ApplicationWindow {
         }
         onDiscarded: root.send({
             "action": "invoke_action",
-            "id": actionId
+            "id": actionId,
+            "confirmed": true
         })
+        onClosed: Qt.callLater(root.focusPane)
     }
     Dialog {
         id: quitDialog
@@ -1288,6 +1270,7 @@ Kirigami.ApplicationWindow {
         anchors.centerIn: parent
         modal: true
         standardButtons: Dialog.Discard | Dialog.Cancel
+        onClosed: Qt.callLater(root.focusPane)
         width: Math.min(root.width - 40, 480)
         Label {
             textFormat: Text.PlainText
@@ -1297,7 +1280,8 @@ Kirigami.ApplicationWindow {
         }
         onDiscarded: root.send({
             "action": "quit",
-            "force": true
+            "force": true,
+            "confirmed": true
         })
     }
 }

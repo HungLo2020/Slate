@@ -1799,7 +1799,7 @@ impl App {
                     return Ok(());
                 }
                 "r" => {
-                    self.refresh();
+                    self.invoke_action("refresh", "")?;
                     return Ok(());
                 }
                 _ => {}
@@ -1832,11 +1832,8 @@ impl App {
                     "End" => *selected = length.saturating_sub(1),
                     "Enter" => {
                         if git {
-                            if let Some(e) = self.git.get(*selected) {
-                                return self.execute(Command::GitDiff {
-                                    path: e.path.clone(),
-                                    staged: e.staged,
-                                });
+                            if self.git.get(*selected).is_some() {
+                                return self.invoke_action("diff", "");
                             }
                         } else if let Some(e) = self.files.get(*selected) {
                             return self.execute(Command::Open {
@@ -2544,10 +2541,18 @@ pub fn terminal_key(k: &Key, application_cursor: bool) -> Vec<u8> {
 impl App {
     pub fn command_line(&mut self, line: &str) {
         self.revision += 1;
+        match self.resolve_command_input(line) {
+            Ok(cmd) => self.dispatch(cmd),
+            Err(error) => self.status = format!("Error: {error:#}"),
+        }
+    }
+    /// Resolve a command without executing it, so frontends can apply their
+    /// confirmation and clipboard policies after the shared parsing step.
+    pub fn resolve_command_line(&self, line: &str) -> Option<Command> {
         let (verb, args) = line.trim().split_once(' ').unwrap_or((line.trim(), ""));
         let args = args.trim();
         let selected = || self.selected_path().unwrap_or_default();
-        let cmd = match verb {
+        match verb {
             "prompt-find" | "prompt-replace" | "prompt-goto" => Some(Command::Prompt {
                 kind: verb.trim_start_matches("prompt-").into(),
             }),
@@ -2651,6 +2656,7 @@ impl App {
             "unstage" => Some(Command::GitUnstage { path: selected() }),
             "stage-all" => Some(Command::GitStageAll),
             "unstage-all" => Some(Command::GitUnstageAll),
+            "stage-group" => Some(Command::GitStageGroup { group: args.into() }),
             "diff" => Some(Command::GitDiff {
                 path: selected(),
                 staged: self.git.get(self.git_selected).is_some_and(|e| e.staged),
@@ -2659,13 +2665,6 @@ impl App {
                 message: args.into(),
             }),
             _ => None,
-        };
-        if let Some(cmd) = cmd {
-            self.dispatch(cmd);
-        } else {
-            self.status =
-                "Unknown or incomplete command. Open Commands (F1) to search available actions."
-                    .into();
         }
     }
 }

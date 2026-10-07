@@ -264,6 +264,19 @@ fn shared_actions_offer_context_and_argument_forms() {
         .unwrap();
     assert!(!undo.enabled);
     assert!(!undo.reason.is_empty());
+    app.dispatch(Command::Focus { pane: 2 });
+    app.preferences
+        .global_keys
+        .insert("Ctrl+s".into(), "quit".into());
+    assert!(
+        app.command_catalog("save")
+            .into_iter()
+            .find(|action| action.id == "save")
+            .unwrap()
+            .shortcut
+            .is_empty(),
+        "A shadowed editor binding must not be advertised"
+    );
     app.command_line("unknown-command");
     assert!(app.status.contains("F1"));
     assert!(app.status.len() < 120);
@@ -728,4 +741,48 @@ fn compact_editor_lines_preserve_tabs_unicode_and_selection_without_padding() {
     assert_eq!(overlays[0].start, 0);
     assert_eq!(overlays[0].length, 10); // UTF-16, including both surrogate pairs.
     assert_eq!(selected.cursor, Some((2, 0)));
+}
+
+#[test]
+fn scoped_catalogs_preserve_focus_and_report_the_requested_git_row() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    std::fs::write(dir.path().join("staged.txt"), "staged").unwrap();
+    std::fs::write(dir.path().join("untracked.txt"), "untracked").unwrap();
+    git(dir.path(), &["add", "staged.txt"]);
+    let mut app = App::new_with_startup(
+        dir.path(),
+        Some(slate_core::preferences::StartupMode::Workspace),
+    )
+    .unwrap();
+    app.dispatch(Command::Focus { pane: 1 });
+    app.dispatch(Command::AddView { kind: "git".into() });
+    let snapshot = git_ready(&mut app);
+    app.dispatch(Command::Focus { pane: 2 });
+    let focus = app.focus;
+    for (row, entry) in snapshot.git.iter().enumerate() {
+        let actions = app.command_catalog_for("", 1, Some(row));
+        let enabled = |id: &str| {
+            actions
+                .iter()
+                .find(|action| action.id == id)
+                .unwrap()
+                .enabled
+        };
+        assert_eq!(enabled("stage"), !entry.staged);
+        assert_eq!(enabled("unstage"), entry.staged);
+        assert!(enabled("diff"));
+        assert!(actions
+            .iter()
+            .filter(|action| matches!(action.id.as_str(), "stage" | "unstage"))
+            .all(|action| action.shortcut.is_empty()));
+    }
+    assert_eq!(app.focus, focus);
+    assert!(
+        !app.command_catalog_for("", 1, Some(100))
+            .into_iter()
+            .find(|action| action.id == "stage")
+            .unwrap()
+            .enabled
+    );
 }

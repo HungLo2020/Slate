@@ -16,7 +16,8 @@ with tempfile.TemporaryDirectory(prefix='slate-gui-offscreen-') as temporary:
     (workspace/'edit.txt').write_text('original\n')
     (workspace/'second.txt').write_text('second original')
     git_smoke = bool(os.environ.get('SLATE_GUI_GIT_SMOKE'))
-    if os.environ.get('SLATE_GUI_FEATURE_SMOKE') or git_smoke:
+    command_smoke = bool(os.environ.get('SLATE_GUI_COMMAND_SMOKE'))
+    if os.environ.get('SLATE_GUI_FEATURE_SMOKE') or git_smoke or command_smoke:
         def git(*args): subprocess.run(['git', '-C', str(workspace), *args], check=True, capture_output=True)
         git('init', '-q'); git('config', 'user.name', 'Slate test'); git('config', 'user.email', 'test@example.invalid')
         if git_smoke:
@@ -40,6 +41,10 @@ with tempfile.TemporaryDirectory(prefix='slate-gui-offscreen-') as temporary:
             hook = workspace/'.git/hooks/pre-commit'
             hook.write_text('#!/bin/sh\necho "Fixture hook rejected commit" >&2\nexit 1\n')
             hook.chmod(0o700)
+    if command_smoke:
+        (root/'config/slate').mkdir(parents=True)
+        (root/'config/slate/settings.toml').write_text(
+            '[global_keys]\n"f5" = "quit"\n"f4" = "discard-document"\n"f2" = "settings"\n"f3" = "layout-save"\n')
     (root/'runtime').mkdir(mode=0o700)
     platform = os.environ.get('SLATE_GUI_PLATFORM', 'offscreen')
     environment = {**os.environ, 'SLATE_GUI_SMOKE_DIR':temporary,

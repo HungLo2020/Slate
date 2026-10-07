@@ -33,6 +33,12 @@ file I/O in the shared Rust backend and currently supports local files.
 **Ctrl+O** opens a file, **Ctrl+Shift+O** opens a folder, and **Ctrl+Shift+S** saves
 as a new path. Saving an untitled document opens Save As automatically.
 
+GUI menus, pane menus, Git controls and the command palette share command
+availability with configured shortcuts. **Ctrl+Q** (or its configured replacement)
+and **File → Quit** use the same unsaved-changes confirmation; Cancel preserves
+all edits. Raw palette commands such as `:discard-quit` also require confirmation.
+Configured global shortcuts work in tool input fields as well as the editor.
+
 ```bash
 cargo build --release
 ./target/release/slate .                  # terminal mode

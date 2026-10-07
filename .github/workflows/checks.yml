@@ -47,6 +47,8 @@ jobs:
       - run: python3 scripts/startup-smoke.py target/debug/slate
       - run: python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: SLATE_GUI_FEATURE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
+      - run: SLATE_GUI_COMMAND_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
+      - run: SLATE_GUI_TAB_CLOSE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: SLATE_GUI_GIT_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: python3 scripts/gui-layout-smoke.py target/debug/slate
       - run: python3 scripts/recovery-smoke.py target/debug/slate

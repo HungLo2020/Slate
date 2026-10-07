@@ -10,6 +10,7 @@ FocusScope {
     required property var frame
     required property var paneData
     required property int paneId
+    required property var commandInfoFor
     signal actionRequested(var action)
     readonly property var entries: frame.git || []
     readonly property int stagedCount: entries.filter(function (e) {
@@ -41,8 +42,16 @@ FocusScope {
             });
         actionRequested(action);
     }
+    function commandInfo(id, row) {
+        return commandInfoFor(id, row);
+    }
+    function invokeAction(id, argument, row) {
+        if (row !== undefined && row >= 0)
+            send({"action": "click", "pane": paneId, "row": row, "col": 0});
+        send({"action": "invoke_action", "id": id, "argument": argument || ""});
+    }
     function commit() {
-        if (frame.git_busy || !stagedCount || !draft.trim().length)
+        if (!commandInfo("commit").enabled || !draft.trim().length)
             return;
         if (frame.focus !== paneId)
             send({
@@ -96,10 +105,8 @@ FocusScope {
                 iconName: "view-refresh"
                 tip: "Refresh Git changes"
                 flat: true
-                enabled: !view.frame.git_busy
-                onClicked: view.send({
-                    "action": "refresh"
-                })
+                enabled: view.commandInfo("refresh").enabled === true
+                onClicked: view.invokeAction("refresh")
             }
         }
         Basic.ScrollView {
@@ -162,7 +169,7 @@ FocusScope {
             highlighted: enabled
             text: view.committing ? "Committing…" : (view.compactHeight ? "Commit…" : "Commit") + (view.stagedCount ? " (" + view.stagedCount + ")" : "")
             tip: !view.stagedCount ? "Stage changes before committing" : !view.draft.trim().length ? "Enter a commit message" : "Commit staged changes (Ctrl+Enter)"
-            enabled: !view.frame.git_busy && view.stagedCount > 0 && (view.compactHeight || view.draft.trim().length > 0)
+            enabled: view.commandInfo("commit").enabled === true && (view.compactHeight || view.draft.trim().length > 0)
             onClicked: {
                 if (view.compactHeight) {
                     commitDialog.open();
@@ -182,20 +189,16 @@ FocusScope {
                 text: "Stage all"
                 compact: true
                 tip: "Stage all changes, including untracked files"
-                enabled: !view.frame.git_busy && view.unstagedCount > 0
-                onClicked: view.send({
-                    "action": "git_stage_all"
-                })
+                enabled: view.commandInfo("stage-all").enabled === true
+                onClicked: view.invokeAction("stage-all")
             }
             ActionButton {
                 objectName: "gitUnstageAll_" + view.paneId
                 text: "Unstage all"
                 compact: true
                 tip: "Unstage all changes and keep working files"
-                enabled: !view.frame.git_busy && view.stagedCount > 0
-                onClicked: view.send({
-                    "action": "git_unstage_all"
-                })
+                enabled: view.commandInfo("unstage-all").enabled === true
+                onClicked: view.invokeAction("unstage-all")
             }
             ActionButton {
                 objectName: (view.compactHeight ? "gitRefresh_" : "hiddenGitRefresh_") + view.paneId
@@ -204,10 +207,8 @@ FocusScope {
                 tip: "Refresh Git changes"
                 compact: true
                 flat: true
-                enabled: !view.frame.git_busy
-                onClicked: view.send({
-                    "action": "refresh"
-                })
+                enabled: view.commandInfo("refresh").enabled === true
+                onClicked: view.invokeAction("refresh")
             }
         }
         Label {
@@ -269,15 +270,7 @@ FocusScope {
                             "action": "focus",
                             "pane": view.paneId
                         });
-                    if (event.key === Qt.Key_C && !(event.modifiers & (Qt.ControlModifier | Qt.AltModifier))) {
-                        if (view.compactHeight) {
-                            commitDialog.open();
-                            dialogMessage.forceActiveFocus();
-                        } else
-                            message.forceActiveFocus();
-                    } else {
-                        view.bridge.key(event.key, event.text, event.modifiers);
-                    }
+                    view.bridge.key(event.key, event.text, event.modifiers);
                     event.accepted = true;
                 }
                 section.property: "group"
@@ -300,13 +293,8 @@ FocusScope {
                         tip: section === "Staged" ? "Unstage all staged changes" : "Stage all " + section.toLowerCase() + " changes"
                         compact: true
                         flat: true
-                        enabled: !view.frame.git_busy
-                        onClicked: view.send(section === "Staged" ? {
-                            "action": "git_unstage_all"
-                        } : {
-                            "action": "git_stage_group",
-                            "group": section
-                        })
+                        enabled: view.commandInfo(section === "Staged" ? "unstage-all" : "stage-group").enabled === true
+                        onClicked: view.invokeAction(section === "Staged" ? "unstage-all" : "stage-group", section === "Staged" ? "" : section)
                     }
                 }
                 delegate: Basic.ItemDelegate {
@@ -334,11 +322,7 @@ FocusScope {
                     }
                     function inspect() {
                         selectEntry();
-                        view.send({
-                            "action": "git_diff",
-                            "path": modelData.path,
-                            "staged": modelData.staged
-                        });
+                        view.invokeAction("diff", "", index);
                     }
                     contentItem: RowLayout {
                         spacing: 4
@@ -377,7 +361,7 @@ FocusScope {
                             tip: "Inspect " + (entry.modelData.staged ? "staged" : "working") + " changes"
                             compact: true
                             flat: true
-                            enabled: !view.frame.git_busy
+                            enabled: view.commandInfo("diff", entry.index).enabled === true
                             onClicked: entry.inspect()
                         }
                         ActionButton {
@@ -387,11 +371,8 @@ FocusScope {
                             tip: entry.modelData.staged ? "Unstage file" : "Stage file"
                             compact: true
                             flat: true
-                            enabled: !view.frame.git_busy
-                            onClicked: view.send({
-                                "action": entry.modelData.staged ? "git_unstage" : "git_stage",
-                                "path": entry.modelData.path
-                            })
+                            enabled: view.commandInfo(entry.modelData.staged ? "unstage" : "stage", entry.index).enabled === true
+                            onClicked: view.invokeAction(entry.modelData.staged ? "unstage" : "stage", "", entry.index)
                         }
                     }
                     background: Rectangle {
@@ -417,16 +398,13 @@ FocusScope {
                         id: contextMenu
                         MenuItem {
                             text: "Inspect changes"
-                            enabled: !view.frame.git_busy
+                            enabled: view.commandInfo("diff", entry.index).enabled === true
                             onTriggered: entry.inspect()
                         }
                         MenuItem {
                             text: entry.modelData.staged ? "Unstage file" : "Stage file"
-                            enabled: !view.frame.git_busy
-                            onTriggered: view.send({
-                                "action": entry.modelData.staged ? "git_unstage" : "git_stage",
-                                "path": entry.modelData.path
-                            })
+                            enabled: view.commandInfo(entry.modelData.staged ? "unstage" : "stage", entry.index).enabled === true
+                            onTriggered: view.invokeAction(entry.modelData.staged ? "unstage" : "stage", "", entry.index)
                         }
                     }
                 }
@@ -506,7 +484,7 @@ FocusScope {
                 objectName: "gitDialogCommit_" + view.paneId
                 text: view.committing ? "Committing…" : "Commit staged"
                 highlighted: enabled
-                enabled: !view.frame.git_busy && view.stagedCount > 0 && view.draft.trim().length > 0
+                enabled: view.commandInfo("commit").enabled === true && view.draft.trim().length > 0
                 onClicked: view.commit()
             }
         }

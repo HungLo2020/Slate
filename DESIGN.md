@@ -125,6 +125,21 @@ Checkpoints include both live and deferred terminal resources, preserving valid
 layout references. Recovery in workspace mode prepares shells before replacing
 the current model, so a spawn failure leaves the current workspace usable.
 
+GUI command inputs resolve to shared Rust commands before dispatch, including
+configured key bindings and raw palette input. Menus and Git controls obtain
+availability and effective shortcuts from the same scoped command catalog;
+queries for another pane or Git row never change application focus. Qt caches
+catalogs by state revision and keeps row catalogs until Git state or configured
+global bindings change. Catalogs remain outside editor frame payloads.
+
+The GUI adapter requests quit/discard confirmation before executing destructive
+commands, regardless of input route. Only dialog acceptance supplies a confirmed
+request. Global Qt shortcuts are projected from Rust preferences and remain
+available in tool input fields, while modal dialogs retain their own input.
+File pickers, settings and dirty-tab confirmations continue to follow shared
+backend prompts; ordinary terminal keys and text-field editing retain their
+normal behavior.
+
 GUI startup controls and the TUI settings list use the same preferences and
 configuration commands. Settings changes affect subsequent launches; presentation
 toggles never write startup preferences. Configured key maps from older releases

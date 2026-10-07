@@ -62,6 +62,7 @@ class Bridge : public QObject {
     QFont font() const;
     Q_INVOKABLE QVariantMap send(const QVariantMap &command);
     Q_INVOKABLE QVariantList commands(const QString &query);
+    Q_INVOKABLE QVariantMap commandInfo(const QString &id, int pane = 0, int row = -1);
     void applyTheme();
     Q_INVOKABLE void command(const QString &text);
     Q_INVOKABLE void viewport(int width, int height);
@@ -80,6 +81,7 @@ class Bridge : public QObject {
     bool closeDialogOpen() const { return !m_closeDialog.isNull(); }
     Q_INVOKABLE void confirmCloseTab(QObject *window);
   signals:
+    void confirmationRequested(const QString &id);
     void closeDialogOpenChanged();
     void pathDialogOpenChanged();
     void frameChanged();
@@ -96,10 +98,13 @@ class Bridge : public QObject {
     bool m_refreshing = false;
     QHash<int, CellView *> m_views;
     QHash<int, QVariantMap> m_surfaces;
-    qulonglong m_updates = 0, m_lastBytes = 0, m_clipboardReads = 0;
+    qulonglong m_updates = 0, m_lastBytes = 0, m_clipboardReads = 0, m_catalogRequests = 0;
     void *m_context;
     QVariantMap m_frame;
     QVariantMap m_theme;
+    QHash<QString, QVariantList> m_catalogs;
+    QHash<QString, QVariantList> m_rowCatalogs;
+    QVariant m_catalogRevision;
     QVariantList m_paneIds, m_handleIds;
     int m_headerHeight = 43;
     int m_width = 1280, m_height = 700;

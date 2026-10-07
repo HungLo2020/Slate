@@ -1,7 +1,7 @@
 use serde::Serialize;
 use slate_core::{
     text_presentation::{EditorText, TextLayout, TextSpan},
-    App, Command, Key,
+    App, Command,
 };
 use std::{
     collections::BTreeMap,
@@ -23,6 +23,7 @@ struct GuiContext {
     colors: Option<(String, String)>,
     files: u64,
     git: u64,
+    global_keys: Option<BTreeMap<String, String>>,
 }
 impl GuiContext {
     fn new(app: App) -> Self {
@@ -37,6 +38,7 @@ impl GuiContext {
             colors: None,
             files: 0,
             git: 0,
+            global_keys: None,
         }
     }
 }
@@ -106,32 +108,95 @@ unsafe extern "C" fn slate_request(context: *mut c_void, request: *const c_char)
     .unwrap_or_else(|_| "{\"status\":\"Internal error processing GUI request\"}".into());
     CString::new(response).unwrap().into_raw()
 }
-fn clipboard_action(app: &App, request: &serde_json::Value) -> String {
-    let action = request["action"].as_str().unwrap_or_default();
-    match action {
-        "key" => serde_json::from_value::<Key>(request.clone())
-            .ok()
-            .and_then(|key| app.key_binding(&key).map(str::to_owned))
-            .unwrap_or_default(),
-        "invoke_action" => request["id"].as_str().unwrap_or_default().into(),
-        "command" => request["text"].as_str().unwrap_or_default().trim().into(),
-        _ => action.into(),
+// Resolve every user command before dispatch. Qt-specific confirmations live
+// here, after Rust has interpreted configured shortcuts and palette commands.
+fn resolve_gui_command(app: &App, request: &serde_json::Value) -> anyhow::Result<Command> {
+    if request["action"] == "paste" && !request["text"].is_string() {
+        return Ok(Command::Paste {
+            text: app.clipboard.clone(),
+        });
+    }
+    if request["action"] == "shortcut" {
+        let chord = request["chord"].as_str().unwrap_or_default();
+        let binding = app
+            .preferences
+            .global_keys
+            .get(chord)
+            .ok_or_else(|| anyhow::anyhow!("Unknown shortcut: {chord}"))?;
+        return app.resolve_command_input(binding);
+    }
+    if request["action"] == "command" {
+        return app.resolve_command_input(request["text"].as_str().unwrap_or_default());
+    }
+    let command: Command = serde_json::from_value(request.clone())?;
+    match command {
+        Command::Key { ref key } => {
+            if let Some(binding) = app.key_binding(key) {
+                return app.resolve_command_input(binding);
+            }
+            Ok(command)
+        }
+        Command::InvokeAction { id, argument } => app.resolve_action(&id, &argument),
+        _ => Ok(command),
     }
 }
-fn respond(state: &mut GuiContext, mut request: serde_json::Value) -> String {
-    let action = request["action"].as_str().unwrap_or_default().to_owned();
-    let clipboard = clipboard_action(&state.app, &request);
-    // Only an actual paste requests system data. Resolve custom bindings in Rust
-    // before dispatch, so arbitrary Ctrl/Alt shortcuts never touch the clipboard.
-    if clipboard == "paste" && !(action == "paste" && request["text"].is_string()) {
-        let Some(text) = request["clipboard_input"].as_str() else {
-            return "{\"clipboard_request\":true}".into();
+fn dispatch_gui(state: &mut GuiContext, request: serde_json::Value) -> String {
+    let app = &mut state.app;
+    let result = (|| -> anyhow::Result<serde_json::Value> {
+        let mut command = resolve_gui_command(app, &request)?;
+        let id = command.action_id();
+        if let Some(info) = id.as_ref().and_then(|id| {
+            app.command_catalog("")
+                .into_iter()
+                .find(|info| &info.id == id)
+        }) {
+            anyhow::ensure!(info.enabled, "{}", info.reason);
+        }
+        // Force is a backend capability, not permission to skip a GUI dialog.
+        // Dialog acceptance must explicitly mark the request as confirmed.
+        let confirmation = match command {
+            Command::Quit { force: false } if app.dirty() => Some("quit"),
+            Command::Quit { force: true } => Some("discard-quit"),
+            Command::CloseDocument { force: true } => Some("discard-document"),
+            _ => None,
         };
-        state.app.clipboard = text.to_owned();
-        if action == "paste" {
-            request["text"] = serde_json::Value::String(text.to_owned());
+        if request["confirmed"] != true {
+            if let Some(id) = confirmation {
+                return Ok(serde_json::json!({"confirmation":id}));
+            }
+        }
+        if let Command::Paste { text } = &mut command {
+            if !(request["action"] == "paste" && request["text"].is_string()) {
+                let Some(input) = request["clipboard_input"].as_str() else {
+                    return Ok(serde_json::json!({"clipboard_request":true}));
+                };
+                app.clipboard = input.to_owned();
+                *text = input.to_owned();
+            }
+        }
+        let apply_theme = matches!(command, Command::ReloadSettings)
+            || matches!(&command, Command::Configure { name, value } if name == "theme" && value == "auto");
+        app.dispatch(command);
+        let mut response = serde_json::json!({"status":app.status,"quit":app.quit});
+        if apply_theme {
+            response["apply_theme"] = true.into();
+        }
+        if id.as_deref().is_some_and(|id| id == "copy" || id == "cut") {
+            response["clipboard"] = app.clipboard.clone().into();
+        }
+        Ok(response)
+    })();
+    match result {
+        Ok(response) => response.to_string(),
+        Err(error) => {
+            app.status = format!("Error: {error:#}");
+            state.viewport.clear();
+            serde_json::json!({"status":app.status,"quit":app.quit}).to_string()
         }
     }
+}
+fn respond(state: &mut GuiContext, request: serde_json::Value) -> String {
+    let action = request["action"].as_str().unwrap_or_default().to_owned();
     let app = &mut state.app;
     match action.as_str() {
         "file_dialog_context" => {
@@ -155,7 +220,9 @@ fn respond(state: &mut GuiContext, mut request: serde_json::Value) -> String {
         }
         "catalog" => {
             let query = request["query"].as_str().unwrap_or_default();
-            serde_json::json!({"commands": app.command_catalog(query)}).to_string()
+            let pane = request["pane"].as_u64().unwrap_or(app.focus);
+            let row = request["row"].as_u64().map(|row| row as usize);
+            serde_json::json!({"commands": app.command_catalog_for(query, pane, row)}).to_string()
         }
         "snapshot" | "update" => {
             app.process_events();
@@ -310,6 +377,13 @@ fn respond(state: &mut GuiContext, mut request: serde_json::Value) -> String {
                 .clone();
             frame.remove("clipboard");
             frame.remove("commands");
+            if !patch || state.global_keys.as_ref() != Some(&app.preferences.global_keys) {
+                frame.insert(
+                    "global_shortcuts".into(),
+                    serde_json::json!(app.preferences.global_keys.keys().collect::<Vec<_>>()),
+                );
+                state.global_keys = Some(app.preferences.global_keys.clone());
+            }
             frame.insert("command_revision".into(), state.revision.into());
             if patch && !files_changed {
                 frame.remove("files");
@@ -324,24 +398,7 @@ fn respond(state: &mut GuiContext, mut request: serde_json::Value) -> String {
             }
             serde_json::to_string(&GuiUpdate { frame, surfaces }).unwrap()
         }
-        _ => {
-            if action == "command" {
-                app.command_line(request["text"].as_str().unwrap_or_default());
-            } else {
-                match serde_json::from_value::<Command>(request) {
-                    Ok(command) => app.dispatch(command),
-                    Err(e) => {
-                        app.status = format!("Invalid command: {e}");
-                        state.viewport.clear();
-                    }
-                }
-            }
-            let mut response = serde_json::json!({"status":app.status,"quit":app.quit});
-            if clipboard == "copy" || clipboard == "cut" {
-                response["clipboard"] = app.clipboard.clone().into();
-            }
-            response.to_string()
-        }
+        _ => dispatch_gui(state, request),
     }
 }
 #[no_mangle]
@@ -410,18 +467,12 @@ mod tests {
         let patch = request(&mut state, update);
         assert!(patch["surfaces"].as_array().unwrap().is_empty());
         let error = request(&mut state, serde_json::json!({"action":"invalid-action"}));
-        assert!(error["status"]
-            .as_str()
-            .unwrap()
-            .starts_with("Invalid command:"));
+        assert!(error["status"].as_str().unwrap().starts_with("Error:"));
         let patch = request(
             &mut state,
             serde_json::json!({"action":"update", "width":1280, "height":720}),
         );
-        assert!(patch["status"]
-            .as_str()
-            .unwrap()
-            .starts_with("Invalid command:"));
+        assert!(patch["status"].as_str().unwrap().starts_with("Error:"));
     }
     fn editor_state(file: &std::path::Path) -> GuiContext {
         let mut app =
@@ -649,5 +700,214 @@ mod tests {
             serde_json::json!({"action":"key","key":"s","ctrl":true}),
         );
         assert!(save.get("clipboard_request").is_none() && save.get("clipboard").is_none());
+    }
+    #[test]
+    fn quit_and_discard_routes_require_confirmation_after_shortcut_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("edit.txt");
+        std::fs::write(&file, "original").unwrap();
+        let mut state = editor_state(&file);
+        request(
+            &mut state,
+            serde_json::json!({"action":"paste","text":"DIRTY"}),
+        );
+        state
+            .app
+            .preferences
+            .global_keys
+            .insert("f5".into(), "quit".into());
+        state
+            .app
+            .preferences
+            .editor_keys
+            .insert("f4".into(), "discard-document".into());
+        for input in [
+            serde_json::json!({"action":"quit","force":false}),
+            serde_json::json!({"action":"invoke_action","id":"quit"}),
+            serde_json::json!({"action":"command","text":"quit"}),
+            serde_json::json!({"action":"key","key":"q","ctrl":true}),
+            serde_json::json!({"action":"key","key":"f5"}),
+            serde_json::json!({"action":"shortcut","chord":"f5"}),
+        ] {
+            assert_eq!(
+                request(&mut state, input),
+                serde_json::json!({"confirmation":"quit"})
+            );
+            assert!(!state.app.quit);
+            assert_eq!(state.app.documents[&10].text(), "DIRTYoriginal");
+        }
+        for input in [
+            serde_json::json!({"action":"command","text":"discard-quit"}),
+            serde_json::json!({"action":"quit","force":true}),
+        ] {
+            assert_eq!(request(&mut state, input)["confirmation"], "discard-quit");
+            assert!(!state.app.quit && state.app.dirty());
+        }
+        for input in [
+            serde_json::json!({"action":"invoke_action","id":"discard-document"}),
+            serde_json::json!({"action":"command","text":"discard-document"}),
+            serde_json::json!({"action":"key","key":"f4"}),
+        ] {
+            assert_eq!(
+                request(&mut state, input)["confirmation"],
+                "discard-document"
+            );
+            assert_eq!(state.app.documents[&10].text(), "DIRTYoriginal");
+        }
+        request(
+            &mut state,
+            serde_json::json!({"action":"invoke_action","id":"discard-document","confirmed":true}),
+        );
+        assert!(!state.app.dirty());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "original");
+        request(
+            &mut state,
+            serde_json::json!({"action":"quit","force":false}),
+        );
+        assert!(state.app.quit);
+    }
+    #[test]
+    fn settings_and_disabled_clipboard_actions_use_the_same_context_on_every_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("edit.txt");
+        std::fs::write(&file, "original").unwrap();
+        let mut state = editor_state(&file);
+        state
+            .app
+            .preferences
+            .global_keys
+            .insert("f2".into(), "settings".into());
+        for input in [
+            serde_json::json!({"action":"invoke_action","id":"settings"}),
+            serde_json::json!({"action":"command","text":"settings"}),
+            serde_json::json!({"action":"key","key":"f2"}),
+            serde_json::json!({"action":"shortcut","chord":"f2"}),
+        ] {
+            request(&mut state, input);
+            assert_eq!(state.app.prompt.as_ref().unwrap().kind, "settings");
+            request(&mut state, serde_json::json!({"action":"dismiss_prompt"}));
+        }
+        request(&mut state, serde_json::json!({"action":"focus","pane":1}));
+        for input in [
+            serde_json::json!({"action":"invoke_action","id":"paste"}),
+            serde_json::json!({"action":"command","text":"paste"}),
+            serde_json::json!({"action":"paste"}),
+            serde_json::json!({"action":"paste","text":"UNEXPECTED"}),
+        ] {
+            let response = request(&mut state, input);
+            assert!(response["status"].as_str().unwrap().contains("Focus"));
+            assert!(response.get("clipboard_request").is_none());
+            assert_eq!(state.app.documents[&10].text(), "original");
+        }
+        request(&mut state, serde_json::json!({"action":"focus","pane":2}));
+        assert_eq!(
+            request(&mut state, serde_json::json!({"action":"paste"})),
+            serde_json::json!({"clipboard_request":true})
+        );
+    }
+    #[test]
+    fn configured_global_shortcuts_are_revisioned_without_repeating_them_in_patches() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("edit.txt");
+        std::fs::write(&file, "original").unwrap();
+        let mut state = editor_state(&file);
+        let update = serde_json::json!({"action":"update"});
+        let initial = request(&mut state, update.clone());
+        assert!(initial["global_shortcuts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|key| key == "Ctrl+q"));
+        request(
+            &mut state,
+            serde_json::json!({"action":"key","key":"Right"}),
+        );
+        assert!(request(&mut state, update.clone())
+            .get("global_shortcuts")
+            .is_none());
+        state
+            .app
+            .preferences
+            .global_keys
+            .insert("f5".into(), "quit".into());
+        state.app.dispatch(Command::Focus { pane: 2 });
+        let changed = request(&mut state, update);
+        assert!(changed["global_shortcuts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|key| key == "f5"));
+    }
+    #[test]
+    fn pending_saves_block_all_quit_routes_before_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("edit.txt");
+        std::fs::write(&file, "original").unwrap();
+        let mut state = editor_state(&file);
+        request(
+            &mut state,
+            serde_json::json!({"action":"paste","text":"EDIT"}),
+        );
+        request(&mut state, serde_json::json!({"action":"save"}));
+        for input in [
+            serde_json::json!({"action":"quit","force":false}),
+            serde_json::json!({"action":"quit","force":true,"confirmed":true}),
+            serde_json::json!({"action":"invoke_action","id":"quit"}),
+            serde_json::json!({"action":"command","text":"discard-quit"}),
+            serde_json::json!({"action":"key","key":"q","ctrl":true}),
+        ] {
+            let response = request(&mut state, input);
+            assert!(response["status"]
+                .as_str()
+                .unwrap()
+                .contains("pending file saves"));
+            assert!(response.get("confirmation").is_none());
+            assert!(!state.app.quit);
+        }
+    }
+    #[test]
+    fn accepting_quit_confirmation_discards_edits_without_writing_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("edit.txt");
+        std::fs::write(&file, "original").unwrap();
+        let mut state = editor_state(&file);
+        request(
+            &mut state,
+            serde_json::json!({"action":"paste","text":"DIRTY"}),
+        );
+        assert_eq!(
+            request(
+                &mut state,
+                serde_json::json!({"action":"quit","force":false})
+            )["confirmation"],
+            "quit"
+        );
+        request(
+            &mut state,
+            serde_json::json!({"action":"quit","force":true,"confirmed":true}),
+        );
+        assert!(state.app.quit && !state.app.dirty());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "original");
+    }
+    #[test]
+    fn bare_argument_actions_open_identical_prompts_from_palette_and_shortcuts() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("edit.txt");
+        std::fs::write(&file, "original").unwrap();
+        let mut state = editor_state(&file);
+        state
+            .app
+            .preferences
+            .editor_keys
+            .insert("f4".into(), "layout-save".into());
+        for input in [
+            serde_json::json!({"action":"invoke_action","id":"layout-save"}),
+            serde_json::json!({"action":"command","text":"layout-save"}),
+            serde_json::json!({"action":"key","key":"f4"}),
+        ] {
+            request(&mut state, input);
+            assert_eq!(state.app.prompt.as_ref().unwrap().kind, "layout-save");
+            request(&mut state, serde_json::json!({"action":"dismiss_prompt"}));
+        }
     }
 }

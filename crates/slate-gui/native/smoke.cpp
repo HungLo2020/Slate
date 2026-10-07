@@ -1077,7 +1077,8 @@ static void startFileDialogSmoke(Bridge *state, QQuickWindow *window) {
         QGuiApplication::exit(pass ? 0 : 2);
     };
     auto invoke = [=](const QString &id) {
-        QMetaObject::invokeMethod(window, "invokeAction", Q_ARG(QVariant, QVariant(id)));
+        QMetaObject::invokeMethod(window, "invokeAction", Q_ARG(QVariant, QVariant(id)),
+            Q_ARG(QVariant, QVariant("")), Q_ARG(QVariant, QVariant(0)), Q_ARG(QVariant, QVariant(-1)));
     };
     auto checkDialog = [=](QFileDialog::FileMode mode, QFileDialog::AcceptMode accept) {
         auto dialog = pathDialog();
@@ -1221,6 +1222,120 @@ static void startFileDialogSmoke(Bridge *state, QQuickWindow *window) {
             if (read(saved) != "scratch document") return;
             finish(true, "Platform file/folder/save dialogs, File menu, palette routing, shortcuts, cancellation, untitled saves, Unicode paths and confirmed/cancelled overwrites");
             return;
+        }
+        ++*step;
+    });
+    timer->start(150);
+}
+
+static void startCommandSmoke(Bridge *state, QQuickWindow *window) {
+    const QString dir = qEnvironmentVariable("SLATE_GUI_SMOKE_DIR");
+    auto timer = new QTimer(state);
+    auto step = new int(0), ticks = new int(0);
+    auto finish = [=](bool pass, const QString &detail) {
+        QFile report(dir + "/report.json"); report.open(QIODevice::WriteOnly);
+        report.write(QJsonDocument(QJsonObject{{"pass", pass}, {"detail", detail}, {"steps", *step}}).toJson());
+        window->grabWindow().save(dir + "/gui.png");
+        timer->stop(); QGuiApplication::exit(pass ? 0 : 2);
+    };
+    auto palette = [=](const QString &command) {
+        QTest::keyClick(window, Qt::Key_F1);
+        auto input = findItem(window->contentItem(), "commandSearch");
+        if (!input || !input->isVisible()) return false;
+        input->setProperty("text", command);
+        QTest::keyClick(window, Qt::Key_Return);
+        return true;
+    };
+    QObject::connect(timer, &QTimer::timeout, state, [=]() {
+        if (++*ticks > 150) { finish(false, QString("Command routing timeout at %1").arg(*step)); return; }
+        if (*step == 0) {
+            state->send({{"action", "paste"}, {"text", "DIRTY"}}); state->refresh();
+            ++*step; return;
+        }
+        const int scenario = (*step - 1) / 2;
+        const bool trigger = (*step - 1) % 2 == 0;
+        if (scenario < 14) {
+            if (trigger) {
+                state->send({{"action", "focus"}, {"pane", 2}}); state->refresh();
+                auto cells = findItem(window->contentItem(), "cells_2");
+                if (!cells) { finish(false, "Editor missing"); return; }
+                cells->forceActiveFocus();
+                switch (scenario) {
+                case 0: QTest::keyClick(window, Qt::Key_Q, Qt::ControlModifier); break;
+                case 1: QTest::keyClick(window, Qt::Key_F5); break;
+                case 2: if (!palette("quit")) { finish(false, "Palette missing"); return; } break;
+                case 3: if (!palette(":quit")) { finish(false, "Raw palette missing"); return; } break;
+                case 4: window->close(); break;
+                case 5: if (!clickMenuAction(window, timer, "File", "quit")) { finish(false, "File Quit unavailable"); return; } break;
+                case 6: if (!palette(":discard-quit")) { finish(false, "Discard palette missing"); return; } break;
+                case 7: QTest::keyClick(window, Qt::Key_F4); break;
+                case 8: if (!clickMenuAction(window, timer, "File", "settings")) { finish(false, "Settings menu unavailable"); return; } break;
+                case 9: QTest::keyClick(window, Qt::Key_F2); break;
+                case 10: if (!palette(":settings")) { finish(false, "Settings palette missing"); return; } break;
+                case 11: {
+                    state->send({{"action", "focus"}, {"pane", 1}});
+                    state->send({{"action", "add_view"}, {"kind", "git"}}); state->refresh();
+                    auto message = findItem(window->contentItem(), "gitMessage_1");
+                    if (!message) { finish(false, "Git message field missing"); return; }
+                    message->forceActiveFocus();
+                    QTest::keyClick(window, Qt::Key_Q, Qt::ControlModifier);
+                    break;
+                }
+                case 12: if (!palette(":layout-save")) { finish(false, "Layout palette missing"); return; } break;
+                case 13: QTest::keyClick(window, Qt::Key_F3); break;
+                }
+            } else {
+                const auto name = scenario >= 12 ? "editPrompt" : scenario >= 8 && scenario <= 10 ? "settingsDialog" :
+                    scenario == 6 || scenario == 7 ? "confirmDiscard" : "quitDialog";
+                auto dialog = window->findChild<QObject *>(name);
+                if (!dialog || !dialog->property("visible").toBool() || !state->frame().value("dirty").toBool()) {
+                    finish(false, QString("Route %1 did not open %2 while preserving edits").arg(scenario).arg(name)); return;
+                }
+                QMetaObject::invokeMethod(dialog, "reject");
+                state->refresh();
+                if (!window->isVisible() || state->frame().value("quit").toBool() || !state->frame().value("dirty").toBool()) {
+                    finish(false, "Cancelling a command lost edits or closed the window"); return;
+                }
+            }
+        } else if (scenario == 14) {
+            if (trigger) {
+                if (state->frame().value("git_busy").toBool() || state->frame().value("git").toList().isEmpty()) return;
+                state->send({{"action", "focus"}, {"pane", 1}}); state->refresh();
+                auto button = findItem(window->contentItem(), "paneActions_1");
+                if (!button || !button->isVisible()) { finish(false, "Git pane menu button missing"); return; }
+                QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                    button->mapToScene(QPointF(button->width()/2, button->height()/2)).toPoint());
+            } else {
+                const auto rows = state->frame().value("git").toList();
+                const auto paneInfo = state->commandInfo("stage", 1);
+                auto stage = findMenuItem(window, "menuAction_stage");
+                auto unstage = findMenuItem(window, "menuAction_unstage");
+                auto diff = findMenuItem(window, "menuAction_diff");
+                if (!stage || !unstage || !diff || stage->isEnabled() != paneInfo.value("enabled").toBool() ||
+                    unstage->isEnabled() != state->commandInfo("unstage", 1).value("enabled").toBool() || !diff->isEnabled()) {
+                    finish(false, "Git pane menu disagrees with the shared catalog"); return;
+                }
+                for (int row = 0; row < rows.size(); ++row) {
+                    const bool staged = rows[row].toMap().value("staged").toBool();
+                    const auto info = state->commandInfo(staged ? "unstage" : "stage", 1, row);
+                    auto button = findItem(window->contentItem(), "gitStage_1_" + QString::number(row));
+                    if (!button || !info.value("enabled").toBool() || !button->isEnabled() ||
+                        state->commandInfo(staged ? "stage" : "unstage", 1, row).value("enabled").toBool()) {
+                        finish(false, QString("Git row %1 availability: staged=%2 button=%3 enabled=%4 info=%5 opposite=%6")
+                            .arg(row).arg(staged).arg(button != nullptr).arg(button && button->isEnabled())
+                            .arg(info.value("enabled").toBool())
+                            .arg(state->commandInfo(staged ? "stage" : "unstage", 1, row).value("enabled").toBool())); return;
+                    }
+                }
+                QTest::keyClick(window, Qt::Key_Escape);
+                state->send({{"action", "focus"}, {"pane", 2}}); state->refresh();
+                const auto before = state->diagnostics().value("catalog_requests").toULongLong();
+                state->commandInfo("stage", 1, 0); state->commandInfo("unstage", 1, 0);
+                if (state->diagnostics().value("catalog_requests").toULongLong() != before || state->frame().value("focus").toInt() != 2) {
+                    finish(false, "Scoped row queries changed focus or bypassed the revision cache"); return;
+                }
+                finish(true, "Shared command availability, Git pane/row controls, default and remapped global shortcuts, palette/raw commands, menus/window close, dirty quit/discard cancellation and settings routing"); return;
+            }
         }
         ++*step;
     });
@@ -1456,6 +1571,10 @@ void startSmoke(Bridge *state, QQuickWindow *window) {
     }
     if (!qEnvironmentVariableIsEmpty("SLATE_GUI_FILE_DIALOG_SMOKE")) {
         startFileDialogSmoke(state, window);
+        return;
+    }
+    if (!qEnvironmentVariableIsEmpty("SLATE_GUI_COMMAND_SMOKE")) {
+        startCommandSmoke(state, window);
         return;
     }
     if (!qEnvironmentVariableIsEmpty("SLATE_GUI_TAB_CLOSE_SMOKE")) {

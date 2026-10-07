@@ -52,7 +52,35 @@ void EntryModel::replace(const QVariantList &rows) {
     }
 }
 QVariantList Bridge::commands(const QString &query) {
+    if (query.isEmpty()) {
+        if (!m_catalogs.contains("0:-1"))
+            m_catalogs.insert("0:-1", send({{"action", "catalog"}, {"query", query}}).value("commands").toList());
+        return m_catalogs.value("0:-1");
+    }
     return send({{"action", "catalog"}, {"query", query}}).value("commands").toList();
+}
+QVariantMap Bridge::commandInfo(const QString &id, int pane, int row) {
+    QString kind;
+    if (row >= 0)
+        for (const auto &value : m_frame.value("panes").toList()) {
+            const auto info = value.toMap();
+            if (info.value("id").toInt() == pane) { kind = info.value("kind").toString(); break; }
+        }
+    const auto key = row >= 0 ? QString("%1:%2:%3").arg(pane).arg(row).arg(kind)
+                             : QString("%1:%2").arg(pane).arg(row);
+    auto &catalogs = row >= 0 ? m_rowCatalogs : m_catalogs;
+    if (!catalogs.contains(key)) {
+        QVariantMap request{{"action", "catalog"}};
+        if (row >= 0) request.insert("query", "selected");
+        if (pane) request.insert("pane", pane);
+        if (row >= 0) request.insert("row", row);
+        catalogs.insert(key, send(request).value("commands").toList());
+    }
+    for (const auto &value : catalogs.value(key)) {
+        const auto info = value.toMap();
+        if (info.value("id") == id) return info;
+    }
+    return {};
 }
 Bridge::Bridge(void *context, QObject *parent) : QObject(parent), m_context(context) {
     m_refreshTimer.setSingleShot(true);
@@ -155,7 +183,7 @@ void Bridge::scheduleRefresh() {
 }
 QVariantMap Bridge::diagnostics() const {
     return {{"updates", m_updates}, {"last_update_bytes", m_lastBytes},
-            {"clipboard_reads", m_clipboardReads}};
+            {"clipboard_reads", m_clipboardReads}, {"catalog_requests", m_catalogRequests}};
 }
 void Bridge::attachView(int id, CellView *view) {
     m_views.insert(id, view);
@@ -178,6 +206,11 @@ int Bridge::cellWidth() const {
 }
 int Bridge::cellHeight() const { return int(std::ceil(QFontMetricsF(font()).height())); }
 QVariantMap Bridge::send(const QVariantMap &command) {
+    const auto action = command.value("action").toString();
+    if (action == "catalog") ++m_catalogRequests;
+    if (action != "catalog" && action != "input_context" && action != "file_dialog_context" &&
+        action != "diagnostics" && action != "update" && action != "snapshot")
+        m_catalogs.clear();
     auto exchange = [this](const QVariantMap &request) {
         const auto bytes = QJsonDocument(QJsonObject::fromVariantMap(request)).toJson(QJsonDocument::Compact);
         char *raw = slate_request(m_context, bytes.constData());
@@ -196,13 +229,18 @@ QVariantMap Bridge::send(const QVariantMap &command) {
     }
     if (result.contains("clipboard"))
         QGuiApplication::clipboard()->setText(result.value("clipboard").toString());
-    const auto action = command.value("action").toString();
-    if (action == "reload_settings" ||
-        (action == "invoke_action" && command.value("id") == "settings-reload") ||
-        (action == "configure" && command.value("name") == "theme" &&
-         command.value("value") == "auto") ||
-        (action == "command" && (command.value("text").toString().trimmed() == "settings-reload" ||
-                                 command.value("text").toString().trimmed() == "set theme auto")))
+    if (result.contains("command_revision") && result.value("command_revision") != m_catalogRevision) {
+        m_catalogs.clear();
+        m_catalogRevision = result.value("command_revision");
+    }
+    // Row action state depends on Git, not cursor movement in another pane.
+    if (result.contains("command_revision") &&
+        (result.value("git_revision") != m_frame.value("git_revision") ||
+         result.value("git_busy") != m_frame.value("git_busy") || result.contains("global_shortcuts")))
+        m_rowCatalogs.clear();
+    if (result.contains("confirmation"))
+        emit confirmationRequested(result.value("confirmation").toString());
+    if (result.value("apply_theme").toBool())
         applyTheme();
     return result;
 }
@@ -287,7 +325,7 @@ void Bridge::refresh() {
     if (frame.value("unchanged").toBool()) { emit refreshFinished(); return; }
     ++m_updates;
     const auto surfaces = frame.take("surfaces").toList();
-    for (const auto &key : {"files", "git", "settings"})
+    for (const auto &key : {"files", "git", "settings", "global_shortcuts"})
         if (!frame.contains(key)) frame.insert(key, m_frame.value(key));
     QVariantList panes, handles;
     for (const auto &p : frame.value("panes").toList()) {

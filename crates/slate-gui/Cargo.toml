@@ -7,6 +7,7 @@ edition.workspace = true
 smoke = []
 
 [dependencies]
+anyhow = "1"
 slate-core = { path = "../slate-core" }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }

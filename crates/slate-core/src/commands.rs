@@ -324,6 +324,13 @@ const ACTIONS: &[(&str, &str, &str, &str, &str)] = &[
         "unstaged",
     ),
     (
+        "stage-group",
+        "Stage a change group…",
+        "Stage all files in an unstaged change group",
+        "Change group",
+        "unstaged",
+    ),
+    (
         "unstage-all",
         "Unstage all changes",
         "Remove all staged changes from the index; keep working files",
@@ -368,10 +375,31 @@ const ACTIONS: &[(&str, &str, &str, &str, &str)] = &[
 ];
 impl App {
     pub fn command_catalog(&self, query: &str) -> Vec<CommandInfo> {
+        self.command_catalog_for(query, self.focus, None)
+    }
+    /// Describe a pane or row without changing the user's active focus/selection.
+    pub fn command_catalog_for(
+        &self,
+        query: &str,
+        pane: u64,
+        selection: Option<usize>,
+    ) -> Vec<CommandInfo> {
         let query = query.trim().to_lowercase();
-        let editor = self
-            .active_editor()
-            .map(|v| &self.documents[&self.views[&v].document]);
+        let view = self.layout.view(pane);
+        let kind = match view {
+            Some(crate::layout::View::Editor(_)) => "editor",
+            Some(crate::layout::View::Terminal(_)) => "terminal",
+            Some(crate::layout::View::Git) => "git",
+            Some(crate::layout::View::Files) => "files",
+            None => "",
+        };
+        let editor = match view {
+            Some(crate::layout::View::Editor(id)) => {
+                Some(&self.documents[&self.views[id].document])
+            }
+            _ => None,
+        };
+        let selected = self.git.get(selection.unwrap_or(self.git_selected));
         let mut results = Vec::new();
         for &(id, name, description, argument, scope) in ACTIONS {
             let haystack = format!("{id} {name} {description}").to_lowercase();
@@ -379,20 +407,14 @@ impl App {
                 continue;
             }
             let mut enabled = match scope {
-                "closable" => editor.is_some() || self.focused_kind() == "terminal",
+                "closable" => editor.is_some() || kind == "terminal",
                 "editor" => editor.is_some(),
                 "edit" => editor.is_some_and(|d| !d.read_only),
-                "text" => editor.is_some() || self.focused_kind() == "terminal",
-                "write" => {
-                    editor.is_some_and(|d| !d.read_only) || self.focused_kind() == "terminal"
-                }
-                "terminal" => self.focused_kind() == "terminal",
+                "text" => editor.is_some() || kind == "terminal",
+                "write" => editor.is_some_and(|d| !d.read_only) || kind == "terminal",
+                "terminal" => kind == "terminal",
                 "search" => editor.is_some() && !self.search.query.is_empty(),
-                "git" => {
-                    self.focused_kind() == "git"
-                        && self.selected_path().is_some()
-                        && self.git_jobs == 0
-                }
+                "git" => kind == "git" && selected.is_some() && self.git_jobs == 0,
                 "repository" => {
                     self.git_repository && self.git_jobs == 0 && self.git.iter().any(|e| e.staged)
                 }
@@ -403,7 +425,7 @@ impl App {
                 _ => true,
             };
             if scope == "git" {
-                if let Some(entry) = self.git.get(self.git_selected) {
+                if let Some(entry) = selected {
                     if id == "stage" {
                         enabled &= !entry.staged;
                     }
@@ -412,20 +434,43 @@ impl App {
                     }
                 }
             }
+            if matches!(id, "quit" | "discard-quit" | "save" | "save-as") {
+                enabled &= self.pending_save.is_empty();
+            }
+            if id == "refresh" && kind == "git" {
+                enabled &= self.git_jobs == 0;
+            }
             let shortcut = self
                 .preferences
                 .global_keys
                 .iter()
-                .chain(if self.focused_kind() == "terminal" {
-                    self.preferences.terminal_keys.iter()
-                } else {
-                    self.preferences.editor_keys.iter()
+                .chain(
+                    match kind {
+                        "terminal" => Some(&self.preferences.terminal_keys),
+                        "editor" => Some(&self.preferences.editor_keys),
+                        _ => None,
+                    }
+                    .into_iter()
+                    .flat_map(|keys| keys.iter()),
+                )
+                .find(|(key, value)| {
+                    value.as_str() == id
+                        && self
+                            .preferences
+                            .global_keys
+                            .get(*key)
+                            .is_none_or(|binding| binding.as_str() == id)
                 })
-                .find(|(_, value)| value.as_str() == id)
                 .map(|(key, _)| key.clone())
                 .unwrap_or_default();
             let reason = if enabled {
                 ""
+            } else if matches!(id, "quit" | "discard-quit" | "save" | "save-as")
+                && !self.pending_save.is_empty()
+            {
+                "Wait for pending file saves"
+            } else if id == "refresh" && kind == "git" && self.git_jobs != 0 {
+                "Wait for running Git operations"
             } else {
                 match scope {
                     "closable" => "Focus an editor or terminal",
@@ -463,6 +508,10 @@ impl App {
         results
     }
     pub(super) fn invoke_action(&mut self, id: &str, argument: &str) -> anyhow::Result<()> {
+        let command = self.resolve_action(id, argument)?;
+        self.execute(command)
+    }
+    pub fn resolve_action(&self, id: &str, argument: &str) -> anyhow::Result<Command> {
         let action = self
             .command_catalog("")
             .into_iter()
@@ -472,14 +521,81 @@ impl App {
             anyhow::bail!("{}", action.reason);
         }
         if id == "settings" {
-            self.execute(Command::Prompt {
+            Ok(Command::Prompt {
                 kind: "settings".into(),
-            })?;
+            })
         } else if !action.argument.is_empty() && argument.trim().is_empty() {
-            self.execute(Command::Prompt { kind: id.into() })?;
+            Ok(Command::Prompt { kind: id.into() })
         } else {
-            self.command_line(&format!("{id} {argument}"));
+            self.resolve_command_line(&format!("{id} {argument}"))
+                .ok_or_else(|| anyhow::anyhow!("Unknown or incomplete command: {id}"))
         }
-        Ok(())
+    }
+    /// Bare catalog actions request their argument prompt on every input route.
+    /// Commands with supplied arguments retain the shared command-line syntax.
+    pub fn resolve_command_input(&self, input: &str) -> anyhow::Result<Command> {
+        let input = input.trim();
+        if self
+            .command_catalog("")
+            .iter()
+            .any(|action| action.id == input)
+        {
+            return self.resolve_action(input, "");
+        }
+        self.resolve_command_line(input).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unknown or incomplete command. Open Commands (F1) to search available actions."
+            )
+        })
+    }
+}
+
+impl Command {
+    /// The shared catalog identity of a resolved command, when it has one.
+    pub fn action_id(&self) -> Option<String> {
+        let id = match self {
+            Command::New => "new",
+            Command::Save => "save",
+            Command::SaveAs { .. } => "save-as",
+            Command::CloseDocument { force: false } => "close",
+            Command::CloseDocument { force: true } => "discard-document",
+            Command::Quit { force: false } => "quit",
+            Command::Quit { force: true } => "discard-quit",
+            Command::Undo => "undo",
+            Command::Redo => "redo",
+            Command::Copy => "copy",
+            Command::Cut => "cut",
+            Command::Paste { .. } => "paste",
+            Command::SelectAll => "select-all",
+            Command::Indent { outdent: false } => "indent",
+            Command::Indent { outdent: true } => "outdent",
+            Command::Prompt { kind } => {
+                return Some(match kind.as_str() {
+                    "find" | "replace" | "goto" => format!("prompt-{kind}"),
+                    _ => kind.clone(),
+                })
+            }
+            Command::ReloadSettings => "settings-reload",
+            Command::EditorOnly => "editor-only",
+            Command::ShowWorkspace => "workspace",
+            Command::ToggleWorkspace => "toggle-workspace",
+            Command::NewTerminal => "terminal",
+            Command::TerminateTerminal => "terminate-terminal",
+            Command::AddView { kind } => return Some(kind.clone()),
+            Command::ClosePane => "close-pane",
+            Command::FocusNext => "next-pane",
+            Command::NextTab => "next-tab",
+            Command::Preset { name } => return Some(format!("preset {name}")),
+            Command::Refresh => "refresh",
+            Command::GitStage { .. } => "stage",
+            Command::GitUnstage { .. } => "unstage",
+            Command::GitStageAll => "stage-all",
+            Command::GitUnstageAll => "unstage-all",
+            Command::GitStageGroup { .. } => "stage-group",
+            Command::GitDiff { .. } => "diff",
+            Command::GitCommit { .. } => "commit",
+            _ => return None,
+        };
+        Some(id.into())
     }
 }
