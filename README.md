@@ -83,6 +83,50 @@ supports that shortcut. Keybindings, including F10, remain configurable in
 (normally `~/.local/state/slate/workspaces`). Empty or relative XDG directory
 values use the standard home-directory defaults.
 
+## Debian packages and MattPackages publication
+
+Slate follows Basalt's MattPackages workflow. On an amd64 Debian/Ubuntu build
+host with Rust 1.89+ and Python 3.11+, install the distro-provided dependencies
+with `bash DevUtils/InstallDependencies.sh`, then:
+
+```bash
+bash DevUtils/Build.sh
+python3 scripts/deb-smoke.py builds/slate_0.1.0_amd64.deb
+sudo apt install ./builds/slate_0.1.0_amd64.deb
+```
+
+The package includes `/usr/bin/slate`, the `slate-gui` symlink, desktop entry,
+icon and README. Shared-library requirements come from `dpkg-shlibdeps`; QML
+modules, SVG plugins and Git are declared separately. It does not bundle Qt or
+require an exact Qt runtime version. The manual **Build Linux amd64 DEB** workflow
+builds in Ubuntu 26.04, matching Basalt's target distribution, and keeps the
+package as a workflow artifact. A locally built package targets the libraries on
+that build host, so it may require newer libraries than older distributions have.
+
+Publishing uses the same authoritative repository manager as Basalt:
+
+```bash
+python3 DevUtils/PublishMattOSPackage.py doctor
+python3 DevUtils/PublishMattOSPackage.py publish --dry-run
+python3 DevUtils/PublishMattOSPackage.py publish
+```
+
+Each invocation downloads the latest `ManageMattOSRepository.py` into the ignored
+`DevUtils/.downloaded/` directory and explicitly selects `--repo mattpackages`.
+The manager owns server access, authentication, signing and repository updates;
+Slate stores no separate publishing credentials. Failed downloads never run an
+old cached manager. Publishing checks that the workspace version is newer than
+all published Slate versions, builds the package, reads `builds/latest-build.env`
+without evaluating shell code, validates the package name/version/architecture,
+and uploads with overwrite protection. `--dry-run` builds and validates without
+uploading; `--package PATH` selects an already built package and skips rebuilding.
+Before the next release, bump `[workspace.package].version` and refresh Cargo.lock
+with Cargo. Generated packages and build metadata stay in the ignored `builds/`
+directory. Run `python3 -m unittest discover -s tests -v` for publisher tests.
+
+Once the MattPackages APT repository is configured, install with `sudo apt install
+slate`; subsequent releases arrive through normal APT updates.
+
 ## Working prototype features
 
 - File-aware editor-only / workspace startup in both frontends; configurable defaults.

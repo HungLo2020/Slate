@@ -1,3 +1,5 @@
 /target/
+/builds/
+/DevUtils/.downloaded/
 *.swp
 __pycache__/
