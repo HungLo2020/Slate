@@ -44,7 +44,7 @@ fn tab_regions(tabs: &[slate_core::Tab], width: u16) -> Vec<TabRegion> {
     let widths: Vec<usize> = tabs
         .iter()
         .map(|tab| {
-            Span::raw(clean(&tab.title)).width() + 2 + if tab.editor_id.is_some() { 3 } else { 0 }
+            Span::raw(clean(&tab.title)).width() + 2 + if tab.close_id.is_some() { 3 } else { 0 }
         })
         .collect();
     let crowded = widths.iter().sum::<usize>() > width as usize;
@@ -62,7 +62,7 @@ fn tab_regions(tabs: &[slate_core::Tab], width: u16) -> Vec<TabRegion> {
             index,
             x,
             width: size,
-            close: (tab.editor_id.is_some() && size >= 3).then(|| x + size - 3),
+            close: (tab.close_id.is_some() && size >= 3).then(|| x + size - 3),
         });
         x += size;
     }
@@ -310,7 +310,7 @@ pub fn run(mut app: App) -> Result<()> {
                                             && m.kind
                                                 == MouseEventKind::Down(event::MouseButton::Left)
                                         {
-                                            if let Some(view) = pane.tabs[region.index].editor_id {
+                                            if let Some(view) = pane.tabs[region.index].close_id {
                                                 app.dispatch(Command::CloseTab {
                                                     pane: pane.id,
                                                     view,

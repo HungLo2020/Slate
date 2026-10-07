@@ -15,6 +15,8 @@ Kirigami.ApplicationWindow {
     visible: true
     title: "Slate"
     property var frame: slate.frame
+    // Fetch action availability and configured shortcuts only when a menu opens.
+    property var menuCommands: []
     property int priorFocus: -1
     property string priorPaneKey: ""
     // Pane delegates are recreated when compact layouts change their visible
@@ -99,6 +101,10 @@ Kirigami.ApplicationWindow {
         }
     }
     function invokeAction(id) {
+        if (id === "quit") {
+            root.close();
+            return;
+        }
         if (id === "settings") {
             settingsDialog.open();
             return;
@@ -112,6 +118,34 @@ Kirigami.ApplicationWindow {
             "action": "invoke_action",
             "id": id
         });
+    }
+    function menuCommand(id) {
+        return menuCommands.find(function (command) { return command.id === id; }) || {};
+    }
+    component CommandMenuItem: Basic.MenuItem {
+        id: commandItem
+        required property string actionId
+        property string label: ""
+        readonly property var commandInfo: root.menuCommand(actionId)
+        objectName: "menuAction_" + actionId
+        text: label || commandInfo.name || actionId
+        enabled: commandInfo.enabled === true
+        font: root.font
+        contentItem: RowLayout {
+            spacing: 24
+            Text {
+                text: commandItem.text
+                font: commandItem.font
+                color: commandItem.enabled ? Kirigami.Theme.textColor : Kirigami.Theme.disabledTextColor
+                Layout.fillWidth: true
+            }
+            Text {
+                text: commandItem.commandInfo.shortcut || ""
+                font: commandItem.font
+                color: Kirigami.Theme.disabledTextColor
+            }
+        }
+        onTriggered: root.invokeAction(actionId)
     }
     function paletteWith(text) {
         commandText.text = text || "";
@@ -188,195 +222,104 @@ Kirigami.ApplicationWindow {
         sequence: "Ctrl+Shift+P"
         onActivated: root.paletteWith("")
     }
-    header: Basic.ToolBar {
-        id: mainToolbar
+    menuBar: Basic.MenuBar {
+        id: mainMenuBar
+        objectName: "mainMenuBar"
+        font: root.font
+        delegate: Basic.MenuBarItem {
+            objectName: "menu_" + text.replace("&", "")
+            font: root.font
+            leftPadding: 8
+            rightPadding: 8
+        }
         background: Rectangle {
             color: Kirigami.Theme.backgroundColor
         }
-        objectName: "mainToolbar"
-        implicitHeight: mainActions.implicitHeight + 2 * Kirigami.Units.smallSpacing
-        RowLayout {
-            id: mainActions
-            objectName: "mainActions"
-            anchors.fill: parent
-            anchors.margins: Kirigami.Units.smallSpacing
-            spacing: Kirigami.Units.smallSpacing
-            ActionButton {
-                id: menuButton
-                objectName: "mainMenuButton"
-                text: "Menu"
-                onClicked: mainMenu.popup()
-                tip: "File, editing, and workspace commands"
-                Menu {
-                    id: mainMenu
-                    y: menuButton.height
-                    Menu {
-                        title: "File"
-                        MenuItem {
-                            text: "Open File…"
-                            onTriggered: root.invokeAction("open")
-                        }
-                        MenuItem {
-                            objectName: "openFolderAction"
-                            text: "Open Folder…"
-                            onTriggered: root.invokeAction("open-folder")
-                        }
-                        MenuItem {
-                            text: "New document"
-                            onTriggered: root.send({
-                                "action": "new"
-                            })
-                        }
-                        MenuItem {
-                            text: "Save"
-                            onTriggered: root.send({
-                                "action": "save"
-                            })
-                        }
-                        MenuItem {
-                            text: "Save as…"
-                            onTriggered: root.invokeAction("save-as")
-                        }
-                        MenuSeparator {}
-                        MenuItem {
-                            text: "Quit"
-                            onTriggered: root.close()
-                        }
-                    }
-                    Menu {
-                        title: "Edit"
-                        MenuItem {
-                            text: "Undo"
-                            onTriggered: root.send({
-                                "action": "undo"
-                            })
-                        }
-                        MenuItem {
-                            text: "Redo"
-                            onTriggered: root.send({
-                                "action": "redo"
-                            })
-                        }
-                        MenuSeparator {}
-                        MenuItem {
-                            text: "Find…"
-                            onTriggered: root.send({
-                                "action": "prompt",
-                                "kind": "find"
-                            })
-                        }
-                        MenuItem {
-                            text: "Replace…"
-                            onTriggered: root.send({
-                                "action": "prompt",
-                                "kind": "replace"
-                            })
-                        }
-                        MenuItem {
-                            text: "Go to line…"
-                            onTriggered: root.send({
-                                "action": "prompt",
-                                "kind": "goto"
-                            })
-                        }
-                    }
-                    Menu {
-                        title: "Workspace"
-                        MenuItem {
-                            text: "Expand / collapse workspace"
-                            onTriggered: root.send({"action": "toggle_workspace"})
-                        }
-                        MenuItem {
-                            text: "Three panes"
-                            onTriggered: root.send({
-                                "action": "preset",
-                                "name": "development"
-                            })
-                        }
-                        MenuItem {
-                            text: "Terminal below"
-                            onTriggered: root.send({
-                                "action": "preset",
-                                "name": "bottom_terminal"
-                            })
-                        }
-                        MenuItem {
-                            text: "Editor only"
-                            onTriggered: root.send({
-                                "action": "editor_only"
-                            })
-                        }
-                        MenuItem {
-                            text: "Focus next pane"
-                            onTriggered: slate.key(Qt.Key_F6, "", 0)
-                        }
-                        MenuSeparator {}
-                        MenuItem {
-                            text: "Save named layout…"
-                            onTriggered: root.invokeAction("layout-save")
-                        }
-                        MenuItem {
-                            text: "Load named layout…"
-                            onTriggered: root.invokeAction("layout-load")
-                        }
-                        MenuSeparator {}
-                        MenuItem {
-                            text: "Editor settings…"
-                            onTriggered: root.paletteWith("set ")
-                        }
-                        MenuItem {
-                            text: "Settings…"
-                            onTriggered: root.invokeAction("settings")
-                        }
-                        MenuItem {
-                            text: "Reload settings"
-                            onTriggered: root.send({
-                                "action": "reload_settings"
-                            })
-                        }
-                    }
-                    MenuSeparator {}
-                    MenuItem {
-                        text: "Commands…"
-                        onTriggered: root.paletteWith("")
-                    }
-                }
+        Menu {
+            objectName: "fileMenu"
+            title: "&File"
+            onAboutToShow: root.menuCommands = slate.commands("")
+            CommandMenuItem { actionId: "new"; label: "New File" }
+            CommandMenuItem { actionId: "open"; label: "Open File…" }
+            CommandMenuItem { actionId: "open-folder"; label: "Open Folder…" }
+            MenuSeparator {}
+            CommandMenuItem { actionId: "save"; label: "Save" }
+            CommandMenuItem { actionId: "save-as"; label: "Save As…" }
+            CommandMenuItem { actionId: "close"; label: "Close Tab" }
+            MenuSeparator {}
+            CommandMenuItem { actionId: "settings"; label: "Settings…" }
+            CommandMenuItem { actionId: "settings-reload"; label: "Reload Settings" }
+            MenuSeparator {}
+            CommandMenuItem { actionId: "quit"; label: "Quit" }
+        }
+        Menu {
+            objectName: "editMenu"
+            title: "&Edit"
+            onAboutToShow: root.menuCommands = slate.commands("")
+            CommandMenuItem { actionId: "undo" }
+            CommandMenuItem { actionId: "redo" }
+            MenuSeparator {}
+            CommandMenuItem { actionId: "cut"; label: "Cut" }
+            CommandMenuItem { actionId: "copy"; label: "Copy" }
+            CommandMenuItem { actionId: "paste" }
+            CommandMenuItem { actionId: "select-all" }
+            MenuSeparator {}
+            CommandMenuItem { actionId: "prompt-find" }
+            CommandMenuItem { actionId: "prompt-replace" }
+            MenuSeparator {}
+            CommandMenuItem { actionId: "indent" }
+            CommandMenuItem { actionId: "outdent" }
+        }
+        Menu {
+            objectName: "viewMenu"
+            title: "&View"
+            onAboutToShow: root.menuCommands = slate.commands("")
+            MenuItem {
+                objectName: "menuAction_commands"
+                text: "Command Palette…"
+                onTriggered: root.paletteWith("")
             }
-            ActionButton {
-                id: openButton
-                objectName: "openButton"
-                text: "Open File…"
-                visible: mainToolbar.width > implicitWidth + saveButton.implicitWidth + commandsButton.implicitWidth + workspaceToggleButton.implicitWidth + menuButton.implicitWidth + 7 * Kirigami.Units.smallSpacing
-                onClicked: root.invokeAction("open")
+            MenuSeparator {}
+            CommandMenuItem {
+                actionId: "toggle-workspace"
+                label: root.frame.editor_only ? "Expand Workspace" : "Collapse to Editor"
             }
-            ActionButton {
-                id: saveButton
-                objectName: "saveButton"
-                text: "Save"
-                visible: mainToolbar.width > implicitWidth + commandsButton.implicitWidth + workspaceToggleButton.implicitWidth + menuButton.implicitWidth + 6 * Kirigami.Units.smallSpacing
-                onClicked: root.send({
-                    "action": "save"
-                })
+            CommandMenuItem { actionId: "files"; label: "File Browser" }
+            CommandMenuItem { actionId: "git"; label: "Git Changes" }
+            MenuSeparator {}
+            Menu {
+                title: "Layout"
+                CommandMenuItem { actionId: "preset development"; label: "Three Panes" }
+                CommandMenuItem { actionId: "preset bottom_terminal"; label: "Terminal Below" }
+                CommandMenuItem { actionId: "editor-only"; label: "Editor Only" }
+                MenuSeparator {}
+                CommandMenuItem { actionId: "layout-save"; label: "Save Layout…" }
+                CommandMenuItem { actionId: "layout-load"; label: "Load Layout…" }
             }
-            Item {
-                Layout.fillWidth: true
-                Layout.minimumWidth: 0
-            }
-            ActionButton {
-                id: workspaceToggleButton
-                objectName: "workspaceToggleButton"
-                text: root.frame.editor_only ? "Workspace" : "Editor only"
-                visible: mainToolbar.width > implicitWidth + commandsButton.implicitWidth + menuButton.implicitWidth + 4 * Kirigami.Units.smallSpacing
-                tip: root.frame.editor_only ? "Expand the workspace (F10)" : "Collapse to the editor (F10)"
-                onClicked: root.send({"action": "toggle_workspace"})
-            }
-            ActionButton {
-                id: commandsButton
-                objectName: "commandsButton"
-                text: "Commands"
-                onClicked: root.paletteWith("")
-                tip: "Command palette (Ctrl+Shift+P or F1)"
-            }
+            CommandMenuItem { actionId: "split-right" }
+            CommandMenuItem { actionId: "split-down" }
+            CommandMenuItem { actionId: "close-pane" }
+        }
+        Menu {
+            objectName: "goMenu"
+            title: "&Go"
+            onAboutToShow: root.menuCommands = slate.commands("")
+            CommandMenuItem { actionId: "prompt-goto" }
+            CommandMenuItem { actionId: "find-next" }
+            CommandMenuItem { actionId: "find-previous" }
+            MenuSeparator {}
+            CommandMenuItem { actionId: "next-tab" }
+            CommandMenuItem { actionId: "next-pane" }
+        }
+        Menu {
+            objectName: "terminalMenu"
+            title: "&Terminal"
+            onAboutToShow: root.menuCommands = slate.commands("")
+            CommandMenuItem { actionId: "terminal" }
+            CommandMenuItem { actionId: "terminate-terminal"; label: "Close Terminal" }
+            MenuSeparator {}
+            CommandMenuItem { actionId: "split-terminal-right" }
+            CommandMenuItem { actionId: "split-terminal-down" }
         }
     }
     Item {
@@ -476,8 +419,8 @@ Kirigami.ApplicationWindow {
                                     }
                                     ActionButton {
                                         id: tabClose
-                                        objectName: "tabClose_" + panel.paneId + "_" + fileTab.modelData.editor_id
-                                        visible: fileTab.modelData.editor_id !== null && fileTab.modelData.editor_id !== undefined
+                                        objectName: "tabClose_" + panel.paneId + "_" + fileTab.modelData.close_id
+                                        visible: fileTab.modelData.close_id !== null && fileTab.modelData.close_id !== undefined
                                         anchors.right: parent.right
                                         anchors.rightMargin: 4
                                         anchors.verticalCenter: parent.verticalCenter
@@ -494,12 +437,12 @@ Kirigami.ApplicationWindow {
                                             border.width: tabClose.visualFocus ? 2 : 0
                                             border.color: tabClose.foregroundColor
                                         }
-                                        tip: "Close " + fileTab.modelData.title
+                                        tip: (fileTab.modelData.editor_id === null ? "Stop and close " : "Close ") + fileTab.modelData.title
                                         Accessible.name: tip
                                         onClicked: root.send({
                                             "action": "close_tab",
                                             "pane": panel.paneId,
-                                            "view": fileTab.modelData.editor_id
+                                            "view": fileTab.modelData.close_id
                                         })
                                     }
                                 }
@@ -1338,6 +1281,7 @@ Kirigami.ApplicationWindow {
     }
     Dialog {
         id: quitDialog
+        objectName: "quitDialog"
         enter: Transition {}
         exit: Transition {}
         title: "Unsaved documents"

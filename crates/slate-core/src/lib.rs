@@ -263,6 +263,7 @@ pub struct Tab {
     pub title: String,
     pub active: bool,
     pub editor_id: Option<u64>,
+    pub close_id: Option<u64>,
 }
 #[derive(Serialize)]
 pub struct PaneSnapshot {
@@ -531,8 +532,18 @@ impl App {
         let index = self
             .layout
             .pane_mut(pane)
-            .and_then(|(tabs, _)| tabs.iter().position(|v| *v == View::Editor(view)))
-            .context("This editor tab is no longer open")?;
+            .and_then(|(tabs, _)| {
+                tabs.iter()
+                    .position(|v| matches!(v, View::Editor(id) | View::Terminal(id) if *id == view))
+            })
+            .context("This tab is no longer open")?;
+        if self.layout.pane_mut(pane).unwrap().0[index] == View::Terminal(view) {
+            self.terminals.remove(&view);
+            self.deferred_terminals.remove(&view);
+            self.remove_terminal_views(view);
+            self.status = format!("Closed Terminal {view}");
+            return Ok(());
+        }
         let doc = self
             .views
             .get(&view)
@@ -1054,7 +1065,10 @@ impl App {
                 self.status = "Saving…".into();
             }
             Command::CloseDocument { force } => {
-                let id = self.active_editor().context("Focus an editor first")?;
+                let id = match self.focused() {
+                    Some(View::Editor(id) | View::Terminal(id)) => id,
+                    _ => bail!("Focus an editor or terminal first"),
+                };
                 self.close_tab(self.focus, id, force)?;
             }
             Command::CloseTab { pane, view, force } => self.close_tab(pane, view, force)?,
@@ -1156,8 +1170,7 @@ impl App {
                 let Some(View::Terminal(id)) = self.focused() else {
                     bail!("Focus a terminal first")
                 };
-                self.terminals.remove(&id);
-                self.remove_terminal_views(id);
+                self.close_tab(self.focus, id, false)?;
             }
             Command::AddView { kind } => {
                 if kind != "editor" {
@@ -1507,7 +1520,13 @@ impl App {
     fn remove_terminal_views(&mut self, id: u64) {
         for pane in self.layout.panes() {
             let (tabs, active) = self.layout.pane_mut(pane).unwrap();
+            let removed_before_active = tabs
+                .iter()
+                .take(*active)
+                .filter(|v| **v == View::Terminal(id))
+                .count();
             tabs.retain(|v| *v != View::Terminal(id));
+            *active = active.saturating_sub(removed_before_active);
             if tabs.is_empty() {
                 tabs.push(View::Files);
             }
@@ -2054,6 +2073,10 @@ impl App {
                             active: index == active,
                             editor_id: match v {
                                 View::Editor(id) => Some(*id),
+                                _ => None,
+                            },
+                            close_id: match v {
+                                View::Editor(id) | View::Terminal(id) => Some(*id),
                                 _ => None,
                             },
                         })

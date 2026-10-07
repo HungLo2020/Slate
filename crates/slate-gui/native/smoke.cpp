@@ -19,6 +19,7 @@
 #include <QPushButton>
 #include <QQuickWindow>
 #include <QSignalSpy>
+#include <QSignalBlocker>
 #include <QTest>
 #include <QTimer>
 #include <functional>
@@ -30,6 +31,53 @@ static QQuickItem *findItem(QQuickItem *item, const QString &name) {
         if (auto found = findItem(child, name))
             return found;
     return nullptr;
+}
+static QQuickItem *findMenuItem(QQuickWindow *window, const QString &name) {
+    auto item = findItem(window->contentItem(), name);
+    if (item && item->isVisible())
+        return item;
+    // Desktop styles can place menus in separate popup windows.
+    for (auto candidate : QGuiApplication::allWindows())
+        if (auto popup = qobject_cast<QQuickWindow *>(candidate))
+            if (popup != window && popup->isVisible())
+                if (auto found = findItem(popup->contentItem(), name))
+                    return found;
+    return item;
+}
+static void dismissMenu(QQuickWindow *window) {
+    auto popup = QGuiApplication::focusWindow();
+    QTest::keyClick(popup ? popup : window, Qt::Key_Escape);
+}
+static bool openMenu(QQuickWindow *window, QTimer *driver, const QString &name) {
+    // QtTest injects input faster than desktop menu animations. Block the
+    // workflow timer while waiting so its next step cannot run recursively.
+    QSignalBlocker block(driver);
+    const QStringList names{"fileMenu", "editMenu", "viewMenu", "goMenu", "terminalMenu"};
+    for (const auto &name : names)
+        if (auto menu = window->findChild<QObject *>(name))
+            if (menu->property("visible").toBool()) QMetaObject::invokeMethod(menu, "close");
+    if (!QTest::qWaitFor([=]() {
+        for (const auto &name : names)
+            if (auto menu = window->findChild<QObject *>(name))
+                if (menu->property("visible").toBool()) return false;
+        return true;
+    }, 2000)) return false;
+    auto heading = findItem(window->contentItem(), "menu_" + name);
+    auto menu = window->findChild<QObject *>(name.toLower() + "Menu");
+    if (!heading || !heading->isVisible() || !menu) return false;
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+        heading->mapToScene(QPointF(heading->width()/2, heading->height()/2)).toPoint());
+    return QTest::qWaitFor([=]() { return menu->property("opened").toBool(); }, 2000);
+}
+static bool clickMenuAction(QQuickWindow *window, QTimer *driver, const QString &menu, const QString &action) {
+    QSignalBlocker block(driver);
+    if (!openMenu(window, driver, menu)) return false;
+    auto item = findMenuItem(window, "menuAction_" + action);
+    if (!item || !item->isVisible() || !item->isEnabled()) return false;
+    QSignalSpy triggered(item, SIGNAL(triggered()));
+    QTest::mouseClick(item->window(), Qt::LeftButton, Qt::NoModifier,
+        item->mapToScene(QPointF(item->width()/2, item->height()/2)).toPoint());
+    return triggered.count() == 1;
 }
 static QByteArray read(const QString &path) {
     QFile file(path);
@@ -127,9 +175,12 @@ static QString checkCaptions(Bridge *state, QQuickWindow *window) {
     return {};
 }
 static QString checkLayout(Bridge *state, QQuickWindow *window) {
-    auto actions = findItem(window->contentItem(), "mainActions");
+    auto menuBar = findItem(window->contentItem(), "mainMenuBar");
+    auto actions = menuBar ? menuBar->property("contentItem").value<QQuickItem *>() : nullptr;
     if (!actions)
-        return "Missing toolbar";
+        return "Missing menu bar";
+    if (actions->width() > menuBar->width() + 1)
+        return "Menu bar exceeds the window width";
     QList<QRectF> controls;
     for (auto item : actions->childItems()) {
         if (!item->isVisible() || item->objectName().isEmpty())
@@ -174,7 +225,7 @@ static QString checkLayout(Bridge *state, QQuickWindow *window) {
             if (rect.left() < -1 || rect.top() < -1 || rect.right() > tabs->width() + 1 ||
                 rect.bottom() > tabs->height() + 1 || tab->height() + 1 < tab->implicitHeight())
                 return "A tab button is clipped by its header";
-            const auto editor = entries[index].toMap().value("editor_id");
+            const auto editor = entries[index].toMap().value("close_id");
             if (!editor.isNull()) {
                 auto close = findItem(tab, "tabClose_" + id + "_" + editor.toString());
                 if (!close || !close->isVisible() || close->width() < close->implicitWidth() - 1 ||
@@ -931,11 +982,8 @@ static void startStartupSmoke(Bridge *state, QQuickWindow *window) {
                 finish(false, "Editor-only startup launched a hidden shell");
                 return;
             }
-            if (auto button = findItem(window->contentItem(), "workspaceToggleButton")) {
-                QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
-                                  button->mapToScene(QPointF(button->width()/2, button->height()/2)).toPoint());
-            } else {
-                finish(false, "Missing workspace toggle button");
+            if (!clickMenuAction(window, timer, "View", "toggle-workspace")) {
+                finish(false, "Workspace toggle menu action unavailable");
                 return;
             }
             break;
@@ -1067,13 +1115,10 @@ static void startFileDialogSmoke(Bridge *state, QQuickWindow *window) {
         const auto frame = state->frame();
         switch (*step) {
         case 0: {
-            auto button = findItem(window->contentItem(), "openButton");
-            if (!button || !button->isVisible()) {
-                finish(false, "Open File toolbar button missing");
+            if (!clickMenuAction(window, timer, "File", "open")) {
+                finish(false, "File > Open File menu action unavailable");
                 return;
             }
-            QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
-                              button->mapToScene(QPointF(button->width()/2, button->height()/2)).toPoint());
             break;
         }
         case 1:
@@ -1093,7 +1138,9 @@ static void startFileDialogSmoke(Bridge *state, QQuickWindow *window) {
             break;
         case 4:
             if (state->send({{"action", "file_dialog_context"}}).value("path") != picked) return;
-            invoke("save-as");
+            if (!clickMenuAction(window, timer, "File", "save-as")) {
+                finish(false, "File > Save As menu action unavailable"); return;
+            }
             break;
         case 5:
             if (!checkDialog(QFileDialog::AnyFile, QFileDialog::AcceptSave)) return;
@@ -1172,7 +1219,7 @@ static void startFileDialogSmoke(Bridge *state, QQuickWindow *window) {
             break;
         case 20:
             if (read(saved) != "scratch document") return;
-            finish(true, "Platform file/folder/save dialogs, toolbar, palette routing, shortcuts, cancellation, untitled saves, Unicode paths and confirmed/cancelled overwrites");
+            finish(true, "Platform file/folder/save dialogs, File menu, palette routing, shortcuts, cancellation, untitled saves, Unicode paths and confirmed/cancelled overwrites");
             return;
         }
         ++*step;
@@ -1185,9 +1232,9 @@ static void startTabCloseSmoke(Bridge *state, QQuickWindow *window) {
     auto timer = new QTimer(state);
     auto step = new int(0), ticks = new int(0);
     auto target = new QString;
-    auto tabs = [=]() {
+    auto tabs = [=](int pane = 2) {
         for (const auto &value : state->frame().value("panes").toList())
-            if (value.toMap().value("id").toInt() == 2)
+            if (value.toMap().value("id").toInt() == pane)
                 return value.toMap().value("tabs").toList();
         return QVariantList{};
     };
@@ -1197,10 +1244,10 @@ static void startTabCloseSmoke(Bridge *state, QQuickWindow *window) {
         window->grabWindow().save(dir + "/gui.png");
         timer->stop(); QGuiApplication::exit(pass ? 0 : 2);
     };
-    auto clickClose = [=](const QString &editor) {
-        auto button = findItem(window->contentItem(), "tabClose_2_" + editor);
+    auto clickClose = [=](const QString &editor, int pane = 2) {
+        auto button = findItem(window->contentItem(), "tabClose_" + QString::number(pane) + "_" + editor);
         if (!button || !button->isVisible()) {
-            finish(false, "Visible editor tab has no close button"); return false;
+                finish(false, "Visible file or terminal tab has no close button"); return false;
         }
         QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
             button->mapToScene(QPointF(button->width()/2, button->height()/2)).toPoint());
@@ -1273,7 +1320,122 @@ static void startTabCloseSmoke(Bridge *state, QQuickWindow *window) {
             QTest::keyClick(window, Qt::Key_W, Qt::ControlModifier); break;
         case 10:
             if (entries.size() != 5) { finish(false, "Ctrl+W did not close the active tab"); return; }
-            finish(true, "GUI tab close buttons, background tabs, native unsaved/cancel/discard confirmation, final-tab editor, crowded headers and Ctrl+W"); return;
+            state->send({{"action", "preset"}, {"name", "bottom_terminal"}});
+            state->send({{"action", "focus"}, {"pane", 3}});
+            state->refresh(); window->resize(1360, 820); break;
+        case 11:
+        case 12:
+            if (!clickMenuAction(window, timer, "Terminal", "terminal")) {
+                finish(false, "Terminal > New Terminal menu action unavailable"); return;
+            }
+            break;
+        case 13: {
+            const auto terminals = tabs(3);
+            if (terminals.size() != 3) { finish(false, "New Terminal menu did not create terminal tabs"); return; }
+            const auto error = checkLayout(state, window);
+            if (!error.isEmpty()) { finish(false, error); return; }
+            window->grabWindow().save(dir + "/terminal-tabs.png");
+            *target = terminals.last().toMap().value("close_id").toString();
+            if (!clickClose(terminals.first().toMap().value("close_id").toString(), 3)) return;
+            break;
+        }
+        case 14: {
+            const auto terminals = tabs(3);
+            if (terminals.size() != 2 || !terminals.last().toMap().value("active").toBool() ||
+                terminals.last().toMap().value("close_id").toString() != *target ||
+                state->frame().value("focus").toInt() != 3 || state->closeDialogOpen()) {
+                finish(false, "Closing an inactive terminal changed focus or the active terminal"); return;
+            }
+            if (!clickClose(*target, 3)) return;
+            break;
+        }
+        case 15: {
+            const auto terminals = tabs(3);
+            if (terminals.size() != 1 || terminals.first().toMap().value("close_id").isNull()) {
+                finish(false, "Closing the active terminal removed the wrong session"); return;
+            }
+            if (!clickMenuAction(window, timer, "File", "close")) {
+                finish(false, "File > Close Tab is unavailable for a terminal"); return;
+            }
+            break;
+        }
+        case 16: {
+            const auto terminals = tabs(3);
+            if (terminals.size() != 1 || !terminals.first().toMap().value("close_id").isNull() ||
+                state->frame().value("status").toString().startsWith("Error")) {
+                finish(false, "The final terminal did not close cleanly"); return;
+            }
+            if (!openMenu(window, timer, "File")) { finish(false, "File menu did not open"); return; }
+            break;
+        }
+        case 17: {
+            auto save = findMenuItem(window, "menuAction_save");
+            auto close = findMenuItem(window, "menuAction_close");
+            if (!save || !close || save->property("enabled").toBool() || close->property("enabled").toBool()) {
+                finish(false, QString("File menu availability: save=%1 close=%2 focus=%3")
+                    .arg(save ? (save->property("enabled").toBool() ? "enabled" : "disabled") : "missing")
+                    .arg(close ? (close->property("enabled").toBool() ? "enabled" : "disabled") : "missing")
+                    .arg(state->frame().value("focus").toInt())); return;
+            }
+            window->grabWindow().save(dir + "/file-menu.png");
+            dismissMenu(window);
+            state->send({{"action", "focus"}, {"pane", 2}});
+            state->send({{"action", "paste"}, {"text", "MENU_EDIT"}}); state->refresh();
+            break;
+        }
+        case 18:
+            if (!clickMenuAction(window, timer, "Edit", "select-all")) {
+                finish(false, "Edit > Select All menu action unavailable"); return;
+            }
+            break;
+        case 19:
+            if (!clickMenuAction(window, timer, "Edit", "cut")) {
+                finish(false, "Edit > Cut menu action unavailable"); return;
+            }
+            break;
+        case 20:
+            if (QGuiApplication::clipboard()->text() != "MENU_EDIT") {
+                const auto editor = state->send({{"action", "input_context"}, {"pane", 2}}).value("editor").toMap();
+                finish(false, QString("Edit > Cut clipboard mismatch: remaining=%1 selection=%2")
+                    .arg(editor.value("surrounding").toString().size())
+                    .arg(editor.value("selection").toString().size())); return;
+            }
+            if (!clickMenuAction(window, timer, "Edit", "paste")) {
+                finish(false, "Edit > Paste menu action unavailable"); return;
+            }
+            break;
+        case 21: {
+            if (!openMenu(window, timer, "Edit")) { finish(false, "Edit menu did not open"); return; }
+            break;
+        }
+        case 22: {
+            auto undo = findMenuItem(window, "menuAction_undo");
+            if (!undo || !undo->property("enabled").toBool()) { finish(false, "Edit menu did not enable editor actions"); return; }
+            window->grabWindow().save(dir + "/edit-menu.png");
+            dismissMenu(window);
+            break;
+        }
+        case 23:
+            if (!clickMenuAction(window, timer, "File", "quit")) {
+                finish(false, "File > Quit menu action unavailable"); return;
+            }
+            break;
+        case 24: {
+            auto dialog = window->findChild<QObject *>("quitDialog");
+            if (!dialog || !dialog->property("visible").toBool() || !state->frame().value("dirty").toBool()) {
+                finish(false, "File > Quit did not confirm unsaved changes"); return;
+            }
+            QMetaObject::invokeMethod(dialog, "reject");
+            break;
+        }
+        case 25: {
+            auto dialog = window->findChild<QObject *>("quitDialog");
+            if (!dialog || dialog->property("visible").toBool() || !state->frame().value("dirty").toBool() ||
+                state->frame().value("quit").toBool()) {
+                finish(false, "Cancelling File > Quit lost unsaved work"); return;
+            }
+            finish(true, "GUI file/terminal close buttons, inactive-tab focus, native unsaved/cancel/discard confirmation, final tabs, crowded headers, Ctrl+W, menu availability, Edit clipboard actions and Quit cancellation"); return;
+        }
         }
         ++*step;
     });

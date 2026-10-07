@@ -319,6 +319,88 @@ fn close_tab_rejects_stale_targets_and_pending_saves() {
 }
 
 #[test]
+fn closing_terminal_tabs_stops_only_the_target_shell_and_preserves_focus() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = App::new(dir.path()).unwrap();
+    app.dispatch(Command::Focus { pane: 3 });
+    app.terminals
+        .get_mut(&12)
+        .unwrap()
+        .write(b"printf '%s' \"$$\" > shell.pid\r")
+        .unwrap();
+    wait_app(&mut app, |_| {
+        fs::read_to_string(dir.path().join("shell.pid")).is_ok_and(|pid| pid.parse::<i32>().is_ok())
+    });
+    let pid: i32 = fs::read_to_string(dir.path().join("shell.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    app.dispatch(Command::NewTerminal);
+    let next = app.layout.view(3).unwrap().clone();
+    app.dispatch(Command::NewTerminal);
+    let active = app.layout.view(3).unwrap().clone();
+    app.dispatch(Command::Focus { pane: 2 });
+    app.dispatch(Command::Paste {
+        text: "keep unsaved".into(),
+    });
+    app.dispatch(Command::CloseTab {
+        pane: 3,
+        view: 12,
+        force: false,
+    });
+    assert_eq!(app.focus, 2);
+    assert_eq!(app.layout.view(3), Some(&active));
+    assert!(!app.terminals.contains_key(&12));
+    assert_eq!(app.terminals.len(), 2);
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        -1,
+        "Closed shell is still running"
+    );
+    assert!(app.dirty());
+    assert!(app.prompt.is_none());
+    app.dispatch(Command::CloseTab {
+        pane: 3,
+        view: 12,
+        force: false,
+    });
+    assert!(app.status.contains("no longer open"));
+    assert_eq!(app.layout.view(3), Some(&active));
+    app.dispatch(Command::Focus { pane: 3 });
+    assert!(app
+        .command_catalog("close")
+        .iter()
+        .any(|c| c.id == "close" && c.enabled));
+    app.dispatch(Command::CloseDocument { force: false });
+    assert_eq!(app.layout.view(3), Some(&next));
+    app.dispatch(Command::TerminateTerminal);
+    assert!(app.terminals.is_empty());
+    assert_eq!(app.layout.view(3), Some(&View::Files));
+    assert_eq!(app.focus, 3);
+    assert!(app.layout.validate());
+    assert!(app.dirty());
+}
+
+#[test]
+fn closing_deferred_terminal_prevents_it_from_starting_on_expansion() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("file.txt");
+    fs::write(&path, "original").unwrap();
+    let mut app = App::new(&path).unwrap();
+    assert!(app.editor_only);
+    assert!(app.terminals.is_empty());
+    app.dispatch(Command::CloseTab {
+        pane: 3,
+        view: 12,
+        force: false,
+    });
+    app.dispatch(Command::ShowWorkspace);
+    assert!(app.terminals.is_empty());
+    assert_eq!(app.layout.view(3), Some(&View::Files));
+    assert_eq!(app.layout.view(2), Some(&View::Editor(11)));
+}
+
+#[test]
 fn close_and_quit_protect_unsaved_work() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = App::new(dir.path()).unwrap();

@@ -51,9 +51,9 @@ const ACTIONS: &[(&str, &str, &str, &str, &str)] = &[
     (
         "close",
         "Close tab",
-        "Close the active editor tab; preserve unsaved work",
+        "Close the active file or terminal tab; preserve unsaved documents",
         "",
-        "editor",
+        "closable",
     ),
     (
         "discard-document",
@@ -379,6 +379,7 @@ impl App {
                 continue;
             }
             let mut enabled = match scope {
+                "closable" => editor.is_some() || self.focused_kind() == "terminal",
                 "editor" => editor.is_some(),
                 "edit" => editor.is_some_and(|d| !d.read_only),
                 "text" => editor.is_some() || self.focused_kind() == "terminal",
@@ -427,6 +428,7 @@ impl App {
                 ""
             } else {
                 match scope {
+                    "closable" => "Focus an editor or terminal",
                     "edit" => "Focus an editable document",
                     "write" => "Focus an editable document or terminal",
                     "editor" => "Focus an editor",

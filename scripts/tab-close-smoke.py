@@ -5,6 +5,7 @@ import os
 import pathlib
 import pty
 import select
+import signal
 import struct
 import subprocess
 import sys
@@ -60,6 +61,20 @@ with tempfile.TemporaryDirectory(prefix="slate-tab-close-") as temporary:
             assert time.monotonic() < deadline, output.decode(errors="replace")[-3000:]
             pump(0.05)
 
+    def shell_pid(path):
+        deadline = time.monotonic() + 5
+        while not path.exists() or not path.read_text().isdigit():
+            assert time.monotonic() < deadline, output.decode(errors="replace")[-3000:]
+            pump(0.05)
+        return int(path.read_text())
+
+    def assert_stopped(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        raise AssertionError(f"Closed terminal shell {pid} is still running")
+
     try:
         pump(0.7)
         assert b"[x]" in output, "TUI editor tab has no visible close button"
@@ -95,10 +110,30 @@ with tempfile.TemporaryDirectory(prefix="slate-tab-close-") as temporary:
         command("save-as " + str(narrow))
         wait_file(narrow, "NARROW")
         assert long_file.read_text() == "long original"
+        # Compact to the focused pane so every tab's coordinates are fixed.
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 60, 0, 0))
+        os.kill(process.pid, signal.SIGWINCH)
+        pump()
+        command("terminal")
+        send(b"printf '%s' \"$$\" > first-terminal.pid\r")
+        first_pid = shell_pid(root / "first-terminal.pid")
+        command("terminal")
+        send(b"printf '%s' \"$$\" > second-terminal.pid\r")
+        second_pid = shell_pid(root / "second-terminal.pid")
+        click(31)  # Inactive terminal after the 15-column narrow.txt tab.
+        assert_stopped(first_pid)
+        os.kill(second_pid, 0)
+        send(b"printf ACTIVE > terminal-focus.txt\r")
+        wait_file(root / "terminal-focus.txt", "ACTIVE")
+        click(31)  # Active terminal; the editor becomes active again.
+        assert_stopped(second_pid)
+        send(b"TERMINALCLOSED")
+        send(b"\x13")
+        wait_file(narrow, "NARROWTERMINALCLOSED")
         send(b"\x11")
         process.wait(timeout=5)
         assert process.returncode == 0
-        print("PASS TUI tab close: visible [x], Unicode mouse coordinates, inactive/active tabs, cancellation, discard, Ctrl+W and clipped long filenames")
+        print("PASS TUI tab close: file/terminal [x], shell cleanup, inactive-tab focus, Unicode coordinates, cancellation, discard, Ctrl+W and clipped long filenames")
     finally:
         if process.poll() is None:
             process.terminate()
