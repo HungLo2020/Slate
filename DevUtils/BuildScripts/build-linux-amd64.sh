@@ -30,6 +30,7 @@ mkdir -p "$package_root/DEBIAN" "$package_root/usr/bin" "$staging/debian"
 install -m755 "$target_dir/release/slate" "$package_root/usr/bin/slate"
 install -m755 "$target_dir/release/slate-gui" "$package_root/usr/bin/slate-gui"
 install -Dm644 packaging/slate.desktop "$package_root/usr/share/applications/slate.desktop"
+install -Dm644 packaging/slate.metainfo.xml "$package_root/usr/share/metainfo/slate.metainfo.xml"
 install -Dm644 resources/slate.svg "$package_root/usr/share/icons/hicolor/scalable/apps/slate.svg"
 install -Dm644 README.md "$package_root/usr/share/doc/slate/README.md"
 
@@ -49,7 +50,8 @@ if [[ "$shlib_depends" == *qt6* || "$shlib_depends" == *libqt* ]]; then
     exit 1
 fi
 # QML imports/plugins are loaded dynamically and aren't found by shlibdeps.
-qml_depends="qml6-module-org-kde-kirigami, qml6-module-qtquick, qml6-module-qtquick-controls, qml6-module-qtquick-layouts, qml6-module-qtquick-templates, qml6-module-qtquick-window, qml6-module-qtqml, qml6-module-qtqml-models, qml6-module-qtqml-workerscript, qt6-svg-plugins"
+# The GUI uses only Qt Quick Controls; it does not need Kirigami or KDE.
+qml_depends="qml6-module-qtquick, qml6-module-qtquick-controls, qml6-module-qtquick-layouts, qml6-module-qtquick-templates, qml6-module-qtquick-window, qml6-module-qtqml, qml6-module-qtqml-models, qml6-module-qtqml-workerscript, qt6-svg-plugins"
 installed_size="$(du -sk "$package_root/usr" | cut -f1)"
 cat > "$package_root/DEBIAN/control" <<EOF
 Package: slate
@@ -61,7 +63,7 @@ Maintainer: Slate Maintainers
 Installed-Size: $installed_size
 Depends: $shlib_depends
 Recommends: $gui_depends, $qml_depends, git, plasma-integration, qml6-module-org-kde-desktop, breeze-icon-theme, fonts-dejavu-core
-Suggests: aspell | hunspell, wl-clipboard | xclip
+Suggests: aspell | hunspell, wl-clipboard | xclip, breeze-icon-theme | adwaita-icon-theme
 Homepage: https://github.com/HungLo2020/Slate
 Description: Shared graphical and terminal text editor
  Slate provides a Kirigami graphical editor and a terminal editor using the

@@ -340,6 +340,11 @@ impl TerminalSession {
         self.child.try_wait().ok().flatten().is_some()
     }
     pub fn screen(&self) -> Screen {
+        self.screen_with("#d8dee9", "#20242c")
+    }
+    /// The screen with the default foreground/background drawn in the
+    /// editor theme's colours, so terminals follow light and dark themes.
+    pub fn screen_with(&self, default_fg: &str, default_bg: &str) -> Screen {
         let p = self.parser.lock().unwrap();
         let s = self.selection_screen.as_ref().unwrap_or_else(|| p.screen());
         let (rows, cols) = s.size();
@@ -348,8 +353,14 @@ impl TerminalSession {
             let mut line = Vec::with_capacity(cols as usize);
             for col in 0..cols {
                 let c = s.cell(row, col).unwrap();
-                let mut fg = color(c.fgcolor(), false);
-                let mut bg = color(c.bgcolor(), true);
+                let mut fg = match c.fgcolor() {
+                    vt100::Color::Default => default_fg.to_string(),
+                    other => color(other, false),
+                };
+                let mut bg = match c.bgcolor() {
+                    vt100::Color::Default => default_bg.to_string(),
+                    other => color(other, true),
+                };
                 if c.inverse() {
                     std::mem::swap(&mut fg, &mut bg);
                 }

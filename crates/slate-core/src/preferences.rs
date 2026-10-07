@@ -46,6 +46,16 @@ pub struct Preferences {
     /// Capture the mouse in the terminal interface. Off leaves selection to
     /// the outer terminal.
     pub tui_mouse: bool,
+    /// Mark spaces (·) and tabs (→) in editors.
+    pub show_whitespace: bool,
+    /// Reload unmodified documents when their file changes on disk.
+    pub auto_reload: bool,
+    /// Show the document overview beside GUI editors.
+    pub minimap: bool,
+    /// GUI editor font; empty uses the desktop's fixed-width font.
+    pub font_family: String,
+    /// GUI editor font size in points.
+    pub font_size: usize,
     pub global_keys: BTreeMap<String, String>,
     pub editor_keys: BTreeMap<String, String>,
     pub terminal_keys: BTreeMap<String, String>,
@@ -185,6 +195,11 @@ impl Default for Preferences {
             backup: false,
             file_recovery: false,
             tui_mouse: true,
+            show_whitespace: false,
+            auto_reload: true,
+            minimap: true,
+            font_family: String::new(),
+            font_size: 11,
             global_keys,
             editor_keys,
             terminal_keys,
@@ -274,6 +289,16 @@ pub const SETTINGS: &[Setting] = &[
         label: "Terminal UI captures mouse",
         kind: SettingKind::Bool,
     },
+    Setting {
+        name: "show-whitespace",
+        label: "Show whitespace",
+        kind: SettingKind::Bool,
+    },
+    Setting {
+        name: "auto-reload",
+        label: "Reload files changed on disk",
+        kind: SettingKind::Bool,
+    },
 ];
 
 impl Preferences {
@@ -297,6 +322,11 @@ impl Preferences {
             "backup" => self.backup.to_string(),
             "file-recovery" => self.file_recovery.to_string(),
             "tui-mouse" => self.tui_mouse.to_string(),
+            "show-whitespace" => self.show_whitespace.to_string(),
+            "auto-reload" => self.auto_reload.to_string(),
+            "minimap" => self.minimap.to_string(),
+            "font-family" => self.font_family.clone(),
+            "font-size" => self.font_size.to_string(),
             _ => String::new(),
         }
     }
@@ -354,6 +384,12 @@ impl Preferences {
         }
         if !(10..=500).contains(&self.wrap_column) {
             bail!("wrap_column must be 10–500");
+        }
+        if !(6..=72).contains(&self.font_size) {
+            bail!("font_size must be 6–72");
+        }
+        if self.font_family.len() > 200 {
+            bail!("font_family is too long");
         }
         if self.global_keys.len() + self.editor_keys.len() + self.terminal_keys.len() > 256 {
             bail!("Too many key bindings");
@@ -503,8 +539,13 @@ impl App {
             "backup" => settings.backup = flag(value)?,
             "file-recovery" => settings.file_recovery = flag(value)?,
             "tui-mouse" | "mouse" => settings.tui_mouse = flag(value)?,
+            "show-whitespace" => settings.show_whitespace = flag(value)?,
+            "auto-reload" => settings.auto_reload = flag(value)?,
+            "minimap" => settings.minimap = flag(value)?,
+            "font-family" => settings.font_family = value.trim().into(),
+            "font-size" => settings.font_size = value.parse()?,
             _ => bail!(
-                "Options: {}",
+                "Options: {}, minimap, font-family, font-size",
                 SETTINGS
                     .iter()
                     .map(|s| s.name)

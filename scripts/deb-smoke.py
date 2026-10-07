@@ -19,8 +19,9 @@ depends, recommends = fields[3], fields[4]
 assert "private-abi" not in depends + recommends and " (= " not in depends + recommends, fields
 # The terminal interface installs without Qt; the GUI's needs are recommended.
 assert "qt6" not in depends and "libqt" not in depends.lower(), depends
-for dependency in ("qml6-module-org-kde-kirigami", "qml6-module-qtquick-controls", "qml6-module-qtqml-workerscript", "qt6-svg-plugins", "git"):
+for dependency in ("qml6-module-qtquick-controls", "qml6-module-qtqml-workerscript", "qt6-svg-plugins", "git"):
     assert dependency in recommends, dependency
+assert "kirigami" not in depends + recommends, "The GUI no longer needs Kirigami"
 assert "qt6" in recommends.lower(), recommends
 contents = subprocess.check_output(["dpkg-deb", "--fsys-tarfile", str(artifact)])
 with tarfile.open(fileobj=io.BytesIO(contents)) as archive:
@@ -40,7 +41,8 @@ with tempfile.TemporaryDirectory(prefix="slate-deb-smoke-") as temporary:
     assert subprocess.check_output([str(binary), "--version"], text=True).strip() == f"Slate {version}"
     assert (destination / "usr/share/icons/hicolor/scalable/apps/slate.svg").read_bytes() == (root / "resources/slate.svg").read_bytes()
     desktop = destination / "usr/share/applications/slate.desktop"
-    assert "Exec=slate-gui %f" in desktop.read_text()
+    assert "Exec=slate-gui %F" in desktop.read_text()
+    assert (destination / "usr/share/metainfo/slate.metainfo.xml").exists()
     assert "Icon=slate" in desktop.read_text()
     subprocess.run([sys.executable, str(root / "scripts/tui-smoke.py"), str(binary)], check=True)
     subprocess.run([sys.executable, str(root / "scripts/startup-smoke.py"), str(binary), "--tui-only"], check=True)

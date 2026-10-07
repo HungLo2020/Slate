@@ -502,3 +502,30 @@ fn several_files_open_as_tabs() {
     tui.send(b"\x13");
     wait_file(&b, b"2B");
 }
+
+#[test]
+fn external_changes_reload_clean_files_and_ask_about_modified_ones() {
+    let env = Env::new();
+    let path = env.path("watched.txt");
+    fs::write(&path, "first\n").unwrap();
+    let mut tui = env.slate(&[path.to_str().unwrap()]);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    fs::write(&path, "second\n").unwrap();
+    tui.wait_for("reloaded");
+    tui.wait_for("second");
+    tui.send("mine ");
+    fs::write(&path, "third version\n").unwrap();
+    tui.wait_for("changed on disk while you have unsaved changes");
+    tui.send("r");
+    tui.wait_gone("changed on disk while");
+    tui.wait_for("third version");
+    // Reloading keeps the cursor where it was; type at the start instead.
+    tui.send(b"\x1b[1;5H");
+    tui.send("again ");
+    fs::write(&path, "fourth\n").unwrap();
+    tui.wait_for("changed on disk while you have unsaved changes");
+    tui.send("k");
+    tui.wait_for("Kept your version");
+    tui.send(b"\x13");
+    wait_file(&path, b"again third version\n");
+}

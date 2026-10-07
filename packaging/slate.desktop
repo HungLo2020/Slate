@@ -1,12 +1,19 @@
 [Desktop Entry]
 Type=Application
 Name=Slate
-Comment=Edit code with shared graphical and terminal workflows
-Exec=slate-gui %f
+GenericName=Text Editor
+Comment=Edit text and code with shared graphical and terminal workflows
+Exec=slate-gui %F
 TryExec=slate-gui
 Icon=slate
 Terminal=false
-Categories=Development;TextEditor;
-MimeType=text/plain;
+Categories=Development;TextEditor;Utility;
+Keywords=text;editor;code;programming;nano;
+MimeType=text/plain;text/markdown;text/x-markdown;text/x-csrc;text/x-chdr;text/x-c++src;text/x-c++hdr;text/x-rust;text/x-python;text/x-python3;text/x-go;text/x-java;text/x-kotlin;text/x-csharp;text/x-script.python;text/x-shellscript;application/x-shellscript;text/x-makefile;text/x-cmake;text/css;text/html;text/javascript;application/javascript;application/typescript;application/json;application/xml;text/xml;application/x-yaml;text/x-yaml;application/toml;text/x-toml;text/x-log;text/x-patch;text/x-diff;text/x-sql;text/x-lua;text/x-ruby;text/x-perl;application/x-perl;text/x-php;text/x-tex;text/csv;text/x-ini;text/x-systemd-unit;
 StartupNotify=true
 StartupWMClass=Slate
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=slate-gui --new-instance

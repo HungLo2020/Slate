@@ -8,7 +8,7 @@ recovery and process control.
 ## Updates and frontend boundary
 
 Rust remains authoritative for documents, history, view state and services. The
-Kirigami frontend owns graphical controls, text shaping and pixel hit testing;
+Qt Quick frontend owns graphical controls, text shaping and pixel hit testing;
 Ratatui owns terminal presentation. Neither frontend has a second mutable editor
 buffer or independent undo stack.
 
@@ -231,9 +231,40 @@ separation and tmux's Unix sockets; their full local workflows were not validate
 there. Vim, htop, mouse protocol probes and the actual shell workflows did run.
 
 CI additionally checks the Qt 6.4 public adapter API and runs GUI tests against
-Fedora and Debian's compatible Qt/Kirigami packages. Remote CI results must be
+Fedora and Debian's compatible Qt packages, without KDE frameworks. Remote CI results must be
 checked separately; adding the matrix is not evidence that those remote jobs
 have passed. Cargo requirements are compatible ranges, native discovery is a
 minimum API requirement, and QML imports are versionless. The dependency-policy
 check rejects exact constraints. Lockfile resolutions and locally observed SDK
-versions do not impose exact installed Qt/Kirigami runtime versions.
+versions do not impose exact installed Qt runtime versions.
+
+## Desktop editor (GUI)
+
+The GUI depends only on Qt Quick Controls. A `Theme` singleton maps the
+platform `SystemPalette` to the colours the QML uses, and an `image://icon/`
+provider renders freedesktop theme icons tinted like text; when the platform
+names no icon theme (offscreen, other desktops) an installed one is chosen.
+Menus read the shared action catalog when they open and the Git pane only when
+repository state or pane kinds change, so typing never queries the catalog; the
+desktop smoke test asserts this.
+
+Editor rows are cached `QTextLayout`s painted opaquely. Wheel and touchpad input
+accumulate pixel deltas: whole rows scroll the core view, the remainder offsets
+the painted rows, and the core renders one extra row so the offset never shows
+a gap. Horizontal scrolling uses the core's `left` column, which the cursor
+only reclaims after it moves. The minimap paints a sampled outline (indent and
+length per line) that the core caches per document generation; the horizontal
+scroll range covers every line.
+
+The external-change watcher runs on the IO worker once a second: it compares
+each file's size, modification time and inode with the document's stamp and
+rereads only changed files, comparing their hash with the save baseline, so
+`touch` is not a change. Clean documents reload; modified ones queue a
+`file-changed` prompt that either reloads or adopts the new baseline.
+
+`slate-gui FILE` hands files to a running window over a per-user Unix socket in
+`XDG_RUNTIME_DIR`; the running window opens them (at their `+LINE`) and raises
+itself. A signal thread turns SIGTERM/SIGHUP/SIGINT into an orderly Qt quit, so
+recovery state is flushed and the socket removed. Other platforms wake the Qt
+loop through a callback instead of the Unix event descriptor, and CMake reports
+the Qt libraries for Cargo to link.

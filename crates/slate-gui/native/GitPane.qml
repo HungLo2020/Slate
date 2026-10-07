@@ -1,8 +1,8 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Controls.Basic as Basic
+import Slate.Native
 import QtQuick.Layouts
-import org.kde.kirigami as Kirigami
 
 FocusScope {
     id: view
@@ -77,11 +77,12 @@ FocusScope {
             visible: !view.compactHeight || !view.frame.git_repository
             Layout.fillWidth: true
             spacing: 6
-            Kirigami.Icon {
-                source: "git-branch"
+            Image {
+                source: slate.hasIcon("git-branch") ? "image://icon/git-branch?" + Theme.textColor : ""
+                sourceSize: Qt.size(18, 18)
                 Layout.preferredWidth: 18
                 Layout.preferredHeight: 18
-                visible: view.frame.git_repository
+                visible: view.frame.git_repository && status === Image.Ready
             }
             Label {
                 id: branchLabel
@@ -121,8 +122,8 @@ FocusScope {
             contentWidth: availableWidth
             background: Rectangle {
                 radius: 4
-                color: Kirigami.Theme.alternateBackgroundColor
-                border.color: message.activeFocus ? Kirigami.Theme.highlightColor : Qt.alpha(Kirigami.Theme.textColor, 0.25)
+                color: Theme.alternateBackgroundColor
+                border.color: message.activeFocus ? Theme.highlightColor : Qt.alpha(Theme.textColor, 0.25)
                 border.width: message.activeFocus ? 2 : 1
             }
             Basic.TextArea {
@@ -143,9 +144,9 @@ FocusScope {
                 wrapMode: TextEdit.Wrap
                 selectByMouse: true
                 padding: 8
-                color: Kirigami.Theme.textColor
-                selectionColor: Kirigami.Theme.highlightColor
-                selectedTextColor: Kirigami.Theme.highlightedTextColor
+                color: Theme.textColor
+                selectionColor: Theme.highlightColor
+                selectedTextColor: Theme.highlightedTextColor
                 background: null
                 Keys.onPressed: function (event) {
                     if (view.frame.focus !== view.paneId)
@@ -222,7 +223,7 @@ FocusScope {
             wrapMode: Text.Wrap
             maximumLineCount: view.compactHeight ? 1 : 3
             elide: Text.ElideRight
-            color: view.frame.git_error ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.disabledTextColor
+            color: view.frame.git_error ? Theme.negativeTextColor : Theme.disabledTextColor
             HoverHandler {
                 id: noticeHover
             }
@@ -232,8 +233,10 @@ FocusScope {
                 text: view.frame.git_error
             }
         }
-        Kirigami.Separator {
+        Rectangle {
             Layout.fillWidth: true
+            implicitHeight: 1
+            color: Qt.alpha(Theme.textColor, 0.2)
         }
         Item {
             id: viewport
@@ -336,7 +339,7 @@ FocusScope {
                                 text: entry.filename
                                 textFormat: Text.PlainText
                                 elide: Text.ElideMiddle
-                                color: entry.highlighted ? Kirigami.Theme.highlightedTextColor : Kirigami.Theme.textColor
+                                color: entry.highlighted ? Theme.highlightedTextColor : Theme.textColor
                             }
                             Label {
                                 Layout.fillWidth: true
@@ -345,18 +348,18 @@ FocusScope {
                                 textFormat: Text.PlainText
                                 elide: Text.ElideMiddle
                                 opacity: 0.75
-                                color: entry.highlighted ? Kirigami.Theme.highlightedTextColor : Kirigami.Theme.textColor
+                                color: entry.highlighted ? Theme.highlightedTextColor : Theme.textColor
                             }
                         }
                         Label {
                             text: entry.modelData.untracked ? "U" : entry.modelData.group === "Conflicts" ? "!" : entry.modelData.status.charAt(entry.modelData.staged ? 0 : 1)
                             textFormat: Text.PlainText
-                            color: entry.highlighted ? Kirigami.Theme.highlightedTextColor : Kirigami.Theme.neutralTextColor
+                            color: entry.highlighted ? Theme.highlightedTextColor : Theme.neutralTextColor
                             font.bold: true
                         }
                         ActionButton {
                             objectName: "gitDiff_" + view.paneId + "_" + entry.index
-                            foregroundColor: entry.highlighted ? Kirigami.Theme.highlightedTextColor : Kirigami.Theme.textColor
+                            foregroundColor: entry.highlighted ? Theme.highlightedTextColor : Theme.textColor
                             iconName: "vcs-diff"
                             tip: "Inspect " + (entry.modelData.staged ? "staged" : "working") + " changes"
                             compact: true
@@ -366,7 +369,7 @@ FocusScope {
                         }
                         ActionButton {
                             objectName: "gitStage_" + view.paneId + "_" + entry.index
-                            foregroundColor: entry.highlighted ? Kirigami.Theme.highlightedTextColor : Kirigami.Theme.textColor
+                            foregroundColor: entry.highlighted ? Theme.highlightedTextColor : Theme.textColor
                             iconName: entry.modelData.staged ? "list-remove" : "list-add"
                             tip: entry.modelData.staged ? "Unstage file" : "Stage file"
                             compact: true
@@ -377,7 +380,7 @@ FocusScope {
                     }
                     background: Rectangle {
                         radius: 3
-                        color: entry.highlighted ? Kirigami.Theme.highlightColor : entry.hovered ? Kirigami.Theme.alternateBackgroundColor : "transparent"
+                        color: entry.highlighted ? Theme.highlightColor : entry.hovered ? Theme.alternateBackgroundColor : "transparent"
                     }
                     Hint {
                         anchorItem: entry
@@ -417,7 +420,7 @@ FocusScope {
                 textFormat: Text.PlainText
                 wrapMode: Text.Wrap
                 horizontalAlignment: Text.AlignHCenter
-                color: Kirigami.Theme.disabledTextColor
+                color: Theme.disabledTextColor
             }
         }
     }
@@ -468,7 +471,7 @@ FocusScope {
                     text: view.frame.git_error
                     textFormat: Text.PlainText
                     wrapMode: Text.Wrap
-                    color: Kirigami.Theme.negativeTextColor
+                    color: Theme.negativeTextColor
                 }
             }
         }

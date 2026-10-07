@@ -1,20 +1,22 @@
 # Slate
 
-A Rust workspace editor with a Kirigami GUI and a terminal UI sharing the same
-editor core. This repository contains a Linux prototype with recoverable workspaces.
+A Rust editor with a Qt Quick GUI and a terminal UI sharing the same editor
+core: a nano replacement in the terminal, a Kate/gedit-style desktop editor,
+and a workspace with terminals and Git.
 
 ## Build and launch
 
-Install Rust **1.89 or newer**, a C++17 compiler, CMake, pkg-config, and Qt 6
-Core/Gui/Widgets/Qml/Quick development packages. GUI runtime packages must include
-**Kirigami 6** and Qt Quick Controls, Layouts, Templates, Window, QtQml, Models,
-and WorkerScript modules. Git is used for the Git pane. Your shell is taken
-from `SHELL`, falling back to `/bin/sh`.
+Install Rust **1.89 or newer**, a C++17 compiler, CMake, and Qt 6
+Core/Gui/Widgets/PrintSupport/Qml/Quick development packages. GUI runtime packages
+must include Qt Quick Controls, Layouts, Templates, Window, QtQml, Models and
+WorkerScript modules. No KDE frameworks are needed: the GUI follows any
+desktop's Qt palette and icon theme (on Plasma, the KDE platform integration
+supplies Breeze colours, icons and file dialogs). Git is used for the Git pane.
+Your shell is taken from `SHELL`, falling back to `/bin/sh`.
 
-On a current KDE/Kubuntu installation, install the distro's Qt 6 development
-packages and Kirigami 6 QML package. Package names vary with distro release;
-older distributions may only package Kirigami for Qt 5, which is insufficient.
-Slate does not download or vendor Qt or Kirigami.
+CMake locates Qt (set `CMAKE_PREFIX_PATH` or `Qt6_DIR` for a non-system
+installation) and tells Cargo which Qt libraries to link, so the build does not
+depend on pkg-config. Slate does not download or vendor Qt.
 
 File and terminal tabs have a **×** close button in the GUI and a clickable **[x]**
 in the TUI. Closing a terminal tab stops that session and its shell; other sessions
@@ -42,7 +44,7 @@ Configured global shortcuts work in tool input fields as well as the editor.
 ```bash
 cargo build --release                     # builds slate (terminal) and slate-gui
 ./target/release/slate .                  # terminal mode
-./target/release/slate --gui .            # Kirigami mode (runs slate-gui)
+./target/release/slate --gui .            # graphical mode (runs slate-gui)
 ./target/release/slate src/main.rs        # editor only
 ./target/release/slate --gui --editor-only .  # GUI editor only
 ./target/release/slate --workspace src/main.rs # file in the full TUI workspace
@@ -118,6 +120,39 @@ key is ^H). Copy and paste use the desktop clipboard through `wl-copy`/`xclip`/
 `xsel` when a display is available, and OSC 52 otherwise. **Toggle mouse capture**
 leaves selection to the outer terminal. Soft wrap (**Alt+Z**, or nano's M-S) wraps
 long lines at word boundaries; the cursor moves by screen rows.
+
+## The desktop editor
+
+`slate-gui FILE…` opens files in the running window, as Kate and gedit do; the
+desktop entry passes every selected file (`%F`). Directories, `slate-gui -`
+and `--new-instance` start a new window, and **File → New Window** opens one.
+Drop files from a file manager onto the window to open them. **File → Open
+Recent** lists the last 20 files, and **File → Print** prints the document.
+
+The title bar shows the document, its folder and `*` for unsaved changes. Status
+messages and errors (save failures, conflicts, refused files) appear in the
+status bar; errors in red. Files changed by other programs reload automatically
+when unmodified; a modified document asks whether to reload it or keep your
+version (the next save replaces the file). Deleted files are reported and must be
+saved or discarded.
+
+The editor supports double-click word and triple-click line selection, a
+blinking caret following the desktop's cursor flash time, smooth touchpad and
+wheel scrolling, horizontal scrolling (Shift+wheel or a tilt wheel), a
+horizontal scrollbar and a minimap that scrolls on click or drag. **View** toggles
+word wrap, whitespace markers, line numbers and the minimap, and zooms
+(**Ctrl+=**, **Ctrl+-**, **Ctrl+0**, or Ctrl+wheel). Choose the font in Settings.
+**Edit → Document** sets the encoding and line endings, reopens a file with
+another encoding, and toggles read-only mode. Right-click the editor for Undo,
+Redo, Cut, Copy, Paste and Select All; the caret moves to the click unless text
+is selected.
+
+Input methods show their own composition styling and caret. Shortcuts work on
+non-Latin keyboard layouts (by physical key), and screen readers get the
+editor's text, caret and selection through Qt's accessibility interface. Logging
+out keeps unsaved work (recovery checkpoints or `NAME.save` files); SIGTERM and
+SIGHUP quit through the same path. Qt options such as `-platform`, `-style` and
+`-reverse` pass through to Qt.
 
 ## Startup and settings
 
@@ -445,17 +480,18 @@ with `printf '\033]7;file://localhost%s\007' "$PWD"` in its prompt hook.
   services, preferences/search/highlighting, workspace recovery, terminal processes,
   and VT emulator state.
 - `slate-cli`: Ratatui/Crossterm presentation and terminal input.
-- `slate-gui`: Kirigami QML and a thin Qt C++ presentation adapter. A small
-  JSON/C ABI connects it to the Rust core; editing and PTY logic remain Rust.
+- `slate-gui`: Qt Quick QML and a thin Qt C++ presentation adapter (editor and
+  terminal surfaces, minimap, accessibility, printing). A small JSON/C ABI
+  connects it to the Rust core; editing and PTY logic remain Rust.
 - `slate` (root package) is the terminal executable and does not link Qt;
   `--gui` execs the `slate-gui` executable built by the `slate-gui` crate.
 
 **No exact runtime dependency constraints.** Qt discovery specifies a minimum
 public API, without CMake `EXACT`; QML imports have no numeric version pins.
-Use compatible distro-provided Qt 6/Kirigami 6 updates. Cargo manifests use
+Use compatible distro-provided Qt 6 updates. Cargo manifests use
 compatible version ranges, never `=version` requirements. `Cargo.lock` records
 build resolution for reproducibility; it does not require an exact installed
-Qt/Kirigami runtime version. Major ABI/API changes may require rebuilding.
+Qt runtime version. Major ABI/API changes may require rebuilding.
 
 ## Validation
 
@@ -470,7 +506,9 @@ python3 scripts/install-smoke.py target/release/slate
 python3 scripts/dependency-policy.py
 cargo build -p slate -p slate-gui --features slate-gui/smoke
 python3 scripts/gui-offscreen-smoke.py target/debug/slate
-python3 scripts/gui-layout-smoke.py target/debug/slate  # Qt Test + Kirigami 6
+python3 scripts/gui-layout-smoke.py target/debug/slate  # Qt Test, Basic/Fusion/KDE styles
+SLATE_GUI_DESKTOP_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
+python3 scripts/single-instance-smoke.py target/debug/slate-gui
 SLATE_GUI_FEATURE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
 SLATE_GUI_FILE_DIALOG_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
 SLATE_GUI_TAB_CLOSE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
@@ -489,8 +527,8 @@ recovery/disk baselines, layout geometry, syntax colors, PTY mouse/paste/selecti
 terminal directories and unsaved-work protection. Optional Vim/htop/SSH/tmux
 integration checks run when tools are available; `SLATE_REQUIRE_TERMINAL_TOOLS=1`
 makes SSH/tmux availability and execution mandatory. CI installs those tools,
-checks the Qt 6.4 adapter API, and runs GUI workflows with distro-provided Qt and
-Kirigami in Fedora and Debian containers. Container jobs exercise their current
+checks the Qt 6.4 adapter API, and runs GUI workflows with distro-provided Qt
+(without KDE frameworks) in Fedora and Debian containers. Container jobs exercise their current
 compatible packages without exact runtime version constraints.
 
 Smoke tests drive actual GUI/TUI input, saves, editing prompts, shell execution,

@@ -1,6 +1,6 @@
 # Slate — Project Goals
 
-Slate is a native Rust code editor with a Kirigami graphical frontend and a
+Slate is a native Rust code editor with a Qt Quick graphical frontend and a
 terminal frontend. Both are views of the same editor core and offer the same
 configurable workspace model.
 
@@ -9,7 +9,7 @@ intended behavior, not features already implemented.
 
 ## Critical dependency rule
 
-Runtime dependencies, including Qt and Kirigami, must never require an exact
+Runtime dependencies, including Qt, must never require an exact
 version. Use compatible version ranges or minimum API requirements, versionless
 QML imports, and distro-provided runtime packages.
 
@@ -17,7 +17,7 @@ QML imports, and distro-provided runtime packages.
 
 - `slate` opens the terminal user interface (TUI). It must not link Qt, so it
   runs on servers, over SSH and on minimal systems.
-- `slate-gui` opens the Kirigami graphical interface (GUI) and can also run the
+- `slate-gui` opens the Qt Quick graphical interface (GUI) and can also run the
   TUI with `--tui`.
 - `slate --gui` hands over to `slate-gui`; `slate-gui --tui` runs the TUI.
 - Accept files or a workspace directory, such as `slate main.rs` or `slate .`,
@@ -33,13 +33,13 @@ Start with a Cargo workspace containing these three principal crates:
 | --- | --- |
 | `slate-core` | Documents, editing, undo/redo, editor views, workspace state, commands, layout, settings, file operations, Git services, and terminal sessions. |
 | `slate-cli` | TUI rendering, terminal input, focus interaction, shortcuts, and terminal-specific clipboard integration. |
-| `slate-gui` | Kirigami/Qt Quick presentation, graphical input, and adapters exposing core state to QML. |
+| `slate-gui` | Qt Quick presentation, graphical input, and adapters exposing core state to QML. |
 
 A thin binary entry point selects the frontend and composes these crates into
 one program. Additional crates may be extracted when clear boundaries emerge.
 
 **Shared editor behavior belongs in the core; each frontend owns its
-presentation and input adaptation.** The core must not depend on Qt, Kirigami,
+presentation and input adaptation.** The core must not depend on Qt,
 QML, or a TUI rendering framework. Frontends must not independently implement
 editing rules, document history, Git operations, or terminal process ownership.
 
@@ -111,7 +111,7 @@ the foundation for configurable bindings and a command palette.
 
 ## Implementation direction and scope
 
-Use Rust for editor and application logic, with Kirigami and Qt Quick for the
+Use Rust for editor and application logic, with Qt Quick (no KDE frameworks) for the
 GUI. CXX-Qt is a candidate bridge, not a committed dependency. Prefer mature
 text-buffer, parsing, PTY, and terminal-emulation libraries where appropriate;
 specific choices require evaluation.

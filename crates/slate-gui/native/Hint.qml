@@ -1,7 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Controls.Basic as Basic
-import org.kde.kirigami as Kirigami
+import Slate.Native
 
 // Keep each hint anchored to its owner. Native shared tooltips can retain stale
 // placement after a resize; a hint must never swallow a control's mouse click.
@@ -19,13 +19,13 @@ Basic.ToolTip {
     y: Overlay.overlay && anchorItem.mapToItem(Overlay.overlay, 0, 0).y + anchorItem.height + implicitHeight + 8 < Overlay.overlay.height ? anchorItem.height + 6 : -implicitHeight - 6
     background: Rectangle {
         radius: 4
-        color: Kirigami.Theme.backgroundColor
-        border.color: Qt.alpha(Kirigami.Theme.textColor, 0.3)
+        color: Theme.backgroundColor
+        border.color: Qt.alpha(Theme.textColor, 0.3)
     }
     contentItem: Text {
         text: hint.text
         font: hint.font
-        color: Kirigami.Theme.textColor
+        color: Theme.textColor
         wrapMode: Text.WrapAnywhere
     }
 }

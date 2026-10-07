@@ -148,6 +148,7 @@ const CHOICE_PROMPTS: &[&str] = &[
     "save-read-only",
     "save-elevated",
     "reload-changed",
+    "file-changed",
 ];
 
 /// Whether the tty's erase character is ^H, making Ctrl+H Backspace.
@@ -812,6 +813,11 @@ fn prompt_view(prompt: &slate_core::search::Prompt) -> (String, &'static str, u1
             "Permission denied",
             5,
         ),
+        "file-changed" => (
+            format!("{input} changed on disk while you have unsaved changes.\nR: reload it (discard your edits) · K: keep your version (saving replaces the file) · Escape: decide later"),
+            "File changed on disk",
+            5,
+        ),
         "reload-changed" => (
             format!("Reload {input} from disk and discard your unsaved changes?\nY: reload · N / Escape: keep editing"),
             "Reload",
@@ -835,6 +841,7 @@ fn prompt_view(prompt: &slate_core::search::Prompt) -> (String, &'static str, u1
                 "set-encoding" => "Encoding for saving (utf-8, utf-16le, windows-1252…)",
                 "reopen-encoding" => "Reopen with encoding (utf-8, latin1, shift_jis…)",
                 "set-line-ending" => "Line endings: lf, crlf or cr",
+                "open-recent" => "Open recent file (path or number)",
                 "goto" => "Go to line",
                 "find" => "Find",
                 _ => "Input",

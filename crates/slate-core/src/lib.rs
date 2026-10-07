@@ -1,11 +1,13 @@
 mod actions;
 pub mod cli;
 pub mod commands;
+pub mod desktop;
 pub mod document;
 mod editing;
 pub mod events;
 pub mod fsio;
 mod highlight;
+pub mod instance;
 pub mod layout;
 pub mod paths;
 pub mod preferences;
@@ -74,6 +76,11 @@ pub enum Command {
     ScrollTo {
         pane: u64,
         line: usize,
+    },
+    /// Scroll an editor horizontally by display columns.
+    ScrollColumns {
+        pane: u64,
+        delta: i32,
     },
     OpenSettings,
     EditorOnly,
@@ -317,6 +324,10 @@ pub struct EditorPresentation {
     pub selection: String,
     pub line_count: usize,
     pub top: usize,
+    /// Horizontal scroll position in display columns.
+    pub left: usize,
+    pub document: u64,
+    pub generation: u64,
 }
 #[derive(Serialize)]
 pub struct Snapshot {
@@ -342,6 +353,9 @@ pub struct Snapshot {
     pub commands: Vec<commands::CommandInfo>,
     pub settings: Preferences,
     pub editor_only: bool,
+    /// Window title: the active document and the workspace folder.
+    pub title: String,
+    pub recent: Vec<String>,
     pub git_branch: String,
     pub git_repository: bool,
     pub git_busy: bool,
@@ -420,6 +434,16 @@ pub struct App {
     checkpoint_key: u64,
     /// The terminal interface hosts this session (enables suspend, mouse toggle).
     pub terminal_frontend: bool,
+    disk_check_at: Instant,
+    disk_check_pending: bool,
+    disk_conflicts: std::collections::VecDeque<(u64, Document)>,
+    recent: Vec<String>,
+    overview_cache: BTreeMap<u64, desktop::Overview>,
+    /// Requests only a frontend can fulfil (new window, print), drained by it.
+    frontend_requests: Vec<String>,
+    inbox: Option<instance::Inbox>,
+    /// Cursor positions (line, column) for files whose open is in flight.
+    pending_positions: BTreeMap<PathBuf, (usize, usize)>,
 }
 /// A privileged write the terminal frontend performs with `sudo`, after
 /// handing it the terminal for a password prompt.
@@ -597,6 +621,14 @@ impl App {
             suspend_requested: false,
             checkpoint_key: 0,
             terminal_frontend: true,
+            disk_check_at: Instant::now(),
+            disk_check_pending: false,
+            disk_conflicts: Default::default(),
+            recent: desktop::load_recent(),
+            overview_cache: BTreeMap::new(),
+            frontend_requests: vec![],
+            inbox: None,
+            pending_positions: BTreeMap::new(),
         };
         app.read_settings();
         app.load_preferences();
@@ -638,6 +670,8 @@ impl App {
     pub fn process_events(&mut self) {
         self.events.drain();
         self.poll();
+        self.drain_inbox();
+        self.watch_files();
         self.schedule_highlight();
         if self.workspace_dirty && self.checkpoint_at.elapsed() >= Duration::from_secs(1) {
             self.checkpoint();
@@ -839,6 +873,11 @@ impl App {
                     v.manual_scroll = true;
                 }
             }
+            Command::ScrollColumns { pane, delta } => {
+                if let Some(View::Editor(id)) = self.layout.view(pane).cloned() {
+                    self.scroll_columns(id, delta);
+                }
+            }
             Command::OpenSettings => {
                 if !Preferences::path().exists() {
                     self.preferences.save()?;
@@ -933,6 +972,7 @@ impl App {
                     "set-encoding",
                     "reopen-encoding",
                     "set-line-ending",
+                    "open-recent",
                 ]
                 .contains(&kind.as_str())
                 {
@@ -980,6 +1020,21 @@ impl App {
             Command::SubmitPrompt { all } => {
                 let p = self.prompt.clone().context("No active prompt")?;
                 match p.kind.as_str() {
+                    // Graphical frontends answer confirmations through
+                    // dialogs: `all` selects the alternative button.
+                    "save-read-only" | "save-elevated" | "reload-changed" => {
+                        self.prompt = None;
+                        self.confirm_pending(&p.kind)?;
+                    }
+                    "file-changed" => self.resolve_disk_conflict(!all),
+                    "quit" => {
+                        self.prompt = None;
+                        if all {
+                            self.execute(Command::Quit { force: true })?;
+                        } else {
+                            self.save_all(true)?;
+                        }
+                    }
                     "close-tab" => {
                         let target = self.pending_close.take();
                         self.prompt = None;
@@ -1004,7 +1059,8 @@ impl App {
                             self.prompt = Some(p);
                         }
                     }
-                    "insert-file" | "set-encoding" | "reopen-encoding" | "set-line-ending" => {
+                    "insert-file" | "set-encoding" | "reopen-encoding" | "set-line-ending"
+                    | "open-recent" => {
                         if p.input.trim().is_empty() {
                             bail!("Enter a value");
                         }
@@ -1036,8 +1092,22 @@ impl App {
                 }
             }
             Command::DismissPrompt => {
-                self.prompt = None;
+                let kind = self.prompt.take().map(|p| p.kind).unwrap_or_default();
                 self.pending_close = None;
+                match kind.as_str() {
+                    "save-read-only" | "save-elevated" | "reload-changed" => {
+                        self.pending_retry = None;
+                        self.quit_after_save = false;
+                        self.status = "Save cancelled".into();
+                    }
+                    "quit" => self.status = "Quit cancelled".into(),
+                    // Decide later: the next save reports the conflict.
+                    "file-changed" => {
+                        self.disk_conflicts.pop_front();
+                        self.offer_disk_conflict();
+                    }
+                    _ => {}
+                }
             }
             Command::Theme {
                 foreground,
@@ -1109,6 +1179,16 @@ impl App {
                         col,
                         shift: shift || kind == "drag",
                     })?;
+                } else if kind == "double" || kind == "triple" {
+                    self.execute(Command::Click {
+                        pane,
+                        row,
+                        col,
+                        shift: false,
+                    })?;
+                    if let Some(View::Editor(id)) = self.layout.view(pane).cloned() {
+                        self.select_unit(id, kind == "triple");
+                    }
                 }
             }
             Command::Key { key } => self.key(key)?,
@@ -1553,6 +1633,9 @@ impl App {
                     self.pending_save.retain(|d| *d != id);
                     match result {
                         Ok(d) => {
+                            if let Some(path) = d.path.clone() {
+                                self.remember_recent(&path);
+                            }
                             if let Some(doc) = self.documents.get_mut(&id) {
                                 doc.accept_save(d);
                                 self.status = if doc.dirty() {
@@ -1642,6 +1725,7 @@ impl App {
                 }
                 Reply::Error(e) => self.status = e,
                 Reply::Spelling(result) => self.spelling_result(result),
+                Reply::Disk(changes) => self.disk_changes(changes),
                 Reply::Output(_, _) if self.quit => {
                     self.git_jobs = self.git_jobs.saturating_sub(1);
                 }
@@ -1944,6 +2028,15 @@ impl App {
                 } else if cancel || k.key == "Enter" {
                     self.prompt = None;
                     self.status = "Quit cancelled".into();
+                }
+            }
+            "file-changed" => {
+                if letter == "r" {
+                    self.resolve_disk_conflict(true);
+                } else if letter == "k" {
+                    self.resolve_disk_conflict(false);
+                } else if cancel {
+                    self.execute(Command::DismissPrompt)?;
                 }
             }
             "save-read-only" | "save-elevated" | "reload-changed" => {
@@ -2402,6 +2495,8 @@ impl App {
             },
             settings: self.preferences.clone(),
             editor_only: self.editor_only,
+            title: self.window_title(),
+            recent: self.recent.clone(),
             git_branch: self.git_branch.clone(),
             git_repository: self.git_repository,
             git_busy: self.git_jobs > 0,
@@ -2441,6 +2536,9 @@ impl App {
             selection: selected.chars().take(2048).collect(),
             line_count: doc.line_count(),
             top: v.top,
+            left: v.left,
+            document: v.document,
+            generation: doc.generation,
         }
     }
     fn editor_signature(&self, id: u64) -> String {
@@ -2456,6 +2554,8 @@ impl App {
             &self.search,
             self.preferences.line_numbers,
             self.preferences.indent_width,
+            self.preferences.soft_wrap,
+            self.preferences.show_whitespace,
         ))
         .unwrap()
     }
@@ -2482,13 +2582,14 @@ impl App {
         screen
     }
     fn cached_terminal_screen(&mut self, id: u64, revision: u64) -> std::sync::Arc<Screen> {
-        let key = format!("terminal:{revision}");
+        let key = format!("terminal:{revision}:{}:{}", self.colors.0, self.colors.1);
         if let Some((prior, _, screen)) = self.render_cache.get(&id) {
             if *prior == key {
                 return screen.clone();
             }
         }
-        let screen = std::sync::Arc::new(self.terminals[&id].screen());
+        let screen =
+            std::sync::Arc::new(self.terminals[&id].screen_with(&self.colors.0, &self.colors.1));
         self.screen_builds += 1;
         self.render_cache
             .insert(id, (key, self.screen_builds, screen.clone()));
@@ -2518,9 +2619,11 @@ impl App {
         let (cursor_line, cursor_row, cursor_col) =
             self.visual_position(id, self.views[&id].cursor);
         if !wrapping {
-            // Horizontal scrolling keeps the cursor column visible.
+            // Horizontal scrolling keeps the cursor column visible, unless the
+            // user scrolled away deliberately (wheel or scrollbar).
             let v = self.views.get_mut(&id).unwrap();
-            if cursor_col < v.left {
+            if v.manual_scroll {
+            } else if cursor_col < v.left {
                 v.left = cursor_col;
             } else if cursor_col >= v.left + usable {
                 v.left = cursor_col + 1 - usable;
@@ -2528,7 +2631,11 @@ impl App {
         } else {
             self.views.get_mut(&id).unwrap().left = 0;
         }
-        let visible = self.visible_rows(id, rows as usize);
+        // Graphical views draw one extra row for pixel-smooth scrolling.
+        let render_rows = rows as usize + usize::from(graphical);
+        let visible = self.visible_rows(id, render_rows);
+        let show_whitespace = self.preferences.show_whitespace;
+        let whitespace_color = desktop::blend(&self.colors.0, &self.colors.1, 0.6);
         let v = &self.views[&id];
         let document = &self.documents[&doc_id];
         let text = &document.text;
@@ -2538,11 +2645,11 @@ impl App {
         blank.fg = self.colors.0.clone();
         blank.bg = self.colors.1.clone();
         let mut cells = if graphical {
-            vec![vec![]; rows as usize]
+            vec![vec![]; render_rows]
         } else {
             vec![vec![blank; cols as usize]; rows as usize]
         };
-        let mut decorations = vec![vec![]; rows as usize];
+        let mut decorations = vec![vec![]; render_rows];
         let token_data = self
             .tokens
             .get(&doc_id)
@@ -2641,6 +2748,15 @@ impl App {
                         let matched = ranges
                             .get(match_index)
                             .is_some_and(|(a, b)| i >= *a && i < *b);
+                        if show_whitespace && (g == " " || g == "\t") {
+                            c.text = match (g, offset) {
+                                (" ", _) => "·",
+                                (_, 0) => "→",
+                                _ => " ",
+                            }
+                            .into();
+                            c.fg = whitespace_color.clone();
+                        }
                         c.wide = width == 2 && g != "\t" && offset == 0;
                         c.continuation = width == 2 && g != "\t" && offset == 1;
                         let selected = selection
@@ -2964,6 +3080,16 @@ const ACTION_VERBS: &[&str] = &[
     "toggle-mouse",
     "toggle-backup",
     "suspend",
+    "toggle-whitespace",
+    "toggle-minimap",
+    "toggle-auto-reload",
+    "zoom-in",
+    "zoom-out",
+    "zoom-reset",
+    "open-recent",
+    "clear-recent",
+    "new-window",
+    "print",
 ];
 pub fn key_chord(k: &Key) -> String {
     // Shift is implied by shifted punctuation such as `}` or `_`, and
@@ -3013,9 +3139,25 @@ impl App {
             );
             self.add_tab(View::Editor(id));
         }
+        let path = path.unwrap();
+        if let Some((line, column)) = self.pending_positions.remove(&path) {
+            if let Some(View::Editor(view)) = self.layout.view(self.focus).cloned() {
+                let doc = self.views[&view].document;
+                let cursor = self.documents[&doc].at_line_col(
+                    line.saturating_sub(1),
+                    column.saturating_sub(1),
+                    self.preferences.indent_width,
+                );
+                let v = self.views.get_mut(&view).unwrap();
+                v.cursor = cursor;
+                v.anchor = None;
+                v.manual_scroll = false;
+            }
+        }
+        self.remember_recent(&path);
         self.status = format!(
             "Opened {}{}",
-            path.unwrap().display(),
+            path.display(),
             notice.map(|n| format!(" · {n}")).unwrap_or_default()
         );
         self.workspace_dirty = true;

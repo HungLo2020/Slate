@@ -1585,6 +1585,7 @@ version = "0.1.2"
 dependencies = [
  "anyhow",
  "cmake",
+ "libc",
  "pkg-config",
  "serde",
  "serde_json",

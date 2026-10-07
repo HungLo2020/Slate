@@ -15,6 +15,7 @@ anyhow = "1"
 slate-core = { path = "../slate-core" }
 slate-cli = { path = "../slate-cli" }
 serde_json = "1"
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 
 [build-dependencies]

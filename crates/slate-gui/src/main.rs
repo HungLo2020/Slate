@@ -2,9 +2,60 @@
 //! from the same executable.
 use anyhow::{bail, Result};
 use slate_core::cli::{self, Frontend};
+use std::ffi::OsString;
+
+/// Qt's own command-line options and whether each takes a value.
+const QT_OPTIONS: &[(&str, bool)] = &[
+    ("-platform", true),
+    ("-platformpluginpath", true),
+    ("-platformtheme", true),
+    ("-plugin", true),
+    ("-qwindowgeometry", true),
+    ("-qwindowicon", true),
+    ("-qwindowtitle", true),
+    ("-display", true),
+    ("-style", true),
+    ("-stylesheet", true),
+    ("-session", true),
+    ("-name", true),
+    ("-reverse", false),
+    ("-widgetcount", false),
+    ("-nograb", false),
+    ("-dograb", false),
+    ("-sync", false),
+];
+
+/// Separate Qt options (passed to QApplication) from Slate's arguments.
+fn split_arguments(args: Vec<OsString>) -> (Vec<OsString>, Vec<String>) {
+    let mut slate = vec![];
+    let mut qt = vec![];
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        let text = arg.to_string_lossy().into_owned();
+        let name = text.split('=').next().unwrap_or_default().to_string();
+        match QT_OPTIONS
+            .iter()
+            .find(|(option, _)| *option == name || format!("-{option}") == name)
+        {
+            Some((_, takes_value)) => {
+                qt.push(text.clone());
+                if *takes_value && !text.contains('=') {
+                    if let Some(value) = iter.next() {
+                        qt.push(value.to_string_lossy().into_owned());
+                    }
+                }
+            }
+            None if text.starts_with("-qmljsdebugger") => qt.push(text),
+            None => slate.push(arg),
+        }
+    }
+    (slate, qt)
+}
 
 fn main() -> Result<()> {
-    let launch = cli::parse(std::env::args_os().skip(1))?;
+    slate_gui::handle_termination_signals();
+    let (args, qt_arguments) = split_arguments(std::env::args_os().skip(1).collect());
+    let launch = cli::parse(args)?;
     if launch.help {
         println!("{}", cli::USAGE);
         return Ok(());
@@ -16,18 +67,65 @@ fn main() -> Result<()> {
     if launch.frontend == Some(Frontend::Tui) {
         return slate_cli::run(cli::start(&launch)?);
     }
+    // Files go to a running window, like other desktop editors. Directories,
+    // standard input and --new-instance always open a new window.
+    let single = !launch.new_instance
+        && launch.directory.is_none()
+        && launch.stdin.is_none()
+        && std::env::var_os("SLATE_GUI_SMOKE_DIR").is_none();
+    if single && !launch.files.is_empty() && slate_core::instance::forward(&launch.files) {
+        return Ok(());
+    }
     let smoke = std::env::var_os("SLATE_GUI_SMOKE_DIR").is_some();
     if smoke {
         eprintln!("Smoke startup: constructing shared core");
     }
-    let app = cli::start(&launch)?;
+    let mut app = cli::start(&launch)?;
     if smoke {
         eprintln!("Smoke startup: core constructed");
         eprintln!("Smoke startup: workspace ready");
     }
-    let code = slate_gui::run(app);
+    let owns_socket = if single {
+        let events = app.events();
+        match slate_core::instance::listen(move || events.notify()) {
+            Some(inbox) => {
+                app.attach_inbox(inbox);
+                true
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
+    let code = slate_gui::run_with(app, &qt_arguments);
+    if owns_socket {
+        slate_core::instance::release();
+    }
     if code != 0 {
         bail!("GUI exited with code {code}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_arguments;
+
+    #[test]
+    fn qt_options_are_separated_from_files() {
+        let args = [
+            "-platform",
+            "offscreen",
+            "file.txt",
+            "-reverse",
+            "--style=Fusion",
+            "+3",
+            "b",
+        ]
+        .map(std::ffi::OsString::from)
+        .to_vec();
+        let (slate, qt) = split_arguments(args);
+        assert_eq!(slate, ["file.txt", "+3", "b"].map(std::ffi::OsString::from));
+        assert_eq!(qt, ["-platform", "offscreen", "-reverse", "--style=Fusion"]);
+    }
 }

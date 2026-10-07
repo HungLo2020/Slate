@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>slate</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <name>Slate</name>
+  <summary>Text and code editor with graphical and terminal interfaces</summary>
+  <description>
+    <p>
+      Slate edits text and code in a desktop window or a terminal. Both
+      interfaces share one editor core: documents, undo history, split panes,
+      terminals, Git and workspace recovery behave the same in each.
+    </p>
+    <ul>
+      <li>A nano-compatible terminal interface that runs without a desktop</li>
+      <li>Encodings, line endings, file watching and metadata-preserving saves</li>
+      <li>Syntax highlighting, minimap, soft wrap and printing</li>
+      <li>Integrated terminals and a Git changes view</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">slate.desktop</launchable>
+  <url type="homepage">https://github.com/HungLo2020/Slate</url>
+  <provides>
+    <binary>slate</binary>
+    <binary>slate-gui</binary>
+  </provides>
+  <categories>
+    <category>Development</category>
+    <category>TextEditor</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+</component>

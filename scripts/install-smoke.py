@@ -35,6 +35,8 @@ with tempfile.TemporaryDirectory(prefix='slate-install-') as temporary:
         assert (prefix/'share/applications/slate.desktop').exists()
         assert (prefix/'share/icons/hicolor/scalable/apps/slate.svg').read_bytes() == (root/'resources/slate.svg').read_bytes()
         assert 'Icon=slate' in (prefix/'share/applications/slate.desktop').read_text()
+        assert 'Exec=slate-gui %F' in (prefix/'share/applications/slate.desktop').read_text()
+        assert (prefix/'share/metainfo/slate.metainfo.xml').exists()
         subprocess.run([str(gui), '--help'], check=True, stdout=subprocess.DEVNULL)
         # `slate --gui` hands over to the installed slate-gui.
         version = subprocess.check_output([str(installed), '--gui', '--version'], text=True)

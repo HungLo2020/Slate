@@ -32,14 +32,14 @@ jobs:
         distro: [fedora:latest, debian:trixie]
     container: ${{ matrix.distro }}
     steps:
-      - name: Install distro-provided Qt and Kirigami packages
+      - name: Install distro-provided Qt packages (no KDE frameworks needed)
         shell: sh
         run: |
           if command -v dnf >/dev/null; then
-            dnf install -y git gcc-c++ cmake pkgconf-pkg-config curl rust cargo qt6-qtbase-devel qt6-qtdeclarative-devel kf6-kirigami dejavu-sans-mono-fonts python3
+            dnf install -y git gcc-c++ cmake pkgconf-pkg-config curl rust cargo qt6-qtbase-devel qt6-qtdeclarative-devel dejavu-sans-mono-fonts python3
           else
             apt-get update
-            apt-get install -y git g++ cmake pkg-config curl ca-certificates qt6-base-dev qt6-declarative-dev qml6-module-org-kde-kirigami qml6-module-qtquick-controls qml6-module-qtquick-layouts qml6-module-qtquick-templates qml6-module-qtquick-window qml6-module-qtqml-workerscript fonts-dejavu-core python3
+            apt-get install -y git g++ cmake pkg-config curl ca-certificates qt6-base-dev qt6-declarative-dev qml6-module-qtquick-controls qml6-module-qtquick-layouts qml6-module-qtquick-templates qml6-module-qtquick-window qml6-module-qtqml-workerscript fonts-dejavu-core python3
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           fi
@@ -51,6 +51,9 @@ jobs:
       - run: SLATE_GUI_COMMAND_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: SLATE_GUI_TAB_CLOSE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: SLATE_GUI_GIT_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
+      - run: SLATE_GUI_DESKTOP_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
+      - run: SLATE_GUI_FILE_DIALOG_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
+      - run: python3 scripts/single-instance-smoke.py target/debug/slate-gui
       - run: python3 scripts/gui-layout-smoke.py target/debug/slate
       - run: python3 scripts/recovery-smoke.py target/debug/slate
       - run: cargo build --release --package slate --package slate-gui --features slate-gui/smoke

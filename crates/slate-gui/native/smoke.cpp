@@ -22,6 +22,10 @@
 #include <QSignalBlocker>
 #include <QTest>
 #include <QTimer>
+#include <QAccessible>
+#include <QMimeData>
+#include <QTextCharFormat>
+#include <QWheelEvent>
 #include <functional>
 
 static QQuickItem *findItem(QQuickItem *item, const QString &name) {
@@ -84,6 +88,9 @@ static bool clickMenuAction(QQuickWindow *window, QTimer *driver, const QString 
     auto item = findMenuItem(window, "menuAction_" + action);
     if (!item || !item->isVisible() || !item->isEnabled()) return false;
     QSignalSpy triggered(item, SIGNAL(triggered()));
+    // Let the opened menu finish its first frame; real pointers never click
+    // within the same event-loop turn that shows a popup.
+    QTest::qWait(60);
     QTest::mouseClick(item->window(), Qt::LeftButton, Qt::NoModifier,
         item->mapToScene(QPointF(item->width()/2, item->height()/2)).toPoint());
     return triggered.count() == 1;
@@ -1132,7 +1139,7 @@ static void startFileDialogSmoke(Bridge *state, QQuickWindow *window) {
             break;
         }
         case 1:
-            if (!checkDialog(QFileDialog::ExistingFile, QFileDialog::AcceptOpen)) return;
+            if (!checkDialog(QFileDialog::ExistingFiles, QFileDialog::AcceptOpen)) return;
             pathDialog()->reject();
             break;
         case 2:
@@ -1143,7 +1150,7 @@ static void startFileDialogSmoke(Bridge *state, QQuickWindow *window) {
             QTest::keyClick(window, Qt::Key_O, Qt::ControlModifier);
             break;
         case 3:
-            if (!checkDialog(QFileDialog::ExistingFile, QFileDialog::AcceptOpen)) return;
+            if (!checkDialog(QFileDialog::ExistingFiles, QFileDialog::AcceptOpen)) return;
             select(picked);
             break;
         case 4:
@@ -1567,6 +1574,295 @@ static void startTabCloseSmoke(Bridge *state, QQuickWindow *window) {
 }
 
 void startPerformanceSmoke(Bridge *, QQuickWindow *);
+
+// Desktop-editor behaviour of the graphical interface (commit "Kate parity").
+static void startDesktopSmoke(Bridge *state, QQuickWindow *window) {
+    const QString dir = qEnvironmentVariable("SLATE_GUI_SMOKE_DIR");
+    const QString workspace = dir + "/workspace";
+    auto timer = new QTimer(state);
+    auto step = new int(0), ticks = new int(0);
+    auto memory = new QVariantMap;
+    auto finish = [=](bool pass, const QString &detail) {
+        QFile report(dir + "/report.json");
+        report.open(QIODevice::WriteOnly);
+        report.write(QJsonDocument(QJsonObject{{"pass", pass}, {"detail", detail}, {"steps", *step}}).toJson());
+        window->grabWindow().save(dir + "/gui.png");
+        timer->stop();
+        QGuiApplication::exit(pass ? 0 : 2);
+    };
+    auto editorPane = [=]() -> QVariantMap {
+        for (const auto &value : state->frame().value("panes").toList())
+            if (value.toMap().value("kind") == "editor") return value.toMap();
+        return {};
+    };
+    auto grid = [=]() { return findItem(window->contentItem(), "cells_" + editorPane().value("id").toString()); };
+    auto context = [=]() {
+        return state->send({{"action", "input_context"}, {"pane", editorPane().value("id")}}).value("editor").toMap();
+    };
+    auto surfaceText = [=](int pane) {
+        QStringList lines;
+        for (const auto &line : state->surface(pane).value("lines").toList())
+            lines.append(line.toMap().value("layout").toMap().value("text").toString());
+        return lines.join("\n");
+    };
+    auto cellPoint = [=](int row, int column) {
+        const int gutter = editorPane().value("rows").toInt() > 0 ? 6 : 0;
+        return grid()->mapToScene(QPointF(1 + (gutter + column) * state->cellWidth() + state->cellWidth() / 2.0,
+                                          1 + row * state->cellHeight() + state->cellHeight() / 2.0)).toPoint();
+    };
+    auto write = [](const QString &path, const QByteArray &bytes) {
+        QFile file(path);
+        file.open(QIODevice::WriteOnly | QIODevice::Truncate);
+        file.write(bytes);
+    };
+    auto read = [](const QString &path) {
+        QFile file(path);
+        file.open(QIODevice::ReadOnly);
+        return file.readAll();
+    };
+    auto wheel = [=](QPoint at, QPoint pixels, QPoint angle) {
+        QWheelEvent event(QPointF(at), window->mapToGlobal(at), pixels, angle, Qt::NoButton, Qt::NoModifier,
+                          Qt::ScrollUpdate, false);
+        QCoreApplication::sendEvent(window, &event);
+    };
+    QObject::connect(timer, &QTimer::timeout, state, [=]() {
+        state->refresh();
+        if (++*ticks > 400) {
+            finish(false, QString("Desktop smoke timeout at step %1: %2").arg(*step).arg(state->frame().value("status").toString()));
+            return;
+        }
+        const auto frame = state->frame();
+        const auto pane = editorPane();
+        switch (*step) {
+        case 0:
+            state->send({{"action", "open"}, {"path", workspace + "/edit.txt"}});
+            break;
+        case 1:
+            if (!frame.value("title").toString().contains("edit.txt") || !window->title().contains("Slate")) return;
+            grid()->forceActiveFocus();
+            memory->insert("catalogs", state->diagnostics().value("catalog_requests"));
+            for (const auto c : QString("Hello world "))
+                QTest::keyClick(window, c.toLatin1());
+            break;
+        case 2:
+            if (!window->title().contains("edit.txt *")) return;
+            // Typing never queries the command catalog: menus read it on open.
+            if (state->diagnostics().value("catalog_requests") != memory->value("catalogs")) {
+                finish(false, QString("Typing queried the command catalog %1 times")
+                    .arg(state->diagnostics().value("catalog_requests").toLongLong() -
+                         memory->value("catalogs").toLongLong()));
+                return;
+            }
+            // Double click selects a word, a quick third click the line.
+            QTest::mouseDClick(window, Qt::LeftButton, Qt::NoModifier, cellPoint(0, 1));
+            break;
+        case 3:
+            if (context().value("selection") != "Hello") {
+                finish(false, "Double click did not select the word: " + context().value("selection").toString());
+                return;
+            }
+            QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, cellPoint(0, 1));
+            break;
+        case 4:
+            if (context().value("selection") != "Hello world original\n") {
+                finish(false, "Triple click did not select the line: " + context().value("selection").toString());
+                return;
+            }
+            QTest::keyClick(window, Qt::Key_Escape);
+            // An external change while the document is modified asks first.
+            write(workspace + "/edit.txt", "external change\n");
+            break;
+        case 5: {
+            auto dialog = window->findChild<QObject *>("choiceDialog");
+            if (!dialog || !dialog->property("visible").toBool()) return;
+            // Click once the dialog has been laid out and painted.
+            if (!memory->value("dialog").toBool()) {
+                memory->insert("dialog", true);
+                return;
+            }
+            if (frame.value("prompt").toMap().value("kind") != "file-changed") {
+                finish(false, "Unexpected prompt for an external change");
+                return;
+            }
+            auto keep = findItem(window->contentItem(), "choiceAlternative");
+            if (!keep) keep = [&]() -> QQuickItem * {
+                for (auto candidate : window->contentItem()->findChildren<QQuickItem *>())
+                    if (candidate->objectName() == "choiceAlternative" && candidate->isVisible()) return candidate;
+                return nullptr;
+            }();
+            if (!keep) { finish(false, "Missing Keep My Version button"); return; }
+            QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                keep->mapToScene(QPointF(keep->width() / 2, keep->height() / 2)).toPoint());
+            break;
+        }
+        case 6:
+            if (!frame.value("status").toString().startsWith("Kept your version")) return;
+            grid()->forceActiveFocus();
+            QTest::keyClick(window, Qt::Key_S, Qt::ControlModifier);
+            break;
+        case 7:
+            if (read(workspace + "/edit.txt") != "Hello world original\n") return;
+            // A clean document follows its file automatically.
+            write(workspace + "/edit.txt", "changed outside\n");
+            break;
+        case 8:
+            if (!context().value("surrounding").toString().startsWith("changed outside") ||
+                !frame.value("status").toString().contains("reloaded")) return;
+            memory->insert("cell", state->cellWidth());
+            state->send({{"action", "invoke_action"}, {"id", "zoom-in"}});
+            break;
+        case 9:
+            if (frame.value("settings").toMap().value("font_size").toInt() != 12) return;
+            if (state->cellWidth() < memory->value("cell").toInt()) { finish(false, "Zoom did not change the font"); return; }
+            state->send({{"action", "invoke_action"}, {"id", "zoom-reset"}});
+            {
+                QByteArray text;
+                for (int i = 0; i < 400; ++i) text += "line " + QByteArray::number(i) + "\n";
+                text += QByteArray(500, 'w') + "\n";
+                write(workspace + "/long.txt", text);
+            }
+            state->send({{"action", "open"}, {"path", workspace + "/long.txt"}});
+            break;
+        case 10: {
+            if (!frame.value("title").toString().contains("long.txt") || !grid()) return;
+            // Touchpad scrolling: many small pixel deltas still scroll.
+            const auto at = grid()->mapToScene(QPointF(40, 40)).toPoint();
+            for (int i = 0; i < 12; ++i) wheel(at, QPoint(0, -6), QPoint(0, -15));
+            break;
+        }
+        case 11: {
+            const int top = pane.value("editor").toMap().value("top").toInt();
+            const qreal pixels = grid()->property("scrollPixels").toReal();
+            if (top < 2) return;
+            if (pixels < 0 || pixels >= state->cellHeight()) { finish(false, "Smooth scroll offset out of range"); return; }
+            state->send({{"action", "go_to_line"}, {"line", 401}});
+            break;
+        }
+        case 12: {
+            const auto at = grid()->mapToScene(QPointF(40, 40)).toPoint();
+            wheel(at, QPoint(-60, 0), QPoint(-120, 0));
+            break;
+        }
+        case 13: {
+            if (pane.value("editor").toMap().value("left").toInt() <= 0) return;
+            auto minimap = findItem(window->contentItem(), "minimap_" + pane.value("id").toString());
+            if (!minimap || !minimap->isVisible()) { finish(false, "Minimap missing"); return; }
+            if (minimap->property("widest").toInt() < 500) { finish(false, "Minimap overview is incomplete"); return; }
+            QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                minimap->mapToScene(QPointF(minimap->width() / 2, 4)).toPoint());
+            break;
+        }
+        case 14:
+            if (pane.value("editor").toMap().value("top").toInt() != 0) return;
+            // Moving the cursor scrolls back to it horizontally.
+            grid()->forceActiveFocus();
+            QTest::keyClick(window, Qt::Key_Home, Qt::ControlModifier);
+            state->send({{"action", "invoke_action"}, {"id", "toggle-whitespace"}});
+            break;
+        case 15:
+            if (!surfaceText(pane.value("id").toInt()).contains(QStringLiteral("line·0"))) return;
+            state->send({{"action", "invoke_action"}, {"id", "toggle-whitespace"}});
+            if (!frame.value("recent").toList().contains(workspace + "/edit.txt")) {
+                finish(false, "Recent files list is missing edit.txt");
+                return;
+            }
+            qputenv("SLATE_GUI_PRINT_PDF", (dir + "/print.pdf").toUtf8());
+            state->send({{"action", "invoke_action"}, {"id", "print"}});
+            break;
+        case 16:
+            if (read(dir + "/print.pdf").size() < 1000 || !read(dir + "/print.pdf").startsWith("%PDF")) return;
+            QTest::mouseClick(window, Qt::RightButton, Qt::NoModifier, cellPoint(2, 2));
+            break;
+        case 17: {
+            auto menu = window->findChild<QObject *>("editorMenu");
+            if (!menu || !menu->property("opened").toBool()) return;
+            auto undo = findMenuItem(window, "menuAction_undo");
+            auto cut = findMenuItem(window, "menuAction_cut");
+            if (!undo || !undo->isVisible() || !cut || !cut->isVisible()) { finish(false, "Editor context menu lacks edit actions"); return; }
+            dismissMenu(window);
+            // The editor exposes a text interface to assistive technology.
+            auto accessible = QAccessible::queryAccessibleInterface(grid());
+            if (!accessible || accessible->role() != QAccessible::EditableText || !accessible->textInterface() ||
+                accessible->textInterface()->characterCount() == 0 ||
+                !accessible->text(QAccessible::Name).contains("long.txt")) {
+                finish(false, "Editor accessibility interface is missing");
+                return;
+            }
+            // Dropping files from a file manager opens them.
+            auto mime = new QMimeData;
+            mime->setUrls({QUrl::fromLocalFile(workspace + "/second.txt")});
+            const auto at = grid()->mapToScene(QPointF(30, 30));
+            QDragEnterEvent enter(at.toPoint(), Qt::CopyAction, mime, Qt::LeftButton, Qt::NoModifier);
+            QCoreApplication::sendEvent(window, &enter);
+            QDragMoveEvent move(at.toPoint(), Qt::CopyAction, mime, Qt::LeftButton, Qt::NoModifier);
+            QCoreApplication::sendEvent(window, &move);
+            QDropEvent drop(at, Qt::CopyAction, mime, Qt::LeftButton, Qt::NoModifier);
+            QCoreApplication::sendEvent(window, &drop);
+            break;
+        }
+        case 18: {
+            if (!frame.value("title").toString().contains("second.txt")) return;
+            // Ctrl+A on a non-Latin layout: the key is Cyrillic, the scan code 'a'.
+            grid()->forceActiveFocus();
+            QKeyEvent press(QEvent::KeyPress, 0x0424, Qt::ControlModifier, 38, 0, 0, QString(QChar(0x0444)));
+            QCoreApplication::sendEvent(window, &press);
+            break;
+        }
+        case 19: {
+            const auto all = context();
+            if (all.value("selection") != all.value("surrounding")) return;
+            QTest::keyClick(window, Qt::Key_End, Qt::ControlModifier);
+            // Input method composition keeps the IME's styling, then commits.
+            QTextCharFormat underline;
+            underline.setFontUnderline(true);
+            QInputMethodEvent compose(QStringLiteral("ねこ"), {
+                QInputMethodEvent::Attribute(QInputMethodEvent::TextFormat, 0, 2, underline),
+                QInputMethodEvent::Attribute(QInputMethodEvent::Cursor, 1, 1, QVariant())});
+            QCoreApplication::sendEvent(grid(), &compose);
+            QInputMethodEvent commit;
+            commit.setCommitString(QStringLiteral("猫"));
+            QCoreApplication::sendEvent(grid(), &commit);
+            break;
+        }
+        case 20: {
+            if (!context().value("surrounding").toString().endsWith(QStringLiteral("猫"))) return;
+            // Terminals use the editor theme's default background.
+            QVariantMap terminal;
+            for (const auto &value : frame.value("panes").toList())
+                if (value.toMap().value("kind") == "terminal") terminal = value.toMap();
+            const auto cells = state->surface(terminal.value("id").toInt()).value("screen").toMap().value("cells").toList();
+            if (cells.isEmpty() || cells.last().toList().isEmpty()) return;
+            const auto bg = cells.last().toList().last().toMap().value("bg").toString();
+            if (bg != frame.value("background").toString()) {
+                finish(false, "Terminal background " + bg + " ignores the theme " + frame.value("background").toString());
+                return;
+            }
+            qputenv("SLATE_GUI_NEW_WINDOW_LOG", (dir + "/new-window.log").toUtf8());
+            state->send({{"action", "invoke_action"}, {"id", "new-window"}});
+            break;
+        }
+        case 21:
+            if (!read(dir + "/new-window.log").contains("new-window")) return;
+            // Errors stand out in the status bar.
+            state->send({{"action", "go_to_line"}, {"line", 999999}});
+            break;
+        case 22: {
+            auto label = findItem(window->contentItem(), "statusLabel");
+            if (!label || !label->property("text").toString().startsWith("Error") || !label->property("font").value<QFont>().bold()) return;
+            if (state->send({{"action", "flush"}}).value("status").toString().isEmpty()) {
+                finish(false, "Session flush did not report");
+                return;
+            }
+            finish(true, "Title/modified marker, word and line selection, external change keep/reload, zoom, smooth and horizontal scrolling, minimap, whitespace, recent files, print, context menu, accessibility, drag and drop, non-Latin shortcuts, IME, terminal theme, new window and error status");
+            return;
+        }
+        }
+        ++*step;
+        *ticks = 0;
+    });
+    timer->start(100);
+}
+
 void startSmoke(Bridge *state, QQuickWindow *window) {
     if (QGuiApplication::desktopFileName() != "slate" ||
         QGuiApplication::windowIcon().pixmap(64, 64).isNull()) {
@@ -1576,6 +1872,10 @@ void startSmoke(Bridge *state, QQuickWindow *window) {
     }
     if (!qEnvironmentVariableIsEmpty("SLATE_GUI_PERF_SMOKE")) {
         startPerformanceSmoke(state, window);
+        return;
+    }
+    if (!qEnvironmentVariableIsEmpty("SLATE_GUI_DESKTOP_SMOKE")) {
+        startDesktopSmoke(state, window);
         return;
     }
     if (!qEnvironmentVariableIsEmpty("SLATE_GUI_FILE_DIALOG_SMOKE")) {

@@ -500,6 +500,10 @@ impl App {
             _ => Ok(()),
         }
     }
+    /// Actions the frontend must perform itself (new window, print).
+    pub fn take_frontend_requests(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.frontend_requests)
+    }
     /// A privileged save the terminal frontend should perform now.
     pub fn take_elevation(&mut self) -> Option<Elevation> {
         self.elevation.take()
@@ -1030,6 +1034,48 @@ impl App {
                 self.configure("backup", &value)?;
             }
             "suspend" => self.suspend_requested = true,
+            "toggle-whitespace" => {
+                let value = (!self.preferences.show_whitespace).to_string();
+                self.configure("show-whitespace", &value)?;
+            }
+            "toggle-minimap" => {
+                let value = (!self.preferences.minimap).to_string();
+                self.configure("minimap", &value)?;
+            }
+            "toggle-auto-reload" => {
+                let value = (!self.preferences.auto_reload).to_string();
+                self.configure("auto-reload", &value)?;
+            }
+            "zoom-in" | "zoom-out" | "zoom-reset" => {
+                let size = match name {
+                    "zoom-in" => (self.preferences.font_size + 1).min(72),
+                    "zoom-out" => self.preferences.font_size.saturating_sub(1).max(6),
+                    _ => 11,
+                };
+                self.configure("font-size", &size.to_string())?;
+            }
+            "open-recent" => {
+                let target = argument.trim();
+                if target.is_empty() {
+                    self.prompt = Some(prompt(
+                        "open-recent",
+                        self.recent.first().cloned().unwrap_or_default(),
+                    ));
+                    return Ok(());
+                }
+                let path = target
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| self.recent.get(n.checked_sub(1)?).cloned())
+                    .unwrap_or_else(|| target.to_string());
+                self.execute(Command::Open { path: path.into() })?;
+            }
+            "clear-recent" => {
+                self.recent.clear();
+                let _ = std::fs::remove_file(crate::paths::state_dir().join("slate/recent.json"));
+                self.status = "Cleared recent files".into();
+            }
+            "new-window" | "print" => self.frontend_requests.push(name.to_string()),
             _ => bail!("Unknown action: {name}"),
         }
         Ok(())

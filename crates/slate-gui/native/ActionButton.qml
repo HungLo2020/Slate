@@ -1,7 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Controls.Basic as Basic
-import org.kde.kirigami as Kirigami
+import Slate.Native
 
 // Own the caption and background together: a native KDE button background can
 // paint its own caption, and its style insets can escape a tightly sized row.
@@ -9,7 +9,7 @@ Basic.Button {
     id: control
     property string iconName: ""
     property string tip: ""
-    property color foregroundColor: Kirigami.Theme.textColor
+    property color foregroundColor: Theme.textColor
     readonly property string fallbackGlyph: ({
             "list-add": "+",
             "list-remove": "−",
@@ -43,15 +43,17 @@ Basic.Button {
         text: control.tip
     }
     contentItem: Item {
-        Kirigami.Icon {
+        Image {
             id: glyph
-            visible: control.iconName.length > 0
-            source: control.iconName
+            readonly property bool valid: status === Image.Ready && control.iconName.length > 0
+            visible: valid
+            // Theme icons, tinted like text so symbolic icons suit dark themes.
+            source: control.iconName.length > 0 && slate.hasIcon(control.iconName) ? "image://icon/" + control.iconName + "?" + caption.color : ""
+            sourceSize: Qt.size(control.iconExtent, control.iconExtent)
             width: control.iconExtent
             height: width
             anchors.verticalCenter: parent.verticalCenter
             x: control.iconOnly ? (parent.width - width) / 2 : 0
-            color: caption.color
         }
         Text {
             visible: control.iconOnly && !glyph.valid
@@ -73,14 +75,14 @@ Basic.Button {
             elide: Text.ElideMiddle
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
-            color: !control.enabled ? Kirigami.Theme.disabledTextColor : control.highlighted || control.down ? Kirigami.Theme.highlightedTextColor : control.foregroundColor
+            color: !control.enabled ? Theme.disabledTextColor : control.highlighted || control.down ? Theme.highlightedTextColor : control.foregroundColor
         }
     }
     background: Rectangle {
         radius: 4
-        color: control.highlighted || control.down ? Kirigami.Theme.highlightColor : control.hovered ? Qt.tint(Kirigami.Theme.backgroundColor, Qt.alpha(Kirigami.Theme.highlightColor, 0.12)) : control.flat ? "transparent" : Kirigami.Theme.backgroundColor
+        color: control.highlighted || control.down ? Theme.highlightColor : control.hovered ? Qt.tint(Theme.backgroundColor, Qt.alpha(Theme.highlightColor, 0.12)) : control.flat ? "transparent" : Theme.backgroundColor
         border.width: control.visualFocus ? 2 : control.flat && !control.hovered ? 0 : 1
-        border.color: control.visualFocus || control.highlighted ? Kirigami.Theme.highlightColor : Qt.alpha(Kirigami.Theme.textColor, control.enabled ? 0.24 : 0.1)
+        border.color: control.visualFocus || control.highlighted ? Theme.highlightColor : Qt.alpha(Theme.textColor, control.enabled ? 0.24 : 0.1)
         opacity: control.enabled ? 1 : 0.6
     }
 }

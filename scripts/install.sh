@@ -50,6 +50,7 @@ if [ "$mode" = gui ]; then
     install_binary "$gui_binary" slate-gui
     repo_dir=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
     install -Dm644 "$repo_dir/packaging/slate.desktop" "$prefix/share/applications/slate.desktop"
+    install -Dm644 "$repo_dir/packaging/slate.metainfo.xml" "$prefix/share/metainfo/slate.metainfo.xml"
     install -Dm644 "$repo_dir/resources/slate.svg" "$prefix/share/icons/hicolor/scalable/apps/slate.svg"
     if command -v update-desktop-database >/dev/null 2>&1; then update-desktop-database "$prefix/share/applications"; fi
 fi

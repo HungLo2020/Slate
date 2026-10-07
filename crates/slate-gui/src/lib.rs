@@ -10,7 +10,35 @@ use std::{
     sync::Arc,
 };
 extern "C" {
-    fn slate_qt_run(context: *mut c_void) -> i32;
+    fn slate_qt_run(context: *mut c_void, argc: i32, argv: *mut *mut c_char) -> i32;
+    fn slate_qt_quit();
+}
+
+static TERMINATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn SIGTERM, SIGHUP and SIGINT into an orderly quit: recovery state is
+/// flushed (or NAME.save files written) and the single-instance socket is
+/// removed. Call before starting other threads, which inherit the mask.
+pub fn handle_termination_signals() {
+    #[cfg(unix)]
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+            libc::sigaddset(&mut set, signal);
+        }
+        if libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) != 0 {
+            return;
+        }
+        let waiting = set;
+        std::thread::spawn(move || loop {
+            let mut signal = 0;
+            if libc::sigwait(&waiting, &mut signal) == 0 {
+                TERMINATED.store(true, std::sync::atomic::Ordering::SeqCst);
+                slate_qt_quit();
+            }
+        });
+    }
 }
 struct GuiContext {
     app: App,
@@ -81,14 +109,71 @@ struct GuiUpdate {
     frame: serde_json::Map<String, serde_json::Value>,
     surfaces: Vec<SurfacePatch>,
 }
-pub fn run(mut app: App) -> i32 {
+/// Run the graphical interface. `qt_arguments` are Qt's own options
+/// (-platform, -style, -reverse…), which Qt consumes.
+pub fn run(app: App) -> i32 {
+    run_with(app, &[])
+}
+pub fn run_with(mut app: App, qt_arguments: &[String]) -> i32 {
     app.terminal_frontend = false;
     // A desktop session authorizes privileged saves through polkit.
     if slate_core::fsio::which("pkexec").is_some() {
         app.elevation_mode = slate_core::ElevationMode::Background("pkexec");
     }
     let mut context = GuiContext::new(app);
-    unsafe { slate_qt_run((&mut context as *mut GuiContext).cast()) }
+    let mut arguments: Vec<CString> = std::iter::once("slate-gui".to_string())
+        .chain(qt_arguments.iter().cloned())
+        .filter_map(|a| CString::new(a).ok())
+        .collect();
+    let mut pointers: Vec<*mut c_char> = arguments
+        .iter_mut()
+        .map(|a| a.as_ptr() as *mut c_char)
+        .chain(std::iter::once(std::ptr::null_mut()))
+        .collect();
+    let code = unsafe {
+        slate_qt_run(
+            (&mut context as *mut GuiContext).cast(),
+            arguments.len() as i32,
+            pointers.as_mut_ptr(),
+        )
+    };
+    drop(arguments);
+    if TERMINATED.load(std::sync::atomic::Ordering::SeqCst) && !context.app.wants_recovery() {
+        let saved = context.app.emergency_save();
+        if !saved.is_empty() {
+            eprintln!(
+                "Slate saved unsaved buffers to: {}",
+                saved
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    code
+}
+struct Target(*mut c_void);
+unsafe impl Send for Target {}
+unsafe impl Sync for Target {}
+/// Register a thread-safe wake callback (platforms without an event fd).
+#[no_mangle]
+unsafe extern "C" fn slate_set_waker(
+    context: *mut c_void,
+    wake: Option<unsafe extern "C" fn(*mut c_void)>,
+    target: *mut c_void,
+) {
+    let (Some(wake), false) = (wake, context.is_null()) else {
+        return;
+    };
+    let target = Target(target);
+    (&*context.cast::<GuiContext>())
+        .app
+        .events()
+        .set_waker(move || {
+            let target = &target;
+            unsafe { wake(target.0) }
+        });
 }
 #[no_mangle]
 unsafe extern "C" fn slate_event_fd(context: *mut c_void) -> i32 {
@@ -104,14 +189,31 @@ unsafe extern "C" fn slate_event_fd(context: *mut c_void) -> i32 {
 }
 #[no_mangle]
 unsafe extern "C" fn slate_request(context: *mut c_void, request: *const c_char) -> *mut c_char {
+    if context.is_null() || request.is_null() {
+        return CString::new("{}").unwrap().into_raw();
+    }
     let response = catch_unwind(AssertUnwindSafe(|| {
         let state = &mut *context.cast::<GuiContext>();
         let request: serde_json::Value =
             serde_json::from_slice(CStr::from_ptr(request).to_bytes()).unwrap_or_default();
         respond(state, request)
     }))
-    .unwrap_or_else(|_| "{\"status\":\"Internal error processing GUI request\"}".into());
-    CString::new(response).unwrap().into_raw()
+    .unwrap_or_else(|_| {
+        // The frontend's cached projection may no longer match the core;
+        // resend everything on the next update.
+        let state = &mut *context.cast::<GuiContext>();
+        state.revision = 0;
+        state.viewport.clear();
+        state.panes.clear();
+        state.editors.clear();
+        state.terminals.clear();
+        state.app.status = "Error: an internal error interrupted the last action".into();
+        "{\"status\":\"Internal error processing GUI request\"}".into()
+    });
+    // JSON escapes NUL characters, so the response never contains one.
+    CString::new(response)
+        .unwrap_or_else(|_| CString::new("{}").unwrap())
+        .into_raw()
 }
 // Resolve every user command before dispatch. Qt-specific confirmations live
 // here, after Rust has interpreted configured shortcuts and palette commands.
@@ -186,6 +288,10 @@ fn dispatch_gui(state: &mut GuiContext, request: serde_json::Value) -> String {
         if apply_theme {
             response["apply_theme"] = true.into();
         }
+        let requests = app.take_frontend_requests();
+        if !requests.is_empty() {
+            response["requests"] = requests.into();
+        }
         if id.as_deref().is_some_and(|id| id == "copy" || id == "cut") {
             response["clipboard"] = app.clipboard.clone().into();
         }
@@ -219,6 +325,29 @@ fn respond(state: &mut GuiContext, request: serde_json::Value) -> String {
             "editor": request["pane"].as_u64().and_then(|id| app.editor_input_context(id))
         })
         .to_string(),
+        "overview" => serde_json::json!({
+            "overview": request["pane"].as_u64().and_then(|id| app.pane_overview(id))
+        })
+        .to_string(),
+        "document_text" => match app.active_document() {
+            Some((title, text)) => serde_json::json!({"title": title, "text": text}).to_string(),
+            None => "{}".into(),
+        },
+        // Session logout: keep unsaved work without asking.
+        "flush" => {
+            let result = if app.wants_recovery() {
+                app.flush_workspace()
+                    .map(|_| "Recovery state saved".to_string())
+            } else {
+                let saved = app.emergency_save();
+                Ok(format!(
+                    "Saved {} unsaved buffer(s) as .save files",
+                    saved.len()
+                ))
+            };
+            serde_json::json!({"status": result.unwrap_or_else(|e| format!("Error: {e:#}"))})
+                .to_string()
+        }
         "diagnostics" => {
             serde_json::json!({ "screen_builds": app.screen_builds, "revision": app.revision() })
                 .to_string()
@@ -390,6 +519,10 @@ fn respond(state: &mut GuiContext, request: serde_json::Value) -> String {
                 state.global_keys = Some(app.preferences.global_keys.clone());
             }
             frame.insert("command_revision".into(), state.revision.into());
+            let requests = app.take_frontend_requests();
+            if !requests.is_empty() {
+                frame.insert("requests".into(), requests.into());
+            }
             if patch && !files_changed {
                 frame.remove("files");
             }
@@ -576,6 +709,58 @@ mod tests {
             serde_json::json!({"action":"input_context","pane":999}),
         );
         assert!(invalid["editor"].is_null());
+    }
+    #[test]
+    fn desktop_requests_overview_print_and_session_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("doc.txt");
+        std::fs::write(&file, "one\n    two\n").unwrap();
+        let mut app = App::new(&file).unwrap();
+        app.terminal_frontend = false;
+        let mut state = GuiContext::new(app);
+        request(
+            &mut state,
+            serde_json::json!({"action":"update","width":1280,"height":720}),
+        );
+        let pane = state.app.focus;
+        let overview = request(
+            &mut state,
+            serde_json::json!({"action":"overview","pane":pane}),
+        );
+        assert_eq!(overview["overview"]["total"], 3);
+        assert_eq!(overview["overview"]["lines"][1], serde_json::json!([4, 7]));
+        let document = request(&mut state, serde_json::json!({"action":"document_text"}));
+        assert_eq!(document["title"], "doc.txt");
+        assert_eq!(document["text"], "one\n    two\n");
+        // Print and new-window are carried out by the Qt side.
+        let printed = request(
+            &mut state,
+            serde_json::json!({"action":"invoke_action","id":"print","argument":""}),
+        );
+        assert_eq!(printed["requests"], serde_json::json!(["print"]));
+        // Logging out keeps unsaved work: single files get NAME.save.
+        request(
+            &mut state,
+            serde_json::json!({"action":"paste","text":"unsaved "}),
+        );
+        let flushed = request(&mut state, serde_json::json!({"action":"flush"}));
+        assert!(
+            flushed["status"].as_str().unwrap().contains(".save"),
+            "{flushed}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("doc.txt.save")).unwrap(),
+            "unsaved one\n    two\n"
+        );
+    }
+    #[test]
+    fn null_requests_are_rejected_without_touching_state() {
+        unsafe {
+            let response = slate_request(std::ptr::null_mut(), std::ptr::null());
+            assert_eq!(CStr::from_ptr(response).to_str().unwrap(), "{}");
+            slate_response_free(response);
+            slate_set_waker(std::ptr::null_mut(), None, std::ptr::null_mut());
+        }
     }
     #[test]
     fn terminal_output_finishes_in_the_cached_view_without_another_user_event() {

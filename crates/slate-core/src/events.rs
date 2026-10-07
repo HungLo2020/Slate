@@ -10,9 +10,12 @@ use std::{
 
 #[derive(Clone)]
 pub struct Events(Arc<Inner>);
+type Waker = Box<dyn Fn() + Send + Sync>;
 struct Inner {
     generation: Mutex<u64>,
     ready: Condvar,
+    /// Frontends without an event descriptor are woken through a callback.
+    waker: Mutex<Option<Waker>>,
     #[cfg(unix)]
     pipe: (Mutex<UnixStream>, Mutex<UnixStream>),
 }
@@ -31,6 +34,7 @@ impl Default for Events {
         Self(Arc::new(Inner {
             generation: Mutex::new(0),
             ready: Condvar::new(),
+            waker: Mutex::new(None),
             #[cfg(unix)]
             pipe,
         }))
@@ -40,10 +44,16 @@ impl Events {
     pub fn notify(&self) {
         *self.0.generation.lock().unwrap() += 1;
         self.0.ready.notify_all();
+        if let Some(waker) = self.0.waker.lock().unwrap().as_ref() {
+            waker();
+        }
         #[cfg(unix)]
         {
             let _ = self.0.pipe.1.lock().unwrap().write(&[1]);
         }
+    }
+    pub fn set_waker(&self, waker: impl Fn() + Send + Sync + 'static) {
+        *self.0.waker.lock().unwrap() = Some(Box::new(waker));
     }
     pub fn generation(&self) -> u64 {
         *self.0.generation.lock().unwrap()

@@ -2,10 +2,9 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Controls.Basic as Basic
 import QtQuick.Layouts
-import org.kde.kirigami as Kirigami
 import Slate.Native
 
-Kirigami.ApplicationWindow {
+ApplicationWindow {
     id: root
     objectName: "slateWindow"
     width: 1360
@@ -13,7 +12,8 @@ Kirigami.ApplicationWindow {
     minimumWidth: 480
     minimumHeight: 320
     visible: true
-    title: "Slate"
+    title: frame.title || "Slate"
+    color: Theme.backgroundColor
     property var frame: slate.frame
     property int priorFocus: -1
     property string priorPaneKey: ""
@@ -22,15 +22,33 @@ Kirigami.ApplicationWindow {
     property string gitCommitDraft: ""
     property string gitSubmittedMessage: ""
     property bool gitCommitting: false
+    readonly property var settings: frame.settings || ({})
+    readonly property bool statusIsError: {
+        var s = frame.status || "";
+        return s.indexOf("Error") === 0 || s.indexOf("failed") !== -1 || s.indexOf("Failed") === 0;
+    }
     // Tool views receive their own metadata, not editor/PTY cell snapshots.
-    readonly property var gitFrame: ({
+    // It is replaced only when repository state or focus changes, so Git
+    // controls do not re-evaluate (or query the catalog) while typing.
+    property var gitFrame: ({ "git": [] })
+    property string gitKey: ""
+    function updateGitFrame() {
+        // Row actions also depend on which panes show Git, so pane kinds count.
+        var kinds = (frame.panes || []).map(function (p) { return p.id + ":" + p.kind; }).join(",");
+        var key = [frame.git_revision, frame.git_busy, frame.git_error, frame.git_branch, frame.git_repository, frame.focus, frame.editor_only, kinds].join("|");
+        if (key === gitKey)
+            return;
+        gitKey = key;
+        gitFrame = {
             "git_repository": frame.git_repository,
             "git_branch": frame.git_branch,
             "git_busy": frame.git_busy,
             "git_error": frame.git_error,
             "git": frame.git || [],
             "focus": frame.focus
-        })
+        };
+    }
+    Component.onCompleted: updateGitFrame()
     // One measured header size is shared with Rust's editor/PTY viewport calculation.
     FontMetrics {
         id: uiMetrics
@@ -39,16 +57,25 @@ Kirigami.ApplicationWindow {
     readonly property int paneHeaderHeight: Math.ceil(Math.max(40, uiMetrics.height + 20))
     readonly property int uiTabMinimum: Math.ceil(Math.max(122, uiMetrics.averageCharacterWidth * 10 + 52))
     readonly property int fileRowHeight: Math.ceil(Math.max(28, uiMetrics.height + 12))
+    readonly property int minimapWidth: 72
     function syncViewport() {
         slate.paneHeader(paneHeaderHeight + 3);
         slate.viewport(workspace.width, workspace.height);
     }
     onPaneHeaderHeightChanged: Qt.callLater(syncViewport)
+    function anyDialogOpen() {
+        return slate.pathDialogOpen || slate.closeDialogOpen || commandPalette.visible || editPrompt.visible || settingsDialog.visible || confirmDiscard.visible || quitDialog.visible || choiceDialog.visible;
+    }
     function send(action) {
         slate.send(action);
         slate.refresh();
-        if (!frame.prompt && !slate.pathDialogOpen && !slate.closeDialogOpen && !palette.visible && !quitDialog.visible && !settingsDialog.visible && !confirmDiscard.visible)
+        if (!frame.prompt && !anyDialogOpen())
             Qt.callLater(root.focusPane);
+    }
+    // High-frequency input (divider drags, scrollbar drags) coalesces refreshes.
+    function sendLater(action) {
+        slate.send(action);
+        slate.scheduleRefresh();
     }
     function pane(id) {
         var items = frame.panes || [];
@@ -90,7 +117,7 @@ Kirigami.ApplicationWindow {
             });
     }
     function focusPane() {
-        if (slate.pathDialogOpen || slate.closeDialogOpen || palette.visible || editPrompt.visible || settingsDialog.visible || confirmDiscard.visible || quitDialog.visible)
+        if (anyDialogOpen())
             return;
         for (var i = 0; i < panes.count; i++) {
             var item = panes.itemAt(i);
@@ -106,19 +133,40 @@ Kirigami.ApplicationWindow {
         }
         root.send({"action": "invoke_action", "id": id, "argument": argument || ""});
     }
-    function commandInfo(id, paneId, row) {
-        // A revision dependency updates bindings; Bridge caches the catalog so
-        // controls share one request for each context until state changes.
-        var revision = root.frame.command_revision;
+    // Git controls depend on repository state only, not on every editor frame.
+    function gitCommandInfo(id, paneId, row) {
+        var dependency = root.gitKey;
         return slate.commandInfo(id, paneId || 0, row === undefined ? -1 : row);
+    }
+    // Menus read the shared catalog when they open, never on every frame.
+    function refreshMenu(menu) {
+        for (var i = 0; i < menu.count; i++) {
+            var item = menu.itemAt(i);
+            if (item && item.refreshInfo)
+                item.refreshInfo();
+        }
+        // Lay the list out now, so it never moves under the pointer.
+        if (menu.contentItem && menu.contentItem.forceLayout)
+            menu.contentItem.forceLayout();
+    }
+    component CommandMenu: Menu {
+        id: commandMenu
+        onAboutToShow: root.refreshMenu(commandMenu)
     }
     component CommandMenuItem: Basic.MenuItem {
         id: commandItem
         required property string actionId
         property string label: ""
+        property string argument: ""
         property int commandPane: 0
-        readonly property var commandInfo: root.commandInfo(actionId, commandPane)
-        objectName: "menuAction_" + actionId
+        property var commandInfo: ({})
+        function refreshInfo() {
+            commandInfo = slate.commandInfo(actionId, commandPane, -1);
+        }
+        // Names and shortcuts are known before the first open; availability
+        // is refreshed whenever the menu opens.
+        Component.onCompleted: refreshInfo()
+        objectName: "menuAction_" + actionId + (argument ? "_" + argument : "")
         text: label || commandInfo.name || actionId
         enabled: commandInfo.enabled === true
         height: visible ? implicitHeight : 0
@@ -126,24 +174,39 @@ Kirigami.ApplicationWindow {
         contentItem: RowLayout {
             spacing: 24
             Text {
-                text: commandItem.text
+                text: (commandItem.checkable ? (commandItem.checked ? "✓  " : "    ") : "") + commandItem.text
                 font: commandItem.font
-                color: commandItem.enabled ? Kirigami.Theme.textColor : Kirigami.Theme.disabledTextColor
+                color: commandItem.highlighted ? Theme.highlightedTextColor : commandItem.enabled ? Theme.textColor : Theme.disabledTextColor
                 Layout.fillWidth: true
             }
             Text {
                 text: commandItem.commandInfo.shortcut || ""
                 font: commandItem.font
-                color: Kirigami.Theme.disabledTextColor
+                color: commandItem.highlighted ? Theme.highlightedTextColor : Theme.disabledTextColor
             }
         }
-        onTriggered: root.invokeAction(actionId, "", commandPane)
+        background: Rectangle {
+            color: commandItem.highlighted ? Theme.highlightColor : "transparent"
+        }
+        onTriggered: root.invokeAction(actionId, argument, commandPane)
     }
     function paletteWith(text) {
         commandText.text = text || "";
-        palette.open();
+        commandPalette.open();
+        commandPalette.search();
         commandText.forceActiveFocus();
         commandText.cursorPosition = commandText.text.length;
+    }
+    function openUrls(urls) {
+        var opened = 0;
+        for (var i = 0; i < urls.length; i++) {
+            var path = slate.localPath(urls[i]);
+            if (path.length) {
+                root.send({"action": "open", "path": path});
+                opened++;
+            }
+        }
+        return opened;
     }
     onClosing: function (close) {
         close.accepted = false;
@@ -168,6 +231,7 @@ Kirigami.ApplicationWindow {
                 Qt.callLater(root.focusPane);
         }
         function onFrameChanged() {
+            root.updateGitFrame();
             if (root.gitCommitting)
                 Qt.callLater(function () {
                     if (root.gitCommitting && !root.frame.git_busy) {
@@ -176,36 +240,44 @@ Kirigami.ApplicationWindow {
                         root.gitCommitting = false;
                     }
                 });
-            if (root.frame.prompt && root.frame.prompt.kind === "settings") {
+            var prompt = root.frame.prompt;
+            if (prompt && prompt.kind === "settings") {
                 Qt.callLater(function () {
                     settingsDialog.open();
                     root.send({"action": "dismiss_prompt"});
                 });
                 return;
             }
-            if (root.frame.prompt && root.frame.prompt.kind === "close-tab") {
+            if (prompt && prompt.kind === "close-tab") {
                 Qt.callLater(function () {
                     if (root.frame.prompt && root.frame.prompt.kind === "close-tab")
                         slate.confirmCloseTab(root);
                 });
                 return;
             }
-            if (root.frame.prompt && ["open", "open-folder", "save-as"].indexOf(root.frame.prompt.kind) !== -1) {
+            if (prompt && ["open", "open-folder", "save-as"].indexOf(prompt.kind) !== -1) {
                 Qt.callLater(function () {
                     if (root.frame.prompt && ["open", "open-folder", "save-as"].indexOf(root.frame.prompt.kind) !== -1)
                         slate.pickPath(root.frame.prompt.kind, root);
                 });
                 return;
             }
-            if (root.frame.prompt && !editPrompt.visible) {
+            if (prompt && choiceDialog.kinds.indexOf(prompt.kind) !== -1) {
+                if (!choiceDialog.visible)
+                    choiceDialog.open();
+                return;
+            } else if (choiceDialog.visible && (!prompt || choiceDialog.kinds.indexOf(prompt.kind) === -1)) {
+                choiceDialog.close();
+            }
+            if (prompt && !editPrompt.visible) {
                 editPrompt.open();
                 promptInput.forceActiveFocus();
-            } else if (!root.frame.prompt && editPrompt.visible) {
+            } else if (!prompt && editPrompt.visible) {
                 editPrompt.close();
                 Qt.callLater(root.focusPane);
             }
             var paneKey = (root.frame.panes || []).map(function (pane) { return pane.id; }).join(",");
-            if ((root.priorFocus !== root.frame.focus || root.priorPaneKey !== paneKey) && !palette.visible && !settingsDialog.visible && !confirmDiscard.visible && !editPrompt.visible) {
+            if ((root.priorFocus !== root.frame.focus || root.priorPaneKey !== paneKey) && !anyDialogOpen()) {
                 root.priorFocus = root.frame.focus;
                 root.priorPaneKey = paneKey;
                 Qt.callLater(root.focusPane);
@@ -220,12 +292,28 @@ Kirigami.ApplicationWindow {
         sequence: "Ctrl+Shift+P"
         onActivated: root.paletteWith("")
     }
+    // Zoom follows desktop editors: Ctrl+= / Ctrl++ / Ctrl+- / Ctrl+0.
+    Shortcut {
+        sequences: ["Ctrl+=", "Ctrl++", StandardKey.ZoomIn]
+        enabled: !anyDialogOpen()
+        onActivated: root.invokeAction("zoom-in")
+    }
+    Shortcut {
+        sequences: ["Ctrl+-", StandardKey.ZoomOut]
+        enabled: !anyDialogOpen()
+        onActivated: root.invokeAction("zoom-out")
+    }
+    Shortcut {
+        sequence: "Ctrl+0"
+        enabled: !anyDialogOpen()
+        onActivated: root.invokeAction("zoom-reset")
+    }
     Instantiator {
         model: root.frame.global_shortcuts || []
         delegate: Shortcut {
             required property string modelData
             sequence: modelData
-            enabled: !root.frame.prompt && !palette.visible && !editPrompt.visible && !settingsDialog.visible && !confirmDiscard.visible && !quitDialog.visible && !slate.pathDialogOpen && !slate.closeDialogOpen
+            enabled: !root.frame.prompt && !anyDialogOpen()
             onActivated: root.send({"action": "shortcut", "chord": modelData})
         }
     }
@@ -240,17 +328,50 @@ Kirigami.ApplicationWindow {
             rightPadding: 8
         }
         background: Rectangle {
-            color: Kirigami.Theme.backgroundColor
+            color: Theme.backgroundColor
         }
-        Menu {
+        CommandMenu {
             objectName: "fileMenu"
             title: "&File"
             CommandMenuItem { actionId: "new"; label: "New File" }
+            CommandMenuItem { actionId: "new-window"; label: "New Window" }
             CommandMenuItem { actionId: "open"; label: "Open File…" }
             CommandMenuItem { actionId: "open-folder"; label: "Open Folder…" }
+            Menu {
+                id: recentMenu
+                objectName: "recentMenu"
+                title: "Open Recent"
+                enabled: (root.frame.recent || []).length > 0
+                Instantiator {
+                    model: root.frame.recent || []
+                    delegate: Basic.MenuItem {
+                        required property string modelData
+                        required property int index
+                        objectName: "recent_" + index
+                        text: (index < 9 ? "&" + (index + 1) + "  " : "") + modelData.substring(modelData.lastIndexOf("/") + 1) + "   —   " + modelData
+                        onTriggered: root.invokeAction("open-recent", modelData)
+                    }
+                    onObjectAdded: function (index, object) {
+                        recentMenu.insertItem(index, object);
+                    }
+                    onObjectRemoved: function (index, object) {
+                        recentMenu.removeItem(object);
+                    }
+                }
+                MenuSeparator {}
+                Basic.MenuItem {
+                    text: "Clear Recent Files"
+                    onTriggered: root.invokeAction("clear-recent")
+                }
+            }
             MenuSeparator {}
             CommandMenuItem { actionId: "save"; label: "Save" }
             CommandMenuItem { actionId: "save-as"; label: "Save As…" }
+            CommandMenuItem { actionId: "save-all"; label: "Save All" }
+            CommandMenuItem { actionId: "reload"; label: "Reload from Disk" }
+            MenuSeparator {}
+            CommandMenuItem { actionId: "print"; label: "Print…" }
+            MenuSeparator {}
             CommandMenuItem { actionId: "close"; label: "Close Tab" }
             MenuSeparator {}
             CommandMenuItem { actionId: "settings"; label: "Settings…" }
@@ -258,7 +379,7 @@ Kirigami.ApplicationWindow {
             MenuSeparator {}
             CommandMenuItem { actionId: "quit"; label: "Quit" }
         }
-        Menu {
+        CommandMenu {
             objectName: "editMenu"
             title: "&Edit"
             CommandMenuItem { actionId: "undo" }
@@ -274,8 +395,70 @@ Kirigami.ApplicationWindow {
             MenuSeparator {}
             CommandMenuItem { actionId: "indent" }
             CommandMenuItem { actionId: "outdent" }
+            CommandMenuItem { actionId: "justify" }
+            CommandMenuItem { actionId: "insert-file" }
+            MenuSeparator {}
+            CommandMenuItem { actionId: "spell-check" }
+            CommandMenuItem { actionId: "word-count" }
+                MenuSeparator {}
+                CommandMenu {
+                objectName: "documentMenu"
+                title: "Document"
+                CommandMenu {
+                    id: encodingMenu
+                    objectName: "encodingMenu"
+                    title: "Encoding"
+                    Instantiator {
+                        model: slate.encodings
+                        delegate: CommandMenuItem {
+                            required property string modelData
+                            actionId: "set-encoding"
+                            argument: modelData
+                            label: modelData
+                            checkable: true
+                            checked: (root.frame.location || "").indexOf(" · " + modelData) !== -1
+                        }
+                        onObjectAdded: function (index, object) {
+                            encodingMenu.insertItem(index, object);
+                        }
+                        onObjectRemoved: function (index, object) {
+                            encodingMenu.removeItem(object);
+                        }
+                    }
+                    MenuSeparator {}
+                    CommandMenuItem { actionId: "toggle-bom"; label: "Byte-Order Mark" }
+                }
+                CommandMenu {
+                    id: reopenMenu
+                    title: "Reopen with Encoding"
+                    Instantiator {
+                        model: slate.encodings
+                        delegate: CommandMenuItem {
+                            required property string modelData
+                            actionId: "reopen-encoding"
+                            argument: modelData
+                            label: modelData
+                        }
+                        onObjectAdded: function (index, object) {
+                            reopenMenu.insertItem(index, object);
+                        }
+                        onObjectRemoved: function (index, object) {
+                            reopenMenu.removeItem(object);
+                        }
+                    }
+                }
+                CommandMenu {
+                    title: "Line Endings"
+                    CommandMenuItem { actionId: "set-line-ending"; argument: "lf"; label: "Unix (LF)"; checkable: true; checked: / LF( ·|$)/.test(root.frame.location || "") }
+                    CommandMenuItem { actionId: "set-line-ending"; argument: "crlf"; label: "Windows (CRLF)"; checkable: true; checked: / CRLF( ·|$)/.test(root.frame.location || "") }
+                    CommandMenuItem { actionId: "set-line-ending"; argument: "cr"; label: "Classic Mac (CR)"; checkable: true; checked: / CR( ·|$)/.test(root.frame.location || "") }
+                }
+                MenuSeparator {}
+                CommandMenuItem { actionId: "toggle-read-only"; label: "Read Only" }
+                CommandMenuItem { actionId: "toggle-auto-reload"; label: "Reload Files Changed on Disk"; checkable: true; checked: !!root.settings.auto_reload }
+            }
         }
-        Menu {
+        CommandMenu {
             objectName: "viewMenu"
             title: "&View"
             MenuItem {
@@ -291,7 +474,16 @@ Kirigami.ApplicationWindow {
             CommandMenuItem { actionId: "files"; label: "File Browser" }
             CommandMenuItem { actionId: "git"; label: "Git Changes" }
             MenuSeparator {}
-            Menu {
+            CommandMenuItem { actionId: "toggle-soft-wrap"; label: "Word Wrap"; checkable: true; checked: !!root.settings.soft_wrap }
+            CommandMenuItem { actionId: "toggle-whitespace"; label: "Show Whitespace"; checkable: true; checked: !!root.settings.show_whitespace }
+            CommandMenuItem { actionId: "toggle-line-numbers"; label: "Line Numbers"; checkable: true; checked: !!root.settings.line_numbers }
+            CommandMenuItem { actionId: "toggle-minimap"; label: "Minimap"; checkable: true; checked: !!root.settings.minimap }
+            MenuSeparator {}
+            CommandMenuItem { actionId: "zoom-in"; label: "Zoom In" }
+            CommandMenuItem { actionId: "zoom-out"; label: "Zoom Out" }
+            CommandMenuItem { actionId: "zoom-reset"; label: "Reset Zoom" }
+            MenuSeparator {}
+            CommandMenu {
                 title: "Layout"
                 CommandMenuItem { actionId: "preset development"; label: "Three Panes" }
                 CommandMenuItem { actionId: "preset bottom_terminal"; label: "Terminal Below" }
@@ -304,7 +496,7 @@ Kirigami.ApplicationWindow {
             CommandMenuItem { actionId: "split-down" }
             CommandMenuItem { actionId: "close-pane" }
         }
-        Menu {
+        CommandMenu {
             objectName: "goMenu"
             title: "&Go"
             CommandMenuItem { actionId: "prompt-goto" }
@@ -314,7 +506,7 @@ Kirigami.ApplicationWindow {
             CommandMenuItem { actionId: "next-tab" }
             CommandMenuItem { actionId: "next-pane" }
         }
-        Menu {
+        CommandMenu {
             objectName: "terminalMenu"
             title: "&Terminal"
             CommandMenuItem { actionId: "terminal" }
@@ -333,6 +525,15 @@ Kirigami.ApplicationWindow {
             root.syncViewport();
             Qt.callLater(root.focusPane);
         }
+        // Drop files from a file manager to open them.
+        DropArea {
+            anchors.fill: parent
+            keys: ["text/uri-list"]
+            onDropped: function (drop) {
+                if (drop.hasUrls && root.openUrls(drop.urls) > 0)
+                    drop.acceptProposedAction();
+            }
+        }
         Repeater {
             id: panes
             model: slate.paneIds
@@ -343,6 +544,8 @@ Kirigami.ApplicationWindow {
                 property var paneData: root.pane(paneId)
                 property var tabItems: []
                 property string tabKey: ""
+                readonly property bool isEditor: paneData.kind === "editor"
+                readonly property bool showMinimap: isEditor && !!root.settings.minimap && width > 360
                 function updateTabs() {
                     var next = paneData && paneData.tabs ? paneData.tabs : [];
                     var key = JSON.stringify(next);
@@ -360,8 +563,8 @@ Kirigami.ApplicationWindow {
                 y: paneData.rect.y
                 width: paneData.rect.width
                 height: paneData.rect.height
-                color: Kirigami.Theme.backgroundColor
-                border.color: root.frame.focus === paneId ? Kirigami.Theme.highlightColor : Kirigami.Theme.disabledTextColor
+                color: Theme.backgroundColor
+                border.color: root.frame.focus === paneId ? Theme.highlightColor : Theme.disabledTextColor
                 border.width: root.frame.focus === paneId ? 2 : 1
                 clip: true
                 function focusContent() {
@@ -379,7 +582,7 @@ Kirigami.ApplicationWindow {
                     y: 2
                     width: Math.max(0, parent.width - 4)
                     height: root.paneHeaderHeight
-                    spacing: Kirigami.Units.smallSpacing
+                    spacing: Theme.smallSpacing
                     Item {
                         id: tabs
                         objectName: "tabs_" + panel.paneId
@@ -432,7 +635,7 @@ Kirigami.ApplicationWindow {
                                         width: Math.max(implicitWidth, implicitHeight)
                                         height: implicitHeight
                                         flat: true
-                                        foregroundColor: fileTab.modelData.active ? Kirigami.Theme.highlightedTextColor : Kirigami.Theme.textColor
+                                        foregroundColor: fileTab.modelData.active ? Theme.highlightedTextColor : Theme.textColor
                                         background: Rectangle {
                                             radius: 4
                                             color: tabClose.down ? Qt.alpha(tabClose.foregroundColor, 0.24) : tabClose.hovered ? Qt.alpha(tabClose.foregroundColor, 0.12) : "transparent"
@@ -511,17 +714,38 @@ Kirigami.ApplicationWindow {
                     objectName: "cells_" + panel.paneId
                     x: 1
                     y: root.paneHeaderHeight + 2
-                    width: Math.max(0, parent.width - 2)
-                    height: Math.max(0, parent.height - root.paneHeaderHeight - 3)
+                    width: Math.max(0, parent.width - 2 - (panel.showMinimap ? root.minimapWidth : 0) - (editorScroll.visible ? editorScroll.width : 0))
+                    height: Math.max(0, parent.height - root.paneHeaderHeight - 3 - (horizontalScroll.visible ? horizontalScroll.height : 0))
                     visible: panel.paneData.kind === "editor" || panel.paneData.kind === "terminal"
                     paneId: panel.paneId
-                    Accessible.role: panel.paneData.kind === "editor" ? Accessible.EditableText : Accessible.Pane
+                    Accessible.role: panel.paneData.kind === "editor" ? Accessible.EditableText : Accessible.Terminal
                     Accessible.name: (panel.paneData.tabs || []).filter(function (t) {
                         return t.active;
                     }).map(function (t) {
                         return t.title;
                     }).join("")
-                    Accessible.description: panel.paneData.read_only ? "Read-only inspection. " + (panel.paneData.editor ? panel.paneData.editor.surrounding : "") : "Text editor. " + (panel.paneData.editor ? panel.paneData.editor.surrounding : "")
+                    Accessible.description: panel.paneData.read_only ? "Read-only document" : (panel.paneData.kind === "editor" ? "Text editor" : "Terminal")
+                    onContextMenuRequested: function (x, y) {
+                        root.send({"action": "focus", "pane": panel.paneId});
+                        if (panel.paneData.kind === "editor") {
+                            editorMenu.commandPane = panel.paneId;
+                            editorMenu.popup(grid, x, y);
+                        } else {
+                            paneMenu.popup(grid, x, y);
+                        }
+                    }
+                }
+                Minimap {
+                    id: minimap
+                    objectName: "minimap_" + panel.paneId
+                    visible: panel.showMinimap
+                    x: grid.x + grid.width
+                    y: grid.y
+                    width: root.minimapWidth
+                    height: grid.height
+                    paneId: panel.paneId
+                    editor: panel.paneData.editor || ({})
+                    visibleRows: panel.paneData.rows || 0
                 }
                 ScrollBar {
                     id: editorScroll
@@ -535,12 +759,33 @@ Kirigami.ApplicationWindow {
                     size: panel.paneData.editor ? Math.min(1, panel.paneData.rows / Math.max(1, panel.paneData.editor.line_count)) : 1
                     position: panel.paneData.editor ? panel.paneData.editor.top / Math.max(1, panel.paneData.editor.line_count) : 0
                     onPositionChanged: if (pressed)
-                        root.send({
+                        root.sendLater({
                             "action": "scroll_to",
                             "pane": panel.paneId,
                             "line": Math.round(position * panel.paneData.editor.line_count)
                         })
                     Accessible.name: "Document scroll position"
+                }
+                ScrollBar {
+                    id: horizontalScroll
+                    objectName: "horizontalScroll_" + panel.paneId
+                    readonly property int contentColumns: minimap.widest
+                    readonly property int scrollColumn: panel.paneData.editor ? panel.paneData.editor.left : 0
+                    visible: panel.isEditor && !root.settings.soft_wrap && contentColumns > panel.paneData.cols
+                    x: grid.x
+                    y: grid.y + grid.height
+                    width: grid.width
+                    orientation: Qt.Horizontal
+                    policy: ScrollBar.AsNeeded
+                    size: Math.min(1, panel.paneData.cols / Math.max(1, contentColumns))
+                    position: scrollColumn / Math.max(1, contentColumns)
+                    onPositionChanged: if (pressed)
+                        root.sendLater({
+                            "action": "scroll_columns",
+                            "pane": panel.paneId,
+                            "delta": Math.round(position * contentColumns) - scrollColumn
+                        })
+                    Accessible.name: "Horizontal scroll position"
                 }
                 GitPane {
                     id: gitView
@@ -551,7 +796,7 @@ Kirigami.ApplicationWindow {
                     height: Math.max(0, panel.height - y - 2)
                     visible: panel.paneData.kind === "git"
                     bridge: slate
-                    commandInfoFor: function (id, row) { return root.commandInfo(id, panel.paneId, row); }
+                    commandInfoFor: function (id, row) { return root.gitCommandInfo(id, panel.paneId, row); }
                     frame: root.gitFrame
                     paneData: ({
                             "selected": panel.paneData.selected || 0
@@ -606,6 +851,13 @@ Kirigami.ApplicationWindow {
                         wrapMode: Text.Wrap
                         horizontalAlignment: Text.AlignHCenter
                     }
+                    // One shared hint for the whole list instead of one per row.
+                    Hint {
+                        id: rowHint
+                        property Item target: browser
+                        anchorItem: target
+                        visible: false
+                    }
                     delegate: Basic.ItemDelegate {
                         id: fileDelegate
                         objectName: "entry_" + panel.paneId + "_" + index
@@ -620,15 +872,19 @@ Kirigami.ApplicationWindow {
                             font: fileDelegate.font
                             elide: Text.ElideMiddle
                             verticalAlignment: Text.AlignVCenter
-                            color: fileDelegate.highlighted ? Kirigami.Theme.highlightedTextColor : Kirigami.Theme.textColor
+                            color: fileDelegate.highlighted ? Theme.highlightedTextColor : Theme.textColor
                         }
                         background: Rectangle {
-                            color: fileDelegate.highlighted ? Kirigami.Theme.highlightColor : fileDelegate.hovered ? Kirigami.Theme.alternateBackgroundColor : "transparent"
+                            color: fileDelegate.highlighted ? Theme.highlightColor : fileDelegate.hovered ? Theme.alternateBackgroundColor : "transparent"
                         }
-                        Hint {
-                            anchorItem: fileDelegate
-                            visible: fileDelegate.hovered
-                            text: fileDelegate.modelData.path
+                        onHoveredChanged: {
+                            if (hovered) {
+                                rowHint.target = fileDelegate;
+                                rowHint.text = fileDelegate.modelData.path;
+                                rowHint.visible = true;
+                            } else if (rowHint.target === fileDelegate) {
+                                rowHint.visible = false;
+                            }
                         }
                         text: (modelData.directory ? "▸  " : "   ") + modelData.name
                         highlighted: index === browser.currentIndex
@@ -654,20 +910,18 @@ Kirigami.ApplicationWindow {
                     }
                 }
                 MouseArea {
-                    anchors.fill: parent
+                    anchors.fill: browser
                     acceptedButtons: Qt.RightButton
-                    enabled: panel.paneData.kind !== "terminal" && panel.paneData.kind !== "git"
+                    enabled: panel.paneData.kind === "files"
                     onClicked: function (mouse) {
-                        if (browser.visible) {
-                            var index = browser.indexAt(mouse.x - browser.x, mouse.y - browser.y + browser.contentY);
-                            if (index >= 0)
-                                root.send({
-                                    "action": "click",
-                                    "pane": panel.paneId,
-                                    "row": index,
-                                    "col": 0
-                                });
-                        }
+                        var index = browser.indexAt(mouse.x, mouse.y + browser.contentY);
+                        if (index >= 0)
+                            root.send({
+                                "action": "click",
+                                "pane": panel.paneId,
+                                "row": index,
+                                "col": 0
+                            });
                         root.send({
                             "action": "focus",
                             "pane": panel.paneId
@@ -675,7 +929,7 @@ Kirigami.ApplicationWindow {
                         paneMenu.popup();
                     }
                 }
-                Menu {
+                CommandMenu {
                     id: paneMenu
                     objectName: "paneMenu_" + panel.paneId
                     x: Math.max(0, panel.width - width - 2)
@@ -792,7 +1046,7 @@ Kirigami.ApplicationWindow {
                 y: handleData.rect.y
                 width: handleData.rect.width
                 height: handleData.rect.height
-                color: drag.containsMouse ? Kirigami.Theme.highlightColor : Kirigami.Theme.disabledTextColor
+                color: drag.containsMouse ? Theme.highlightColor : Theme.disabledTextColor
                 MouseArea {
                     id: drag
                     anchors.fill: parent
@@ -803,7 +1057,7 @@ Kirigami.ApplicationWindow {
                             var p = mapToItem(workspace, mouse.x, mouse.y);
                             var h = parent.handleData;
                             var ratio = h.axis === "horizontal" ? (p.x - h.parent.x) / h.parent.width : (p.y - h.parent.y) / h.parent.height;
-                            root.send({
+                            root.sendLater({
                                 "action": "resize_split",
                                 "id": h.id,
                                 "ratio": ratio
@@ -814,26 +1068,50 @@ Kirigami.ApplicationWindow {
             }
         }
     }
+    // The editor's right-click menu.
+    CommandMenu {
+        id: editorMenu
+        objectName: "editorMenu"
+        property int commandPane: 0
+        CommandMenuItem { actionId: "undo"; commandPane: editorMenu.commandPane }
+        CommandMenuItem { actionId: "redo"; commandPane: editorMenu.commandPane }
+        MenuSeparator {}
+        CommandMenuItem { actionId: "cut"; label: "Cut"; commandPane: editorMenu.commandPane }
+        CommandMenuItem { actionId: "copy"; label: "Copy"; commandPane: editorMenu.commandPane }
+        CommandMenuItem { actionId: "paste"; label: "Paste"; commandPane: editorMenu.commandPane }
+        CommandMenuItem { actionId: "select-all"; label: "Select All"; commandPane: editorMenu.commandPane }
+        MenuSeparator {}
+        CommandMenuItem { actionId: "prompt-find"; label: "Find…"; commandPane: editorMenu.commandPane }
+        CommandMenuItem { actionId: "prompt-goto"; label: "Go to Line…"; commandPane: editorMenu.commandPane }
+        MenuSeparator {}
+        CommandMenuItem { actionId: "split-right"; commandPane: editorMenu.commandPane }
+        CommandMenuItem { actionId: "split-down"; commandPane: editorMenu.commandPane }
+    }
     footer: Basic.ToolBar {
         background: Rectangle {
-            color: Kirigami.Theme.backgroundColor
+            color: Theme.backgroundColor
         }
-        implicitHeight: statusRow.implicitHeight + 2 * Kirigami.Units.smallSpacing
+        implicitHeight: statusRow.implicitHeight + 2 * Theme.smallSpacing
         RowLayout {
             id: statusRow
             anchors.fill: parent
-            anchors.margins: Kirigami.Units.smallSpacing
+            anchors.margins: Theme.smallSpacing
             Label {
                 id: statusLabel
+                objectName: "statusLabel"
                 textFormat: Text.PlainText
                 Layout.fillWidth: true
                 Layout.minimumWidth: 0
-                text: root.frame.hints || ""
+                // Status messages and errors; key hints when there is no news.
+                text: root.frame.status || root.frame.hints || ""
+                color: root.statusIsError ? Theme.negativeTextColor : Theme.textColor
+                font.bold: root.statusIsError
                 elide: Text.ElideRight
+                Accessible.role: Accessible.StatusBar
                 Hint {
                     anchorItem: statusLabel
                     visible: statusHover.hovered
-                    text: statusLabel.text
+                    text: statusLabel.text + (root.frame.hints ? "\n" + root.frame.hints : "")
                 }
                 HoverHandler {
                     id: statusHover
@@ -843,7 +1121,7 @@ Kirigami.ApplicationWindow {
                 textFormat: Text.PlainText
                 text: root.frame.location || ""
                 visible: text.length > 0
-                Layout.maximumWidth: root.width * 0.4
+                Layout.maximumWidth: root.width * 0.45
                 elide: Text.ElideMiddle
             }
             ActionButton {
@@ -877,7 +1155,12 @@ Kirigami.ApplicationWindow {
                 "layout-load": "Load layout",
                 "move-pane": "Move or swap pane",
                 "stage-group": "Stage a change group",
-                "settings": "Settings"
+                "settings": "Settings",
+                "insert-file": "Insert file",
+                "set-encoding": "Save with encoding",
+                "reopen-encoding": "Reopen with encoding",
+                "set-line-ending": "Line endings",
+                "open-recent": "Open recent file"
             })[prompt.kind] || "Input"
         anchors.centerIn: parent
         width: Math.min(root.width - 40, 560)
@@ -902,7 +1185,7 @@ Kirigami.ApplicationWindow {
             contentWidth: availableWidth
             ColumnLayout {
                 width: promptScroll.availableWidth
-                spacing: Kirigami.Units.smallSpacing
+                spacing: Theme.smallSpacing
                 TextField {
                     id: promptInput
                     objectName: "searchInput"
@@ -917,7 +1200,12 @@ Kirigami.ApplicationWindow {
                             "layout-load": "Saved layout name",
                             "move-pane": "Target pane number",
                             "stage-group": "Change group, e.g. Untracked",
-                            "settings": "Option and value, e.g. indent-width 4"
+                            "settings": "Option and value, e.g. indent-width 4",
+                            "insert-file": "Path of the file to insert",
+                            "set-encoding": "utf-8, utf-16le, windows-1252, shift_jis…",
+                            "reopen-encoding": "utf-8, latin1, shift_jis…",
+                            "set-line-ending": "lf, crlf or cr",
+                            "open-recent": "Path or list number"
                         })[editPrompt.prompt.kind] || "Find text"
                     onTextEdited: editPrompt.update()
                     onAccepted: root.send({
@@ -938,7 +1226,7 @@ Kirigami.ApplicationWindow {
                 }
                 Flow {
                     Layout.fillWidth: true
-                    spacing: Kirigami.Units.smallSpacing
+                    spacing: Theme.smallSpacing
                     visible: editPrompt.prompt.kind === "find" || editPrompt.prompt.kind === "replace"
                     CheckBox {
                         id: matchCase
@@ -957,11 +1245,12 @@ Kirigami.ApplicationWindow {
                     textFormat: Text.PlainText
                     Layout.fillWidth: true
                     text: root.frame.status || ""
+                    color: root.statusIsError ? Theme.negativeTextColor : Theme.textColor
                     wrapMode: Text.Wrap
                 }
                 Flow {
                     Layout.fillWidth: true
-                    spacing: Kirigami.Units.smallSpacing
+                    spacing: Theme.smallSpacing
                     ActionButton {
                         text: editPrompt.prompt.kind === "goto" ? "Go" : editPrompt.prompt.kind === "replace" ? "Replace next" : editPrompt.prompt.kind === "find" ? "Find next" : "Confirm"
                         onClicked: root.send({
@@ -986,8 +1275,69 @@ Kirigami.ApplicationWindow {
             }
         }
     }
+    // Questions the core asks with a fixed set of answers.
     Dialog {
-        id: palette
+        id: choiceDialog
+        objectName: "choiceDialog"
+        enter: Transition {}
+        exit: Transition {}
+        readonly property var kinds: ["save-read-only", "save-elevated", "reload-changed", "file-changed", "quit"]
+        readonly property var prompt: root.frame.prompt || ({ "kind": "", "input": "" })
+        readonly property var copy: ({
+                "save-read-only": ["Read-only file", "%1 is read-only. Overwrite it anyway?", "Overwrite", ""],
+                "save-elevated": ["Permission denied", "You do not have permission to write %1. Save it with administrator rights?", "Save as Administrator", ""],
+                "reload-changed": ["Reload from disk", "Reload %1 from disk and discard your unsaved changes?", "Reload", ""],
+                "file-changed": ["File changed on disk", "%1 changed on disk while you have unsaved changes.", "Reload from Disk", "Keep My Version"],
+                "quit": ["Unsaved changes", "Save changes before quitting? (%1)", "Save All and Quit", "Discard and Quit"]
+            })[prompt.kind] || ["", "", "OK", ""]
+        title: copy[0]
+        anchors.centerIn: parent
+        width: Math.min(root.width - 40, 520)
+        modal: true
+        closePolicy: Popup.CloseOnEscape
+        onRejected: root.send({"action": "dismiss_prompt"})
+        onClosed: Qt.callLater(root.focusPane)
+        contentItem: ColumnLayout {
+            spacing: Theme.largeSpacing
+            Label {
+                objectName: "choiceMessage"
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                text: choiceDialog.copy[1].replace("%1", choiceDialog.prompt.input)
+            }
+            Flow {
+                Layout.fillWidth: true
+                spacing: Theme.smallSpacing
+                layoutDirection: Qt.RightToLeft
+                ActionButton {
+                    objectName: "choiceAccept"
+                    text: choiceDialog.copy[2]
+                    highlighted: true
+                    onClicked: {
+                        choiceDialog.close();
+                        root.send({"action": "submit_prompt"});
+                    }
+                }
+                ActionButton {
+                    objectName: "choiceAlternative"
+                    visible: choiceDialog.copy[3].length > 0
+                    text: choiceDialog.copy[3]
+                    onClicked: {
+                        choiceDialog.close();
+                        root.send({"action": "submit_prompt", "all": true});
+                    }
+                }
+                ActionButton {
+                    objectName: "choiceCancel"
+                    text: choiceDialog.prompt.kind === "file-changed" ? "Decide Later" : "Cancel"
+                    onClicked: choiceDialog.reject()
+                }
+            }
+        }
+    }
+    Dialog {
+        id: commandPalette
         enter: Transition {}
         exit: Transition {}
         objectName: "commandPalette"
@@ -998,16 +1348,15 @@ Kirigami.ApplicationWindow {
         modal: true
         standardButtons: Dialog.Cancel
         onOpened: commandText.forceActiveFocus()
-        property var results: {
-            if (!visible)
-                return [];
-            var context = root.frame.command_revision;
-            return slate.commands(commandText.text);
+        // Results change with the query, not with every editor frame.
+        property var results: []
+        function search() {
+            results = slate.commands(commandText.text);
         }
         function execute() {
             var raw = commandText.text.trim();
             if (raw.charAt(0) === ":") {
-                palette.close();
+                commandPalette.close();
                 slate.command(raw.substring(1));
                 Qt.callLater(root.focusPane);
                 return;
@@ -1017,7 +1366,7 @@ Kirigami.ApplicationWindow {
             var action = results[commandResults.currentIndex];
             if (!action.enabled)
                 return;
-            palette.close();
+            commandPalette.close();
             root.invokeAction(action.id);
         }
         onRejected: Qt.callLater(root.focusPane)
@@ -1027,8 +1376,11 @@ Kirigami.ApplicationWindow {
                 objectName: "commandSearch"
                 Layout.fillWidth: true
                 placeholderText: "Search actions…"
-                onTextChanged: commandResults.currentIndex = 0
-                onAccepted: palette.execute()
+                onTextChanged: {
+                    commandResults.currentIndex = 0;
+                    commandPalette.search();
+                }
+                onAccepted: commandPalette.execute()
                 Keys.onDownPressed: commandResults.currentIndex = Math.min(commandResults.count - 1, commandResults.currentIndex + 1)
                 Keys.onUpPressed: commandResults.currentIndex = Math.max(0, commandResults.currentIndex - 1)
             }
@@ -1038,7 +1390,7 @@ Kirigami.ApplicationWindow {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 clip: true
-                model: palette.results
+                model: commandPalette.results
                 currentIndex: 0
                 onCurrentIndexChanged: positionViewAtIndex(currentIndex, ListView.Contain)
                 ScrollBar.vertical: ScrollBar {}
@@ -1059,12 +1411,12 @@ Kirigami.ApplicationWindow {
                                 Layout.minimumWidth: 0
                                 elide: Text.ElideRight
                                 font.bold: true
-                                color: commandResult.highlighted ? Kirigami.Theme.highlightedTextColor : Kirigami.Theme.textColor
+                                color: commandResult.highlighted ? Theme.highlightedTextColor : Theme.textColor
                             }
                             Label {
                                 textFormat: Text.PlainText
                                 text: commandResult.modelData.shortcut
-                                color: commandResult.highlighted ? Kirigami.Theme.highlightedTextColor : Kirigami.Theme.disabledTextColor
+                                color: commandResult.highlighted ? Theme.highlightedTextColor : Theme.disabledTextColor
                             }
                         }
                         Label {
@@ -1072,16 +1424,16 @@ Kirigami.ApplicationWindow {
                             text: commandResult.modelData.enabled ? commandResult.modelData.description : commandResult.modelData.reason
                             Layout.fillWidth: true
                             elide: Text.ElideRight
-                            color: commandResult.highlighted ? Kirigami.Theme.highlightedTextColor : Kirigami.Theme.disabledTextColor
+                            color: commandResult.highlighted ? Theme.highlightedTextColor : Theme.disabledTextColor
                         }
                     }
                     background: Rectangle {
-                        color: commandResult.highlighted ? Kirigami.Theme.highlightColor : "transparent"
+                        color: commandResult.highlighted ? Theme.highlightColor : "transparent"
                         radius: 4
                     }
                     onClicked: {
                         commandResults.currentIndex = index;
-                        palette.execute();
+                        commandPalette.execute();
                     }
                 }
                 Label {
@@ -1095,7 +1447,7 @@ Kirigami.ApplicationWindow {
                 textFormat: Text.PlainText
                 Layout.fillWidth: true
                 text: "↑ ↓ select · Enter runs · Escape closes"
-                color: Kirigami.Theme.disabledTextColor
+                color: Theme.disabledTextColor
             }
         }
     }
@@ -1106,18 +1458,21 @@ Kirigami.ApplicationWindow {
         objectName: "settingsDialog"
         title: "Settings"
         anchors.centerIn: parent
-        width: Math.min(root.width - 40, 480)
+        width: Math.min(root.width - 40, 520)
         height: Math.min(root.height - 40, implicitHeight)
         modal: true
         standardButtons: Dialog.Close
+        function configure(name, value) {
+            root.send({"action": "configure", "name": name, "value": value});
+        }
         contentItem: ScrollView {
             id: settingsScroll
             clip: true
             contentWidth: availableWidth
-            leftPadding: Kirigami.Units.largeSpacing
-            rightPadding: Kirigami.Units.largeSpacing
-            topPadding: Kirigami.Units.smallSpacing
-            bottomPadding: Kirigami.Units.smallSpacing
+            leftPadding: Theme.largeSpacing
+            rightPadding: Theme.largeSpacing
+            topPadding: Theme.smallSpacing
+            bottomPadding: Theme.smallSpacing
             ColumnLayout {
                 width: settingsScroll.availableWidth
                 Label {
@@ -1141,9 +1496,8 @@ Kirigami.ApplicationWindow {
                         ComboBox {
                             objectName: modelData.field === "file_startup" ? "settingsFileStartup" : "settingsDirectoryStartup"
                             model: ["Editor only", "Full workspace"]
-                            currentIndex: root.frame.settings && root.frame.settings[modelData.field] === "editor-only" ? 0 : 1
-                            onActivated: root.send({"action": "configure", "name": modelData.setting,
-                                "value": currentIndex === 0 ? "editor-only" : "workspace"})
+                            currentIndex: root.settings[modelData.field] === "editor-only" ? 0 : 1
+                            onActivated: settingsDialog.configure(modelData.setting, currentIndex === 0 ? "editor-only" : "workspace")
                         }
                     }
                 }
@@ -1159,6 +1513,29 @@ Kirigami.ApplicationWindow {
                 RowLayout {
                     Label {
                         textFormat: Text.PlainText
+                        text: "Font"
+                        Layout.fillWidth: true
+                    }
+                    ComboBox {
+                        id: fontFamily
+                        objectName: "settingsFontFamily"
+                        Layout.preferredWidth: 220
+                        model: slate.fontFamilies
+                        currentIndex: Math.max(0, model.indexOf(root.settings.font_family || ""))
+                        displayText: currentIndex === 0 ? "System fixed-width font" : currentText
+                        onActivated: settingsDialog.configure("font-family", currentIndex === 0 ? "" : currentText)
+                    }
+                    SpinBox {
+                        objectName: "settingsFontSize"
+                        from: 6
+                        to: 72
+                        value: root.settings.font_size || 11
+                        onValueModified: settingsDialog.configure("font-size", value.toString())
+                    }
+                }
+                RowLayout {
+                    Label {
+                        textFormat: Text.PlainText
                         text: "Indent width"
                         Layout.fillWidth: true
                     }
@@ -1166,40 +1543,29 @@ Kirigami.ApplicationWindow {
                         objectName: "settingsIndent"
                         from: 1
                         to: 16
-                        value: root.frame.settings ? root.frame.settings.indent_width : 4
-                        onValueModified: root.send({
-                            "action": "configure",
-                            "name": "indent-width",
-                            "value": value.toString()
-                        })
+                        value: root.settings.indent_width || 4
+                        onValueModified: settingsDialog.configure("indent-width", value.toString())
                     }
                 }
-                CheckBox {
-                    text: "Insert spaces instead of tabs"
-                    checked: root.frame.settings ? root.frame.settings.insert_spaces : true
-                    onClicked: root.send({
-                        "action": "configure",
-                        "name": "insert-spaces",
-                        "value": checked.toString()
-                    })
-                }
-                CheckBox {
-                    text: "Indent new lines automatically"
-                    checked: root.frame.settings ? root.frame.settings.auto_indent : true
-                    onClicked: root.send({
-                        "action": "configure",
-                        "name": "auto-indent",
-                        "value": checked.toString()
-                    })
-                }
-                CheckBox {
-                    text: "Show line numbers"
-                    checked: root.frame.settings ? root.frame.settings.line_numbers : true
-                    onClicked: root.send({
-                        "action": "configure",
-                        "name": "line-numbers",
-                        "value": checked.toString()
-                    })
+                Repeater {
+                    model: [
+                        {"label": "Insert spaces instead of tabs", "setting": "insert-spaces", "field": "insert_spaces"},
+                        {"label": "Indent new lines automatically", "setting": "auto-indent", "field": "auto_indent"},
+                        {"label": "Show line numbers", "setting": "line-numbers", "field": "line_numbers"},
+                        {"label": "Wrap long lines", "setting": "soft-wrap", "field": "soft_wrap"},
+                        {"label": "Show whitespace", "setting": "show-whitespace", "field": "show_whitespace"},
+                        {"label": "Show minimap", "setting": "minimap", "field": "minimap"},
+                        {"label": "Reload files changed on disk", "setting": "auto-reload", "field": "auto_reload"},
+                        {"label": "Keep a backup (NAME~) when saving", "setting": "backup", "field": "backup"},
+                        {"label": "Recover unsaved single files after a crash", "setting": "file-recovery", "field": "file_recovery"}
+                    ]
+                    delegate: CheckBox {
+                        required property var modelData
+                        objectName: "settings_" + modelData.field
+                        text: modelData.label
+                        checked: !!root.settings[modelData.field]
+                        onClicked: settingsDialog.configure(modelData.setting, checked.toString())
+                    }
                 }
                 RowLayout {
                     Label {
@@ -1209,12 +1575,21 @@ Kirigami.ApplicationWindow {
                     }
                     ComboBox {
                         model: ["auto", "dark", "light"]
-                        currentIndex: model.indexOf(root.frame.settings ? root.frame.settings.theme : "auto")
-                        onActivated: root.send({
-                            "action": "configure",
-                            "name": "theme",
-                            "value": currentText
-                        })
+                        currentIndex: model.indexOf(root.settings.theme || "auto")
+                        onActivated: settingsDialog.configure("theme", currentText)
+                    }
+                }
+                RowLayout {
+                    Label {
+                        textFormat: Text.PlainText
+                        text: "Keymap"
+                        Layout.fillWidth: true
+                    }
+                    ComboBox {
+                        objectName: "settingsKeymap"
+                        model: ["default", "nano"]
+                        currentIndex: model.indexOf(root.settings.keymap || "default")
+                        onActivated: settingsDialog.configure("keymap", currentText)
                     }
                 }
                 Label {
@@ -1269,19 +1644,45 @@ Kirigami.ApplicationWindow {
         title: "Unsaved documents"
         anchors.centerIn: parent
         modal: true
-        standardButtons: Dialog.Discard | Dialog.Cancel
+        closePolicy: Popup.CloseOnEscape
         onClosed: Qt.callLater(root.focusPane)
         width: Math.min(root.width - 40, 480)
-        Label {
-            textFormat: Text.PlainText
-            width: quitDialog.availableWidth
-            text: "Discard all unsaved changes and quit?"
-            wrapMode: Text.Wrap
+        // Buttons wrap on narrow windows instead of overflowing.
+        contentItem: ColumnLayout {
+            spacing: Theme.largeSpacing
+            Label {
+                textFormat: Text.PlainText
+                Layout.fillWidth: true
+                text: "Save your changes before quitting? Discard closes Slate without saving."
+                wrapMode: Text.Wrap
+            }
+            Flow {
+                Layout.fillWidth: true
+                spacing: Theme.smallSpacing
+                layoutDirection: Qt.RightToLeft
+                ActionButton {
+                    objectName: "quitSave"
+                    text: "Save All"
+                    highlighted: true
+                    onClicked: {
+                        quitDialog.close();
+                        root.send({"action": "save_all", "quit": true});
+                    }
+                }
+                ActionButton {
+                    objectName: "quitDiscard"
+                    text: "Discard"
+                    onClicked: {
+                        quitDialog.close();
+                        root.send({"action": "quit", "force": true, "confirmed": true});
+                    }
+                }
+                ActionButton {
+                    objectName: "quitCancel"
+                    text: "Cancel"
+                    onClicked: quitDialog.reject()
+                }
+            }
         }
-        onDiscarded: root.send({
-            "action": "quit",
-            "force": true,
-            "confirmed": true
-        })
     }
 }

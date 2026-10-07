@@ -58,6 +58,10 @@ pub struct Document {
     /// The file exists but the current user cannot write it.
     #[serde(skip)]
     pub file_read_only: bool,
+    /// Size, modification time and inode when the file was read or written;
+    /// the change watcher only rereads a file when its stamp moves.
+    #[serde(skip)]
+    pub(crate) stamp: Option<FileStamp>,
     #[serde(skip)]
     pub notice: Option<String>,
     #[serde(skip)]
@@ -218,6 +222,7 @@ impl Document {
             disk: None,
             reference: false,
             file_read_only: false,
+            stamp: None,
             notice: None,
             generation: 0,
             undo: Default::default(),
@@ -268,6 +273,7 @@ impl Document {
         let bytes = fs::read(&path)?;
         let decoded = text_format::decode(&bytes, encoding)?;
         let mut document = Self::scratch();
+        document.stamp = FileStamp::of(&path);
         document.file_read_only = !fsio::writable(&path);
         document.saved = decoded.text.clone();
         document.text = decoded.text;
@@ -435,6 +441,7 @@ impl Document {
         self.saved = saved.saved;
         self.saved_format = saved.saved_format;
         self.disk = saved.disk;
+        self.stamp = saved.stamp;
         self.file_read_only = saved.file_read_only;
         self.generation += 1;
     }
@@ -521,6 +528,7 @@ impl Document {
         self.path = Some(path);
         self.saved = self.text.clone();
         self.saved_format = self.format.clone();
+        self.stamp = self.path.as_deref().and_then(FileStamp::of);
         self.file_read_only = self.path.as_deref().is_some_and(|p| !fsio::writable(p));
         self.dirty_cache.set(None);
         self.unavailable = false;
@@ -529,13 +537,104 @@ impl Document {
     /// Record a save performed by an elevated helper.
     pub(crate) fn mark_saved_bytes(&mut self, bytes: &[u8]) {
         self.disk = Some(Baseline::of(bytes));
+        self.stamp = self.path.as_deref().and_then(FileStamp::of);
         self.saved = self.text.clone();
         self.saved_format = self.format.clone();
         self.dirty_cache.set(None);
         self.unavailable = false;
     }
+    pub(crate) fn unavailable_flag(&self) -> bool {
+        self.unavailable
+    }
+    /// Keep this buffer but treat the current disk version as its baseline,
+    /// so the next save replaces it deliberately.
+    pub(crate) fn adopt_disk_baseline(&mut self, fresh: &Document) {
+        self.disk = fresh.disk.clone();
+        self.stamp = fresh.stamp;
+        self.unavailable = false;
+        self.dirty_cache.set(None);
+    }
     pub fn baseline_matches(&self, bytes: &[u8]) -> bool {
         self.disk.as_ref() == Some(&Baseline::of(bytes))
+    }
+}
+
+/// Cheap identity of a file's current version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    inode: u64,
+}
+impl FileStamp {
+    pub fn of(path: &Path) -> Option<Self> {
+        let meta = fs::metadata(path).ok()?;
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(&meta);
+        #[cfg(not(unix))]
+        let inode = 0;
+        Some(Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            inode,
+        })
+    }
+}
+
+/// What the change watcher found for one document.
+pub enum DiskChange {
+    /// Only the stamp moved (e.g. `touch`); the content is unchanged.
+    Touched(Option<FileStamp>),
+    /// The content differs from the document's baseline.
+    Changed(Box<Document>),
+    Missing,
+    /// The file cannot be read now (permissions, or it is mid-write).
+    Unreadable,
+}
+impl Document {
+    /// A snapshot of what the watcher needs, taken on the UI thread.
+    pub(crate) fn watch_entry(
+        &self,
+    ) -> Option<(PathBuf, Option<Baseline>, Option<FileStamp>, String)> {
+        if self.label.is_some() || self.reference {
+            return None;
+        }
+        let path = self.path.clone()?;
+        // A file that has not been created yet has nothing to watch.
+        if self.disk.is_none() && self.stamp.is_none() {
+            return None;
+        }
+        Some((
+            path,
+            self.disk.clone(),
+            self.stamp,
+            self.format.encoding.clone(),
+        ))
+    }
+}
+/// Compare a file with its document baseline (runs on the IO worker).
+pub(crate) fn examine(
+    path: &Path,
+    baseline: Option<&Baseline>,
+    stamp: Option<FileStamp>,
+    encoding: &str,
+) -> Option<DiskChange> {
+    let current = FileStamp::of(path);
+    if current.is_none() {
+        return (baseline.is_some()).then_some(DiskChange::Missing);
+    }
+    if current == stamp {
+        return None;
+    }
+    let Ok(bytes) = fs::read(path) else {
+        return Some(DiskChange::Unreadable);
+    };
+    if baseline == Some(&Baseline::of(&bytes)) {
+        return Some(DiskChange::Touched(current));
+    }
+    match Document::open_with_encoding(path, Some(encoding)).or_else(|_| Document::open(path)) {
+        Ok(document) => Some(DiskChange::Changed(Box::new(document))),
+        Err(_) => Some(DiskChange::Unreadable),
     }
 }
 

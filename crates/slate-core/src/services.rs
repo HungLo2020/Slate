@@ -63,6 +63,17 @@ pub enum IoJob {
     ),
     /// Write through `pkexec`/`sudo` without a terminal (desktop sessions).
     SaveElevated(u64, Document, String),
+    /// Compare open files with their baselines (the external-change watcher).
+    #[allow(clippy::type_complexity)]
+    CheckDisk(
+        Vec<(
+            u64,
+            PathBuf,
+            Option<crate::fsio::Baseline>,
+            Option<crate::document::FileStamp>,
+            String,
+        )>,
+    ),
     Checkpoint(PathBuf, Workspace),
     Flush(mpsc::SyncSender<()>),
 }
@@ -89,6 +100,7 @@ pub enum Reply {
     Output(String, String),
     Error(String),
     Spelling(Result<Vec<String>, String>),
+    Disk(Vec<(u64, crate::document::DiskChange)>),
 }
 #[derive(Clone)]
 struct ReplySender {
@@ -176,6 +188,16 @@ impl Services {
                                 .send(Reply::Error(format!("Recovery checkpoint failed: {e:#}")));
                         }
                         continue;
+                    }
+                    IoJob::CheckDisk(entries) => {
+                        let changes: Vec<_> = entries
+                            .into_iter()
+                            .filter_map(|(id, path, baseline, stamp, encoding)| {
+                                crate::document::examine(&path, baseline.as_ref(), stamp, &encoding)
+                                    .map(|change| (id, change))
+                            })
+                            .collect();
+                        Reply::Disk(changes)
                     }
                     IoJob::Flush(done) => {
                         let _ = done.send(());
