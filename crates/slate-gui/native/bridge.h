@@ -1,6 +1,8 @@
 #pragma once
 #include <QAbstractListModel>
 #include <QFont>
+#include <QHash>
+#include <QTimer>
 #include <QObject>
 #include <QQuickPaintedItem>
 #include <QTextLayout>
@@ -32,6 +34,7 @@ class EntryModel : public QAbstractListModel {
   private:
     QVariantList m_rows;
 };
+class CellView;
 class Bridge : public QObject {
     Q_OBJECT
     Q_PROPERTY(QVariantMap frame READ frame NOTIFY frameChanged)
@@ -57,6 +60,10 @@ class Bridge : public QObject {
     Q_INVOKABLE void command(const QString &text);
     Q_INVOKABLE void viewport(int width, int height);
     Q_INVOKABLE void refresh();
+    Q_INVOKABLE void scheduleRefresh();
+    Q_INVOKABLE QVariantMap diagnostics() const;
+    void attachView(int id, CellView *view);
+    void detachView(int id, CellView *view);
     Q_INVOKABLE void paneHeader(int height);
     Q_INVOKABLE void copyClipboard();
     Q_INVOKABLE void pasteClipboard();
@@ -67,9 +74,15 @@ class Bridge : public QObject {
     void structureChanged();
     void filesChanged();
     void gitChanged();
+    void refreshFinished();
 
   private:
     EntryModel m_files, m_git;
+    QTimer m_refreshTimer;
+    bool m_refreshing = false;
+    QHash<int, CellView *> m_views;
+    QHash<int, QVariantMap> m_surfaces;
+    qulonglong m_updates = 0, m_lastBytes = 0, m_clipboardReads = 0;
     void *m_context;
     QVariantMap m_frame;
     QVariantMap m_theme;
@@ -80,15 +93,23 @@ class Bridge : public QObject {
 
 class CellView : public QQuickPaintedItem {
     Q_OBJECT
-    Q_PROPERTY(QVariantMap pane READ pane WRITE setPane NOTIFY paneChanged)
+    Q_PROPERTY(int paneId READ paneId WRITE setPaneId NOTIFY paneIdChanged)
+    Q_PROPERTY(QVariantMap pane READ pane NOTIFY paneChanged)
+    Q_PROPERTY(qulonglong layoutBuilds READ layoutBuilds)
   public:
     CellView(QQuickItem *parent = nullptr);
+    ~CellView() override;
+    int paneId() const { return m_paneId; }
+    void setPaneId(int id);
+    qulonglong layoutBuilds() const { return m_layoutBuilds; }
+    void applySurface(const QVariantMap &patch);
     QVariantMap pane() const { return m_pane; }
     void setPane(const QVariantMap &pane);
     void paint(QPainter *painter) override;
     QVariant inputMethodQuery(Qt::InputMethodQuery query) const override;
   signals:
     void paneChanged();
+    void paneIdChanged();
 
   protected:
     void keyPressEvent(QKeyEvent *event) override;
@@ -100,11 +121,17 @@ class CellView : public QQuickPaintedItem {
     void inputMethodEvent(QInputMethodEvent *event) override;
 
   private:
-    QVariantMap m_pane;
+    int m_paneId = 0;
+    QVariantMap m_pane, m_screen;
+    QVariantList m_cursor;
+    QVector<QVariantMap> m_lineData;
+    QVector<QVariantList> m_overlays;
+    mutable QVector<QString> m_layoutPreedit;
+    mutable QVector<int> m_preeditPosition;
+    mutable qulonglong m_layoutBuilds = 0;
     QString m_preedit;
     mutable std::vector<std::unique_ptr<QTextLayout>> m_lines;
     mutable std::vector<QVector<int>> m_columns;
-    mutable bool m_layoutDirty = true;
     void layoutText() const;
     int textPosition(int row, int column) const;
     qreal cursorX(int row, int column) const;

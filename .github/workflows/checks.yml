@@ -50,3 +50,5 @@ jobs:
       - run: SLATE_GUI_GIT_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: python3 scripts/gui-layout-smoke.py target/debug/slate
       - run: python3 scripts/recovery-smoke.py target/debug/slate
+      - run: cargo build --release --features gui-smoke
+      - run: python3 scripts/gui-performance-smoke.py target/release/slate

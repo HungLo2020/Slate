@@ -17,6 +17,7 @@
 #include <QQmlContext>
 #include <QQuickWindow>
 #include <QSocketNotifier>
+#include <QScopedValueRollback>
 #include <QTextCharFormat>
 #include <QTextLayout>
 #include <QTimer>
@@ -49,7 +50,29 @@ void EntryModel::replace(const QVariantList &rows) {
 QVariantList Bridge::commands(const QString &query) {
     return send({{"action", "catalog"}, {"query", query}}).value("commands").toList();
 }
-Bridge::Bridge(void *context, QObject *parent) : QObject(parent), m_context(context) {}
+Bridge::Bridge(void *context, QObject *parent) : QObject(parent), m_context(context) {
+    m_refreshTimer.setSingleShot(true);
+    m_refreshTimer.setInterval(8);
+    m_refreshTimer.setTimerType(Qt::PreciseTimer);
+    connect(&m_refreshTimer, &QTimer::timeout, this, &Bridge::refresh);
+}
+void Bridge::scheduleRefresh() {
+    if (!m_refreshTimer.isActive()) m_refreshTimer.start();
+}
+QVariantMap Bridge::diagnostics() const {
+    return {{"updates", m_updates}, {"last_update_bytes", m_lastBytes},
+            {"clipboard_reads", m_clipboardReads}};
+}
+void Bridge::attachView(int id, CellView *view) {
+    m_views.insert(id, view);
+    for (const auto &p : m_frame.value("panes").toList()) {
+        if (p.toMap().value("id").toInt() == id) { view->setPane(p.toMap()); break; }
+    }
+    if (m_surfaces.contains(id)) view->applySurface(m_surfaces.value(id));
+}
+void Bridge::detachView(int id, CellView *view) {
+    if (m_views.value(id) == view) m_views.remove(id);
+}
 QFont Bridge::font() const {
     auto f = QFontDatabase::systemFont(QFontDatabase::FixedFont);
     f.setPointSize(11);
@@ -61,11 +84,24 @@ int Bridge::cellWidth() const {
 }
 int Bridge::cellHeight() const { return int(std::ceil(QFontMetricsF(font()).height())); }
 QVariantMap Bridge::send(const QVariantMap &command) {
-    const auto bytes =
-        QJsonDocument(QJsonObject::fromVariantMap(command)).toJson(QJsonDocument::Compact);
-    char *raw = slate_request(m_context, bytes.constData());
-    const auto result = QJsonDocument::fromJson(QByteArray(raw)).object().toVariantMap();
-    slate_response_free(raw);
+    auto exchange = [this](const QVariantMap &request) {
+        const auto bytes = QJsonDocument(QJsonObject::fromVariantMap(request)).toJson(QJsonDocument::Compact);
+        char *raw = slate_request(m_context, bytes.constData());
+        const QByteArray response(raw);
+        if (request.value("action") == "update") m_lastBytes = response.size();
+        const auto result = QJsonDocument::fromJson(response).object().toVariantMap();
+        slate_response_free(raw);
+        return result;
+    };
+    auto result = exchange(command);
+    if (result.value("clipboard_request").toBool()) {
+        ++m_clipboardReads;
+        auto retry = command;
+        retry.insert("clipboard_input", QGuiApplication::clipboard()->text());
+        result = exchange(retry);
+    }
+    if (result.contains("clipboard"))
+        QGuiApplication::clipboard()->setText(result.value("clipboard").toString());
     const auto action = command.value("action").toString();
     if (action == "reload_settings" ||
         (action == "invoke_action" && command.value("id") == "settings-reload") ||
@@ -85,9 +121,14 @@ void Bridge::viewport(int width, int height) {
         return;
     m_width = qBound(1, width, 65535);
     m_height = qBound(1, height, 65535);
-    refresh();
+    scheduleRefresh();
 }
-void Bridge::paneHeader(int height) { m_headerHeight = qBound(1, height, 65535); }
+void Bridge::paneHeader(int height) {
+    const int next = qBound(1, height, 65535);
+    if (next == m_headerHeight) return;
+    m_headerHeight = next;
+    scheduleRefresh();
+}
 void Bridge::applyTheme() {
     const auto palette = QGuiApplication::palette();
     const QVariantMap theme{
@@ -102,71 +143,96 @@ void Bridge::applyTheme() {
     m_theme = theme;
     send(theme);
 }
+static QVariantMap patchTerminal(QVariantMap prior, const QVariantMap &patch) {
+    auto cells = prior.value("cells").toList();
+    const int rows = patch.value("rows").toInt();
+    while (cells.size() > rows) cells.removeLast();
+    while (cells.size() < rows) cells.append(QVariant(QVariantList()));
+    for (const auto &entry : patch.value("lines").toList()) {
+        const auto line = entry.toMap();
+        const int row = line.value("row").toInt();
+        if (row >= 0 && row < cells.size()) cells[row] = line.value("cells");
+    }
+    // Complete cached surfaces are used when a pane delegate is recreated.
+    if (patch.contains("cells")) cells = patch.value("cells").toList();
+    prior = patch;
+    prior.remove("lines");
+    prior.insert("cells", cells);
+    return prior;
+}
+// Assemble compact native content separately from the small metadata QML sees.
+static QVariantMap patchSurface(QVariantMap prior, const QVariantMap &patch) {
+    if (prior.value("kind") != patch.value("kind")) prior.clear();
+    if (patch.value("kind") == "editor") {
+        auto lines = prior.value("lines").toList();
+        const int count = patch.value("line_count").toInt();
+        while (lines.size() > count) lines.removeLast();
+        while (lines.size() < count) lines.append(QVariantMap{{"row", lines.size()}});
+        for (const auto &entry : patch.value("lines").toList()) {
+            const auto change = entry.toMap();
+            const int row = change.value("row").toInt();
+            if (row < 0 || row >= lines.size()) continue;
+            auto data = lines[row].toMap();
+            for (auto it = change.begin(); it != change.end(); ++it) data.insert(it.key(), it.value());
+            lines[row] = data;
+        }
+        prior.insert("lines", lines);
+    }
+    for (auto it = patch.begin(); it != patch.end(); ++it)
+        if (it.key() == "screen") prior.insert("screen", patchTerminal(prior.value("screen").toMap(), it.value().toMap()));
+        else if (it.key() != "lines") prior.insert(it.key(), it.value());
+    return prior;
+}
 void Bridge::refresh() {
-    auto frame = send({{"action", "update"},
-                       {"width", m_width},
-                       {"height", m_height},
-                       {"cell_width", cellWidth()},
-                       {"cell_height", cellHeight()},
-                       {"header_height", m_headerHeight},
-                       {"minimum_width", qMax(160, m_headerHeight * 4)}});
-    if (frame.value("unchanged").toBool())
-        return;
-    // Missing components in an update retain their previous model/screen.
-    if (!frame.contains("files"))
-        frame.insert("files", m_frame.value("files"));
-    if (!frame.contains("git"))
-        frame.insert("git", m_frame.value("git"));
-    QVariantList patched;
-    for (const auto &item : frame.value("panes").toList()) {
-        auto pane = item.toMap();
-        if (!pane.contains("screen")) {
-            for (const auto &prior : m_frame.value("panes").toList()) {
-                if (prior.toMap().value("id") == pane.value("id") &&
-                    prior.toMap().value("kind") == pane.value("kind")) {
-                    pane.insert("screen", prior.toMap().value("screen"));
-                    break;
-                }
-            }
-        }
-        patched.append(pane);
+    if (m_refreshing) { scheduleRefresh(); return; }
+    QScopedValueRollback<bool> refreshing(m_refreshing, true);
+    m_refreshTimer.stop();
+    auto frame = send({{"action", "update"}, {"width", m_width}, {"height", m_height},
+                       {"cell_width", cellWidth()}, {"cell_height", cellHeight()},
+                       {"header_height", m_headerHeight}, {"minimum_width", qMax(160, m_headerHeight * 4)}});
+    if (frame.value("unchanged").toBool()) { emit refreshFinished(); return; }
+    ++m_updates;
+    const auto surfaces = frame.take("surfaces").toList();
+    for (const auto &key : {"files", "git", "settings"})
+        if (!frame.contains(key)) frame.insert(key, m_frame.value(key));
+    QVariantList panes, handles;
+    for (const auto &p : frame.value("panes").toList()) {
+        const auto pane = p.toMap();
+        const int id = pane.value("id").toInt();
+        panes.append(pane.value("id"));
+        if (m_surfaces.value(id).value("kind") != pane.value("kind")) m_surfaces.remove(id);
     }
-    frame.insert("panes", patched);
-    {
-        QVariantList panes, handles;
-        for (const auto &p : frame.value("panes").toList())
-            panes.append(p.toMap().value("id"));
-        for (const auto &h : frame.value("handles").toList())
-            handles.append(h.toMap().value("id"));
-        const bool structure = panes != m_paneIds || handles != m_handleIds;
-        const bool fileChange = frame.value("files") != m_frame.value("files"),
-                   gitChange = frame.value("git") != m_frame.value("git");
-        m_frame = frame;
-        m_paneIds = panes;
-        m_handleIds = handles;
-        if (structure)
-            emit structureChanged();
-        if (fileChange) {
-            m_files.replace(m_frame.value("files").toList());
-            emit filesChanged();
-        }
-        if (gitChange) {
-            m_git.replace(m_frame.value("git").toList());
-            emit gitChanged();
-        }
-        emit frameChanged();
+    for (auto it = m_surfaces.begin(); it != m_surfaces.end();) {
+        if (!panes.contains(it.key())) it = m_surfaces.erase(it); else ++it;
     }
-    if (frame.value("quit").toBool())
-        QCoreApplication::quit();
+    for (const auto &h : frame.value("handles").toList()) handles.append(h.toMap().value("id"));
+    const bool structure = panes != m_paneIds || handles != m_handleIds;
+    const bool fileChange = frame.value("files") != m_frame.value("files"),
+               gitChange = frame.value("git") != m_frame.value("git");
+    m_frame = frame;
+    m_paneIds = panes;
+    m_handleIds = handles;
+    // Store before delegates are created, so a restored/recreated view can
+    // immediately attach to complete native content even on a metadata-only frame.
+    for (const auto &entry : surfaces) {
+        const auto patch = entry.toMap();
+        const int id = patch.value("id").toInt();
+        m_surfaces.insert(id, patchSurface(m_surfaces.value(id), patch));
+        if (auto view = m_views.value(id)) view->applySurface(patch);
+    }
+    if (structure) emit structureChanged();
+    for (const auto &p : frame.value("panes").toList()) {
+        const auto pane = p.toMap();
+        if (auto view = m_views.value(pane.value("id").toInt())) view->setPane(pane);
+    }
+    if (fileChange) { m_files.replace(m_frame.value("files").toList()); emit filesChanged(); }
+    if (gitChange) { m_git.replace(m_frame.value("git").toList()); emit gitChanged(); }
+    emit frameChanged();
+    emit refreshFinished();
+    if (frame.value("quit").toBool()) QCoreApplication::quit();
 }
-void Bridge::copyClipboard() {
-    QGuiApplication::clipboard()->setText(send({{"action", "copy"}}).value("clipboard").toString());
-    refresh();
-}
-void Bridge::pasteClipboard() {
-    send({{"action", "paste"}, {"text", QGuiApplication::clipboard()->text()}});
-    refresh();
-}
+void Bridge::copyClipboard() { send({{"action", "copy"}}); scheduleRefresh(); }
+void Bridge::pasteClipboard() { send({{"action", "paste"}}); scheduleRefresh(); }
 void Bridge::exit() {
     send({{"action", "quit"}, {"force", false}});
     refresh();
@@ -178,16 +244,49 @@ CellView::CellView(QQuickItem *parent) : QQuickPaintedItem(parent) {
     setActiveFocusOnTab(true);
     setClip(true);
 }
+CellView::~CellView() { if (bridge) bridge->detachView(m_paneId, this); }
+void CellView::setPaneId(int id) {
+    if (m_paneId == id) return;
+    if (bridge) bridge->detachView(m_paneId, this);
+    m_paneId = id;
+    if (bridge) bridge->attachView(id, this);
+    emit paneIdChanged();
+}
 void CellView::setPane(const QVariantMap &pane) {
-    if (m_pane == pane)
-        return;
-    if (m_pane.value("revision") != pane.value("revision") ||
-        m_pane.value("kind") != pane.value("kind"))
-        m_layoutDirty = true;
+    if (m_pane == pane) return;
+    const bool kindChanged = m_pane.value("kind") != pane.value("kind");
     m_pane = pane;
-    if (hasActiveFocus() && QGuiApplication::inputMethod())
-        QGuiApplication::inputMethod()->update(Qt::ImQueryAll);
+    if (kindChanged && pane.value("kind") != "editor") {
+        m_lines.clear(); m_columns.clear(); m_lineData.clear(); m_overlays.clear();
+        m_layoutPreedit.clear(); m_preeditPosition.clear();
+    }
+    if (hasActiveFocus() && QGuiApplication::inputMethod()) QGuiApplication::inputMethod()->update(Qt::ImQueryAll);
     emit paneChanged();
+    update();
+}
+void CellView::applySurface(const QVariantMap &patch) {
+    m_cursor = patch.value("cursor").toList();
+    if (patch.value("kind") == "terminal") {
+        if (patch.contains("screen")) m_screen = patchTerminal(m_screen, patch.value("screen").toMap());
+        update();
+        return;
+    }
+    const int count = patch.value("line_count").toInt();
+    m_lines.resize(count); m_columns.resize(count);
+    m_lineData.resize(count); m_overlays.resize(count);
+    m_layoutPreedit.resize(count); m_preeditPosition.resize(count);
+    for (const auto &entry : patch.value("lines").toList()) {
+        const auto line = entry.toMap();
+        const int row = line.value("row").toInt();
+        if (row < 0 || row >= count) continue;
+        if (line.contains("layout")) {
+            const auto data = line.value("layout").toMap();
+            if (data != m_lineData[row]) { m_lineData[row] = data; m_lines[row].reset(); }
+        }
+        if (line.contains("overlays")) m_overlays[row] = line.value("overlays").toList();
+    }
+    if (hasActiveFocus() && QGuiApplication::inputMethod())
+        QGuiApplication::inputMethod()->update(Qt::ImCursorRectangle);
     update();
 }
 int CellView::textPosition(int row, int column) const {
@@ -203,59 +302,53 @@ qreal CellView::cursorX(int row, int column) const {
     layoutText();
     if (row < 0 || row >= int(m_lines.size()))
         return column * bridge->cellWidth();
-    return m_lines[row]->lineAt(0).cursorToX(textPosition(row, column));
+    if (!m_lines[row] || m_lines[row]->lineCount() == 0) return column * bridge->cellWidth();
+    const auto &columns = m_columns[row];
+    const int end = columns.isEmpty() ? 0 : columns.last();
+    return m_lines[row]->lineAt(0).cursorToX(textPosition(row, column)) +
+           qMax(0, column - end) * bridge->cellWidth();
+}
+static QTextLayout::FormatRange textFormat(const QVariantMap &span, bool overlay = false) {
+    QTextCharFormat format;
+    format.setForeground(QColor(span.value("fg").toString()));
+    format.setBackground(QColor(span.value("bg").toString()));
+    if (!overlay) {
+        format.setFontWeight(span.value("bold").toBool() ? QFont::Bold : QFont::Normal);
+        format.setFontItalic(span.value("italic").toBool());
+    }
+    format.setFontUnderline(span.value("underline").toBool());
+    return {span.value("start").toInt(), span.value("length").toInt(), format};
 }
 void CellView::layoutText() const {
-    if (!m_layoutDirty || !bridge || m_pane.value("kind") != "editor")
-        return;
-    m_lines.clear();
-    m_columns.clear();
-    const auto rows = m_pane.value("screen").toMap().value("cells").toList();
-    const auto cursor = m_pane.value("screen").toMap().value("cursor").toList();
-    for (int row = 0; row < rows.size(); ++row) {
-        QString text;
+    if (!bridge || m_pane.value("kind") != "editor") return;
+    for (int row = 0; row < int(m_lines.size()); ++row) {
+        const bool composing = m_cursor.size() == 2 && m_cursor[0].toInt() == row && !m_preedit.isEmpty();
+        const QString preedit = composing ? m_preedit : QString();
+        const int position = composing ? m_cursor[1].toInt() : -1;
+        if (m_lines[row] && m_layoutPreedit[row] == preedit && m_preeditPosition[row] == position) continue;
+        const auto data = m_lineData[row];
         QVector<int> columns;
-        QList<QTextLayout::FormatRange> formats;
-        const auto cells = rows[row].toList();
-        for (int col = 0; col < cells.size(); ++col) {
-            const auto cell = cells[col].toMap();
-            if (cell.value("continuation").toBool())
-                continue;
-            QString glyph = cell.value("text").toString();
-            if (glyph.isEmpty())
-                glyph = " ";
-            QTextCharFormat format;
-            format.setForeground(QColor(cell.value("fg").toString()));
-            format.setBackground(QColor(cell.value("bg").toString()));
-            format.setFontWeight(cell.value("bold").toBool() ? QFont::Bold : QFont::Normal);
-            format.setFontItalic(cell.value("italic").toBool());
-            format.setFontUnderline(cell.value("underline").toBool());
-            if (!formats.isEmpty() && formats.last().format == format)
-                formats.last().length += glyph.size();
-            else
-                formats.append({int(text.size()), int(glyph.size()), format});
-            for (int i = 0; i < glyph.size(); ++i)
-                columns.append(col);
-            text += glyph;
-        }
-        columns.append(cells.size());
-        auto layout = std::make_unique<QTextLayout>(text, bridge->font());
+        for (const auto &col : data.value("columns").toList()) columns.append(col.toInt());
+        m_columns[row] = columns;
+        auto layout = std::make_unique<QTextLayout>(data.value("text").toString(), bridge->font());
         QTextOption option;
         option.setWrapMode(QTextOption::NoWrap);
         option.setTextDirection(Qt::LeftToRight);
         layout->setTextOption(option);
+        QList<QTextLayout::FormatRange> formats;
+        for (const auto &span : data.value("formats").toList()) formats.append(textFormat(span.toMap()));
         layout->setFormats(formats);
         layout->setCacheEnabled(true);
-        m_columns.push_back(columns);
-        if (cursor.size() == 2 && cursor[0].toInt() == row && !m_preedit.isEmpty())
-            layout->setPreeditArea(textPosition(row, cursor[1].toInt()), m_preedit);
+        if (composing) layout->setPreeditArea(textPosition(row, position), preedit);
         layout->beginLayout();
         auto line = layout->createLine();
-        line.setLineWidth(1000000);
+        if (line.isValid()) line.setLineWidth(1000000);
         layout->endLayout();
-        m_lines.push_back(std::move(layout));
+        m_lines[row] = std::move(layout);
+        m_layoutPreedit[row] = preedit;
+        m_preeditPosition[row] = position;
+        ++m_layoutBuilds;
     }
-    m_layoutDirty = false;
 }
 void CellView::paint(QPainter *p) {
     if (!bridge)
@@ -263,12 +356,15 @@ void CellView::paint(QPainter *p) {
     const bool editor = m_pane.value("kind") == "editor";
     p->fillRect(boundingRect(), editor ? QColor(bridge->frame().value("background").toString())
                                        : QColor("#20242c"));
-    const auto screen = m_pane.value("screen").toMap();
+    const auto screen = m_screen;
     const int cw = bridge->cellWidth(), ch = bridge->cellHeight();
     if (editor) {
         layoutText();
-        for (int row = 0; row < int(m_lines.size()); ++row)
-            m_lines[row]->draw(p, QPointF(1, 1 + row * ch));
+        for (int row = 0; row < int(m_lines.size()); ++row) {
+            QList<QTextLayout::FormatRange> overlays;
+            for (const auto &span : m_overlays[row]) overlays.append(textFormat(span.toMap(), true));
+            m_lines[row]->draw(p, QPointF(1, 1 + row * ch), overlays);
+        }
     } else {
         const auto rows = screen.value("cells").toList();
         const auto base = bridge->font();
@@ -291,7 +387,7 @@ void CellView::paint(QPainter *p) {
             }
         }
     }
-    const auto cursor = screen.value("cursor").toList();
+    const auto cursor = m_cursor;
     if (cursor.size() == 2 && m_pane.value("focused").toBool()) {
         const int row = cursor[0].toInt(), col = cursor[1].toInt();
         p->setPen(QColor(bridge->frame().value("accent").toString()));
@@ -349,19 +445,10 @@ void Bridge::key(int code, const QString &text, int modifiers) {
     QKeyEvent event(QEvent::KeyPress, code, Qt::KeyboardModifiers(modifiers), text);
     const bool ctrl = event.modifiers().testFlag(Qt::ControlModifier),
                alt = event.modifiers().testFlag(Qt::AltModifier);
-    const auto clipboard = QGuiApplication::clipboard()->text();
-    if (ctrl || alt)
-        send({{"action", "set_clipboard"}, {"text", clipboard}});
-    const auto response =
-        send({{"action", "key"},
-              {"key", keyName(&event)},
-              {"text", text},
-              {"ctrl", ctrl},
-              {"alt", alt},
-              {"shift", event.modifiers().testFlag(Qt::ShiftModifier) || code == Qt::Key_Backtab}});
-    if ((ctrl || alt) && response.value("clipboard").toString() != clipboard)
-        QGuiApplication::clipboard()->setText(response.value("clipboard").toString());
-    refresh();
+    send({{"action", "key"}, {"key", keyName(&event)}, {"text", text},
+          {"ctrl", ctrl}, {"alt", alt},
+          {"shift", event.modifiers().testFlag(Qt::ShiftModifier) || code == Qt::Key_Backtab}});
+    scheduleRefresh();
 }
 void CellView::keyPressEvent(QKeyEvent *e) {
     if (bridge)
@@ -376,7 +463,7 @@ void CellView::click(QMouseEvent *e, const QString &kind) {
     int column = qMax(0, int(e->position().x() - 1) / bridge->cellWidth());
     if (m_pane.value("kind") == "editor") {
         layoutText();
-        if (row < int(m_lines.size())) {
+        if (row < int(m_lines.size()) && m_lines[row] && m_lines[row]->lineCount() > 0) {
             const int position =
                 m_lines[row]->lineAt(0).xToCursor(qMax(0.0, e->position().x() - 1));
             column = m_columns[row].value(position, column);
@@ -396,7 +483,7 @@ void CellView::click(QMouseEvent *e, const QString &kind) {
                   {"shift", e->modifiers().testFlag(Qt::ShiftModifier)},
                   {"ctrl", e->modifiers().testFlag(Qt::ControlModifier)},
                   {"alt", e->modifiers().testFlag(Qt::AltModifier)}});
-    bridge->refresh();
+    bridge->scheduleRefresh();
 }
 void CellView::mousePressEvent(QMouseEvent *e) {
     click(e, "press");
@@ -439,12 +526,11 @@ void CellView::wheelEvent(QWheelEvent *e) {
         bridge->send({{"action", "scroll"},
                       {"pane", m_pane.value("id")},
                       {"delta", e->angleDelta().y() / 40}});
-    bridge->refresh();
+    bridge->scheduleRefresh();
     e->accept();
 }
 void CellView::inputMethodEvent(QInputMethodEvent *e) {
     m_preedit = e->preeditString();
-    m_layoutDirty = true;
     if (!e->commitString().isEmpty() || e->replacementLength() != 0) {
         if (m_pane.value("kind") == "editor")
             bridge->send({{"action", "input_method"},
@@ -453,7 +539,7 @@ void CellView::inputMethodEvent(QInputMethodEvent *e) {
                           {"replace_length", e->replacementLength()}});
         else
             bridge->send({{"action", "paste"}, {"text", e->commitString()}});
-        bridge->refresh();
+        bridge->scheduleRefresh();
     }
     update();
     e->accept();
@@ -461,7 +547,13 @@ void CellView::inputMethodEvent(QInputMethodEvent *e) {
 QVariant CellView::inputMethodQuery(Qt::InputMethodQuery query) const {
     if (!bridge)
         return {};
-    const auto editor = m_pane.value("editor").toMap();
+    // Input is applied immediately but painting is coalesced. IME queries must
+    // observe the current document even before the next presentation update.
+    const bool textQuery = query == Qt::ImSurroundingText || query == Qt::ImCursorPosition ||
+                           query == Qt::ImAnchorPosition || query == Qt::ImCurrentSelection;
+    const auto editor = textQuery && m_pane.value("kind") == "editor"
+        ? bridge->send({{"action", "input_context"}, {"pane", m_paneId}}).value("editor").toMap()
+        : m_pane.value("editor").toMap();
     if (query == Qt::ImEnabled)
         return !m_pane.value("read_only").toBool();
     if (query == Qt::ImSurroundingText)
@@ -473,7 +565,7 @@ QVariant CellView::inputMethodQuery(Qt::InputMethodQuery query) const {
     if (query == Qt::ImCurrentSelection)
         return editor.value("selection");
     if (query == Qt::ImCursorRectangle) {
-        const auto cursor = m_pane.value("screen").toMap().value("cursor").toList();
+        const auto cursor = m_cursor;
         if (cursor.size() == 2) {
             const int row = cursor[0].toInt(), col = cursor[1].toInt();
             return QRectF(1 + (m_pane.value("kind") == "editor" ? cursorX(row, col)
@@ -507,6 +599,8 @@ extern "C" int slate_qt_run(void *context) {
     qmlRegisterType<CellView>("Slate.Native", 1, 0, "CellView");
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty("slate", &state);
+    state.applyTheme();
+    state.refresh();
 #ifdef SLATE_SMOKE_TEST
     if (tracing)
         std::fprintf(stderr, "Smoke startup: loading QML\n");
@@ -523,7 +617,6 @@ extern "C" int slate_qt_run(void *context) {
     QTimer timer;
     QObject::connect(&timer, &QTimer::timeout, &state, &Bridge::refresh);
     timer.start(1000); // Checkpoints and a fallback for non-Unix platforms.
-    state.applyTheme();
     QObject::connect(&app, &QGuiApplication::paletteChanged, &state, [&state]() {
         state.applyTheme();
         state.refresh();
@@ -534,12 +627,10 @@ extern "C" int slate_qt_run(void *context) {
     if (notifier) {
         QObject::connect(notifier, &QSocketNotifier::activated, &state, [notifier, &state]() {
             notifier->setEnabled(false);
-            QTimer::singleShot(16, &state, [notifier, &state]() {
-                state.refresh();
-                notifier->setEnabled(true);
-            });
+            state.scheduleRefresh();
         });
     }
+    if (notifier) QObject::connect(&state, &Bridge::refreshFinished, notifier, [notifier]() { notifier->setEnabled(true); });
     state.refresh();
 
 #ifdef SLATE_SMOKE_TEST

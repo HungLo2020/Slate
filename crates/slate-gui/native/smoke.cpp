@@ -115,8 +115,7 @@ static QString checkLayout(Bridge *state, QQuickWindow *window) {
         if (grid && grid->isVisible()) {
             if (grid->y() < chrome->y() + chrome->height() || grid->height() < 0)
                 return "Text grid overlaps pane header";
-            const auto screen = pane.value("screen").toMap();
-            if (screen.value("rows").toInt() * state->cellHeight() > grid->height())
+            if (pane.value("rows").toInt() * state->cellHeight() > grid->height())
                 return "Editor/PTY rows extend behind the pane boundary";
         }
     }
@@ -660,6 +659,7 @@ static void startFeatureSmoke(Bridge *state, QQuickWindow *window) {
                 return;
             }
             key(Qt::Key_Left);
+            state->refresh(); // Synchronize the rendered geometry before hit testing.
             const int cursor = grid->inputMethodQuery(Qt::ImCursorPosition).toInt();
             const auto rect = grid->inputMethodQuery(Qt::ImCursorRectangle).toRectF();
             const auto point =
@@ -911,7 +911,12 @@ static void startStartupSmoke(Bridge *state, QQuickWindow *window) {
     timer->start(150);
 }
 
+void startPerformanceSmoke(Bridge *, QQuickWindow *);
 void startSmoke(Bridge *state, QQuickWindow *window) {
+    if (!qEnvironmentVariableIsEmpty("SLATE_GUI_PERF_SMOKE")) {
+        startPerformanceSmoke(state, window);
+        return;
+    }
     if (!qEnvironmentVariableIsEmpty("SLATE_GUI_STARTUP_SMOKE")) {
         startStartupSmoke(state, window);
         return;
@@ -1009,7 +1014,7 @@ void startSmoke(Bridge *state, QQuickWindow *window) {
             grid->forceActiveFocus();
             key(Qt::Key_A, Qt::ControlModifier);
             type("G");
-            QTest::qWait(10);
+            state->refresh(); // Flush the dirty-title transition before retaining the tab.
             QPointer<QQuickItem> editingTab;
             for (const auto &value : state->frame().value("panes").toList()) {
                 const auto pane = value.toMap();

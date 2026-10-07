@@ -142,6 +142,10 @@ slate`; subsequent releases arrive through normal APT updates.
 - Shared configurable shortcuts, context-sensitive hints and cursor position.
   The GUI editor follows the desktop palette and uses adaptive tabs and measured controls;
   the TUI has explicit focus borders and interactive editing prompts.
+- The GUI sends compact changed text rows directly to native Qt views, retaining
+  shaped text layouts during cursor movement and selection. QML receives pane
+  metadata; input and worker redraws are coalesced while Rust applies every edit
+  immediately. Terminal updates send changed rows, and idle checks skip snapshots.
 - Split views of the same document share text/history and keep independent
   cursors and scroll positions.
 - Nested horizontal/vertical splits, resizing, selectable view groups,
@@ -363,6 +367,8 @@ python3 scripts/gui-offscreen-smoke.py target/debug/slate
 python3 scripts/gui-layout-smoke.py target/debug/slate  # Qt Test + Kirigami 6
 SLATE_GUI_FEATURE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
 SLATE_GUI_GIT_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
+cargo build --release --features gui-smoke
+python3 scripts/gui-performance-smoke.py target/release/slate
 python3 scripts/idle-smoke.py target/release/slate       # Linux, release GUI/TUI idle CPU
 python3 scripts/gui-smoke.py target/debug/slate   # optional X11: Xvfb + xdotool
 SLATE_GUI_PLATFORM=wayland SLATE_GUI_FEATURE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py  # running Wayland desktop
@@ -385,6 +391,10 @@ regression check for KDE's desktop style when that QML style is installed.
 The populated Git workflow checks normal/narrow/short panes and large fonts,
 scrollbar/action separation, bulk and section staging, and commit hook failures.
 Set `SLATE_GUI_ARTIFACT_DIR` to retain its screenshots and report.
+Release performance checks measure actual input handlers and rendered frames at
+normal, 1080p and 4K sizes, plus cursor/selection layout retention, scrolling,
+syntax highlighting, batched input and typing beside a busy terminal. Set `SLATE_GUI_PERF_REPORT` to
+save the measurements, or `SLATE_GUI_PLATFORM=wayland` to use the desktop renderer.
 For a Qt-free installation, use
 `./scripts/install.sh "$HOME/.local" --tui-only`. The GUI installation also installs
 a desktop launcher and scalable icon; put the selected prefix's `bin` in PATH.

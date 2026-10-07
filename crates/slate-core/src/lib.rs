@@ -10,6 +10,7 @@ mod presentation;
 pub mod search;
 mod services;
 pub mod terminal;
+pub mod text_presentation;
 pub mod workspace;
 
 use anyhow::{bail, Context, Result};
@@ -267,6 +268,10 @@ pub struct PaneSnapshot {
     pub terminal_mouse_motion: bool,
     pub read_only: bool,
     pub selected: usize,
+    pub rows: u16,
+    pub cols: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<text_presentation::EditorText>,
     pub editor: Option<EditorPresentation>,
 }
 #[derive(Serialize)]
@@ -1613,6 +1618,21 @@ impl App {
         view.manual_scroll = false;
         Ok(())
     }
+    pub fn key_binding(&self, key: &Key) -> Option<&str> {
+        if self.prompt.is_some() {
+            return None;
+        }
+        let chord = key_chord(key);
+        self.preferences
+            .global_keys
+            .get(&chord)
+            .or_else(|| match self.focused_kind() {
+                "editor" => self.preferences.editor_keys.get(&chord),
+                "terminal" => self.preferences.terminal_keys.get(&chord),
+                _ => None,
+            })
+            .map(String::as_str)
+    }
     fn key(&mut self, k: Key) -> Result<()> {
         if self.prompt.as_ref().is_some_and(|p| p.kind == "settings") {
             return self.settings_key(&k);
@@ -1646,17 +1666,7 @@ impl App {
             }
             return Ok(());
         }
-        let chord = key_chord(&k);
-        let binding = self
-            .preferences
-            .global_keys
-            .get(&chord)
-            .or_else(|| match self.focused_kind() {
-                "editor" => self.preferences.editor_keys.get(&chord),
-                "terminal" => self.preferences.terminal_keys.get(&chord),
-                _ => None,
-            })
-            .cloned();
+        let binding = self.key_binding(&k).map(str::to_owned);
         if let Some(command) = binding {
             self.command_line(&command);
             return Ok(());
@@ -1877,6 +1887,30 @@ impl App {
         minimum: (u16, u16),
         known: Option<(u64, u64)>,
     ) -> Snapshot {
+        self.snapshot_presentation(area, gap, cell, header, minimum, known, false)
+    }
+    pub fn gui_snapshot(
+        &mut self,
+        area: Rect,
+        gap: u16,
+        cell: (u16, u16),
+        header: u16,
+        minimum: (u16, u16),
+        known: Option<(u64, u64)>,
+    ) -> Snapshot {
+        self.snapshot_presentation(area, gap, cell, header, minimum, known, true)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn snapshot_presentation(
+        &mut self,
+        area: Rect,
+        gap: u16,
+        cell: (u16, u16),
+        header: u16,
+        minimum: (u16, u16),
+        known: Option<(u64, u64)>,
+        graphical: bool,
+    ) -> Snapshot {
         let Rect { width, height, .. } = area;
         let (cell_width, cell_height) = cell;
         self.process_events();
@@ -1944,10 +1978,16 @@ impl App {
                 .checked_div(cw)
                 .unwrap_or(1)
                 .max(1);
+            let mut text = None;
             let (kind, screen, selected) = match view {
                 View::Editor(view) => {
-                    let screen = self.cached_editor_screen(view, rows, cols);
-                    ("editor", Some(screen), 0)
+                    if graphical {
+                        text = Some(self.editor_text(view, rows, cols));
+                        ("editor", None, 0)
+                    } else {
+                        let screen = self.cached_editor_screen(view, rows, cols);
+                        ("editor", Some(screen), 0)
+                    }
                 }
                 View::Terminal(term) => {
                     let screen = self.terminals.get_mut(&term).map(|t| {
@@ -1989,6 +2029,9 @@ impl App {
                 },
                 screen,
                 selected,
+                rows,
+                cols,
+                text,
             });
         }
         Snapshot {
@@ -2009,7 +2052,11 @@ impl App {
             status: self.status.clone(),
             dirty: self.dirty(),
             quit: self.quit,
-            clipboard: self.clipboard.clone(),
+            clipboard: if graphical {
+                String::new()
+            } else {
+                self.clipboard.clone()
+            },
             layouts: self.presets.keys().cloned().collect(),
             prompt: self.prompt.clone(),
             location: self.location(),
@@ -2017,7 +2064,11 @@ impl App {
             foreground: self.colors.0.clone(),
             background: self.colors.1.clone(),
             accent: self.colors.3.clone(),
-            commands: self.command_catalog(""),
+            commands: if graphical {
+                vec![]
+            } else {
+                self.command_catalog("")
+            },
             settings: self.preferences.clone(),
             editor_only: self.editor_only,
             git_branch: self.git_branch.clone(),
@@ -2026,6 +2077,14 @@ impl App {
             git_error: self.git_error.clone(),
             files_revision: self.files_revision,
             git_revision: self.git_revision,
+        }
+    }
+    pub fn editor_input_context(&self, pane: u64) -> Option<EditorPresentation> {
+        match self.layout.view(pane) {
+            Some(View::Editor(id)) if self.views.contains_key(id) => {
+                Some(self.editor_presentation(*id))
+            }
+            _ => None,
         }
     }
     fn editor_presentation(&self, id: u64) -> EditorPresentation {
@@ -2105,6 +2164,15 @@ impl App {
         screen
     }
     fn editor_screen(&mut self, id: u64, rows: u16, cols: u16) -> Screen {
+        self.render_editor(id, rows, cols, false).0
+    }
+    fn render_editor(
+        &mut self,
+        id: u64,
+        rows: u16,
+        cols: u16,
+        graphical: bool,
+    ) -> (Screen, Vec<Vec<text_presentation::TextSpan>>) {
         let v = self.views.get_mut(&id).unwrap();
         v.rows = rows;
         v.cols = cols;
@@ -2136,7 +2204,13 @@ impl App {
         let mut blank = Cell::text(" ");
         blank.fg = self.colors.0.clone();
         blank.bg = self.colors.1.clone();
-        let mut cells = vec![vec![blank; cols as usize]; rows as usize];
+        let mut cells = if graphical {
+            vec![vec![]; rows as usize]
+        } else {
+            vec![vec![blank; cols as usize]; rows as usize]
+        };
+        let mut decorations = vec![vec![]; rows as usize];
+        let mut visible_lines = 0;
         let token_data = self
             .tokens
             .get(&v.document)
@@ -2148,6 +2222,10 @@ impl App {
         let start = self.documents[&v.document].line_offset(v.top);
         let mut byte = start;
         for (y, line) in text[start..].split('\n').take(rows as usize).enumerate() {
+            visible_lines = y + 1;
+            if graphical {
+                cells[y].resize_with(gutter, || Cell::text(" "));
+            }
             let number = format!("{:>4}  ", v.top + y + 1);
             for (x, c) in number.chars().take(gutter).enumerate() {
                 cells[y][x] = Cell::text(c.to_string());
@@ -2197,24 +2275,44 @@ impl App {
                         while match_index < ranges.len() && ranges[match_index].1 <= i {
                             match_index += 1;
                         }
-                        if ranges
+                        let matched = ranges
                             .get(match_index)
-                            .is_some_and(|(a, b)| i >= *a && i < *b)
-                        {
-                            c.bg = self.colors.2.clone();
-                            c.fg = self.selection_foreground.clone();
-                            c.underline = true;
-                        }
+                            .is_some_and(|(a, b)| i >= *a && i < *b);
                         c.wide = width == 2 && g != "\t" && offset == 0;
                         c.continuation = width == 2 && g != "\t" && offset == 1;
-                        if selection
+                        let selected = selection
                             .map(|(a, b)| byte + i >= a && byte + i < b)
-                            .unwrap_or(false)
-                        {
-                            c.bg = self.colors.2.clone();
-                            c.fg = self.selection_foreground.clone();
+                            .unwrap_or(false);
+                        let position = column - v.left + gutter;
+                        if matched || selected {
+                            if graphical {
+                                let mut decoration = c.clone();
+                                decoration.bg = self.colors.2.clone();
+                                decoration.fg = self.selection_foreground.clone();
+                                decoration.underline = matched;
+                                let row: &mut Vec<text_presentation::TextSpan> =
+                                    &mut decorations[y];
+                                if let Some(last) = row.last_mut().filter(|s| {
+                                    s.start + s.length == position && s.underline == matched
+                                }) {
+                                    last.length += 1;
+                                } else {
+                                    row.push(text_presentation::TextSpan::cell(
+                                        position,
+                                        1,
+                                        &decoration,
+                                    ));
+                                }
+                            } else {
+                                c.bg = self.colors.2.clone();
+                                c.fg = self.selection_foreground.clone();
+                                c.underline = matched;
+                            }
                         }
-                        cells[y][column - v.left + gutter] = c;
+                        if graphical && cells[y].len() <= position {
+                            cells[y].resize_with(position + 1, || Cell::text(" "));
+                        }
+                        cells[y][position] = c;
                     }
                 }
                 x += width;
@@ -2224,19 +2322,26 @@ impl App {
             }
             byte += line.len() + 1;
         }
-        Screen {
-            cells,
-            cursor: if row >= v.top && row < v.top + rows as usize && col >= v.left {
-                Some((
-                    (row - v.top) as u16,
-                    ((col - v.left) + gutter).min(cols as usize - 1) as u16,
-                ))
-            } else {
-                None
-            },
-            rows,
-            cols,
+        if graphical {
+            cells.truncate(visible_lines);
+            decorations.truncate(visible_lines);
         }
+        (
+            Screen {
+                cells,
+                cursor: if row >= v.top && row < v.top + rows as usize && col >= v.left {
+                    Some((
+                        (row - v.top) as u16,
+                        ((col - v.left) + gutter).min(cols as usize - 1) as u16,
+                    ))
+                } else {
+                    None
+                },
+                rows,
+                cols,
+            },
+            decorations,
+        )
     }
     pub fn focused_kind(&self) -> &str {
         match self.focused() {

@@ -677,3 +677,55 @@ fn restaging_a_staged_rename_preserves_its_source_removal() {
         .unwrap();
     assert_eq!(staged.stdout, newer.as_bytes());
 }
+
+#[test]
+fn compact_editor_lines_preserve_tabs_unicode_and_selection_without_padding() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("compact.txt");
+    fs::write(&path, "ab\t猫👩‍💻\nsecond\n").unwrap();
+    let mut app = App::new(&path).unwrap();
+    app.preferences = Default::default();
+    app.preferences.line_numbers = false;
+    let area = slate_core::layout::Rect {
+        x: 0,
+        y: 0,
+        width: 3840,
+        height: 2160,
+    };
+    let render = |app: &mut App| {
+        app.gui_snapshot(area, 6, (10, 20), 43, (160, 100), None)
+            .panes
+            .into_iter()
+            .find(|p| p.kind == "editor")
+            .unwrap()
+    };
+    let pane = render(&mut app);
+    assert!(pane.screen.is_none());
+    let text = pane.text.unwrap();
+    assert_eq!(text.lines.len(), 3); // Actual lines, including the empty EOF line.
+    assert!(pane.rows > 100 && pane.cols > 300);
+    assert_eq!(text.lines[0].layout.text, "ab  猫👩‍💻");
+    assert_eq!(
+        text.lines[0].layout.columns,
+        vec![0, 1, 2, 3, 4, 6, 6, 6, 6, 6, 8]
+    );
+    assert_eq!(text.lines[2].layout.text, "");
+    app.dispatch(Command::Key {
+        key: Key {
+            key: "a".into(),
+            ctrl: true,
+            ..Default::default()
+        },
+    });
+    let selected = render(&mut app).text.unwrap();
+    assert_eq!(selected.lines[0].layout.text, text.lines[0].layout.text);
+    assert_eq!(
+        selected.lines[0].layout.columns,
+        text.lines[0].layout.columns
+    );
+    let overlays = &selected.lines[0].overlays;
+    assert_eq!(overlays.len(), 1);
+    assert_eq!(overlays[0].start, 0);
+    assert_eq!(overlays[0].length, 10); // UTF-16, including both surrogate pairs.
+    assert_eq!(selected.cursor, Some((2, 0)));
+}

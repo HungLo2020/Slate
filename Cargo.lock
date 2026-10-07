@@ -1547,6 +1547,7 @@ version = "0.1.0"
 dependencies = [
  "cmake",
  "pkg-config",
+ "serde",
  "serde_json",
  "slate-core",
  "tempfile",

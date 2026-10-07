@@ -501,7 +501,7 @@ Kirigami.ApplicationWindow {
                     width: Math.max(0, parent.width - 2)
                     height: Math.max(0, parent.height - root.paneHeaderHeight - 3)
                     visible: panel.paneData.kind === "editor" || panel.paneData.kind === "terminal"
-                    pane: panel.paneData
+                    paneId: panel.paneId
                     Accessible.role: panel.paneData.kind === "editor" ? Accessible.EditableText : Accessible.Pane
                     Accessible.name: (panel.paneData.tabs || []).filter(function (t) {
                         return t.active;
@@ -519,7 +519,7 @@ Kirigami.ApplicationWindow {
                     height: grid.height
                     orientation: Qt.Vertical
                     policy: ScrollBar.AsNeeded
-                    size: panel.paneData.editor ? Math.min(1, (panel.paneData.screen ? panel.paneData.screen.rows : 1) / Math.max(1, panel.paneData.editor.line_count)) : 1
+                    size: panel.paneData.editor ? Math.min(1, panel.paneData.rows / Math.max(1, panel.paneData.editor.line_count)) : 1
                     position: panel.paneData.editor ? panel.paneData.editor.top / Math.max(1, panel.paneData.editor.line_count) : 0
                     onPositionChanged: if (pressed)
                         root.send({
@@ -1009,7 +1009,9 @@ Kirigami.ApplicationWindow {
         standardButtons: Dialog.Cancel
         onOpened: commandText.forceActiveFocus()
         property var results: {
-            var context = root.frame.commands;
+            if (!visible)
+                return [];
+            var context = root.frame.command_revision;
             return slate.commands(commandText.text);
         }
         function execute() {

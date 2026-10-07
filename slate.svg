@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none" role="img" aria-labelledby="title desc">
+<title id="title">Slate — Folded Blue S on Slate</title>
+<desc id="desc">A layered slate rock slab bearing an angular blue S folded like a ribbon. Pure vector paths and gradients with a transparent background.</desc>
+<defs><linearGradient id="slab" x1="100" y1="67" x2="405" y2="434" gradientUnits="userSpaceOnUse"><stop stop-color="#686876"/><stop offset=".58" stop-color="#454754"/><stop offset="1" stop-color="#30333F"/></linearGradient></defs>
+<path d="m88 91 268-34 76 46 27 285-59 65-277 18-62-65-7-246Z" fill="#232632"/>
+<path d="m88 70 268-34 76 46 27 285-59 65-277 18-62-65-7-246Z" fill="url(#slab)"/>
+<path d="m88 70 268-34 76 46-81-31L97 85l-43 54Z" fill="#AAA8B1"/>
+<path d="m61 385 62 65 277-18 59-65-8 33-49 50-280 18-61-63Z" fill="#535561"/>
+<path d="m71 394 56 48 269-18 42-40-38 50-274 19Z" fill="#82838D"/>
+<path d="m352 52-30 44 62 16-45-22Z" fill="#303440"/>
+<path d="m82 298 27 29 17 91-29-84Z" fill="#252C36" opacity=".8"/>
+<path d="m144 103 146-22-140 32-37 36Z" fill="#B0ADB6" opacity=".2"/>
+<defs>
+    <linearGradient id="upper" x1="178" y1="65" x2="287" y2="164" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#66C9FF"/>
+      <stop offset="1" stop-color="#2499ED"/>
+    </linearGradient>
+    <linearGradient id="crossing" x1="128" y1="169" x2="377" y2="342" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1674D0"/>
+      <stop offset=".5" stop-color="#218BE4"/>
+      <stop offset="1" stop-color="#1257BA"/>
+    </linearGradient>
+    <linearGradient id="lower" x1="148" y1="350" x2="357" y2="437" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#238CE5"/>
+      <stop offset="1" stop-color="#1269CD"/>
+    </linearGradient>
+    <linearGradient id="fold" x1="344" y1="300" x2="426" y2="345" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#81D8FF"/>
+      <stop offset="1" stop-color="#36ADF5"/>
+    </linearGradient>
+  </defs>
+<g transform="translate(82 78) scale(.68)">
+<path d="M181 62h227v82H182l250 126v68l-104 95H105v-82h223L78 225v-68Z" fill="#17212F" opacity=".55" transform="translate(5 10)"/>
+
+  <!-- The diagonal ribbon passes behind both folded ends. -->
+  <path d="m78 157 104-13 250 126-104 81L78 225Z" fill="url(#crossing)"/>
+  <!-- Upper horizontal face folds down at its left end. -->
+  <path d="M181 62h227v82H182L78 225v-68Z" fill="url(#upper)"/>
+  <path d="m78 157 104-13-104 81Z" fill="#0954A8"/>
+  <!-- Narrow crease shadows make the overlap readable without filters. -->
+  <path d="m182 144 36 18-140 63Z" fill="#074B9F" opacity=".38"/>
+  <path d="M181 62h227v4H183L82 158l-4-1Z" fill="#B4E8FF" opacity=".6"/>
+  <!-- Lower face turns back toward the left to complete the S. -->
+  <path d="M328 351H105v82h223l104-95v-68Z" fill="url(#lower)"/>
+  <path d="m432 270-104 81 104-13Z" fill="url(#fold)"/>
+  <path d="m328 351 104-13-100 20H105v-7Z" fill="#084DA6" opacity=".6"/>
+  <path d="m432 270-104 81h-6l110-81Z" fill="#9EE3FF" opacity=".75"/>
+  <path d="M105 429h221l106-96v5l-104 95H105Z" fill="#0C54B2"/>
+</g>
+<path d="m249 394 120-8 39-24-34 34-123 9Z" fill="#657584"/>
+</svg>
