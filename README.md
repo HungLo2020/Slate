@@ -16,6 +16,14 @@ packages and Kirigami 6 QML package. Package names vary with distro release;
 older distributions may only package Kirigami for Qt 5, which is insufficient.
 Slate does not download or vendor Qt or Kirigami.
 
+The GUI uses Qt's native file dialogs for **Open File**, **Open Folder**, and
+**Save As**. On Plasma, the desktop's Qt platform integration (`plasma-integration`
+on Debian/Ubuntu) supplies KDE's file picker, Places sidebar and overwrite
+confirmation. Other desktops use their available Qt platform dialog. Slate keeps
+file I/O in the shared Rust backend and currently supports local files.
+**Ctrl+O** opens a file, **Ctrl+Shift+O** opens a folder, and **Ctrl+Shift+S** saves
+as a new path. Saving an untitled document opens Save As automatically.
+
 ```bash
 cargo build --release
 ./target/release/slate .                  # terminal mode
@@ -371,6 +379,8 @@ cargo build --features gui-smoke
 python3 scripts/gui-offscreen-smoke.py target/debug/slate
 python3 scripts/gui-layout-smoke.py target/debug/slate  # Qt Test + Kirigami 6
 SLATE_GUI_FEATURE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
+SLATE_GUI_FILE_DIALOG_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
+QT_QPA_PLATFORMTHEME=kde SLATE_GUI_PLATFORM=wayland SLATE_GUI_REQUIRE_KDE_DIALOGS=1 SLATE_GUI_FILE_DIALOG_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate # running Plasma desktop
 SLATE_GUI_GIT_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
 cargo build --release --features gui-smoke
 python3 scripts/gui-performance-smoke.py target/release/slate

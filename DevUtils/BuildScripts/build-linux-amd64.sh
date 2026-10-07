@@ -52,7 +52,7 @@ Architecture: amd64
 Maintainer: Slate Maintainers
 Installed-Size: $installed_size
 Depends: $shlib_depends, $qml_depends, git
-Recommends: qml6-module-org-kde-desktop, breeze-icon-theme, fonts-dejavu-core
+Recommends: plasma-integration, qml6-module-org-kde-desktop, breeze-icon-theme, fonts-dejavu-core
 Homepage: https://github.com/HungLo2020/Slate
 Description: Shared graphical and terminal text editor
  Slate provides a Kirigami graphical editor and a terminal editor using the

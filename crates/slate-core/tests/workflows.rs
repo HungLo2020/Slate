@@ -436,6 +436,71 @@ fn undo_memory_is_proportional_to_edits_in_a_large_buffer() {
     assert_eq!(d.history_bytes(), 300);
 }
 #[test]
+fn file_actions_request_paths_and_untitled_save_survives_cancellation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("file.txt");
+    fs::write(&path, "original").unwrap();
+    let mut app = App::new(&path).unwrap();
+    app.preferences = Default::default();
+    for (command, kind) in [
+        ("open", "open"),
+        ("open-folder", "open-folder"),
+        ("save-as", "save-as"),
+    ] {
+        app.command_line(command);
+        assert_eq!(app.prompt.as_ref().unwrap().kind, kind);
+        app.dispatch(Command::DismissPrompt);
+    }
+    app.dispatch(Command::New);
+    app.dispatch(Command::Paste {
+        text: "unsaved text".into(),
+    });
+    app.dispatch(Command::Save);
+    assert_eq!(app.prompt.as_ref().unwrap().kind, "save-as");
+    app.dispatch(Command::DismissPrompt);
+    assert!(app.dirty());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+    // A cancelled save must not leave a pending job preventing the next save.
+    let destination = dir.path().join("new 猫 #% .txt");
+    app.dispatch(Command::SaveAs {
+        path: destination.clone(),
+        overwrite: false,
+    });
+    wait_app(&mut app, |a| a.status == "Saved");
+    assert_eq!(fs::read_to_string(destination).unwrap(), "unsaved text");
+    assert!(!app.dirty());
+}
+
+#[test]
+fn save_as_requires_explicit_overwrite_and_normal_saves_keep_conflict_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = dir.path().join("original.txt");
+    let destination = dir.path().join("existing.txt");
+    fs::write(&original, "original").unwrap();
+    fs::write(&destination, "existing").unwrap();
+    let mut app = App::new(&original).unwrap();
+    app.dispatch(Command::SaveAs {
+        path: destination.clone(),
+        overwrite: false,
+    });
+    wait_app(&mut app, |a| a.status.starts_with("Save failed:"));
+    assert_eq!(fs::read_to_string(&destination).unwrap(), "existing");
+    app.dispatch(Command::SaveAs {
+        path: destination.clone(),
+        overwrite: true,
+    });
+    wait_app(&mut app, |a| a.status == "Saved");
+    assert_eq!(fs::read_to_string(&destination).unwrap(), "original");
+    fs::write(&destination, "external change").unwrap();
+    app.dispatch(Command::SaveAs {
+        path: destination.clone(),
+        overwrite: true,
+    });
+    wait_app(&mut app, |a| a.status.starts_with("Save failed:"));
+    assert_eq!(fs::read_to_string(&destination).unwrap(), "external change");
+}
+
+#[test]
 fn background_save_preserves_newer_edits_and_external_conflicts() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("file");

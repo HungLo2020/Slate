@@ -134,6 +134,17 @@ fn respond(state: &mut GuiContext, mut request: serde_json::Value) -> String {
     }
     let app = &mut state.app;
     match action.as_str() {
+        "file_dialog_context" => {
+            let path = match app.layout.view(app.focus) {
+                Some(slate_core::layout::View::Editor(id)) => app
+                    .views
+                    .get(id)
+                    .and_then(|view| app.documents.get(&view.document))
+                    .and_then(|document| document.path.as_ref()),
+                _ => None,
+            };
+            serde_json::json!({"root": app.root, "path": path}).to_string()
+        }
         "input_context" => serde_json::json!({
             "editor": request["pane"].as_u64().and_then(|id| app.editor_input_context(id))
         })

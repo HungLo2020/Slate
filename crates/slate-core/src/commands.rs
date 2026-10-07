@@ -21,6 +21,13 @@ const ACTIONS: &[(&str, &str, &str, &str, &str)] = &[
         "any",
     ),
     (
+        "open-folder",
+        "Open folder…",
+        "Browse a directory in the file pane",
+        "Path",
+        "any",
+    ),
+    (
         "new",
         "New document",
         "Create an untitled document",

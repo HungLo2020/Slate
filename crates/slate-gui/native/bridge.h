@@ -2,6 +2,7 @@
 #include <QAbstractListModel>
 #include <QFont>
 #include <QHash>
+#include <QPointer>
 #include <QTimer>
 #include <QObject>
 #include <QQuickPaintedItem>
@@ -35,6 +36,7 @@ class EntryModel : public QAbstractListModel {
     QVariantList m_rows;
 };
 class CellView;
+class QFileDialog;
 class Bridge : public QObject {
     Q_OBJECT
     Q_PROPERTY(QVariantMap frame READ frame NOTIFY frameChanged)
@@ -44,8 +46,10 @@ class Bridge : public QObject {
     Q_PROPERTY(QAbstractItemModel *git READ git CONSTANT)
     Q_PROPERTY(int cellWidth READ cellWidth CONSTANT)
     Q_PROPERTY(int cellHeight READ cellHeight CONSTANT)
+    Q_PROPERTY(bool pathDialogOpen READ pathDialogOpen NOTIFY pathDialogOpenChanged)
   public:
     Bridge(void *context, QObject *parent = nullptr);
+    ~Bridge() override;
     QVariantMap frame() const { return m_frame; }
     QVariantList paneIds() const { return m_paneIds; }
     QVariantList handleIds() const { return m_handleIds; }
@@ -69,7 +73,10 @@ class Bridge : public QObject {
     Q_INVOKABLE void pasteClipboard();
     Q_INVOKABLE void exit();
     Q_INVOKABLE void key(int code, const QString &text, int modifiers);
+    bool pathDialogOpen() const { return !m_pathDialog.isNull(); }
+    Q_INVOKABLE void pickPath(const QString &kind, QObject *window);
   signals:
+    void pathDialogOpenChanged();
     void frameChanged();
     void structureChanged();
     void filesChanged();
@@ -78,6 +85,7 @@ class Bridge : public QObject {
 
   private:
     EntryModel m_files, m_git;
+    QPointer<QFileDialog> m_pathDialog;
     QTimer m_refreshTimer;
     bool m_refreshing = false;
     QHash<int, CellView *> m_views;

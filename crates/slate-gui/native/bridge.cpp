@@ -1,6 +1,8 @@
 #include "bridge.h"
 #include <QApplication>
 #include <QClipboard>
+#include <QFileDialog>
+#include <QFileInfo>
 #include <QFontDatabase>
 #include <QFontMetrics>
 #include <QGuiApplication>
@@ -56,6 +58,62 @@ Bridge::Bridge(void *context, QObject *parent) : QObject(parent), m_context(cont
     m_refreshTimer.setInterval(8);
     m_refreshTimer.setTimerType(Qt::PreciseTimer);
     connect(&m_refreshTimer, &QTimer::timeout, this, &Bridge::refresh);
+}
+Bridge::~Bridge() { delete m_pathDialog.data(); }
+void Bridge::pickPath(const QString &kind, QObject *windowObject) {
+    auto window = qobject_cast<QWindow *>(windowObject);
+    if (!window || (kind != "open" && kind != "open-folder" && kind != "save-as"))
+        return;
+    if (m_pathDialog) {
+        m_pathDialog->raise();
+        m_pathDialog->activateWindow();
+        return;
+    }
+    const auto context = send({{"action", "file_dialog_context"}});
+    const auto path = context.value("path").toString();
+    auto dialog = new QFileDialog;
+    // QApplication + the desktop's platform theme supplies KDE's file dialog
+    // on Plasma. Leave native dialogs and overwrite confirmation enabled.
+    m_pathDialog = dialog;
+    dialog->setObjectName("pathDialog");
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->setSupportedSchemes({"file"}); // Rust's document I/O uses local paths.
+    dialog->setWindowTitle(kind == "save-as" ? tr("Save As") :
+                           kind == "open-folder" ? tr("Open Folder") : tr("Open File"));
+    dialog->setAcceptMode(kind == "save-as" ? QFileDialog::AcceptSave : QFileDialog::AcceptOpen);
+    dialog->setFileMode(kind == "save-as" ? QFileDialog::AnyFile :
+                        kind == "open-folder" ? QFileDialog::Directory : QFileDialog::ExistingFile);
+    if (kind == "open-folder")
+        dialog->setOption(QFileDialog::ShowDirsOnly);
+    else
+        dialog->setNameFilter(tr("All files (*)"));
+    const auto directory = !path.isEmpty() && kind != "open-folder"
+        ? QFileInfo(path).absolutePath() : m_frame.value("browser").toString();
+    dialog->setDirectory(directory.isEmpty() ? context.value("root").toString() : directory);
+    if (kind == "save-as" && !path.isEmpty())
+        dialog->selectFile(path);
+    dialog->setWindowModality(Qt::WindowModal);
+    dialog->winId();
+    dialog->windowHandle()->setTransientParent(window);
+    connect(window, &QObject::destroyed, dialog, &QWidget::close);
+    connect(dialog, &QFileDialog::fileSelected, this, [this, kind](const QString &selected) {
+        if (selected.isEmpty()) return;
+        if (kind == "open-folder") send({{"action", "show_workspace"}});
+        send({{"action", kind == "save-as" ? "save_as" : "open"},
+              {"path", selected}, {"overwrite", kind == "save-as"}});
+    });
+    connect(dialog, &QDialog::finished, this, [this, parent = QPointer<QWindow>(window)](int) {
+        m_pathDialog.clear();
+        if (parent) parent->requestActivate();
+        refresh();
+        emit pathDialogOpenChanged();
+    });
+    // Consume the core prompt before showing the native dialog. Cancellation
+    // leaves the document untouched, and paths bypass command-line parsing.
+    send({{"action", "dismiss_prompt"}});
+    emit pathDialogOpenChanged();
+    refresh();
+    dialog->open(); // Asynchronous: workers and Qt's event loop keep running.
 }
 void Bridge::scheduleRefresh() {
     if (!m_refreshTimer.isActive()) m_refreshTimer.start();

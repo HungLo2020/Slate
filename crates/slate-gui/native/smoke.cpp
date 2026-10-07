@@ -1,5 +1,10 @@
 // Built only with the gui-smoke Cargo feature. No test machinery in normal builds.
 #include "bridge.h"
+#include <QApplication>
+#include <QAbstractButton>
+#include <QComboBox>
+#include <QFileDialog>
+#include <QFileInfo>
 #include <QIcon>
 #include <QClipboard>
 #include <QDir>
@@ -8,6 +13,7 @@
 #include <QInputMethodEvent>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QLineEdit>
 #include <QPointer>
 #include <QQuickWindow>
 #include <QSignalSpy>
@@ -28,6 +34,73 @@ static QByteArray read(const QString &path) {
     if (!file.open(QIODevice::ReadOnly))
         return {};
     return file.readAll();
+}
+static QFileDialog *pathDialog() {
+    for (auto widget : QApplication::topLevelWidgets())
+        if (widget->objectName() == "pathDialog")
+            if (auto dialog = qobject_cast<QFileDialog *>(widget))
+                return dialog;
+    return nullptr;
+}
+static void acceptPathDialog() {
+    // Exercise KDE's actual accept path: KFileWidget validates the selection
+    // and publishes its URLs before accepting the platform dialog.
+    for (auto widget : QApplication::topLevelWidgets()) {
+        if (widget->isVisible() && widget->inherits("KDirSelectDialog")) {
+            QMetaObject::invokeMethod(widget, "accept");
+            return;
+        }
+        if (!widget->isVisible() || !widget->inherits("KDEPlatformFileDialog"))
+            continue;
+        for (auto child : widget->findChildren<QWidget *>())
+            if (child->inherits("KFileWidget")) {
+                QMetaObject::invokeMethod(child, "slotOk");
+                return;
+            }
+    }
+    QMetaObject::invokeMethod(pathDialog(), "accept");
+}
+static void selectDialogPath(const QString &path) {
+    auto dialog = pathDialog();
+    if (dialog->fileMode() == QFileDialog::Directory) {
+        dialog->setDirectory(path);
+        // KDE's directory tree selects the requested URL after async loading.
+        QTimer::singleShot(200, dialog, []() { acceptPathDialog(); });
+        return;
+    } else {
+        dialog->selectFile(path);
+        // QFileDialog intentionally leaves a focused filename edit unchanged
+        // on selectFile(). Enter the value as a user would in the fallback UI.
+        if (auto input = dialog->findChild<QLineEdit *>("fileNameEdit"))
+            input->setText(path);
+    }
+    QTimer::singleShot(0, dialog, []() { acceptPathDialog(); });
+}
+static bool answerOverwrite(bool accept) {
+    for (auto widget : QApplication::topLevelWidgets()) {
+        if (!widget->isVisible() || widget->inherits("QFileDialog") ||
+            widget->inherits("KDEPlatformFileDialog") || widget->inherits("KDirSelectDialog"))
+            continue;
+        for (auto button : widget->findChildren<QAbstractButton *>()) {
+            const auto text = QString(button->text()).remove('&');
+            if (accept ? (text == "Overwrite" || text == "Yes") : (text == "Cancel" || text == "No")) {
+                button->click();
+                return true;
+            }
+        }
+    }
+    return false;
+}
+static bool pathDialogHasFilename(const QString &path) {
+    // Native KDE reports selected URLs only after validation. Check the visible
+    // filename field for the initial Save As suggestion instead.
+    for (auto widget : QApplication::topLevelWidgets())
+        if (widget->isVisible() && widget->inherits("KDEPlatformFileDialog")) {
+            for (auto combo : widget->findChildren<QComboBox *>())
+                if (combo->currentText().contains(QFileInfo(path).fileName())) return true;
+            return false;
+        }
+    return pathDialog()->selectedFiles().value(0) == path;
 }
 static QString checkCaptions(Bridge *state, QQuickWindow *window) {
     for (const auto &entry : state->frame().value("panes").toList()) {
@@ -619,14 +692,12 @@ static void startFeatureSmoke(Bridge *state, QQuickWindow *window) {
             key(Qt::Key_Return);
             break;
         case 4: {
-            if (frame.value("prompt").toMap().value("kind") != "open") {
-                finish(false, "Open action did not request a path");
+            auto dialog = pathDialog();
+            if (!dialog || !state->pathDialogOpen() || !frame.value("prompt").isNull()) {
+                finish(false, "Open action did not show a platform file picker");
                 return;
             }
-            auto input = findItem(window->contentItem(), "searchInput");
-            input->forceActiveFocus();
-            type(dir + "/workspace/edit.txt");
-            key(Qt::Key_Return);
+            selectDialogPath(dir + "/workspace/edit.txt");
             break;
         }
         case 5: {
@@ -912,6 +983,178 @@ static void startStartupSmoke(Bridge *state, QQuickWindow *window) {
     timer->start(150);
 }
 
+static void startFileDialogSmoke(Bridge *state, QQuickWindow *window) {
+    const QString dir = qEnvironmentVariable("SLATE_GUI_SMOKE_DIR");
+    const QString picked = dir + QString::fromUtf8("/workspace/picked 猫 #% .txt");
+    const QString saved = dir + QString::fromUtf8("/workspace/saved 猫 #% .txt");
+    const QString scratch = dir + "/workspace/scratch.txt";
+    const QString folder = dir + QString::fromUtf8("/workspace/folder 猫 #%");
+    QDir().mkpath(folder);
+    QFile fixture(picked);
+    fixture.open(QIODevice::WriteOnly);
+    fixture.write("picked document");
+    fixture.close();
+    auto timer = new QTimer(state);
+    auto step = new int(0), ticks = new int(0);
+    auto finish = [=](bool pass, const QString &detail) {
+        QFile report(dir + "/report.json");
+        report.open(QIODevice::WriteOnly);
+        report.write(QJsonDocument(QJsonObject{{"pass", pass}, {"detail", detail}, {"steps", *step}}).toJson());
+        timer->stop();
+        QGuiApplication::exit(pass ? 0 : 2);
+    };
+    auto invoke = [=](const QString &id) {
+        QMetaObject::invokeMethod(window, "invokeAction", Q_ARG(QVariant, QVariant(id)));
+    };
+    auto checkDialog = [=](QFileDialog::FileMode mode, QFileDialog::AcceptMode accept) {
+        auto dialog = pathDialog();
+        if (!dialog || !state->pathDialogOpen() || !state->frame().value("prompt").isNull() ||
+            dialog->fileMode() != mode || dialog->acceptMode() != accept ||
+            dialog->testOption(QFileDialog::DontUseNativeDialog) ||
+            dialog->testOption(QFileDialog::DontConfirmOverwrite) ||
+            dialog->supportedSchemes() != QStringList{"file"} ||
+            dialog->windowHandle()->transientParent() != window) {
+            finish(false, "Platform dialog mode, parenting, prompt routing or defaults incorrect");
+            return false;
+        }
+        if (!qEnvironmentVariableIsEmpty("SLATE_GUI_REQUIRE_KDE_DIALOGS")) {
+            bool native = false;
+            for (auto widget : QApplication::topLevelWidgets())
+                if (widget->isVisible()) {
+                    if (widget->inherits("KDEPlatformFileDialog") || widget->inherits("KDirSelectDialog"))
+                        native = true;
+                }
+            if (!native) {
+                finish(false, "KDE's native file dialog was not used");
+                return false;
+            }
+        }
+        return true;
+    };
+    auto select = [](const QString &path) {
+        selectDialogPath(path);
+    };
+    QObject::connect(timer, &QTimer::timeout, state, [=]() {
+        if (++*ticks > 200) {
+            finish(false, QString("File dialog timeout at %1: %2").arg(*step).arg(state->frame().value("status").toString()));
+            return;
+        }
+        const auto frame = state->frame();
+        switch (*step) {
+        case 0: {
+            auto button = findItem(window->contentItem(), "openButton");
+            if (!button || !button->isVisible()) {
+                finish(false, "Open File toolbar button missing");
+                return;
+            }
+            QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                              button->mapToScene(QPointF(button->width()/2, button->height()/2)).toPoint());
+            break;
+        }
+        case 1:
+            if (!checkDialog(QFileDialog::ExistingFile, QFileDialog::AcceptOpen)) return;
+            pathDialog()->reject();
+            break;
+        case 2:
+            if (state->pathDialogOpen() || !frame.value("prompt").isNull()) {
+                finish(false, "Cancel left a path prompt or dialog open");
+                return;
+            }
+            QTest::keyClick(window, Qt::Key_O, Qt::ControlModifier);
+            break;
+        case 3:
+            if (!checkDialog(QFileDialog::ExistingFile, QFileDialog::AcceptOpen)) return;
+            select(picked);
+            break;
+        case 4:
+            if (state->send({{"action", "file_dialog_context"}}).value("path") != picked) return;
+            invoke("save-as");
+            break;
+        case 5:
+            if (!checkDialog(QFileDialog::AnyFile, QFileDialog::AcceptSave)) return;
+            if (!pathDialogHasFilename(picked)) {
+                finish(false, "Save As did not preselect the current document");
+                return;
+            }
+            select(saved);
+            break;
+        case 6:
+            if (read(saved) != "picked document") return;
+            state->send({{"action", "new"}});
+            state->send({{"action", "paste"}, {"text", "scratch document"}});
+            state->refresh();
+            QTest::keyClick(window, Qt::Key_S, Qt::ControlModifier);
+            break;
+        case 7:
+            if (!checkDialog(QFileDialog::AnyFile, QFileDialog::AcceptSave)) return;
+            pathDialog()->reject();
+            break;
+        case 8:
+            if (QFile::exists(scratch) || !frame.value("dirty").toBool() || state->pathDialogOpen()) {
+                finish(false, "Cancelling an untitled save changed the document");
+                return;
+            }
+            QTest::keyClick(window, Qt::Key_S, Qt::ControlModifier | Qt::ShiftModifier);
+            break;
+        case 9:
+            if (!checkDialog(QFileDialog::AnyFile, QFileDialog::AcceptSave)) return;
+            select(scratch);
+            break;
+        case 10:
+            if (read(scratch) != "scratch document") return;
+            invoke("open-folder");
+            break;
+        case 11:
+            if (!checkDialog(QFileDialog::Directory, QFileDialog::AcceptOpen)) return;
+            select(folder);
+            break;
+        case 12:
+            if (frame.value("browser") != folder) return;
+            if (state->send({{"action", "file_dialog_context"}}).value("path") != scratch) {
+                finish(false, "Opening a folder replaced the editor document");
+                return;
+            }
+            QTest::keyClick(window, Qt::Key_O, Qt::ControlModifier | Qt::ShiftModifier);
+            break;
+        case 13:
+            if (!checkDialog(QFileDialog::Directory, QFileDialog::AcceptOpen)) return;
+            pathDialog()->reject();
+            break;
+        case 14:
+            invoke("save-as");
+            break;
+        case 15:
+            if (!checkDialog(QFileDialog::AnyFile, QFileDialog::AcceptSave)) return;
+            select(saved);
+            break;
+        case 16:
+            if (!answerOverwrite(false)) return;
+            if (read(saved) != "picked document") {
+                finish(false, "Cancelled overwrite modified the existing file");
+                return;
+            }
+            pathDialog()->reject();
+            break;
+        case 17:
+            invoke("save-as");
+            break;
+        case 18:
+            if (!checkDialog(QFileDialog::AnyFile, QFileDialog::AcceptSave)) return;
+            select(saved);
+            break;
+        case 19:
+            if (!answerOverwrite(true)) return;
+            break;
+        case 20:
+            if (read(saved) != "scratch document") return;
+            finish(true, "Platform file/folder/save dialogs, toolbar, palette routing, shortcuts, cancellation, untitled saves, Unicode paths and confirmed/cancelled overwrites");
+            return;
+        }
+        ++*step;
+    });
+    timer->start(150);
+}
+
 void startPerformanceSmoke(Bridge *, QQuickWindow *);
 void startSmoke(Bridge *state, QQuickWindow *window) {
     if (QGuiApplication::desktopFileName() != "slate" ||
@@ -922,6 +1165,10 @@ void startSmoke(Bridge *state, QQuickWindow *window) {
     }
     if (!qEnvironmentVariableIsEmpty("SLATE_GUI_PERF_SMOKE")) {
         startPerformanceSmoke(state, window);
+        return;
+    }
+    if (!qEnvironmentVariableIsEmpty("SLATE_GUI_FILE_DIALOG_SMOKE")) {
+        startFileDialogSmoke(state, window);
         return;
     }
     if (!qEnvironmentVariableIsEmpty("SLATE_GUI_STARTUP_SMOKE")) {

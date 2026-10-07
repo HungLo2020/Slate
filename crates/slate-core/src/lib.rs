@@ -177,6 +177,8 @@ pub enum Command {
     Save,
     SaveAs {
         path: PathBuf,
+        #[serde(default)]
+        overwrite: bool,
     },
     New,
     CloseDocument {
@@ -666,6 +668,7 @@ impl App {
                     "replace",
                     "goto",
                     "open",
+                    "open-folder",
                     "save-as",
                     "commit",
                     "layout-save",
@@ -719,8 +722,8 @@ impl App {
             Command::SubmitPrompt { all } => {
                 let p = self.prompt.clone().context("No active prompt")?;
                 match p.kind.as_str() {
-                    "open" | "save-as" | "commit" | "layout-save" | "layout-load" | "move-pane"
-                    | "settings" => {
+                    "open" | "open-folder" | "save-as" | "commit" | "layout-save"
+                    | "layout-load" | "move-pane" | "settings" => {
                         if p.input.trim().is_empty() {
                             bail!("Enter {}", p.kind);
                         }
@@ -921,17 +924,25 @@ impl App {
                 self.add_tab(View::Editor(view));
             }
             Command::Save | Command::SaveAs { .. } => {
-                let destination = if let Command::SaveAs { path } = cmd {
-                    Some(if path.is_absolute() {
-                        path
-                    } else {
-                        self.root.join(path)
-                    })
+                let (destination, overwrite) = if let Command::SaveAs { path, overwrite } = cmd {
+                    (
+                        Some(if path.is_absolute() {
+                            path
+                        } else {
+                            self.root.join(path)
+                        }),
+                        overwrite,
+                    )
                 } else {
-                    None
+                    (None, false)
                 };
                 let id = self.active_editor().context("Focus an editor to save")?;
                 let doc = self.views[&id].document;
+                if destination.is_none() && self.documents[&doc].path.is_none() {
+                    return self.execute(Command::Prompt {
+                        kind: "save-as".into(),
+                    });
+                }
                 if self.pending_save.contains(&doc) {
                     bail!("A save is already in progress for this document");
                 }
@@ -942,6 +953,7 @@ impl App {
                         doc,
                         self.documents[&doc].checkpoint(),
                         destination,
+                        overwrite,
                     ))
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 self.status = "Saving…".into();
@@ -2472,9 +2484,15 @@ impl App {
                     name: name.into(),
                     value: value.into(),
                 }),
-            "open" => Some(Command::Open { path: args.into() }),
+            "open" | "open-folder" | "save-as" if args.is_empty() => {
+                Some(Command::Prompt { kind: verb.into() })
+            }
+            "open" | "open-folder" => Some(Command::Open { path: args.into() }),
             "save" => Some(Command::Save),
-            "save-as" => Some(Command::SaveAs { path: args.into() }),
+            "save-as" => Some(Command::SaveAs {
+                path: args.into(),
+                overwrite: false,
+            }),
             "new" => Some(Command::New),
             "close" => Some(Command::CloseDocument { force: false }),
             "discard-document" => Some(Command::CloseDocument { force: true }),

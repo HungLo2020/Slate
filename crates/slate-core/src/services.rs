@@ -50,7 +50,7 @@ pub enum Job {
 }
 pub enum IoJob {
     Open(u64, PathBuf),
-    Save(u64, Document, Option<PathBuf>),
+    Save(u64, Document, Option<PathBuf>, bool),
     Checkpoint(PathBuf, Workspace),
     Flush(mpsc::SyncSender<()>),
 }
@@ -122,9 +122,9 @@ impl Services {
                             Reply::Opened(id, Document::open(&path).map_err(|e| format!("{e:#}")))
                         }
                     }
-                    IoJob::Save(id, mut doc, destination) => Reply::Saved(
+                    IoJob::Save(id, mut doc, destination, overwrite) => Reply::Saved(
                         id,
-                        doc.save(destination.as_deref())
+                        doc.save_with_overwrite(destination.as_deref(), overwrite)
                             .map(|()| doc)
                             .map_err(|e| format!("{e:#}")),
                     ),

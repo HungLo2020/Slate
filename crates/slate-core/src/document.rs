@@ -351,6 +351,15 @@ impl Document {
         self.history_size
     }
     pub fn save(&mut self, destination: Option<&Path>) -> Result<()> {
+        self.save_with_overwrite(destination, false)
+    }
+    // Only an explicitly confirmed Save As may replace a different existing
+    // file. Normal saves still compare against the document's disk baseline.
+    pub(crate) fn save_with_overwrite(
+        &mut self,
+        destination: Option<&Path>,
+        overwrite: bool,
+    ) -> Result<()> {
         if self.read_only {
             bail!("Inspection views cannot be saved");
         }
@@ -369,16 +378,20 @@ impl Document {
                 .join(path.file_name().context("Missing filename")?);
         }
         let same = self.path.as_ref() == Some(&path);
-        if path.exists() {
-            if !same {
+        let disk_baseline = if path.exists() {
+            if !same && !overwrite {
                 bail!("Save As refuses to overwrite an existing file");
             }
-            if self.saved.as_bytes() != fs::read(&path)?.as_slice() {
+            let contents = fs::read(&path)?;
+            if same && self.saved.as_bytes() != contents.as_slice() {
                 bail!("File changed on disk. Save As to a new path or reopen after preserving your changes");
             }
+            Some(contents)
         } else if same {
             bail!("File was removed externally. Save As to a new path");
-        }
+        } else {
+            None
+        };
         let parent = path.parent().context("Missing parent directory")?;
         let mut temp = tempfile::NamedTempFile::new_in(parent)?;
         if let Ok(meta) = fs::metadata(&path) {
@@ -388,15 +401,16 @@ impl Document {
         temp.write_all(self.text.as_bytes())?;
         temp.as_file().sync_all()?;
         // Recheck immediately before atomic replacement; ordinary edits are never silently overwritten.
-        if same
-            && self.saved.as_bytes()
+        if let Some(baseline) = &disk_baseline {
+            if baseline.as_slice()
                 != fs::read(&path)
                     .context("File removed during save")?
                     .as_slice()
-        {
-            bail!("File changed during save");
+            {
+                bail!("File changed during save");
+            }
         }
-        if same {
+        if disk_baseline.is_some() {
             temp.persist(&path).map_err(|e| e.error)?;
         } else {
             temp.persist_noclobber(&path).map_err(|e| e.error)?;

@@ -59,9 +59,12 @@ impl Default for Preferences {
                 ("f10", "toggle-workspace"),
                 ("Ctrl+,", "settings"),
                 ("Ctrl+q", "quit"),
+                ("Ctrl+o", "open"),
+                ("Ctrl+Shift+o", "open-folder"),
             ]),
             editor_keys: keys(&[
                 ("Ctrl+s", "save"),
+                ("Ctrl+Shift+s", "save-as"),
                 ("Ctrl+z", "undo"),
                 ("Ctrl+Shift+z", "redo"),
                 ("Ctrl+y", "redo"),
@@ -131,12 +134,18 @@ impl Preferences {
             ("f10", "toggle-workspace"),
             ("Ctrl+,", "settings"),
             ("Ctrl+q", "quit"),
+            ("Ctrl+o", "open"),
+            ("Ctrl+Shift+o", "open-folder"),
         ] {
             settings
                 .global_keys
                 .entry(key.into())
                 .or_insert_with(|| action.into());
         }
+        settings
+            .editor_keys
+            .entry("Ctrl+Shift+s".into())
+            .or_insert_with(|| "save-as".into());
         settings.validate()?;
         Ok(settings)
     }

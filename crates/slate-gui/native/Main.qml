@@ -47,7 +47,7 @@ Kirigami.ApplicationWindow {
     function send(action) {
         slate.send(action);
         slate.refresh();
-        if (!frame.prompt && !palette.visible && !quitDialog.visible && !settingsDialog.visible && !confirmDiscard.visible)
+        if (!frame.prompt && !slate.pathDialogOpen && !palette.visible && !quitDialog.visible && !settingsDialog.visible && !confirmDiscard.visible)
             Qt.callLater(root.focusPane);
     }
     function pane(id) {
@@ -90,7 +90,7 @@ Kirigami.ApplicationWindow {
             });
     }
     function focusPane() {
-        if (palette.visible || editPrompt.visible || settingsDialog.visible || confirmDiscard.visible || quitDialog.visible)
+        if (slate.pathDialogOpen || palette.visible || editPrompt.visible || settingsDialog.visible || confirmDiscard.visible || quitDialog.visible)
             return;
         for (var i = 0; i < panes.count; i++) {
             var item = panes.itemAt(i);
@@ -127,6 +127,10 @@ Kirigami.ApplicationWindow {
     }
     Connections {
         target: slate
+        function onPathDialogOpenChanged() {
+            if (!slate.pathDialogOpen)
+                Qt.callLater(root.focusPane);
+        }
         function onFrameChanged() {
             if (root.gitCommitting)
                 Qt.callLater(function () {
@@ -140,6 +144,13 @@ Kirigami.ApplicationWindow {
                 Qt.callLater(function () {
                     settingsDialog.open();
                     root.send({"action": "dismiss_prompt"});
+                });
+                return;
+            }
+            if (root.frame.prompt && ["open", "open-folder", "save-as"].indexOf(root.frame.prompt.kind) !== -1) {
+                Qt.callLater(function () {
+                    if (root.frame.prompt && ["open", "open-folder", "save-as"].indexOf(root.frame.prompt.kind) !== -1)
+                        slate.pickPath(root.frame.prompt.kind, root);
                 });
                 return;
             }
@@ -191,8 +202,13 @@ Kirigami.ApplicationWindow {
                     Menu {
                         title: "File"
                         MenuItem {
-                            text: "Open…"
+                            text: "Open File…"
                             onTriggered: root.invokeAction("open")
+                        }
+                        MenuItem {
+                            objectName: "openFolderAction"
+                            text: "Open Folder…"
+                            onTriggered: root.invokeAction("open-folder")
                         }
                         MenuItem {
                             text: "New document"
@@ -318,7 +334,7 @@ Kirigami.ApplicationWindow {
             ActionButton {
                 id: openButton
                 objectName: "openButton"
-                text: "Open…"
+                text: "Open File…"
                 visible: mainToolbar.width > implicitWidth + saveButton.implicitWidth + commandsButton.implicitWidth + workspaceToggleButton.implicitWidth + menuButton.implicitWidth + 7 * Kirigami.Units.smallSpacing
                 onClicked: root.invokeAction("open")
             }
