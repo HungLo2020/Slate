@@ -1,1 +1,8 @@
-<RCC><qresource prefix="/slate"><file>Main.qml</file></qresource></RCC>
+<RCC>
+    <qresource prefix="/slate">
+        <file>Main.qml</file>
+        <file>ActionButton.qml</file>
+        <file>Hint.qml</file>
+        <file>GitPane.qml</file>
+    </qresource>
+</RCC>

@@ -1,5 +1,7 @@
+pub mod commands;
 pub mod document;
 mod editing;
+pub mod events;
 mod highlight;
 pub mod layout;
 pub mod preferences;
@@ -52,6 +54,23 @@ pub struct Key {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Command {
+    ScrollTo {
+        pane: u64,
+        line: usize,
+    },
+    OpenSettings,
+    InputMethod {
+        text: String,
+        #[serde(default)]
+        replace_start: i32,
+        #[serde(default)]
+        replace_length: usize,
+    },
+    InvokeAction {
+        id: String,
+        #[serde(default)]
+        argument: String,
+    },
     SetClipboard {
         text: String,
     },
@@ -207,8 +226,15 @@ pub enum Command {
     GitUnstage {
         path: String,
     },
+    GitStageAll,
+    GitUnstageAll,
+    GitStageGroup {
+        group: String,
+    },
     GitDiff {
         path: String,
+        #[serde(default)]
+        staged: bool,
     },
     GitCommit {
         message: String,
@@ -229,8 +255,23 @@ pub struct PaneSnapshot {
     pub rect: Rect,
     pub kind: String,
     pub tabs: Vec<Tab>,
-    pub screen: Option<Screen>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screen: Option<std::sync::Arc<Screen>>,
+    pub revision: u64,
+    pub focused: bool,
+    pub terminal_mouse_motion: bool,
+    pub read_only: bool,
     pub selected: usize,
+    pub editor: Option<EditorPresentation>,
+}
+#[derive(Serialize)]
+pub struct EditorPresentation {
+    pub surrounding: String,
+    pub cursor: usize,
+    pub anchor: usize,
+    pub selection: String,
+    pub line_count: usize,
+    pub top: usize,
 }
 #[derive(Serialize)]
 pub struct Snapshot {
@@ -251,6 +292,14 @@ pub struct Snapshot {
     pub background: String,
     pub foreground: String,
     pub accent: String,
+    pub commands: Vec<commands::CommandInfo>,
+    pub settings: Preferences,
+    pub git_branch: String,
+    pub git_repository: bool,
+    pub git_busy: bool,
+    pub git_error: String,
+    pub files_revision: u64,
+    pub git_revision: u64,
 }
 #[derive(Serialize, Deserialize)]
 struct Settings {
@@ -286,7 +335,19 @@ pub struct App {
     workspace_dirty: bool,
     checkpoint_at: Instant,
     colors: (String, String, String, String),
+    system_colors: Option<(String, String, String, String, String)>,
     selection_foreground: String,
+    events: events::Events,
+    revision: u64,
+    files_revision: u64,
+    git_revision: u64,
+    render_cache: BTreeMap<u64, (String, u64, std::sync::Arc<Screen>)>,
+    pub screen_builds: u64,
+    typing: bool,
+    git_branch: String,
+    git_repository: bool,
+    git_jobs: usize,
+    git_error: String,
 }
 impl App {
     pub fn new(path: &Path) -> Result<Self> {
@@ -318,8 +379,12 @@ impl App {
                 ..Default::default()
             },
         );
+        let events = events::Events::default();
         let mut terminals = BTreeMap::new();
         terminals.insert(12, TerminalSession::spawn(&root, None, 24, 80)?);
+        for terminal in terminals.values_mut() {
+            terminal.set_events(events.clone());
+        }
         let mut app = Self {
             browser: root.clone(),
             root,
@@ -335,7 +400,18 @@ impl App {
             git: vec![],
             selected: 0,
             git_selected: 0,
-            services: Services::new(),
+            services: Services::new(events.clone()),
+            events,
+            revision: 1,
+            files_revision: 1,
+            git_revision: 1,
+            render_cache: BTreeMap::new(),
+            screen_builds: 0,
+            typing: false,
+            git_branch: String::new(),
+            git_repository: false,
+            git_jobs: 0,
+            git_error: String::new(),
             ids: 20,
             presets: BTreeMap::new(),
             preferences: Preferences::default(),
@@ -355,11 +431,26 @@ impl App {
                 "#425b78".into(),
                 "#88c0d0".into(),
             ),
+            system_colors: None,
         };
         app.read_settings();
         app.load_preferences();
         app.refresh();
         Ok(app)
+    }
+    pub fn events(&self) -> events::Events {
+        self.events.clone()
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision.wrapping_add(self.events.generation())
+    }
+    pub fn process_events(&mut self) {
+        self.events.drain();
+        self.poll();
+        self.schedule_highlight();
+        if self.workspace_dirty && self.checkpoint_at.elapsed() >= Duration::from_secs(1) {
+            self.checkpoint();
+        }
     }
     fn id(&mut self) -> u64 {
         self.ids += 1;
@@ -406,20 +497,107 @@ impl App {
     }
     fn add_tab(&mut self, view: View) {
         if let Some((tabs, active)) = self.layout.pane_mut(self.focus) {
+            // Files and Git are singleton views within a pane. Reopening them
+            // should reveal the existing tab instead of crowding the tab bar.
+            if matches!(view, View::Files | View::Git) {
+                if let Some(index) = tabs.iter().position(|tab| *tab == view) {
+                    *active = index;
+                    return;
+                }
+            }
             tabs.push(view);
             *active = tabs.len() - 1;
         }
     }
     pub fn dispatch(&mut self, cmd: Command) {
+        // Passive pointer motion has no editing effect. Only terminals requesting
+        // all-motion reporting need it; desktop compositors can repeat hover events.
+        if let Command::Pointer {
+            pane, kind, shift, ..
+        } = &cmd
+        {
+            if kind == "move"
+                && (*shift
+                    || !matches!(self.layout.view(*pane),
+                Some(View::Terminal(id)) if self.terminals.get(id).is_some_and(TerminalSession::mouse_motion)))
+            {
+                return;
+            }
+        }
+        self.typing =
+            matches!(&cmd, Command::Key { key } if !key.ctrl && !key.alt && !key.text.is_empty());
+        if !self.typing {
+            for doc in self.documents.values_mut() {
+                doc.break_typing();
+            }
+        }
+        self.revision += 1;
         if !matches!(cmd, Command::Theme { .. }) {
             self.workspace_dirty = true;
         }
         if let Err(e) = self.execute(cmd) {
             self.status = format!("Error: {e:#}");
         }
+        self.typing = false;
+        self.schedule_highlight();
     }
     fn execute(&mut self, cmd: Command) -> Result<()> {
         match cmd {
+            Command::ScrollTo { pane, line } => {
+                if let Some(View::Editor(id)) = self.layout.view(pane) {
+                    let v = self.views.get_mut(id).context("Missing editor view")?;
+                    v.top = line.min(
+                        self.documents[&v.document]
+                            .line_count()
+                            .saturating_sub(v.rows.max(1) as usize),
+                    );
+                    v.manual_scroll = true;
+                }
+            }
+            Command::OpenSettings => {
+                if !Preferences::path().exists() {
+                    self.preferences.save()?;
+                }
+                self.execute(Command::Open {
+                    path: Preferences::path(),
+                })?;
+            }
+            Command::InputMethod {
+                text,
+                replace_start,
+                replace_length,
+            } => {
+                let id = self.active_editor().context("Focus an editor first")?;
+                if replace_start == 0 && replace_length == 0 {
+                    self.edit(id, &text)?;
+                } else {
+                    let view = &self.views[&id];
+                    let document = &self.documents[&view.document];
+                    let cursor = document.text[..view.cursor].encode_utf16().count();
+                    let start = cursor
+                        .checked_add_signed(replace_start as isize)
+                        .context("Invalid input-method range")?;
+                    let end = start
+                        .checked_add(replace_length)
+                        .context("Invalid input-method range")?;
+                    let byte = |units: usize| -> Option<usize> {
+                        let mut n = 0;
+                        for (i, c) in document.text.char_indices() {
+                            if n == units {
+                                return Some(i);
+                            }
+                            n += c.len_utf16();
+                        }
+                        (n == units).then_some(document.text.len())
+                    };
+                    let (start, end) = (
+                        byte(start).context("Invalid UTF-16 start")?,
+                        byte(end).context("Invalid UTF-16 end")?,
+                    );
+                    self.edit_range(id, start, end, &text, view.cursor)?;
+                }
+            }
+            Command::InvokeAction { id, argument } => self.invoke_action(&id, &argument)?,
             Command::SetClipboard { text } => self.clipboard = text,
             Command::Search {
                 query,
@@ -427,11 +605,7 @@ impl App {
                 whole_word,
                 backward,
             } => {
-                self.search = Search {
-                    query,
-                    case_sensitive,
-                    whole_word,
-                };
+                self.search = Search::new(query, case_sensitive, whole_word);
                 self.find(backward)?;
             }
             Command::Replace {
@@ -441,42 +615,54 @@ impl App {
                 case_sensitive,
                 whole_word,
             } => {
-                self.search = Search {
-                    query,
-                    case_sensitive,
-                    whole_word,
-                };
+                self.search = Search::new(query, case_sensitive, whole_word);
                 self.replace_matches(&replacement, all)?;
             }
             Command::GoToLine { line } => {
                 let id = self.active_editor().context("Focus an editor first")?;
-                let text = &self.documents[&self.views[&id].document].text;
-                let count = text.bytes().filter(|b| *b == b'\n').count() + 1;
+                let count = self.documents[&self.views[&id].document].line_count();
                 if line == 0 || line > count {
                     bail!("Line must be between 1 and {count}");
                 }
                 let v = self.views.get_mut(&id).unwrap();
-                v.cursor = at_line_col(text, line - 1, 0);
+                v.cursor = self.documents[&v.document].line_offset(line - 1);
                 v.anchor = None;
                 v.manual_scroll = false;
             }
             Command::Indent { outdent } => self.indent(outdent)?,
             Command::Prompt { kind } => {
-                if !["find", "replace", "goto"].contains(&kind.as_str()) {
+                if ![
+                    "find",
+                    "replace",
+                    "goto",
+                    "open",
+                    "save-as",
+                    "commit",
+                    "layout-save",
+                    "layout-load",
+                    "move-pane",
+                    "settings",
+                ]
+                .contains(&kind.as_str())
+                {
                     bail!("Unknown prompt");
                 }
-                let id = self.active_editor().context("Focus an editor first")?;
-                let v = &self.views[&id];
-                let input = if kind == "goto" {
-                    String::new()
+                let input = if ["find", "replace", "goto"].contains(&kind.as_str()) {
+                    let id = self.active_editor().context("Focus an editor first")?;
+                    let v = &self.views[&id];
+                    if kind == "goto" {
+                        String::new()
+                    } else {
+                        v.anchor
+                            .map(|a| {
+                                self.documents[&v.document].text[a.min(v.cursor)..a.max(v.cursor)]
+                                    .to_string()
+                            })
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| self.search.query.clone())
+                    }
                 } else {
-                    v.anchor
-                        .map(|a| {
-                            self.documents[&v.document].text[a.min(v.cursor)..a.max(v.cursor)]
-                                .to_string()
-                        })
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| self.search.query.clone())
+                    String::new()
                 };
                 self.prompt = Some(Prompt {
                     kind,
@@ -503,6 +689,21 @@ impl App {
             Command::SubmitPrompt { all } => {
                 let p = self.prompt.clone().context("No active prompt")?;
                 match p.kind.as_str() {
+                    "open" | "save-as" | "commit" | "layout-save" | "layout-load" | "move-pane"
+                    | "settings" => {
+                        if p.input.trim().is_empty() {
+                            bail!("Enter {}", p.kind);
+                        }
+                        self.prompt = None;
+                        self.command_line(&format!(
+                            "{} {}",
+                            if p.kind == "settings" { "set" } else { &p.kind },
+                            p.input
+                        ));
+                        if self.status.starts_with("Error:") || self.status.starts_with("Unknown") {
+                            self.prompt = Some(p);
+                        }
+                    }
                     "goto" => {
                         self.execute(Command::GoToLine {
                             line: p.input.parse().context("Enter a line number")?,
@@ -543,11 +744,21 @@ impl App {
                 {
                     bail!("Invalid theme color");
                 }
+                let selection_foreground = if valid(&selection_foreground) {
+                    selection_foreground
+                } else {
+                    self.selection_foreground.clone()
+                };
+                self.system_colors = Some((
+                    foreground.clone(),
+                    background.clone(),
+                    selection.clone(),
+                    accent.clone(),
+                    selection_foreground.clone(),
+                ));
                 if self.preferences.theme == "auto" {
                     self.colors = (foreground, background, selection, accent);
-                    if valid(&selection_foreground) {
-                        self.selection_foreground = selection_foreground;
-                    }
+                    self.selection_foreground = selection_foreground;
                 }
             }
             Command::ReloadSettings => self.load_preferences(),
@@ -615,11 +826,9 @@ impl App {
                 match self.focused() {
                     Some(View::Editor(id)) => {
                         let v = self.views.get_mut(&id).unwrap();
-                        let text = &self.documents[&v.document].text;
                         v.manual_scroll = false;
                         let gutter = if self.preferences.line_numbers { 6 } else { 0 };
-                        let cursor = document::at_line_col_with_tabs(
-                            text,
+                        let cursor = self.documents[&v.document].at_line_col(
                             v.top + row,
                             v.left + col.saturating_sub(gutter),
                             self.preferences.indent_width,
@@ -660,7 +869,10 @@ impl App {
                 };
                 let token = self.id();
                 self.pending_open.insert(token, self.focus);
-                self.services.io.send(IoJob::Open(token, path))?;
+                self.services
+                    .io
+                    .send(IoJob::Open(token, path))
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 self.status = "Opening file…".into();
             }
             Command::Browse { path } => self.browse(path)?,
@@ -694,11 +906,14 @@ impl App {
                     bail!("A save is already in progress for this document");
                 }
                 self.pending_save.push(doc);
-                self.services.io.send(IoJob::Save(
-                    doc,
-                    self.documents[&doc].checkpoint(),
-                    destination,
-                ))?;
+                self.services
+                    .io
+                    .send(IoJob::Save(
+                        doc,
+                        self.documents[&doc].checkpoint(),
+                        destination,
+                    ))
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 self.status = "Saving…".into();
             }
             Command::CloseDocument { force } => {
@@ -872,22 +1087,60 @@ impl App {
             }
             Command::Refresh => self.refresh(),
             Command::GitStage { path } => {
-                self.git_action(vec!["add".into(), "--".into(), path], false);
+                let mut args = vec!["add".into(), "--all".into(), "--".into()];
+                if let Some(entry) = self.git.iter().find(|e| e.path == path) {
+                    args.extend(entry.staging_paths());
+                } else {
+                    args.push(path);
+                }
+                self.git_action(args)?;
             }
             Command::GitUnstage { path } => {
-                self.git_action(
-                    vec!["reset".into(), "HEAD".into(), "--".into(), path],
-                    false,
-                );
+                let mut args = vec!["reset".into(), "HEAD".into(), "--".into(), path.clone()];
+                if let Some(old) = self
+                    .git
+                    .iter()
+                    .find(|e| e.path == path)
+                    .and_then(|e| e.original_path.clone())
+                {
+                    args.push(old);
+                }
+                self.git_action(args)?;
             }
-            Command::GitDiff { path } => {
-                self.git_action(vec!["diff".into(), "HEAD".into(), "--".into(), path], true);
+            Command::GitStageAll => {
+                self.git_action(vec!["add".into(), "--all".into(), "--".into(), ".".into()])?;
+            }
+            Command::GitUnstageAll => {
+                self.git_action(vec!["reset".into(), "HEAD".into(), "--".into(), ".".into()])?;
+            }
+            Command::GitStageGroup { group } => {
+                let paths: std::collections::BTreeSet<String> = self
+                    .git
+                    .iter()
+                    .filter(|entry| entry.group == group && !entry.staged)
+                    .flat_map(GitEntry::staging_paths)
+                    .collect();
+                if paths.is_empty() {
+                    bail!("No unstaged changes in {group}");
+                }
+                let mut args = vec!["add".into(), "--all".into(), "--".into()];
+                args.extend(paths);
+                self.git_action(args)?;
+            }
+            Command::GitDiff { path, staged } => {
+                let untracked = self.git.iter().any(|e| e.path == path && e.untracked);
+                self.services
+                    .tx
+                    .send(Job::GitDiff(self.root.clone(), path, staged, untracked))?;
+                self.git_jobs += 1;
+                self.git_error.clear();
+                self.status = "Loading Git diff…".into();
             }
             Command::GitCommit { message } => {
                 if message.trim().is_empty() {
                     bail!("Commit message is empty");
                 }
-                self.git_action(vec!["commit".into(), "-m".into(), message], false);
+                self.git_action(vec!["commit".into(), "-m".into(), message])?;
             }
             Command::Quit { force } => {
                 if self.dirty() && !force {
@@ -932,29 +1185,26 @@ impl App {
         self.refresh_git();
     }
     fn refresh_git(&mut self) {
-        let _ = self.services.tx.send(Job::Git(
-            self.root.clone(),
-            vec![
-                "status".into(),
-                "--porcelain=v1".into(),
-                "--untracked-files=all".into(),
-                "-z".into(),
-            ],
-            false,
-        ));
-    }
-    fn git_action(&mut self, args: Vec<String>, diff: bool) {
-        let _ = self
+        if self
             .services
             .tx
-            .send(Job::Git(self.root.clone(), args, diff));
-        if !diff {
-            self.refresh_git();
+            .send(Job::GitStatus(self.root.clone()))
+            .is_ok()
+        {
+            self.git_jobs += 1;
         }
+    }
+    fn git_action(&mut self, args: Vec<String>) -> Result<()> {
+        self.services.tx.send(Job::Git(self.root.clone(), args))?;
+        self.git_error.clear();
+        self.git_jobs += 1;
+        self.refresh_git();
         self.status = "Running Git…".into();
+        Ok(())
     }
     pub fn poll(&mut self) {
         while let Ok(reply) = self.services.rx.try_recv() {
+            self.revision += 1;
             match reply {
                 Reply::OpenedDirectory(token, path) => {
                     if let Some(pane) = self.pending_open.remove(&token) {
@@ -1005,21 +1255,64 @@ impl App {
                     }
                 }
                 Reply::Files(path, Ok(entries)) if path == self.browser => {
+                    if self.files != entries {
+                        self.files_revision += 1;
+                    }
                     self.files = entries;
                     self.selected = self.selected.min(self.files.len().saturating_sub(1));
                 }
                 Reply::Files(_, Err(e)) => self.status = e,
-                Reply::Git(Ok(entries)) => {
-                    self.git = entries;
+                Reply::Git(Ok(state)) => {
+                    self.git_jobs = self.git_jobs.saturating_sub(1);
+                    self.git_revision += 1;
+                    self.git_branch = state.branch;
+                    self.git_repository = state.repository;
+                    let selection = self
+                        .git
+                        .get(self.git_selected)
+                        .map(|e| (e.path.clone(), e.staged));
+                    self.git = state.entries;
+                    if let Some((path, staged)) = selection {
+                        if let Some(index) = self
+                            .git
+                            .iter()
+                            .position(|e| e.path == path && e.staged == staged)
+                            .or_else(|| self.git.iter().position(|e| e.path == path))
+                        {
+                            self.git_selected = index;
+                        }
+                    }
                     self.git_selected = self.git_selected.min(self.git.len().saturating_sub(1));
                 }
-                Reply::Git(Err(e)) | Reply::Error(e) => self.status = e,
-                Reply::Message(message) => self.status = message,
-                Reply::Output(_) if self.quit => {}
-                Reply::Output(text) => {
+                Reply::Git(Err(e)) => {
+                    self.git_jobs = self.git_jobs.saturating_sub(1);
+                    self.git_error = e.clone();
+                    self.status = format!("Git: {e}");
+                }
+                Reply::GitOperation(result) => {
+                    self.git_jobs = self.git_jobs.saturating_sub(1);
+                    match result {
+                        Ok(message) => {
+                            self.status = if message.is_empty() {
+                                "Git operation completed".into()
+                            } else {
+                                message.lines().next().unwrap_or_default().into()
+                            }
+                        }
+                        Err(e) => {
+                            self.git_error = e.clone();
+                            self.status = format!("Git: {e}");
+                        }
+                    }
+                }
+                Reply::Error(e) => self.status = e,
+                Reply::Output(_, _) if self.quit => {
+                    self.git_jobs = self.git_jobs.saturating_sub(1);
+                }
+                Reply::Output(title, text) => {
+                    self.git_jobs = self.git_jobs.saturating_sub(1);
                     let doc = self.id();
-                    let mut d = Document::scratch();
-                    d.text = text;
+                    let d = Document::inspection(format!("{title} · read-only"), text);
                     self.documents.insert(doc, d);
                     let _ = self.editor_target();
                     let view = self.id();
@@ -1031,7 +1324,7 @@ impl App {
                         },
                     );
                     self.add_tab(View::Editor(view));
-                    self.status = "Git diff (save as a new file if needed)".into();
+                    self.status = "Git diff · read-only".into();
                 }
                 _ => {}
             }
@@ -1039,8 +1332,9 @@ impl App {
     }
     fn new_terminal(&mut self) -> Result<u64> {
         let id = self.id();
-        self.terminals
-            .insert(id, TerminalSession::spawn(&self.root, None, 24, 80)?);
+        let mut terminal = TerminalSession::spawn(&self.root, None, 24, 80)?;
+        terminal.set_events(self.events.clone());
+        self.terminals.insert(id, terminal);
         Ok(id)
     }
     fn create_view(&mut self, kind: &str) -> Result<View> {
@@ -1250,10 +1544,12 @@ impl App {
         before: usize,
     ) -> Result<()> {
         let doc = self.views[&id].document;
-        self.documents
-            .get_mut(&doc)
-            .unwrap()
-            .replace(start, end, value, before)?;
+        let document = self.documents.get_mut(&doc).unwrap();
+        if self.typing && start == end {
+            document.replace_typing(start, end, value, before)?;
+        } else {
+            document.replace(start, end, value, before)?;
+        }
         self.rebase_views(doc, start, end, value.len());
         let view = self.views.get_mut(&id).unwrap();
         view.cursor = start + value.len();
@@ -1309,6 +1605,27 @@ impl App {
         if k.key == "F6" {
             return self.execute(Command::FocusNext);
         }
+        if self.focused_kind() == "git" && !k.ctrl && !k.alt {
+            match k.key.to_lowercase().as_str() {
+                "s" => {
+                    self.invoke_action("stage", "")?;
+                    return Ok(());
+                }
+                "u" => {
+                    self.invoke_action("unstage", "")?;
+                    return Ok(());
+                }
+                "c" => {
+                    self.invoke_action("commit", "")?;
+                    return Ok(());
+                }
+                "r" => {
+                    self.refresh();
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
         match self.focused() {
             Some(View::Terminal(id)) => {
                 let term = self.terminals.get_mut(&id).context("Missing terminal")?;
@@ -1339,6 +1656,7 @@ impl App {
                             if let Some(e) = self.git.get(*selected) {
                                 return self.execute(Command::GitDiff {
                                     path: e.path.clone(),
+                                    staged: e.staged,
                                 });
                             }
                         } else if let Some(e) = self.files.get(*selected) {
@@ -1354,18 +1672,16 @@ impl App {
                 let v = self.views[&id].clone();
                 let text = &self.documents[&v.document].text;
                 let (row, col) =
-                    document::line_col_with_tabs(text, v.cursor, self.preferences.indent_width);
+                    self.documents[&v.document].line_col(v.cursor, self.preferences.indent_width);
                 let movement = match k.key.as_str() {
                     "Left" => Some(previous(text, v.cursor)),
                     "Right" => Some(next(text, v.cursor)),
-                    "Up" => Some(document::at_line_col_with_tabs(
-                        text,
+                    "Up" => Some(self.documents[&v.document].at_line_col(
                         row.saturating_sub(1),
                         col,
                         self.preferences.indent_width,
                     )),
-                    "Down" => Some(document::at_line_col_with_tabs(
-                        text,
+                    "Down" => Some(self.documents[&v.document].at_line_col(
                         row + 1,
                         col,
                         self.preferences.indent_width,
@@ -1491,13 +1807,22 @@ impl App {
         header: u16,
         minimum: (u16, u16),
     ) -> Snapshot {
+        self.snapshot_with_revisions(area, gap, cell, header, minimum, None)
+    }
+    pub fn snapshot_with_revisions(
+        &mut self,
+        area: Rect,
+        gap: u16,
+        cell: (u16, u16),
+        header: u16,
+        minimum: (u16, u16),
+        known: Option<(u64, u64)>,
+    ) -> Snapshot {
         let Rect { width, height, .. } = area;
         let (cell_width, cell_height) = cell;
-        self.poll();
-        self.schedule_highlight();
-        if self.workspace_dirty && self.checkpoint_at.elapsed() >= Duration::from_secs(1) {
-            self.checkpoint();
-        }
+        self.process_events();
+        self.render_cache
+            .retain(|id, _| self.views.contains_key(id) || self.terminals.contains_key(id));
         let cw = cell_width.max(1);
         let ch = cell_height.max(1);
         let required = self.layout.minimum_size(gap, minimum);
@@ -1558,14 +1883,16 @@ impl App {
                 .max(1);
             let (kind, screen, selected) = match view {
                 View::Editor(view) => {
-                    let screen = self.editor_screen(view, rows, cols);
+                    let screen = self.cached_editor_screen(view, rows, cols);
                     ("editor", Some(screen), 0)
                 }
                 View::Terminal(term) => {
                     let screen = self.terminals.get_mut(&term).map(|t| {
                         let _ = t.resize(rows, cols);
-                        t.screen()
+                        // The signature is checked below before the parser grid is copied.
+                        t.revision()
                     });
+                    let screen = screen.map(|revision| self.cached_terminal_screen(term, revision));
                     ("terminal", screen, 0)
                 }
                 View::Files => ("files", None, self.selected),
@@ -1576,6 +1903,27 @@ impl App {
                 rect: r,
                 kind: kind.into(),
                 tabs,
+                revision: self
+                    .render_cache
+                    .get(&match view {
+                        View::Editor(v) | View::Terminal(v) => v,
+                        _ => 0,
+                    })
+                    .map(|(_, revision, _)| *revision)
+                    .unwrap_or(0),
+                focused: id == self.focus,
+                terminal_mouse_motion: match view {
+                    View::Terminal(v) => self.terminals[&v].mouse_motion(),
+                    _ => false,
+                },
+                read_only: match view {
+                    View::Editor(v) => self.documents[&self.views[&v].document].read_only,
+                    _ => false,
+                },
+                editor: match view {
+                    View::Editor(v) => Some(self.editor_presentation(v)),
+                    _ => None,
+                },
                 screen,
                 selected,
             });
@@ -1584,8 +1932,16 @@ impl App {
             panes,
             handles,
             focus: self.focus,
-            files: self.files.clone(),
-            git: self.git.clone(),
+            files: if known.is_some_and(|(files, _)| files == self.files_revision) {
+                vec![]
+            } else {
+                self.files.clone()
+            },
+            git: if known.is_some_and(|(_, git)| git == self.git_revision) {
+                vec![]
+            } else {
+                self.git.clone()
+            },
             browser: self.browser.to_string_lossy().into_owned(),
             status: self.status.clone(),
             dirty: self.dirty(),
@@ -1598,7 +1954,91 @@ impl App {
             foreground: self.colors.0.clone(),
             background: self.colors.1.clone(),
             accent: self.colors.3.clone(),
+            commands: self.command_catalog(""),
+            settings: self.preferences.clone(),
+            git_branch: self.git_branch.clone(),
+            git_repository: self.git_repository,
+            git_busy: self.git_jobs > 0,
+            git_error: self.git_error.clone(),
+            files_revision: self.files_revision,
+            git_revision: self.git_revision,
         }
+    }
+    fn editor_presentation(&self, id: u64) -> EditorPresentation {
+        let v = &self.views[&id];
+        let doc = &self.documents[&v.document];
+        let mut start = v.cursor.saturating_sub(2048);
+        while !doc.text.is_char_boundary(start) {
+            start += 1;
+        }
+        let mut end = (v.cursor + 2048).min(doc.text.len());
+        while !doc.text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let anchor = v.anchor.unwrap_or(v.cursor).clamp(start, end);
+        let selected = v
+            .anchor
+            .map(|a| &doc.text[a.min(v.cursor)..a.max(v.cursor)])
+            .unwrap_or("");
+        EditorPresentation {
+            surrounding: doc.text[start..end].into(),
+            cursor: doc.text[start..v.cursor].encode_utf16().count(),
+            anchor: doc.text[start..anchor].encode_utf16().count(),
+            selection: selected.chars().take(2048).collect(),
+            line_count: doc.line_count(),
+            top: v.top,
+        }
+    }
+    fn editor_signature(&self, id: u64) -> String {
+        let v = &self.views[&id];
+        serde_json::to_string(&(
+            v,
+            self.documents[&v.document].generation,
+            self.tokens
+                .get(&v.document)
+                .map(|(generation, light, _)| (*generation, *light)),
+            &self.colors,
+            &self.selection_foreground,
+            &self.search,
+            self.preferences.line_numbers,
+            self.preferences.indent_width,
+        ))
+        .unwrap()
+    }
+    fn cached_editor_screen(&mut self, id: u64, rows: u16, cols: u16) -> std::sync::Arc<Screen> {
+        let v = self.views.get_mut(&id).unwrap();
+        v.rows = rows;
+        v.cols = cols;
+        let key = self.editor_signature(id);
+        if let Some((prior, _, screen)) = self.render_cache.get(&id) {
+            if *prior == key {
+                return screen.clone();
+            }
+        }
+        let screen = std::sync::Arc::new(self.editor_screen(id, rows, cols));
+        self.screen_builds += 1;
+        self.render_cache.insert(
+            id,
+            (
+                self.editor_signature(id),
+                self.screen_builds,
+                screen.clone(),
+            ),
+        );
+        screen
+    }
+    fn cached_terminal_screen(&mut self, id: u64, revision: u64) -> std::sync::Arc<Screen> {
+        let key = format!("terminal:{revision}");
+        if let Some((prior, _, screen)) = self.render_cache.get(&id) {
+            if *prior == key {
+                return screen.clone();
+            }
+        }
+        let screen = std::sync::Arc::new(self.terminals[&id].screen());
+        self.screen_builds += 1;
+        self.render_cache
+            .insert(id, (key, self.screen_builds, screen.clone()));
+        screen
     }
     fn editor_screen(&mut self, id: u64, rows: u16, cols: u16) -> Screen {
         let v = self.views.get_mut(&id).unwrap();
@@ -1606,7 +2046,7 @@ impl App {
         v.cols = cols;
         let text = &self.documents[&v.document].text;
         let (row, col) =
-            document::line_col_with_tabs(text, v.cursor, self.preferences.indent_width);
+            self.documents[&v.document].line_col(v.cursor, self.preferences.indent_width);
         let gutter = if self.preferences.line_numbers {
             6usize.min(cols as usize)
         } else {
@@ -1625,6 +2065,9 @@ impl App {
         } else if col >= v.left + usable {
             v.left = col + 1 - usable;
         }
+        v.top = v
+            .top
+            .min(self.documents[&v.document].line_count().saturating_sub(1));
         let selection = v.anchor.map(|a| (a.min(v.cursor), a.max(v.cursor)));
         let mut blank = Cell::text(" ");
         blank.fg = self.colors.0.clone();
@@ -1635,9 +2078,10 @@ impl App {
             .get(&v.document)
             .filter(|(generation, _, _)| *generation == self.documents[&v.document].generation);
         let tokens = token_data.map(|(_, _, t)| t.as_slice()).unwrap_or(&[]);
-        let mut token_index = tokens.partition_point(|t| t.end <= at_line_col(text, v.top, 0));
+        let mut token_index =
+            tokens.partition_point(|t| t.end <= self.documents[&v.document].line_offset(v.top));
         let matches = self.search.regex().ok();
-        let start = at_line_col(text, v.top, 0);
+        let start = self.documents[&v.document].line_offset(v.top);
         let mut byte = start;
         for (y, line) in text[start..].split('\n').take(rows as usize).enumerate() {
             let number = format!("{:>4}  ", v.top + y + 1);
@@ -1710,6 +2154,9 @@ impl App {
                     }
                 }
                 x += width;
+                if x >= v.left + usable {
+                    break;
+                }
             }
             byte += line.len() + 1;
         }
@@ -1807,9 +2254,9 @@ pub fn terminal_key(k: &Key, application_cursor: bool) -> Vec<u8> {
     bytes
 }
 
-pub const COMMAND_HELP:&str="find TEXT | find-next | find-previous | replace TEXT => VALUE | replace-all TEXT => VALUE | goto LINE | indent | outdent | set OPTION VALUE | settings-reload | open PATH | save | save-as PATH | new | close | discard-document | quit | discard-quit | undo | redo | copy | cut | paste | select-all | split-right | split-down | split-terminal-right | split-terminal-down | terminal | terminate-terminal | files | git | editor | close-pane | move-pane ID | next-pane | next-tab | resize ID RATIO | preset development|minimal|bottom_terminal | layout-save NAME | layout-load NAME | refresh | stage | unstage | diff | commit MESSAGE";
 impl App {
     pub fn command_line(&mut self, line: &str) {
+        self.revision += 1;
         let (verb, args) = line.trim().split_once(' ').unwrap_or((line.trim(), ""));
         let args = args.trim();
         let selected = || self.selected_path().unwrap_or_default();
@@ -1842,6 +2289,9 @@ impl App {
             "goto" => args.parse().ok().map(|line| Command::GoToLine { line }),
             "indent" | "outdent" => Some(Command::Indent {
                 outdent: verb == "outdent",
+            }),
+            "settings" => Some(Command::Prompt {
+                kind: "settings".into(),
             }),
             "settings-reload" => Some(Command::ReloadSettings),
             "set" => args
@@ -1903,7 +2353,12 @@ impl App {
             "refresh" => Some(Command::Refresh),
             "stage" => Some(Command::GitStage { path: selected() }),
             "unstage" => Some(Command::GitUnstage { path: selected() }),
-            "diff" => Some(Command::GitDiff { path: selected() }),
+            "stage-all" => Some(Command::GitStageAll),
+            "unstage-all" => Some(Command::GitUnstageAll),
+            "diff" => Some(Command::GitDiff {
+                path: selected(),
+                staged: self.git.get(self.git_selected).is_some_and(|e| e.staged),
+            }),
             "commit" => Some(Command::GitCommit {
                 message: args.into(),
             }),
@@ -1912,7 +2367,9 @@ impl App {
         if let Some(cmd) = cmd {
             self.dispatch(cmd);
         } else {
-            self.status = format!("Unknown/incomplete command. {COMMAND_HELP}");
+            self.status =
+                "Unknown or incomplete command. Open Commands (F1) to search available actions."
+                    .into();
         }
     }
 }
@@ -1997,6 +2454,9 @@ impl App {
             if let Some((key, _)) = map.iter().find(|(_, v)| v.as_str() == verb) {
                 hints.push(format!("{key} {}", verb.trim_start_matches("prompt-")));
             }
+        }
+        if self.focused_kind() == "git" {
+            hints.push("Enter diff · S stage · U unstage · C commit · R refresh".into());
         }
         if self.focused_kind() == "terminal" {
             hints.push("Shift-drag selects · Shift-wheel scrollback".into());

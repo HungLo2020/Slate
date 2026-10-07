@@ -29,7 +29,7 @@ with tempfile.TemporaryDirectory(prefix='slate-gui-') as tmp:
         xdo('windowfocus',window);time.sleep(.5)
         def key(*keys):xdo('key','--clearmodifiers',*keys);time.sleep(.1)
         def type_text(text):xdo('type','--clearmodifiers','--delay','4',text);time.sleep(.1)
-        def command(text):key('F1');type_text(text);key('Return');time.sleep(.2)
+        def command(text):key('F1');type_text(':'+text);key('Return');time.sleep(.2)
         # Focus the actual painted editor, type through Qt input, then save through the shared core.
         xdo('mousemove','--window',window,'480','170');xdo('click','1');key('ctrl+a');type_text('GUI edited');key('Return');type_text('second line');key('ctrl+s')
         wait_for(lambda:file.read_text()=='GUI edited\nsecond line')

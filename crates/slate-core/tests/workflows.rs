@@ -25,18 +25,18 @@ fn unicode_edit_undo_redo_and_shared_split_views() {
     key(&mut app, "Right");
     key(&mut app, "Right");
     key(&mut app, "Backspace");
-    assert_eq!(app.documents[&10].text, "a界\n");
+    assert_eq!(app.documents[&10].text(), "a界\n");
     app.dispatch(Command::Undo);
-    assert_eq!(app.documents[&10].text, "a👩‍💻界\n");
+    assert_eq!(app.documents[&10].text(), "a👩‍💻界\n");
     app.dispatch(Command::Redo);
-    assert_eq!(app.documents[&10].text, "a界\n");
+    assert_eq!(app.documents[&10].text(), "a界\n");
     app.dispatch(Command::Split {
         axis: Axis::Vertical,
         kind: None,
     });
     assert_eq!(app.views.len(), 2);
     app.dispatch(Command::Paste { text: "x".into() });
-    assert_eq!(app.documents[&10].text, "ax界\n");
+    assert_eq!(app.documents[&10].text(), "ax界\n");
     assert!(app.views.values().all(|v| v.document == 10));
     app.dispatch(Command::Save);
     wait_app(&mut app, |a| a.status == "Saved");
@@ -268,10 +268,11 @@ fn git_status_stage_diff_commit_and_unstage_in_nested_workspace() {
     app.dispatch(Command::Refresh);
     wait_status(&mut app, "M");
     app.dispatch(Command::GitDiff {
+        staged: false,
         path: "nested/code.rs".into(),
     });
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !app.documents.values().any(|d| d.text.contains("+new")) {
+    while !app.documents.values().any(|d| d.text().contains("+new")) {
         app.poll();
         assert!(Instant::now() < deadline, "missing diff: {}", app.status);
         thread::sleep(Duration::from_millis(10));
@@ -354,21 +355,23 @@ fn search_replace_unicode_whole_words_literal_replacement_and_indentation() {
         case_sensitive: false,
         whole_word: true,
     });
-    assert!(app.documents[&10].text.starts_with("$1猫 $1猫 scatter"));
+    assert!(app.documents[&10].text().starts_with("$1猫 $1猫 scatter"));
     app.dispatch(Command::Undo);
-    assert!(app.documents[&10].text.starts_with("cat CAT scatter"));
+    assert!(app.documents[&10].text().starts_with("cat CAT scatter"));
     app.dispatch(Command::GoToLine { line: 2 });
     key(&mut app, "End");
     key(&mut app, "Enter");
-    assert!(app.documents[&10].text.contains("    fn main() {\n    \n}"));
+    assert!(app.documents[&10]
+        .text()
+        .contains("    fn main() {\n    \n}"));
     app.preferences.indent_width = 2;
     key(&mut app, "Tab");
-    assert!(app.documents[&10].text.contains("{\n      \n}"));
+    assert!(app.documents[&10].text().contains("{\n      \n}"));
     app.dispatch(Command::GoToLine { line: 2 });
     app.dispatch(Command::Indent { outdent: false });
-    assert!(app.documents[&10].text.contains("      fn main()"));
+    assert!(app.documents[&10].text().contains("      fn main()"));
     app.dispatch(Command::Indent { outdent: true });
-    assert!(app.documents[&10].text.contains("    fn main()"));
+    assert!(app.documents[&10].text().contains("    fn main()"));
     app.dispatch(Command::GoToLine { line: 999 });
     assert!(app.status.starts_with("Error:"));
     app.command_line("prompt-find");
@@ -380,14 +383,13 @@ fn search_replace_unicode_whole_words_literal_replacement_and_indentation() {
     });
     app.dispatch(Command::SubmitPrompt { all: false });
     assert_eq!(
-        &app.documents[&10].text[app.views[&11].anchor.unwrap()..app.views[&11].cursor],
+        &app.documents[&10].text()[app.views[&11].anchor.unwrap()..app.views[&11].cursor],
         "猫猫"
     );
 }
 #[test]
 fn undo_memory_is_proportional_to_edits_in_a_large_buffer() {
-    let mut d = Document::scratch();
-    d.text = "x".repeat(8 * 1024 * 1024);
+    let mut d = Document::from_text("x".repeat(8 * 1024 * 1024)).unwrap();
     for _ in 0..100 {
         d.replace(0, 0, "猫", 0).unwrap();
     }
@@ -395,11 +397,11 @@ fn undo_memory_is_proportional_to_edits_in_a_large_buffer() {
     for _ in 0..100 {
         d.undo(0).unwrap();
     }
-    assert_eq!(d.text.len(), 8 * 1024 * 1024);
+    assert_eq!(d.text().len(), 8 * 1024 * 1024);
     for _ in 0..100 {
         d.redo(0).unwrap();
     }
-    assert!(d.text.starts_with("猫猫"));
+    assert!(d.text().starts_with("猫猫"));
     assert_eq!(d.history_bytes(), 300);
 }
 #[test]
@@ -418,7 +420,7 @@ fn background_save_preserves_newer_edits_and_external_conflicts() {
     });
     wait_app(&mut app, |a| a.status.starts_with("Saved"));
     assert_eq!(fs::read_to_string(&path).unwrap(), "saved");
-    assert_eq!(app.documents[&10].text, "saved newer");
+    assert_eq!(app.documents[&10].text(), "saved newer");
     assert!(app.dirty());
     fs::write(&path, "external").unwrap();
     app.dispatch(Command::Save);
@@ -428,7 +430,7 @@ fn background_save_preserves_newer_edits_and_external_conflicts() {
     app.dispatch(Command::Open { path: path.clone() });
     wait_app(&mut app, |a| a.status.starts_with("Opened"));
     assert_eq!(app.documents.len(), 1);
-    assert_eq!(app.documents[&10].text, "saved newer");
+    assert_eq!(app.documents[&10].text(), "saved newer");
 }
 #[test]
 fn recovery_preserves_unsaved_baselines_layout_and_cursors_with_fresh_shells() {
@@ -463,7 +465,7 @@ fn recovery_preserves_unsaved_baselines_layout_and_cursors_with_fresh_shells() {
         .unwrap();
     assert_eq!(restored.focus, focus);
     assert_eq!(restored.layout.panes().len(), 4);
-    assert_eq!(restored.documents[&10].text, "unsaved 猫disk");
+    assert_eq!(restored.documents[&10].text(), "unsaved 猫disk");
     assert!(restored.dirty());
     assert!(restored
         .views
@@ -675,7 +677,7 @@ fn terminal_cwd_and_workspace_clean_file_refresh() {
         true,
     )
     .unwrap();
-    assert_eq!(app.documents[&10].text, "new disk content");
+    assert_eq!(app.documents[&10].text(), "new disk content");
     assert!(!app.dirty());
     #[cfg(target_os = "linux")]
     {
@@ -880,7 +882,7 @@ fn discard_quit_writes_valid_state_and_missing_files_are_recoverable() {
         true,
     )
     .unwrap();
-    assert_eq!(app.documents[&10].text, "base");
+    assert_eq!(app.documents[&10].text(), "base");
     assert!(!app.dirty());
     assert!(app.views.values().all(|v| v.cursor <= 4));
     drop(app);
@@ -891,7 +893,7 @@ fn discard_quit_writes_valid_state_and_missing_files_are_recoverable() {
         true,
     )
     .unwrap();
-    assert_eq!(app.documents[&10].text, "base");
+    assert_eq!(app.documents[&10].text(), "base");
     assert!(app.dirty());
     app.dispatch(Command::Quit { force: false });
     assert!(!app.quit);

@@ -21,6 +21,7 @@ if qtpaths:
     if result.returncode == 0 and result.stdout.strip():
         qml_paths.append(pathlib.Path(result.stdout.strip()))
 if any((path/'org/kde/desktop/qmldir').is_file() for path in qml_paths):
+    styles.append('org.kde.desktop')
     print('Caption regression check: KDE desktop style', flush=True)
     subprocess.run([sys.executable, str(root/'gui-offscreen-smoke.py'), binary],
                    env={**os.environ, 'SLATE_GUI_CAPTION_SMOKE': '1',

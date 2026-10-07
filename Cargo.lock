@@ -1549,6 +1549,7 @@ dependencies = [
  "pkg-config",
  "serde_json",
  "slate-core",
+ "tempfile",
 ]
 
 [[package]]

@@ -113,7 +113,17 @@ impl App {
             Ok(p) => self.preferences = p,
             Err(e) => self.status = format!("Settings error: {e:#}"),
         }
-        if self.preferences.theme == "light" {
+        if let ("auto", Some(palette)) =
+            (self.preferences.theme.as_str(), self.system_colors.as_ref())
+        {
+            self.colors = (
+                palette.0.clone(),
+                palette.1.clone(),
+                palette.2.clone(),
+                palette.3.clone(),
+            );
+            self.selection_foreground = palette.4.clone();
+        } else if self.preferences.theme == "light" {
             self.selection_foreground = "#20242c".into();
             self.colors = (
                 "#20242c".into(),

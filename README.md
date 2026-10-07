@@ -63,7 +63,7 @@ explicit TUI-only build is also available with `cargo build --no-default-feature
   line indentation/outdent. Syntax highlighting is shared by both frontends and
   runs on a separate worker using Syntect's bundled language definitions.
 - Shared configurable shortcuts, context-sensitive hints and cursor position.
-  The GUI editor follows the desktop palette and uses scrollable tabs/toolbars;
+  The GUI editor follows the desktop palette and uses adaptive tabs and measured controls;
   the TUI has explicit focus borders and interactive editing prompts.
 - Split views of the same document share text/history and keep independent
   cursors and scroll positions.
@@ -81,10 +81,11 @@ explicit TUI-only build is also available with `cargo build --no-default-feature
   application mouse reporting and frozen viewport selection/copy.
 - Multiple terminal sessions remain alive when their view is hidden. Closing
   a pane leaves sessions running; `terminate-terminal` explicitly stops one.
-- Git status, stage/unstage, diff, and commit actions. Directory listing and Git
-  commands run on a background worker. File opens/saves have their own worker;
+- Git branch/status, staged/unstaged/untracked groups, direct stage/unstage,
+  read-only diffs and untracked previews, bulk/section staging, and a commit
+  message composer. Directory listing and Git commands have separate workers. File opens/saves have their own worker;
   saving a snapshot leaves edits made during the save dirty. Git operations use
-  the workspace root.
+  the repository root, including when opening a subfolder.
 - Atomic saves preserve ordinary file permissions and symlink targets; external
   disk edits and unintended Save As overwrites are refused. Unsaved documents
   block normal close/quit.
@@ -111,16 +112,42 @@ explicit TUI-only build is also available with `cargo build --no-default-feature
 | Shift+arrows; mouse drag | Select text |
 | Ctrl+A / C / X / V in an editor | Select all / copy / cut / paste |
 
+The command palette searches readable action names and descriptions. Use Up/Down
+and Enter to select an action; unavailable actions explain what is missing.
+Actions needing a path, line, layout name, or commit message open an input form.
+Both frontends use the same Rust catalog and command handlers. Prefix input with
+`:` to execute an advanced textual command directly.
+
 GUI: double-click a file to open it and drag dividers to resize. The top **Menu**
 contains File, Edit, and Workspace commands; Open and Save appear as space allows.
 Each pane has a **⋮** action menu for splits, view changes, and relevant document,
-terminal, or Git actions. Right-click also opens the pane menu outside terminals.
-Tabs scroll horizontally, keep the active tab visible, and show complete names
-in tooltips. Headers and file rows grow with the interface font. Pane minimum
+terminal, or Git actions. Right-click opens the pane menu in files/editors and a file action menu in Git.
+Tabs fit within their header and show complete names in tooltips. When space is
+limited, the active tab stays visible and a dropdown lists every tab. Headers and file rows grow with the interface font. Pane minimum
 sizes constrain displayed split ratios without changing saved preferences. When
 the layout cannot fit, only the focused pane is displayed; F6 changes focus and
 expanding the window restores the full arrangement. Dialog contents scroll when
 the window is too short.
+
+The Git pane shows the branch and separates staged, unstaged, untracked, and
+conflicted files. Its +/− controls stage or unstage that file; double-click opens
+the comparison for that group. Staged diffs compare the index to HEAD (including
+an initial commit); unstaged diffs compare the working file to the index.
+Untracked previews compare the file to an empty file. Git errors remain visible,
+and Refresh reloads changes made outside Slate. **Stage all** and **Unstage all**
+operate on the entire repository; section +/− controls operate on that group.
+Unstaging preserves working files. The GUI shows section counts, file names and
+parent folders, and reserves a gutter for the scrollbar beside the row actions.
+
+Type a message in the GUI composer and click **Commit**, or press **Ctrl+Enter**.
+Commit operates on staged files. Short panes open a compact message dialog.
+The draft survives pane/layout changes and failed commits; successful commits
+clear it. Hover file controls for explanations, or right-click a file for actions.
+In the TUI Git pane, S stages, U unstages, C opens the commit form, R refreshes,
+and Enter inspects the selected change.
+
+GUI Settings provides theme, indentation, spaces/tabs, auto-indent and line-number
+controls, plus an action to open the settings file for keybinding customization.
 
 TUI: Enter or click opens the selected entry;
 mouse dragging resizes dividers. In a TUI editing prompt, Tab switches find and
@@ -136,7 +163,7 @@ to the current terminal view. The GUI uses the system clipboard. TUI copy uses
 OSC 52 when the outer terminal
 supports it; pasting from the outer terminal works through bracketed paste.
 
-Commands accept a verb followed by its argument. Paths and commit messages can
+Advanced commands (entered with a leading `:` in the palette) accept a verb followed by its argument. Paths and commit messages can
 contain spaces without quoting. Useful examples:
 
 ```text
@@ -175,8 +202,9 @@ commit Implement the first feature
 quit
 ```
 
-`stage`, `unstage`, and `diff` use the selected Git entry. A diff opens as an
-untitled buffer. `close` closes the focused document, whereas `close-pane`
+`stage`, `unstage`, and `diff` use the selected Git entry.
+`stage-all` and `unstage-all` operate on the entire repository. A diff opens as a
+named read-only inspection view. Inspecting a diff does not mark the workspace dirty. `close` closes the focused document, whereas `close-pane`
 removes its presentation. Explicit `discard-document` and `discard-quit`
 commands discard unsaved work. GUI window closure asks before discarding.
 
@@ -246,7 +274,11 @@ python3 scripts/dependency-policy.py
 cargo build --features gui-smoke
 python3 scripts/gui-offscreen-smoke.py target/debug/slate
 python3 scripts/gui-layout-smoke.py target/debug/slate  # Qt Test + Kirigami 6
+SLATE_GUI_FEATURE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
+SLATE_GUI_GIT_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
+python3 scripts/idle-smoke.py target/release/slate       # Linux, release GUI/TUI idle CPU
 python3 scripts/gui-smoke.py target/debug/slate   # optional X11: Xvfb + xdotool
+SLATE_GUI_PLATFORM=wayland SLATE_GUI_FEATURE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py  # running Wayland desktop
 ```
 
 Core tests cover Unicode editing/search/replacement, shared views, incremental
@@ -263,6 +295,9 @@ Smoke tests drive actual GUI/TUI input, saves, editing prompts, shell execution,
 clipboard interactions, named layouts, installed entry points and forced-crash
 recovery. GUI layout checks cover Basic and Fusion, plus a duplicate-caption
 regression check for KDE's desktop style when that QML style is installed.
+The populated Git workflow checks normal/narrow/short panes and large fonts,
+scrollbar/action separation, bulk and section staging, and commit hook failures.
+Set `SLATE_GUI_ARTIFACT_DIR` to retain its screenshots and report.
 For a Qt-free installation, use
 `./scripts/install.sh "$HOME/.local" --tui-only`. The GUI installation also installs
 a desktop launcher and scalable icon; put the selected prefix's `bin` in PATH.

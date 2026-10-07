@@ -18,7 +18,15 @@ with tempfile.TemporaryDirectory(prefix='slate-tui-') as tmp:
                 output.extend(data)
                 if b'\x1b[6n' in data: os.write(master,b'\x1b[1;1R')
     def send(data): os.write(master,data);pump()
-    def command(text): send(b'\x1bOP');send(text.encode());send(b'\r')
+    def command(text): send(b'\x1bOP');send((':'+text).encode());send(b'\r')
+    def await_file(path, expected, timeout=5):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if path.exists() and path.read_text() == expected:
+                return
+            assert process.poll() is None, output.decode(errors='replace')[-4000:]
+            pump(.05)
+        raise AssertionError(f'Timed out waiting for {path.name}: {output.decode(errors="replace")[-4000:]}')
     try:
         pump(1)
         assert process.poll() is None,output.decode(errors='replace')
@@ -33,7 +41,7 @@ with tempfile.TemporaryDirectory(prefix='slate-tui-') as tmp:
         assert file.read_text()=='TUI edited\n  REPLACED line',file.read_text()
         command('split-down');command('terminal')
         send(b"printf 'PTY_OK' > terminal.txt\r");pump(.4)
-        assert (root/'terminal.txt').read_text()=='PTY_OK'
+        await_file(root/'terminal.txt', 'PTY_OK')
         command('layout-save smoke');command('preset minimal');command('layout-load smoke')
         assert (root/'config/slate/layouts.toml').exists()
         command('quit');process.wait(timeout=5);assert process.returncode==0

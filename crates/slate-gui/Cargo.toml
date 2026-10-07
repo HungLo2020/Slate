@@ -13,3 +13,6 @@ serde_json = "1"
 [build-dependencies]
 cmake = "0.1"
 pkg-config = "0.3"
+
+[dev-dependencies]
+tempfile = "3"

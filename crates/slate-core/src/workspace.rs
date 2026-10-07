@@ -239,6 +239,9 @@ impl App {
                 }
             }
         }
+        for terminal in self.terminals.values_mut() {
+            terminal.set_events(self.events.clone());
+        }
         self.store = Some(store);
         self.workspace_dirty = true;
         self.refresh();
@@ -281,7 +284,10 @@ impl App {
     }
     pub fn flush_workspace(&mut self) -> Result<()> {
         let (tx, rx) = std::sync::mpsc::sync_channel(0);
-        self.services.io.send(IoJob::Flush(tx))?;
+        self.services
+            .io
+            .send(IoJob::Flush(tx))
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         rx.recv()?;
         self.poll();
         if let Some(store) = &self.store {

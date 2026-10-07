@@ -4,7 +4,10 @@ use serde::Serialize;
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     thread,
 };
 
@@ -55,6 +58,8 @@ pub struct TerminalSession {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Box<dyn Child + Send + Sync>,
     parser: Arc<Mutex<vt100::Parser>>,
+    revision: Arc<AtomicU64>,
+    events: Arc<Mutex<Option<crate::events::Events>>>,
     pub title: String,
     size: (u16, u16),
     initial_cwd: PathBuf,
@@ -90,6 +95,10 @@ impl TerminalSession {
         let responses = writer.clone();
         let reported_cwd = Arc::new(Mutex::new(None));
         let cwd_output = reported_cwd.clone();
+        let revision = Arc::new(AtomicU64::new(1));
+        let output_revision = revision.clone();
+        let events = Arc::new(Mutex::new(None::<crate::events::Events>));
+        let output_events = events.clone();
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
             let mut pending = Vec::new();
@@ -124,6 +133,10 @@ impl TerminalSession {
                     pending.drain(..pending.len() - 16);
                 }
                 drop(p);
+                output_revision.fetch_add(1, Ordering::Release);
+                if let Some(events) = output_events.lock().unwrap().as_ref() {
+                    events.notify();
+                }
                 if !replies.is_empty() {
                     if let Ok(mut w) = responses.lock() {
                         let _ = w.write_all(&replies);
@@ -131,8 +144,14 @@ impl TerminalSession {
                     }
                 }
             }
+            output_revision.fetch_add(1, Ordering::Release);
+            if let Some(events) = output_events.lock().unwrap().as_ref() {
+                events.notify();
+            }
         });
         Ok(Self {
+            revision,
+            events,
             master: pair.master,
             writer,
             child,
@@ -144,6 +163,15 @@ impl TerminalSession {
             selection: None,
             selection_screen: None,
         })
+    }
+    pub fn set_events(&mut self, events: crate::events::Events) {
+        *self.events.lock().unwrap() = Some(events);
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+    fn changed(&self) {
+        self.revision.fetch_add(1, Ordering::Release);
     }
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
         let (rows, cols) = (rows.max(1), cols.max(1));
@@ -164,12 +192,14 @@ impl TerminalSession {
             .screen_mut()
             .set_size(rows, cols);
         self.size = (rows, cols);
+        self.changed();
         Ok(())
     }
     pub fn write(&mut self, bytes: &[u8]) -> Result<()> {
         self.selection = None;
         self.selection_screen = None;
         self.parser.lock().unwrap().screen_mut().set_scrollback(0);
+        self.changed();
         let mut writer = self.writer.lock().unwrap();
         writer.write_all(bytes)?;
         writer.flush()?;
@@ -189,7 +219,12 @@ impl TerminalSession {
     pub fn application_cursor(&self) -> bool {
         self.parser.lock().unwrap().screen().application_cursor()
     }
+    pub fn mouse_motion(&self) -> bool {
+        self.parser.lock().unwrap().screen().mouse_protocol_mode()
+            == vt100::MouseProtocolMode::AnyMotion
+    }
     pub fn scroll(&mut self, delta: i32) {
+        self.changed();
         self.selection = None;
         self.selection_screen = None;
         let mut p = self.parser.lock().unwrap();
@@ -211,6 +246,7 @@ impl TerminalSession {
             .unwrap_or_else(|| self.initial_cwd.clone())
     }
     pub fn select(&mut self, row: usize, col: usize, extend: bool) {
+        self.changed();
         let position = (
             row.min(self.size.0.saturating_sub(1) as usize) as u16,
             col.min(self.size.1 as usize) as u16,

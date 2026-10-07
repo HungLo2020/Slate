@@ -22,7 +22,19 @@ struct Revision {
 #[derive(Serialize, Deserialize)]
 pub struct Document {
     pub path: Option<PathBuf>,
-    pub text: String,
+    pub(crate) text: String,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(skip)]
+    lines: std::cell::RefCell<Option<(u64, Vec<usize>)>>,
+    #[serde(skip)]
+    dirty_cache: std::cell::Cell<Option<(u64, bool)>>,
+    #[serde(skip)]
+    typing_at: Option<std::time::Instant>,
+    #[serde(skip)]
+    history_size: usize,
     saved: String,
     #[serde(default)]
     unavailable: bool,
@@ -35,9 +47,130 @@ pub struct Document {
 }
 
 impl Document {
+    pub fn from_text(text: String) -> Result<Self> {
+        if text.len() > MAX_FILE_BYTES {
+            bail!("Prototype buffer limit is 16 MiB");
+        }
+        let mut document = Self::scratch();
+        document.text = text;
+        Ok(document)
+    }
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+    pub fn inspection(label: String, text: String) -> Self {
+        let mut doc = Self::scratch();
+        doc.text = text;
+        doc.saved = doc.text.clone();
+        doc.label = Some(label);
+        doc.read_only = true;
+        doc
+    }
+    pub fn set_text(&mut self, text: String) -> Result<()> {
+        self.replace(0, self.text.len(), &text, 0)
+    }
+    pub fn break_typing(&mut self) {
+        self.typing_at = None;
+    }
+    pub fn replace_typing(
+        &mut self,
+        start: usize,
+        end: usize,
+        value: &str,
+        cursor: usize,
+    ) -> Result<()> {
+        let merge = start == end
+            && !value.contains(['\n', '\r'])
+            && self
+                .typing_at
+                .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(750))
+            && self.undo.last().is_some_and(|r| {
+                r.removed.is_empty() && r.start + r.inserted.len() == start && r.after == cursor
+            });
+        self.replace(start, end, value, cursor)?;
+        if merge && self.undo.len() >= 2 {
+            let tail = self.undo.pop().unwrap();
+            let prior = self.undo.last_mut().unwrap();
+            prior.inserted.push_str(&tail.inserted);
+            prior.after = tail.after;
+        }
+        self.typing_at = Some(std::time::Instant::now());
+        Ok(())
+    }
+    fn ensure_lines(&self) {
+        let mut lines = self.lines.borrow_mut();
+        if lines.as_ref().is_none_or(|(g, _)| *g != self.generation) {
+            let mut starts = vec![0];
+            starts.extend(
+                self.text
+                    .bytes()
+                    .enumerate()
+                    .filter_map(|(i, b)| (b == b'\n').then_some(i + 1)),
+            );
+            *lines = Some((self.generation, starts));
+        }
+    }
+    pub fn line_count(&self) -> usize {
+        self.ensure_lines();
+        self.lines.borrow().as_ref().unwrap().1.len()
+    }
+    pub fn line_offset(&self, row: usize) -> usize {
+        self.ensure_lines();
+        self.lines
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .1
+            .get(row)
+            .copied()
+            .unwrap_or(self.text.len())
+    }
+    pub fn line_col(&self, cursor: usize, tab: usize) -> (usize, usize) {
+        self.ensure_lines();
+        let lines = self.lines.borrow();
+        let starts = &lines.as_ref().unwrap().1;
+        let row = starts
+            .partition_point(|start| *start <= cursor)
+            .saturating_sub(1);
+        (
+            row,
+            display_width_with_tabs(&self.text[starts[row]..cursor], tab),
+        )
+    }
+    pub fn at_line_col(&self, row: usize, col: usize, tab: usize) -> usize {
+        let start = self.line_offset(row);
+        start + at_line_col_with_tabs(&self.text[start..], 0, col, tab)
+    }
+    fn replace_text(&mut self, start: usize, end: usize, value: &str) {
+        self.ensure_lines();
+        let (_, mut starts) = self.lines.get_mut().take().unwrap();
+        let first = starts.partition_point(|p| *p <= start);
+        let last = starts.partition_point(|p| *p <= end);
+        let delta = value.len() as isize - (end - start) as isize;
+        for offset in &mut starts[last..] {
+            *offset = offset.saturating_add_signed(delta);
+        }
+        starts.splice(
+            first..last,
+            value
+                .bytes()
+                .enumerate()
+                .filter_map(|(i, b)| (b == b'\n').then_some(start + i + 1)),
+        );
+        self.text.replace_range(start..end, value);
+        self.generation += 1;
+        *self.lines.get_mut() = Some((self.generation, starts));
+    }
+
     pub fn scratch() -> Self {
         Self {
             path: None,
+            read_only: false,
+            label: None,
+            lines: Default::default(),
+            dirty_cache: Default::default(),
+            typing_at: None,
+            history_size: 0,
             text: String::new(),
             saved: String::new(),
             unavailable: false,
@@ -55,6 +188,12 @@ impl Document {
         let text = String::from_utf8(bytes).context("Slate currently edits UTF-8 text only")?;
         Ok(Self {
             path: Some(path),
+            read_only: false,
+            label: None,
+            lines: Default::default(),
+            dirty_cache: Default::default(),
+            typing_at: None,
+            history_size: 0,
             saved: text.clone(),
             unavailable: false,
             text,
@@ -64,9 +203,22 @@ impl Document {
         })
     }
     pub fn dirty(&self) -> bool {
-        self.unavailable || self.text != self.saved
+        if self.read_only {
+            return false;
+        }
+        if let Some((generation, dirty)) = self.dirty_cache.get() {
+            if generation == self.generation {
+                return dirty;
+            }
+        }
+        let dirty = self.unavailable || self.text != self.saved;
+        self.dirty_cache.set(Some((self.generation, dirty)));
+        dirty
     }
     pub fn title(&self) -> String {
+        if let Some(label) = &self.label {
+            return label.clone();
+        }
         let name = self
             .path
             .as_ref()
@@ -76,6 +228,10 @@ impl Document {
         format!("{}{}", name, if self.dirty() { " *" } else { "" })
     }
     pub fn replace(&mut self, start: usize, end: usize, value: &str, cursor: usize) -> Result<()> {
+        if self.read_only {
+            bail!("This inspection view is read-only");
+        }
+        self.typing_at = None;
         if start > end
             || end > self.text.len()
             || !self.text.is_char_boundary(start)
@@ -96,18 +252,25 @@ impl Document {
             before: cursor,
             after: start + value.len(),
         });
-        let mut total: usize = self
+        self.history_size = self.history_size.saturating_sub(
+            self.redo
+                .iter()
+                .map(|r| r.removed.len() + r.inserted.len())
+                .sum::<usize>(),
+        );
+        self.history_size += self
             .undo
-            .iter()
+            .last()
             .map(|r| r.removed.len() + r.inserted.len())
-            .sum();
-        while self.undo.len() > 1 && (self.undo.len() > 10_000 || total > HISTORY_BUDGET) {
+            .unwrap_or(0);
+        while self.undo.len() > 1
+            && (self.undo.len() > 10_000 || self.history_size > HISTORY_BUDGET)
+        {
             let r = self.undo.remove(0);
-            total -= r.removed.len() + r.inserted.len();
+            self.history_size -= r.removed.len() + r.inserted.len();
         }
         self.redo.clear();
-        self.text.replace_range(start..end, value);
-        self.generation += 1;
+        self.replace_text(start, end, value);
         Ok(())
     }
     pub fn undo_change(&self) -> Option<(usize, usize, usize)> {
@@ -121,28 +284,38 @@ impl Document {
             .map(|r| (r.start, r.removed.len(), r.inserted.len()))
     }
     pub fn undo(&mut self, cursor: usize) -> Option<usize> {
+        if self.read_only {
+            return None;
+        }
+        self.typing_at = None;
         let mut r = self.undo.pop()?;
-        self.text
-            .replace_range(r.start..r.start + r.inserted.len(), &r.removed);
+        self.replace_text(r.start, r.start + r.inserted.len(), &r.removed);
         r.after = cursor;
         let position = r.before.min(self.text.len());
         self.redo.push(r);
-        self.generation += 1;
         Some(position)
     }
     pub fn redo(&mut self, cursor: usize) -> Option<usize> {
+        if self.read_only {
+            return None;
+        }
+        self.typing_at = None;
         let mut r = self.redo.pop()?;
-        self.text
-            .replace_range(r.start..r.start + r.removed.len(), &r.inserted);
+        self.replace_text(r.start, r.start + r.removed.len(), &r.inserted);
         r.before = cursor;
         let position = r.after.min(self.text.len());
         self.undo.push(r);
-        self.generation += 1;
         Some(position)
     }
     pub fn checkpoint(&self) -> Self {
         Self {
             path: self.path.clone(),
+            read_only: self.read_only,
+            label: self.label.clone(),
+            lines: Default::default(),
+            dirty_cache: Default::default(),
+            typing_at: None,
+            history_size: 0,
             text: self.text.clone(),
             saved: self.saved.clone(),
             unavailable: self.unavailable,
@@ -153,12 +326,14 @@ impl Document {
     }
     pub fn accept_save(&mut self, saved: Self) {
         self.unavailable = false;
+        self.typing_at = None;
         self.path = saved.path;
         self.saved = saved.saved;
         self.generation += 1;
     }
     pub fn mark_unavailable(&mut self) {
         self.unavailable = true;
+        self.dirty_cache.set(None);
     }
     pub fn valid_recovery(&self) -> bool {
         self.text.len() <= MAX_FILE_BYTES && self.saved.len() <= MAX_FILE_BYTES
@@ -166,15 +341,20 @@ impl Document {
     pub fn discard_changes(&mut self) {
         self.unavailable = false;
         self.text = self.saved.clone();
+        self.generation += 1;
+        self.undo.clear();
+        self.redo.clear();
+        self.history_size = 0;
+        self.typing_at = None;
     }
     pub fn history_bytes(&self) -> usize {
-        self.undo
-            .iter()
-            .chain(&self.redo)
-            .map(|r| r.removed.len() + r.inserted.len())
-            .sum()
+        self.history_size
     }
     pub fn save(&mut self, destination: Option<&Path>) -> Result<()> {
+        if self.read_only {
+            bail!("Inspection views cannot be saved");
+        }
+        self.typing_at = None;
         let mut path = destination
             .map(Path::to_path_buf)
             .or_else(|| self.path.clone())
@@ -225,6 +405,7 @@ impl Document {
         fs::File::open(parent)?.sync_all()?;
         self.path = Some(path);
         self.saved = self.text.clone();
+        self.dirty_cache.set(None);
         self.unavailable = false;
 
         Ok(())
