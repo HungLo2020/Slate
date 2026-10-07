@@ -47,10 +47,22 @@ pub enum Job {
     Git(PathBuf, Vec<String>),
     GitStatus(PathBuf),
     GitDiff(PathBuf, String, bool, bool),
+    /// List misspelled words with aspell, hunspell or enchant.
+    Spell(String),
 }
 pub enum IoJob {
     Open(u64, PathBuf),
-    Save(u64, Document, Option<PathBuf>, bool),
+    /// Reread a document's file, optionally decoding with a chosen encoding.
+    Reload(u64, PathBuf, Option<String>),
+    Save(
+        u64,
+        Document,
+        Option<PathBuf>,
+        bool,
+        crate::fsio::WriteOptions,
+    ),
+    /// Write through `pkexec`/`sudo` without a terminal (desktop sessions).
+    SaveElevated(u64, Document, String),
     Checkpoint(PathBuf, Workspace),
     Flush(mpsc::SyncSender<()>),
 }
@@ -61,16 +73,22 @@ pub struct HighlightJob {
     pub path: Option<PathBuf>,
     pub light: bool,
 }
+pub struct SaveFailure {
+    pub kind: crate::fsio::SaveErrorKind,
+    pub message: String,
+}
 pub enum Reply {
     Opened(u64, Result<Document, String>),
+    Reloaded(u64, Result<Document, String>),
     OpenedDirectory(u64, PathBuf),
-    Saved(u64, Result<Document, String>),
+    Saved(u64, Result<Document, SaveFailure>),
     Highlighted(u64, u64, bool, Vec<Token>),
     Files(PathBuf, Result<Vec<Entry>, String>),
     Git(Result<GitState, String>),
     GitOperation(Result<String, String>),
     Output(String, String),
     Error(String),
+    Spelling(Result<Vec<String>, String>),
 }
 #[derive(Clone)]
 struct ReplySender {
@@ -90,7 +108,7 @@ pub struct JobSender {
 }
 impl JobSender {
     pub fn send(&self, job: Job) -> Result<(), mpsc::SendError<Job>> {
-        if matches!(job, Job::Browse(_)) {
+        if matches!(job, Job::Browse(_) | Job::Spell(_)) {
             self.files.send(job)
         } else {
             self.git.send(job)
@@ -122,11 +140,35 @@ impl Services {
                             Reply::Opened(id, Document::open(&path).map_err(|e| format!("{e:#}")))
                         }
                     }
-                    IoJob::Save(id, mut doc, destination, overwrite) => Reply::Saved(
+                    IoJob::Reload(id, path, encoding) => Reply::Reloaded(
                         id,
-                        doc.save_with_overwrite(destination.as_deref(), overwrite)
-                            .map(|()| doc)
+                        Document::open_with_encoding(&path, encoding.as_deref())
                             .map_err(|e| format!("{e:#}")),
+                    ),
+                    IoJob::Save(id, mut doc, destination, overwrite, options) => Reply::Saved(
+                        id,
+                        doc.save_with_options(destination.as_deref(), overwrite, options)
+                            .map(|()| doc)
+                            .map_err(|e| SaveFailure {
+                                kind: crate::fsio::error_kind(&e),
+                                message: format!("{e:#}"),
+                            }),
+                    ),
+                    IoJob::SaveElevated(id, mut doc, program) => Reply::Saved(
+                        id,
+                        (|| -> anyhow::Result<Document> {
+                            let path = doc.path.clone().ok_or_else(|| {
+                                anyhow::anyhow!("Use Save As for an untitled document")
+                            })?;
+                            let bytes = doc.encoded()?;
+                            crate::fsio::write_elevated(&path, &bytes, &program, false)?;
+                            doc.mark_saved_bytes(&bytes);
+                            Ok(doc)
+                        })()
+                        .map_err(|e| SaveFailure {
+                            kind: crate::fsio::SaveErrorKind::Other,
+                            message: format!("{e:#}"),
+                        }),
                     ),
                     IoJob::Checkpoint(path, w) => {
                         if let Err(e) = workspace::write_checkpoint(&path, &w) {
@@ -198,6 +240,7 @@ impl Services {
                             Reply::Files(path, entries.map_err(|e| e.to_string()))
                         }
                         Job::GitStatus(root) => Reply::Git(git_status(&root)),
+                        Job::Spell(text) => Reply::Spelling(spell(&text)),
                         Job::GitDiff(root, path, staged, untracked) => {
                             let root = git_root(&root);
                             let mut args = vec![
@@ -309,6 +352,44 @@ impl Services {
             highlight,
         }
     }
+}
+
+/// Misspelled words, in document order without duplicates.
+fn spell(text: &str) -> Result<Vec<String>, String> {
+    use std::io::Write;
+    let checkers: [(&str, &[&str]); 3] = [
+        ("aspell", &["list"]),
+        ("hunspell", &["-l"]),
+        ("enchant-2", &["-l"]),
+    ];
+    let (program, args) = checkers
+        .iter()
+        .find(|(program, _)| crate::fsio::which(program).is_some())
+        .ok_or("Install aspell, hunspell or enchant to check spelling")?;
+    let mut child = Command::new(program)
+        .args(*args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{program}: {e}"))?;
+    let mut stdin = child.stdin.take().ok_or("No spell checker input")?;
+    let input = text.to_string();
+    let writer = thread::spawn(move || {
+        let _ = stdin.write_all(input.as_bytes());
+    });
+    let output = child.wait_with_output().map_err(|e| e.to_string())?;
+    let _ = writer.join();
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|w| !w.is_empty() && seen.insert(w.to_string()))
+        .map(String::from)
+        .collect())
 }
 
 fn git_output(root: &std::path::Path, args: &[String]) -> Result<std::process::Output, String> {

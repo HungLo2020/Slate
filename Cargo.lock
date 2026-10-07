@@ -219,6 +219,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "core_detect"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -387,6 +393,20 @@ name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
+
+[[package]]
+name = "encoding_rs"
+version = "0.8.42"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e985e0451871ad22fb8d2b6b076e2028a502a0d3950998c2c5c0a4f9b5d9679"
+dependencies = [
+ "cfg-if",
+ "core_detect",
+ "multiversion_no_op",
+ "rustversion",
+ "scopeguard",
+ "simdutf8",
+]
 
 [[package]]
 name = "equivalent"
@@ -801,6 +821,12 @@ dependencies = [
  "wasi",
  "windows-sys",
 ]
+
+[[package]]
+name = "multiversion_no_op"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "nix"
@@ -1489,6 +1515,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
+name = "simdutf8"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
 name = "siphasher"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1505,9 +1537,12 @@ name = "slate"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "libc",
+ "portable-pty",
  "slate-cli",
  "slate-core",
- "slate-gui",
+ "tempfile",
+ "vt100",
 ]
 
 [[package]]
@@ -1517,6 +1552,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "crossterm",
+ "libc",
  "ratatui",
  "slate-core",
 ]
@@ -1526,6 +1562,7 @@ name = "slate-core"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "encoding_rs",
  "fs2",
  "libc",
  "portable-pty",
@@ -1536,6 +1573,7 @@ dependencies = [
  "syntect",
  "tempfile",
  "toml",
+ "two-face",
  "unicode-segmentation",
  "unicode-width",
  "vt100",
@@ -1550,6 +1588,7 @@ dependencies = [
  "pkg-config",
  "serde",
  "serde_json",
+ "slate-cli",
  "slate-core",
  "tempfile",
 ]
@@ -1848,6 +1887,17 @@ name = "toml_write"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
+
+[[package]]
+name = "two-face"
+version = "0.5.2+bat-0.26.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "915be7adc2ff6f4338acbf71f3eda0a146f46003b992a1669c674308610efdac"
+dependencies = [
+ "serde",
+ "serde_derive",
+ "syntect",
+]
 
 [[package]]
 name = "typenum"

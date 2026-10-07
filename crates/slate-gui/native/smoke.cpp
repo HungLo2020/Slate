@@ -32,15 +32,24 @@ static QQuickItem *findItem(QQuickItem *item, const QString &name) {
             return found;
     return nullptr;
 }
-static QQuickItem *findMenuItem(QQuickWindow *window, const QString &name) {
-    auto item = findItem(window->contentItem(), name);
-    if (item && item->isVisible())
+static QQuickItem *findVisibleItem(QQuickItem *item, const QString &name) {
+    if (item->objectName() == name && item->isVisible())
         return item;
+    for (auto child : item->childItems())
+        if (auto found = findVisibleItem(child, name))
+            return found;
+    return nullptr;
+}
+static QQuickItem *findMenuItem(QQuickWindow *window, const QString &name) {
+    // Pane context menus reuse the menu-bar object names; prefer the open one.
+    if (auto visible = findVisibleItem(window->contentItem(), name))
+        return visible;
+    auto item = findItem(window->contentItem(), name);
     // Desktop styles can place menus in separate popup windows.
     for (auto candidate : QGuiApplication::allWindows())
         if (auto popup = qobject_cast<QQuickWindow *>(candidate))
             if (popup != window && popup->isVisible())
-                if (auto found = findItem(popup->contentItem(), name))
+                if (auto found = findVisibleItem(popup->contentItem(), name))
                     return found;
     return item;
 }

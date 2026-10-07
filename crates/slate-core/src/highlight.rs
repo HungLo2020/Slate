@@ -17,12 +17,18 @@ pub struct Token {
 pub fn highlight(text: &str, path: Option<&Path>, light: bool) -> Vec<Token> {
     static SYNTAX: OnceLock<SyntaxSet> = OnceLock::new();
     static THEMES: OnceLock<ThemeSet> = OnceLock::new();
-    let ss = SYNTAX.get_or_init(SyntaxSet::load_defaults_newlines);
+    // bat's grammar collection: TOML, TypeScript, Dockerfile, Nix, … beyond
+    // syntect's built-in set.
+    let ss = SYNTAX.get_or_init(two_face::syntax::extra_newlines);
     let ts = THEMES.get_or_init(ThemeSet::load_defaults);
     let syntax = path
         .and_then(|p| p.file_name())
         .and_then(|s| s.to_str())
-        .and_then(|name| ss.find_syntax_by_extension(name.rsplit('.').next().unwrap_or(name)))
+        .and_then(|name| {
+            // Whole names first (Makefile, Dockerfile, .bashrc), then extensions.
+            ss.find_syntax_by_extension(name)
+                .or_else(|| ss.find_syntax_by_extension(name.rsplit('.').next().unwrap_or(name)))
+        })
         .or_else(|| {
             text.lines()
                 .next()
@@ -101,6 +107,24 @@ impl App {
             } else {
                 break;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn extended_grammars_cover_common_project_files() {
+        for (name, text) in [
+            ("Cargo.toml", "[package]\nname = \"x\"\n"),
+            ("app.ts", "const x: number = 1;\n"),
+            ("Dockerfile", "FROM alpine\n"),
+            ("main.rs", "fn main() {}\n"),
+        ] {
+            let tokens = super::highlight(text, Some(std::path::Path::new(name)), false);
+            let colours: std::collections::BTreeSet<_> =
+                tokens.iter().map(|t| t.fg.clone()).collect();
+            assert!(colours.len() > 1, "{name} was not highlighted");
         }
     }
 }

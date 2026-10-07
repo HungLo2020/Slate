@@ -1,5 +1,8 @@
 [workspace]
 members = ["crates/slate-core", "crates/slate-cli", "crates/slate-gui"]
+# `cargo build` produces both executables: `slate` (terminal, no Qt) and
+# `slate-gui` (graphical). `cargo build -p slate` builds only the former.
+default-members = [".", "crates/slate-gui"]
 resolver = "2"
 
 [workspace.package]
@@ -13,16 +16,16 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
-[features]
-default = ["gui"]
-gui = ["dep:slate-gui"]
-gui-smoke = ["gui", "slate-gui/smoke"]
-
 [dependencies]
 slate-core = { path = "crates/slate-core" }
 slate-cli = { path = "crates/slate-cli" }
-slate-gui = { path = "crates/slate-gui", optional = true }
 anyhow = "1"
 
 [profile.release]
 lto = "thin"
+
+[dev-dependencies]
+portable-pty = "0.9"
+vt100 = "0.16"
+tempfile = "3"
+libc = "0.2"

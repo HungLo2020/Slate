@@ -6,7 +6,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install minimum Qt API build environment and terminal tools
-        run: sudo apt-get update && sudo apt-get install -y cmake pkg-config qt6-base-dev qt6-declarative-dev vim-tiny htop tmux openssh-client openssh-server
+        run: sudo apt-get update && sudo apt-get install -y cmake pkg-config qt6-base-dev qt6-declarative-dev vim-tiny htop tmux openssh-client openssh-server aspell aspell-en
       - name: Install current stable Rust
         run: rustup update stable && rustup default stable && rustup component add rustfmt clippy
       - run: python3 scripts/dependency-policy.py
@@ -16,12 +16,13 @@ jobs:
       - run: cargo test --workspace --all-targets --all-features
         env:
           SLATE_REQUIRE_TERMINAL_TOOLS: "1"
+      # Builds both executables: slate (terminal, no Qt) and slate-gui.
       - run: cargo build --release
       - run: python3 scripts/install-smoke.py target/release/slate
       - run: python3 scripts/startup-smoke.py target/release/slate --tui-only
       - run: python3 scripts/recovery-smoke.py target/release/slate
       - name: Verify optional TUI-only installation
-        run: cargo build --release --no-default-features && python3 scripts/install-smoke.py target/release/slate --tui-only
+        run: cargo build --release --package slate && python3 scripts/install-smoke.py target/release/slate --tui-only
       # Qt 6.4 builds the public adapter API here. Ubuntu 24.04 has no Kirigami 6 runtime.
   gui:
     runs-on: ubuntu-24.04
@@ -43,7 +44,7 @@ jobs:
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           fi
       - uses: actions/checkout@v4
-      - run: cargo build --features gui-smoke
+      - run: cargo build --package slate --package slate-gui --features slate-gui/smoke
       - run: python3 scripts/startup-smoke.py target/debug/slate
       - run: python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: SLATE_GUI_FEATURE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
@@ -52,5 +53,5 @@ jobs:
       - run: SLATE_GUI_GIT_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: python3 scripts/gui-layout-smoke.py target/debug/slate
       - run: python3 scripts/recovery-smoke.py target/debug/slate
-      - run: cargo build --release --features gui-smoke
+      - run: cargo build --release --package slate --package slate-gui --features slate-gui/smoke
       - run: python3 scripts/gui-performance-smoke.py target/release/slate

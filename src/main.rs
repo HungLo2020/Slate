@@ -1,70 +1,62 @@
+//! `slate`: the terminal interface. It does not link Qt, so it runs on
+//! servers and minimal systems; `--gui` hands over to `slate-gui`.
 use anyhow::{bail, Result};
-use std::path::PathBuf;
+use slate_core::cli::{self, Frontend};
+use std::{ffi::OsString, path::PathBuf};
+
+fn graphical_executable() -> Option<PathBuf> {
+    let current = std::env::current_exe().ok()?.canonicalize().ok()?;
+    // An older installation made `slate-gui` a symlink to `slate`; never
+    // exec ourselves.
+    let distinct = |p: &PathBuf| p.is_file() && p.canonicalize().ok().as_ref() != Some(&current);
+    let sibling = current.with_file_name("slate-gui");
+    if distinct(&sibling) {
+        return Some(sibling);
+    }
+    slate_core::fsio::which("slate-gui").filter(distinct)
+}
+
+fn run_gui(args: Vec<OsString>) -> Result<()> {
+    let Some(program) = graphical_executable() else {
+        bail!(
+            "The graphical interface (slate-gui) is not installed. Install the Qt \
+             components (the slate package's recommended dependencies) or run slate \
+             in a terminal without --gui"
+        );
+    };
+    let mut command = std::process::Command::new(&program);
+    command.args(args);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let error = command.exec();
+        bail!("Cannot start {}: {error}", program.display());
+    }
+    #[cfg(not(unix))]
+    {
+        let status = command.status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args_os();
-    let invocation = args.next().unwrap_or_default();
-    let mut gui = PathBuf::from(invocation)
-        .file_name()
-        .map(|n| n == "slate-gui")
-        .unwrap_or(false);
-    let mut path = None;
-    let mut recover = true;
-    let mut startup = None;
-    for arg in args {
-        match arg.to_str() {
-            Some("--fresh") => recover = false,
-            Some("--editor-only") => {
-                startup = Some(slate_core::preferences::StartupMode::EditorOnly)
-            }
-            Some("--workspace") => startup = Some(slate_core::preferences::StartupMode::Workspace),
-            Some("--gui") => gui = true,
-            Some("--tui") => gui = false,
-            Some("--help") | Some("-h") => {
-                println!("Slate — shared Rust editor\n\nslate [--tui|--gui] [--fresh] [--editor-only|--workspace] [FILE|DIRECTORY]\nslate-gui [FILE|DIRECTORY]\n\nF1: commands  F6: next pane  F7: next tab  F8: new terminal\nF9: split right  Shift-F9: split below  F10: expand/collapse workspace\nEditor: Ctrl-S save, Ctrl-Z undo, Ctrl-Y redo, Ctrl-F find, Ctrl-H replace, Ctrl-G line\n--editor-only: show only the editor, regardless of startup settings\n--workspace: show the full workspace, regardless of startup settings\nFiles default to editor-only; directories (or no path) default to the workspace.\nConfigure file-startup and directory-startup in Settings.\n--fresh: start without restoring this workspace\nCtrl-Shift-P: commands (also works from terminal panes)");
-                return Ok(());
-            }
-            Some("--version") => {
-                println!("Slate {}", env!("CARGO_PKG_VERSION"));
-                return Ok(());
-            }
-            Some(s) if s.starts_with('-') => bail!("Unknown argument: {s}"),
-            _ => {
-                if path.replace(PathBuf::from(arg)).is_some() {
-                    bail!("Pass one file or workspace directory");
-                }
-            }
-        }
+    let invocation = PathBuf::from(args.next().unwrap_or_default());
+    let args: Vec<OsString> = args.collect();
+    let launch = cli::parse(args.clone())?;
+    let invoked_as_gui = invocation.file_name().is_some_and(|n| n == "slate-gui");
+    if launch.frontend == Some(Frontend::Gui)
+        || (invoked_as_gui && launch.frontend != Some(Frontend::Tui))
+    {
+        return run_gui(args);
     }
-    let path = path.unwrap_or(std::env::current_dir()?);
-    let smoke = std::env::var_os("SLATE_GUI_SMOKE_DIR").is_some();
-    if smoke {
-        eprintln!("Smoke startup: constructing shared core");
+    if launch.help {
+        println!("{}", cli::USAGE);
+        return Ok(());
     }
-    let mut app = slate_core::App::new_with_startup(&path, startup)?;
-    if smoke {
-        eprintln!("Smoke startup: core constructed");
+    if launch.version {
+        println!("Slate {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
     }
-    if let Err(e) = app.enable_workspace(recover) {
-        app.status = format!("Workspace recovery disabled: {e:#}");
-    }
-    if smoke {
-        eprintln!("Smoke startup: workspace ready");
-    }
-    if gui {
-        #[cfg(feature = "gui")]
-        {
-            let code = slate_gui::run(app);
-            if code != 0 {
-                bail!("GUI exited with code {code}");
-            }
-        }
-        #[cfg(not(feature = "gui"))]
-        {
-            let _ = app;
-            bail!("This build excludes the GUI. Rebuild with default features");
-        }
-    } else {
-        slate_cli::run(app)?;
-    }
-    Ok(())
+    slate_cli::run(cli::start(&launch)?)
 }

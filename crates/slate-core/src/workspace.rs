@@ -50,6 +50,11 @@ impl Workspace {
                 .documents
                 .get(&v.document)
                 .context("Recovery view has no document")?;
+            // Clean files are stored as references; their views are clamped
+            // after the current file contents are read.
+            if d.reference {
+                continue;
+            }
             if v.cursor > d.text.len()
                 || !d.text.is_char_boundary(v.cursor)
                 || v.anchor
@@ -135,6 +140,14 @@ impl WorkspaceStore {
         lock.try_lock_exclusive().context(
             "Workspace is already open; this instance will not replace its recovery state",
         )?;
+        // A killed instance can leave a partially written temporary checkpoint.
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(".tmp") {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
         Ok(Self {
             path: dir.join("session.json"),
             _lock: lock,
@@ -191,17 +204,29 @@ use crate::{services::IoJob, terminal::TerminalSession, App, Command};
 
 impl App {
     pub fn enable_workspace(&mut self, recover: bool) -> Result<()> {
-        let store = WorkspaceStore::acquire(&self.root)?;
+        let store = WorkspaceStore::acquire(&self.recovery_key)?;
         self.attach_workspace(store, recover)
     }
     pub fn attach_workspace(&mut self, store: WorkspaceStore, recover: bool) -> Result<()> {
         let requested = self.documents.values().find_map(|d| d.path.clone());
         if recover {
             if let Some(mut w) = store.load(&self.root)? {
-                let recovered = w.documents.values().filter(|d| d.dirty()).count();
+                let recovered = w
+                    .documents
+                    .values()
+                    .filter(|d| !d.reference && d.dirty())
+                    .count();
                 // Clean buffers follow current disk contents. Dirty buffers retain their original save baseline.
                 for d in w.documents.values_mut() {
-                    if !d.dirty() {
+                    if d.reference {
+                        let read_only = d.read_only;
+                        if let Some(path) = d.path.clone() {
+                            *d = Document::open(&path)
+                                .or_else(|_| Document::new_file(&path))
+                                .unwrap_or_else(|_| Document::scratch());
+                            d.read_only = read_only;
+                        }
+                    } else if !d.dirty() {
                         if let Some(path) = &d.path {
                             match Document::open(path) {
                                 Ok(current) => *d = current,
@@ -270,7 +295,7 @@ impl App {
             documents: self
                 .documents
                 .iter()
-                .map(|(id, d)| (*id, d.checkpoint()))
+                .map(|(id, d)| (*id, d.recovery_copy()))
                 .collect(),
             views: self.views.clone(),
             terminals: self
@@ -289,7 +314,36 @@ impl App {
             ids: self.ids,
         }
     }
+    /// A cheap fingerprint of everything a checkpoint records, so unchanged
+    /// state (pointer motion, idle redraws) never rewrites the recovery file.
+    fn checkpoint_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for (id, d) in &self.documents {
+            (id, d.generation, d.dirty(), &d.path, d.read_only).hash(&mut hasher);
+        }
+        serde_json::to_string(&(
+            &self.views,
+            &self.layout,
+            self.focus,
+            &self.browser,
+            self.ids,
+        ))
+        .unwrap_or_default()
+        .hash(&mut hasher);
+        for (id, t) in &self.terminals {
+            (id, t.cwd()).hash(&mut hasher);
+        }
+        self.deferred_terminals.hash(&mut hasher);
+        hasher.finish()
+    }
     pub(super) fn checkpoint(&mut self) {
+        let fingerprint = self.checkpoint_fingerprint();
+        if fingerprint == self.checkpoint_key {
+            self.workspace_dirty = false;
+            self.checkpoint_at = Instant::now();
+            return;
+        }
         if let Some(store) = &self.store {
             let result = self
                 .services
@@ -297,6 +351,7 @@ impl App {
                 .send(IoJob::Checkpoint(store.path.clone(), self.workspace()));
             if result.is_ok() {
                 self.workspace_dirty = false;
+                self.checkpoint_key = fingerprint;
             } else {
                 self.status = "Recovery worker is unavailable".into();
             }

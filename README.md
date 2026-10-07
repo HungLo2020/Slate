@@ -40,12 +40,13 @@ all edits. Raw palette commands such as `:discard-quit` also require confirmatio
 Configured global shortcuts work in tool input fields as well as the editor.
 
 ```bash
-cargo build --release
+cargo build --release                     # builds slate (terminal) and slate-gui
 ./target/release/slate .                  # terminal mode
-./target/release/slate --gui .            # Kirigami mode
+./target/release/slate --gui .            # Kirigami mode (runs slate-gui)
 ./target/release/slate src/main.rs        # editor only
 ./target/release/slate --gui --editor-only .  # GUI editor only
 ./target/release/slate --workspace src/main.rs # file in the full TUI workspace
+cargo build --release -p slate            # terminal executable only, no Qt needed
 ```
 
 Development launchers build the release executable before starting it:
@@ -62,7 +63,7 @@ refer to the directory where the script was invoked. `RunTui.py` requires a
 graphical desktop and an installed terminal emulator; it prefers Konsole and
 never runs Slate in the terminal used to invoke the script.
 
-Install the one executable and its GUI alias:
+Install both executables (`--tui-only` installs just `slate`):
 
 ```bash
 ./scripts/install.sh "$HOME/.local"
@@ -70,10 +71,53 @@ slate .
 slate-gui .
 ```
 
-`--tui` and `--gui` override invocation-name selection. The default executable
-contains both frontends. Terminal mode does not require a graphical session,
-but a combined build still links Qt libraries. For machines without Qt, an
-explicit TUI-only build is also available with `cargo build --no-default-features`.
+`slate` is the terminal interface and does not link Qt, so it runs on servers,
+over SSH and on minimal systems. `slate-gui` is the graphical interface; `slate
+--gui` hands over to it, and `slate-gui --tui` runs the terminal interface.
+
+## Using Slate as a nano replacement
+
+```bash
+slate notes.txt               # a missing file is created on first save
+slate +42 src/main.rs         # start on line 42 (+LINE,COLUMN or +LINE:COLUMN)
+slate a.rs b.rs               # several files open as tabs
+git log | slate -             # edit standard input; saving asks for a path
+slate -v /etc/fstab           # read-only view
+EDITOR=slate git commit       # blocks until you quit, exits 0
+```
+
+Quitting with unsaved changes asks **Y** (save all and quit), **N** (discard
+and quit) or **C**/Escape (cancel). Choose **Keymap → nano** in Settings (or set
+`keymap = "nano"`) for nano's bindings: ^O write out, ^X exit, ^W where is,
+^\\ replace, ^K cut line (repeated cuts collect lines), ^U paste, ^6/M-A mark,
+^J justify, ^T spell check, ^_ go to line, ^C cursor position, M-D word count,
+^R insert file, ^G help, ^Z suspend, M-U/M-E undo/redo, M-S soft wrap, M-N line
+numbers and M-M mouse capture. The bottom bar shows nano-style hints.
+
+Files keep their format. Slate reads UTF-8 (with or without a BOM), UTF-16 with a
+BOM, and legacy 8-bit files (opened as windows-1252, or any encoding through
+**Reopen with encoding**). LF, CRLF and CR line endings are preserved; mixed files
+are reported and saved with their dominant ending. **Set encoding** and **Set line
+endings** change how a document is saved. Pasted text and text from other
+programs is normalized, so stray carriage returns never reach the file. Binary
+files (containing NUL bytes) are refused.
+
+Saving keeps file metadata: permissions, owner and group (when running as root),
+extended attributes and ACLs, and hard links. Files in directories you cannot
+write are updated in place. Saving a read-only file asks first; saving a file
+you have no permission to write offers **sudo** (terminal) or **pkexec** (GUI).
+With `backup = true`, the previous version is kept as `NAME~`. When the terminal
+is closed or Slate receives SIGTERM, unsaved buffers of individually opened
+files are written to `NAME.save`, as nano does.
+
+The terminal interface uses the outer terminal's colour depth: 24-bit colour with
+`COLORTERM=truecolor`, otherwise 256 or 16 colours, and none with `NO_COLOR`. It
+requests the kitty keyboard protocol for unambiguous Ctrl/Shift keys and decodes
+legacy terminals' control bytes (Ctrl+], ^\\, ^_, and ^H when the terminal's erase
+key is ^H). Copy and paste use the desktop clipboard through `wl-copy`/`xclip`/
+`xsel` when a display is available, and OSC 52 otherwise. **Toggle mouse capture**
+leaves selection to the outer terminal. Soft wrap (**Alt+Z**, or nano's M-S) wraps
+long lines at word boundaries; the cursor moves by screen rows.
 
 ## Startup and settings
 
@@ -90,6 +134,13 @@ Settings are saved automatically to `$XDG_CONFIG_HOME/slate/settings.toml`
 ```toml
 file_startup = "editor-only"
 directory_startup = "workspace"
+keymap = "default"        # or "nano"
+soft_wrap = false
+wrap_column = 80          # justify and hard wrap
+hard_wrap = false
+backup = false            # keep NAME~ on save
+file_recovery = false     # recover unsaved single files after a crash
+tui_mouse = true
 ```
 
 Press **F10** to expand/collapse the workspace. The GUI also has a **Workspace** /
@@ -118,10 +169,11 @@ python3 scripts/deb-smoke.py builds/slate_0.1.1_amd64.deb
 sudo apt install ./builds/slate_0.1.1_amd64.deb
 ```
 
-The package includes `/usr/bin/slate`, the `slate-gui` symlink, desktop entry,
-icon and README. Shared-library requirements come from `dpkg-shlibdeps`; QML
-modules, SVG plugins and Git are declared separately. It does not bundle Qt or
-require an exact Qt runtime version.
+The package includes `/usr/bin/slate`, `/usr/bin/slate-gui`, the desktop entry,
+icon and README. Only the terminal executable's libraries are hard dependencies;
+Qt, the QML modules, SVG plugins and Git are recommended, so `apt install
+--no-install-recommends slate` installs a Qt-free terminal editor. It does not
+bundle Qt or require an exact Qt runtime version.
 
 The application icon comes from `resources/slate.svg`, embedded in the GUI and
 installed into the standard hicolor icon theme for the desktop launcher.
@@ -196,9 +248,16 @@ slate`; subsequent releases arrive through normal APT updates.
   message composer. Directory listing and Git commands have separate workers. File opens/saves have their own worker;
   saving a snapshot leaves edits made during the save dirty. Git operations use
   the repository root, including when opening a subfolder.
-- Atomic saves preserve ordinary file permissions and symlink targets; external
-  disk edits and unintended Save As overwrites are refused. Unsaved documents
-  block normal close/quit.
+- Atomic saves preserve permissions, owner/group, extended attributes, hard
+  links and symlink targets; external disk edits and unintended Save As
+  overwrites are refused. Read-only files ask first; unwritable files offer
+  sudo/pkexec. Quitting with unsaved documents asks to save, discard or cancel.
+- Encodings (UTF-8/BOM, UTF-16, legacy 8-bit), LF/CRLF/CR line endings, binary
+  file detection, new files from the command line, `+LINE`, standard input and
+  read-only views.
+- nano workflows: optional nano keymap and hint bar, cut-line chains, mark,
+  justify, hard and soft wrap, spell checking, word count, cursor position
+  report, insert file, help, suspend, backups and `NAME.save` emergency saves.
 - Small windows show the focused pane; cycling focus accesses the other panes.
 
 ## Controls
@@ -224,6 +283,9 @@ slate`; subsequent releases arrive through normal APT updates.
 | Alt+C / Alt+V in a terminal | Copy/paste when the outer terminal cannot distinguish shifted control keys |
 | Shift+arrows; mouse drag | Select text |
 | Ctrl+A / C / X / V in an editor | Select all / copy / cut / paste |
+| Ctrl+Left / Right, Ctrl+Backspace / Delete | Move by word, delete a word |
+| Home | First non-blank character, then column 1 |
+| Alt+Z | Toggle soft wrap |
 
 The command palette searches readable action names and descriptions. Use Up/Down
 and Enter to select an action; unavailable actions explain what is missing.
@@ -334,13 +396,23 @@ commands discard unsaved work. GUI window closure asks before discarding.
 
 `set` writes `$XDG_CONFIG_HOME/slate/settings.toml` (normally
 `~/.config/slate/settings.toml`). Supported options: `indent-width` (1–16),
-`insert-spaces`, `auto-indent`, `line-numbers` (booleans), and `theme`
-(`auto`, `dark`, `light`). Run `set indent-width 4` to create a complete settings
+`insert-spaces`, `auto-indent`, `line-numbers` (booleans), `theme`
+(`auto`, `dark`, `light`), `keymap` (`default`, `nano`; choosing one replaces the
+key tables), `soft-wrap`, `wrap-column` (10–500), `hard-wrap`, `backup`,
+`file-recovery` and `tui-mouse`. Running as root through `sudo` without `-H`,
+Slate uses root's own configuration and state directories rather than creating
+root-owned files in your home directory. Run `set indent-width 4` to create a complete settings
 file, edit its `global_keys`, `editor_keys` and `terminal_keys` tables, then run
 `settings-reload`. Chords use the order `Ctrl+Alt+Shift+key` with lowercase key
 names, such as `Ctrl+s`, `Shift+f3`, or `Alt+r`. A supplied key table replaces that
 scope's defaults; removing an entry disables it. F1/Ctrl+Shift+P remain frontend
 palette shortcuts; F6 remains a reserved route out of terminal input capture.
+
+Directory workspaces always keep recovery checkpoints. Individually opened files
+(and standard input) do not, unless `file_recovery = true`: then each file has
+its own checkpoint that restores only that file. Checkpoints contain the text of
+unsaved buffers only; clean files are recorded as paths and reread from disk, so
+opening a secret never copies it into the state directory.
 
 Each canonical workspace directory has a private, atomic checkpoint under
 `$XDG_STATE_HOME/slate/workspaces/` (normally `~/.local/state/slate/workspaces/`).
@@ -375,7 +447,8 @@ with `printf '\033]7;file://localhost%s\007' "$PWD"` in its prompt hook.
 - `slate-cli`: Ratatui/Crossterm presentation and terminal input.
 - `slate-gui`: Kirigami QML and a thin Qt C++ presentation adapter. A small
   JSON/C ABI connects it to the Rust core; editing and PTY logic remain Rust.
-- The root binary dispatches between frontends; `slate-gui` is a symlink.
+- `slate` (root package) is the terminal executable and does not link Qt;
+  `--gui` execs the `slate-gui` executable built by the `slate-gui` crate.
 
 **No exact runtime dependency constraints.** Qt discovery specifies a minimum
 public API, without CMake `EXACT`; QML imports have no numeric version pins.
@@ -389,12 +462,13 @@ Qt/Kirigami runtime version. Major ABI/API changes may require rebuilding.
 ```bash
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p slate --test tui_nano      # nano workflows in a real PTY
 python3 scripts/tui-smoke.py target/debug/slate
 python3 scripts/tab-close-smoke.py target/debug/slate
 python3 scripts/recovery-smoke.py target/debug/slate
 python3 scripts/install-smoke.py target/release/slate
 python3 scripts/dependency-policy.py
-cargo build --features gui-smoke
+cargo build -p slate -p slate-gui --features slate-gui/smoke
 python3 scripts/gui-offscreen-smoke.py target/debug/slate
 python3 scripts/gui-layout-smoke.py target/debug/slate  # Qt Test + Kirigami 6
 SLATE_GUI_FEATURE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
@@ -402,7 +476,7 @@ SLATE_GUI_FILE_DIALOG_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debu
 SLATE_GUI_TAB_CLOSE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
 QT_QPA_PLATFORMTHEME=kde SLATE_GUI_PLATFORM=wayland SLATE_GUI_REQUIRE_KDE_DIALOGS=1 SLATE_GUI_FILE_DIALOG_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate # running Plasma desktop
 SLATE_GUI_GIT_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
-cargo build --release --features gui-smoke
+cargo build --release -p slate -p slate-gui --features slate-gui/smoke
 python3 scripts/gui-performance-smoke.py target/release/slate
 python3 scripts/idle-smoke.py target/release/slate       # Linux, release GUI/TUI idle CPU
 python3 scripts/gui-smoke.py target/debug/slate   # optional X11: Xvfb + xdotool

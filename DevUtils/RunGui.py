@@ -12,7 +12,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def build_release() -> Path:
     """Honor Cargo's configured target directory as well as CARGO_TARGET_DIR."""
-    subprocess.run(["cargo", "build", "--release", "--package", "slate"], cwd=ROOT, check=True)
+    # Both executables: `slate` (terminal) execs the sibling `slate-gui` for --gui.
+    subprocess.run(["cargo", "build", "--release", "--package", "slate", "--package", "slate-gui"],
+                   cwd=ROOT, check=True)
     metadata = subprocess.check_output(
         ["cargo", "metadata", "--no-deps", "--format-version", "1"], cwd=ROOT, text=True
     )

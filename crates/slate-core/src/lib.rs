@@ -1,7 +1,10 @@
+mod actions;
+pub mod cli;
 pub mod commands;
 pub mod document;
 mod editing;
 pub mod events;
+pub mod fsio;
 mod highlight;
 pub mod layout;
 pub mod paths;
@@ -10,11 +13,13 @@ mod presentation;
 pub mod search;
 mod services;
 pub mod terminal;
+pub mod text_format;
 pub mod text_presentation;
 pub mod workspace;
+mod wrap;
 
 use anyhow::{bail, Context, Result};
-use document::{at_line_col, line_end, line_start, next, previous, Document};
+use document::{line_start, next, previous, Document};
 use layout::{Axis, Handle, Node, Rect, View};
 use preferences::{Preferences, StartupMode};
 use search::{Prompt, Search};
@@ -28,7 +33,7 @@ use std::{
 };
 use terminal::{Cell, Screen, TerminalSession};
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+
 use workspace::WorkspaceStore;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -41,6 +46,15 @@ pub struct EditorView {
     pub rows: u16,
     pub cols: u16,
     pub manual_scroll: bool,
+    /// With soft wrap, the first visible row within line `top`.
+    #[serde(default)]
+    pub top_row: usize,
+    /// nano-style mark: cursor movement extends the selection.
+    #[serde(default)]
+    pub mark: bool,
+    /// Preferred display column for vertical movement.
+    #[serde(default, skip)]
+    pub goal: Option<usize>,
 }
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]
 pub struct Key {
@@ -257,6 +271,17 @@ pub enum Command {
         #[serde(default)]
         force: bool,
     },
+    /// Save every modified document; untitled ones ask for a path.
+    SaveAll {
+        #[serde(default)]
+        quit: bool,
+    },
+    /// A named editor or application action (see `actions.rs`).
+    Action {
+        name: String,
+        #[serde(default)]
+        argument: String,
+    },
 }
 #[derive(Serialize)]
 pub struct Tab {
@@ -312,6 +337,8 @@ pub struct Snapshot {
     pub background: String,
     pub foreground: String,
     pub accent: String,
+    /// Selection background, so monochrome terminals can show reverse video.
+    pub selection: String,
     pub commands: Vec<commands::CommandInfo>,
     pub settings: Preferences,
     pub editor_only: bool,
@@ -372,40 +399,142 @@ pub struct App {
     git_repository: bool,
     git_jobs: usize,
     git_error: String,
+    /// Launched with files (or standard input) rather than a directory.
+    pub file_mode: bool,
+    /// The path whose recovery checkpoint this session uses.
+    recovery_key: PathBuf,
+    /// Quit once pending "save all" writes succeed.
+    quit_after_save: bool,
+    /// A save waiting for confirmation: (document, destination, overwrite).
+    pending_retry: Option<(u64, Option<PathBuf>, bool)>,
+    /// A privileged save the frontend must perform (terminal `sudo`).
+    elevation: Option<Elevation>,
+    /// How this frontend performs privileged saves.
+    pub elevation_mode: ElevationMode,
+    /// Consecutive line cuts append to the cut buffer, as in nano:
+    /// (view, document generation, cursor) after the last cut.
+    last_cut: Option<(u64, u64, usize)>,
+    misspellings: Vec<String>,
+    /// The terminal frontend should suspend itself (SIGTSTP).
+    pub suspend_requested: bool,
+    checkpoint_key: u64,
+    /// The terminal interface hosts this session (enables suspend, mouse toggle).
+    pub terminal_frontend: bool,
+}
+/// A privileged write the terminal frontend performs with `sudo`, after
+/// handing it the terminal for a password prompt.
+pub struct Elevation {
+    pub document: u64,
+    pub path: PathBuf,
+    pub bytes: Vec<u8>,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ElevationMode {
+    /// No helper; permission errors are reported.
+    #[default]
+    None,
+    /// The frontend takes `Elevation` requests and runs `sudo` interactively.
+    Terminal,
+    /// The IO worker runs this program (e.g. pkexec) without a terminal.
+    Background(&'static str),
 }
 impl App {
     pub fn new(path: &Path) -> Result<Self> {
         Self::new_with_startup(path, None)
     }
+    /// Open one file (created on first save if missing) or directory.
     pub fn new_with_startup(path: &Path, mode: Option<StartupMode>) -> Result<Self> {
-        let path = if path.exists() {
-            path.canonicalize()?
-        } else {
-            bail!("Path does not exist: {}", path.display())
+        let mut launch = cli::Launch {
+            recover: true,
+            startup: mode,
+            ..Default::default()
         };
-        let file = path.is_file();
-        let root = if file {
-            path.parent().unwrap().to_path_buf()
+        if path.is_dir() {
+            launch.directory = Some(path.to_path_buf());
         } else {
-            path.clone()
-        };
-        let mut documents = BTreeMap::new();
-        documents.insert(
-            10,
-            if file {
-                Document::open(&path)?
-            } else {
-                Document::scratch()
-            },
-        );
-        let mut views = BTreeMap::new();
-        views.insert(
-            11,
-            EditorView {
-                document: 10,
+            launch.files.push(cli::LaunchFile {
+                path: path.to_path_buf(),
                 ..Default::default()
-            },
-        );
+            });
+        }
+        Self::launch(&launch, None)
+    }
+    /// Build the initial session from parsed command-line arguments.
+    /// `stdin` holds the bytes read for a `-` argument.
+    pub fn launch(launch: &cli::Launch, stdin: Option<Vec<u8>>) -> Result<Self> {
+        let directory = launch
+            .directory
+            .as_ref()
+            .map(|d| {
+                d.canonicalize()
+                    .with_context(|| format!("Cannot open {}", d.display()))
+            })
+            .transpose()?;
+        let mut opened: Vec<(Document, Option<usize>, Option<usize>)> = vec![];
+        if let (Some(spec), Some(bytes)) = (&launch.stdin, stdin) {
+            let mut document = Document::from_bytes(&bytes, "standard input")?;
+            document.label = None;
+            opened.push((document, spec.line, spec.column));
+        }
+        for file in &launch.files {
+            let document = if file.path.exists() {
+                Document::open(&file.path)
+                    .with_context(|| format!("Cannot open {}", file.path.display()))?
+            } else {
+                Document::new_file(&file.path)?
+            };
+            opened.push((document, file.line, file.column));
+        }
+        let file_mode = directory.is_none() && (!launch.files.is_empty() || launch.stdin.is_some());
+        let root = match &directory {
+            Some(directory) => directory.clone(),
+            None => opened
+                .iter()
+                .find_map(|(d, _, _)| d.path.as_ref()?.parent().map(Path::to_path_buf))
+                .filter(|p| p.is_dir())
+                .map_or_else(std::env::current_dir, Ok)?,
+        };
+        let recovery_key = match (&directory, opened.first()) {
+            (None, Some((d, _, _))) => d.path.clone().unwrap_or_else(|| root.clone()),
+            _ => root.clone(),
+        };
+        let mut notices = vec![];
+        let mut documents = BTreeMap::new();
+        let mut views = BTreeMap::new();
+        let mut positions = vec![];
+        let mut ids = 20;
+        if opened.is_empty() {
+            opened.push((Document::scratch(), None, None));
+        }
+        let mut tabs = vec![];
+        for (index, (mut document, line, column)) in opened.into_iter().enumerate() {
+            let (doc, view) = if index == 0 {
+                (10, 11)
+            } else {
+                ids += 2;
+                (ids - 1, ids)
+            };
+            if launch.read_only {
+                document.read_only = true;
+            }
+            if let Some(notice) = document.notice.take() {
+                notices.push(notice);
+            }
+            documents.insert(doc, document);
+            views.insert(
+                view,
+                EditorView {
+                    document: doc,
+                    ..Default::default()
+                },
+            );
+            tabs.push(View::Editor(view));
+            positions.push((view, line, column));
+        }
+        let mut layout = Node::default_layout(11, 12);
+        if let Some((pane_tabs, _)) = layout.pane_mut(2) {
+            *pane_tabs = tabs;
+        }
         let events = events::Events::default();
         let mut app = Self {
             browser: root.clone(),
@@ -415,7 +544,7 @@ impl App {
             terminals: BTreeMap::new(),
             deferred_terminals: BTreeMap::from([(12, root.clone())]),
             editor_only: false,
-            layout: Node::default_layout(11, 12),
+            layout,
             focus: 2,
             status: "F1 commands · F6 focus · Ctrl-S save".into(),
             quit: false,
@@ -436,7 +565,7 @@ impl App {
             git_repository: false,
             git_jobs: 0,
             git_error: String::new(),
-            ids: 20,
+            ids,
             presets: BTreeMap::new(),
             preferences: Preferences::default(),
             prompt: None,
@@ -457,19 +586,48 @@ impl App {
                 "#88c0d0".into(),
             ),
             system_colors: None,
+            file_mode,
+            recovery_key,
+            quit_after_save: false,
+            pending_retry: None,
+            elevation: None,
+            elevation_mode: ElevationMode::None,
+            last_cut: None,
+            misspellings: vec![],
+            suspend_requested: false,
+            checkpoint_key: 0,
+            terminal_frontend: true,
         };
         app.read_settings();
         app.load_preferences();
-        app.editor_only = mode.unwrap_or(if file {
+        app.editor_only = launch.startup.unwrap_or(if file_mode {
             app.preferences.file_startup
         } else {
             app.preferences.directory_startup
         }) == StartupMode::EditorOnly;
+        for (view, line, column) in positions {
+            if line.is_some() || column.is_some() {
+                let doc = app.views[&view].document;
+                let cursor = app.documents[&doc].at_line_col(
+                    line.unwrap_or(1).saturating_sub(1),
+                    column.unwrap_or(1).saturating_sub(1),
+                    app.preferences.indent_width,
+                );
+                app.views.get_mut(&view).unwrap().cursor = cursor;
+            }
+        }
         if !app.editor_only {
             app.ensure_terminals()?;
         }
+        if !notices.is_empty() {
+            app.status = notices.join(" · ");
+        }
         app.refresh();
         Ok(app)
+    }
+    /// Whether this session keeps workspace recovery checkpoints.
+    pub fn wants_recovery(&self) -> bool {
+        !self.file_mode || self.preferences.file_recovery
     }
     pub fn events(&self) -> events::Events {
         self.events.clone()
@@ -677,6 +835,7 @@ impl App {
                             .line_count()
                             .saturating_sub(v.rows.max(1) as usize),
                     );
+                    v.top_row = 0;
                     v.manual_scroll = true;
                 }
             }
@@ -694,6 +853,7 @@ impl App {
                 replace_length,
             } => {
                 let id = self.active_editor().context("Focus an editor first")?;
+                let text = text_format::normalize_input(&text).into_owned();
                 if replace_start == 0 && replace_length == 0 {
                     self.edit(id, &text)?;
                 } else {
@@ -769,6 +929,10 @@ impl App {
                     "layout-load",
                     "move-pane",
                     "settings",
+                    "insert-file",
+                    "set-encoding",
+                    "reopen-encoding",
+                    "set-line-ending",
                 ]
                 .contains(&kind.as_str())
                 {
@@ -838,6 +1002,16 @@ impl App {
                         ));
                         if self.status.starts_with("Error:") || self.status.starts_with("Unknown") {
                             self.prompt = Some(p);
+                        }
+                    }
+                    "insert-file" | "set-encoding" | "reopen-encoding" | "set-line-ending" => {
+                        if p.input.trim().is_empty() {
+                            bail!("Enter a value");
+                        }
+                        self.prompt = None;
+                        if let Err(e) = self.run_action(&p.kind, &p.input) {
+                            self.prompt = Some(p);
+                            return Err(e);
                         }
                     }
                     "goto" => {
@@ -939,6 +1113,8 @@ impl App {
             }
             Command::Key { key } => self.key(key)?,
             Command::Paste { text } if self.prompt.is_some() => {
+                // Prompts hold a single line.
+                let text = text_format::normalize_input(&text).replace('\n', " ");
                 let p = self.prompt.as_mut().unwrap();
                 if p.field == 0 {
                     p.input.push_str(&text);
@@ -952,7 +1128,8 @@ impl App {
                     .get_mut(&id)
                     .context("Terminal missing")?
                     .paste(&text)?,
-                Some(View::Editor(id)) => self.edit(id, &text)?,
+                // Terminals paste carriage returns; documents store `\n` lines.
+                Some(View::Editor(id)) => self.edit(id, &text_format::normalize_input(&text))?,
                 _ => {}
             },
             Command::Click {
@@ -964,15 +1141,11 @@ impl App {
                 self.focus = pane;
                 match self.focused() {
                     Some(View::Editor(id)) => {
+                        let cursor = self.click_offset(id, row, col);
                         let v = self.views.get_mut(&id).unwrap();
                         v.manual_scroll = false;
-                        let gutter = if self.preferences.line_numbers { 6 } else { 0 };
-                        let cursor = self.documents[&v.document].at_line_col(
-                            v.top + row,
-                            v.left + col.saturating_sub(gutter),
-                            self.preferences.indent_width,
-                        );
-                        if shift {
+                        v.goal = None;
+                        if shift || v.mark {
                             v.anchor.get_or_insert(v.cursor);
                         } else {
                             v.anchor = None;
@@ -992,11 +1165,7 @@ impl App {
                 }
             }
             Command::Scroll { pane, delta } => match self.layout.view(pane).cloned() {
-                Some(View::Editor(id)) => {
-                    let v = self.views.get_mut(&id).unwrap();
-                    v.top = (v.top as i64 - delta as i64).max(0) as usize;
-                    v.manual_scroll = true;
-                }
+                Some(View::Editor(id)) => self.scroll_view(id, delta),
                 Some(View::Terminal(id)) => self.terminals.get_mut(&id).unwrap().scroll(delta),
                 _ => {}
             },
@@ -1049,21 +1218,10 @@ impl App {
                         kind: "save-as".into(),
                     });
                 }
-                if self.pending_save.contains(&doc) {
-                    bail!("A save is already in progress for this document");
-                }
-                self.pending_save.push(doc);
-                self.services
-                    .io
-                    .send(IoJob::Save(
-                        doc,
-                        self.documents[&doc].checkpoint(),
-                        destination,
-                        overwrite,
-                    ))
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                self.status = "Saving…".into();
+                self.start_save(doc, destination, overwrite, false)?;
             }
+            Command::SaveAll { quit } => self.save_all(quit)?,
+            Command::Action { name, argument } => self.run_action(&name, &argument)?,
             Command::CloseDocument { force } => {
                 let id = match self.focused() {
                     Some(View::Editor(id) | View::Terminal(id)) => id,
@@ -1299,7 +1457,19 @@ impl App {
             }
             Command::Quit { force } => {
                 if self.dirty() && !force {
-                    bail!("Unsaved documents. Save them or explicitly discard and quit");
+                    let count = self.documents.values().filter(|d| d.dirty()).count();
+                    self.prompt = Some(Prompt {
+                        kind: "quit".into(),
+                        input: format!(
+                            "{count} unsaved document{}",
+                            if count == 1 { "" } else { "s" }
+                        ),
+                        replacement: String::new(),
+                        field: 0,
+                        case_sensitive: false,
+                        whole_word: false,
+                    });
+                    return Ok(());
                 }
                 if !self.pending_save.is_empty() {
                     bail!("Wait for pending file saves before quitting");
@@ -1394,10 +1564,20 @@ impl App {
                                 self.workspace_dirty = true;
                                 self.refresh();
                             }
+                            if self.quit_after_save {
+                                if let Err(e) = self.save_all(true) {
+                                    self.quit_after_save = false;
+                                    self.status = format!("Error: {e:#}");
+                                }
+                            }
                         }
-                        Err(e) => self.status = format!("Save failed: {e}"),
+                        Err(failure) => self.save_failed(id, failure),
                     }
                 }
+                Reply::Reloaded(id, result) => match result {
+                    Ok(d) => self.finish_reload(id, d),
+                    Err(e) => self.status = format!("Reload failed: {e}"),
+                },
                 Reply::Highlighted(id, generation, light, tokens) => {
                     self.highlight_pending.remove(&id);
                     if self
@@ -1461,6 +1641,7 @@ impl App {
                     }
                 }
                 Reply::Error(e) => self.status = e,
+                Reply::Spelling(result) => self.spelling_result(result),
                 Reply::Output(_, _) if self.quit => {
                     self.git_jobs = self.git_jobs.saturating_sub(1);
                 }
@@ -1716,6 +1897,8 @@ impl App {
         let view = self.views.get_mut(&id).unwrap();
         view.cursor = start + value.len();
         view.anchor = None;
+        view.mark = false;
+        view.goal = None;
         view.manual_scroll = false;
         Ok(())
     }
@@ -1734,15 +1917,53 @@ impl App {
             })
             .map(String::as_str)
     }
-    fn key(&mut self, k: Key) -> Result<()> {
-        if self.prompt.as_ref().is_some_and(|p| p.kind == "close-tab") {
-            return match k.key.as_str() {
-                "Escape" | "Enter" => self.execute(Command::DismissPrompt),
-                _ if !k.ctrl && !k.alt && k.key.eq_ignore_ascii_case("d") => {
-                    self.execute(Command::SubmitPrompt { all: true })
+    /// Single-key answers for confirmation prompts. Returns true when handled.
+    fn choice_key(&mut self, k: &Key) -> Result<bool> {
+        let Some(kind) = self.prompt.as_ref().map(|p| p.kind.clone()) else {
+            return Ok(false);
+        };
+        let letter = if !k.ctrl && !k.alt {
+            k.key.to_lowercase()
+        } else {
+            String::new()
+        };
+        let cancel = k.key == "Escape" || letter == "c";
+        match kind.as_str() {
+            "close-tab" => match k.key.as_str() {
+                "Escape" | "Enter" => self.execute(Command::DismissPrompt)?,
+                _ if letter == "d" => self.execute(Command::SubmitPrompt { all: true })?,
+                _ => {}
+            },
+            "quit" => {
+                if letter == "y" || letter == "s" {
+                    self.prompt = None;
+                    self.save_all(true)?;
+                } else if letter == "n" || letter == "d" {
+                    self.prompt = None;
+                    self.execute(Command::Quit { force: true })?;
+                } else if cancel || k.key == "Enter" {
+                    self.prompt = None;
+                    self.status = "Quit cancelled".into();
                 }
-                _ => Ok(()),
-            };
+            }
+            "save-read-only" | "save-elevated" | "reload-changed" => {
+                if letter == "y" {
+                    self.prompt = None;
+                    self.confirm_pending(&kind)?;
+                } else if letter == "n" || cancel || k.key == "Enter" {
+                    self.prompt = None;
+                    self.pending_retry = None;
+                    self.quit_after_save = false;
+                    self.status = "Save cancelled".into();
+                }
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+    fn key(&mut self, k: Key) -> Result<()> {
+        if self.choice_key(&k)? {
+            return Ok(());
         }
         if self.prompt.as_ref().is_some_and(|p| p.kind == "settings") {
             return self.settings_key(&k);
@@ -1766,10 +1987,11 @@ impl App {
                     value.truncate(at);
                 }
                 _ if !k.ctrl && !k.alt => {
+                    let text = k.text.replace(['\r', '\n'], "");
                     if p.field == 0 {
-                        p.input.push_str(&k.text);
+                        p.input.push_str(&text);
                     } else {
-                        p.replacement.push_str(&k.text);
+                        p.replacement.push_str(&text);
                     }
                 }
                 _ => {}
@@ -1845,53 +2067,37 @@ impl App {
                 }
             }
             Some(View::Editor(id)) => {
-                let v = self.views[&id].clone();
-                let text = &self.documents[&v.document].text;
-                let (row, col) =
-                    self.documents[&v.document].line_col(v.cursor, self.preferences.indent_width);
-                let movement = match k.key.as_str() {
-                    "Left" => Some(previous(text, v.cursor)),
-                    "Right" => Some(next(text, v.cursor)),
-                    "Up" => Some(self.documents[&v.document].at_line_col(
-                        row.saturating_sub(1),
-                        col,
-                        self.preferences.indent_width,
-                    )),
-                    "Down" => Some(self.documents[&v.document].at_line_col(
-                        row + 1,
-                        col,
-                        self.preferences.indent_width,
-                    )),
-                    "Home" => Some(if k.ctrl {
-                        0
-                    } else {
-                        line_start(text, v.cursor)
-                    }),
-                    "End" => Some(if k.ctrl {
-                        text.len()
-                    } else {
-                        line_end(text, v.cursor)
-                    }),
-                    "PageUp" => Some(at_line_col(
-                        text,
-                        row.saturating_sub(v.rows.max(1) as usize),
-                        col,
-                    )),
-                    "PageDown" => Some(at_line_col(text, row + v.rows.max(1) as usize, col)),
+                let name = match k.key.as_str() {
+                    "Left" if k.ctrl => Some("word-left"),
+                    "Right" if k.ctrl => Some("word-right"),
+                    "Left" => Some("move-left"),
+                    "Right" => Some("move-right"),
+                    "Up" => Some("move-up"),
+                    "Down" => Some("move-down"),
+                    "Home" if k.ctrl => Some("document-start"),
+                    "End" if k.ctrl => Some("document-end"),
+                    "Home" => Some("line-start"),
+                    "End" => Some("line-end"),
+                    "PageUp" => Some("page-up"),
+                    "PageDown" => Some("page-down"),
                     _ => None,
                 };
-                if let Some(cursor) = movement {
-                    let view = self.views.get_mut(&id).unwrap();
-                    if k.shift {
-                        view.anchor.get_or_insert(view.cursor);
-                    } else {
-                        view.anchor = None;
-                    }
-                    view.cursor = cursor;
-                    view.manual_scroll = false;
-                    return Ok(());
+                if let Some(name) = name {
+                    return self.move_cursor(id, name, k.shift);
                 }
+                let v = self.views[&id].clone();
+                let text = &self.documents[&v.document].text;
+                let (_, col) =
+                    self.documents[&v.document].line_col(v.cursor, self.preferences.indent_width);
                 match k.key.as_str() {
+                    "Backspace" if k.ctrl && v.anchor.is_none() => {
+                        let start = actions::word_boundary(text, v.cursor, false);
+                        self.edit_range(id, start, v.cursor, "", v.cursor)?;
+                    }
+                    "Delete" if k.ctrl && v.anchor.is_none() => {
+                        let end = actions::word_boundary(text, v.cursor, true);
+                        self.edit_range(id, v.cursor, end, "", v.cursor)?;
+                    }
                     "Backspace" => {
                         if v.anchor.is_none() && v.cursor > 0 {
                             self.views.get_mut(&id).unwrap().anchor =
@@ -1910,13 +2116,12 @@ impl App {
                         }
                     }
                     "Enter" => {
-                        let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
                         let leading = text[line_start(text, v.cursor)..v.cursor]
                             .chars()
                             .take_while(|c| *c == ' ' || *c == '\t')
                             .collect::<String>();
                         let value = format!(
-                            "{newline}{}",
+                            "\n{}",
                             if self.preferences.auto_indent {
                                 leading.as_str()
                             } else {
@@ -1944,8 +2149,18 @@ impl App {
                             self.edit(id, &value)?;
                         }
                     }
-                    "Escape" => self.views.get_mut(&id).unwrap().anchor = None,
-                    _ if !k.ctrl && !k.alt && !k.text.is_empty() => self.edit(id, &k.text)?,
+                    "Escape" => {
+                        let v = self.views.get_mut(&id).unwrap();
+                        v.anchor = None;
+                        v.mark = false;
+                    }
+                    _ if !k.ctrl && !k.alt && !k.text.is_empty() => {
+                        let typed = text_format::normalize_input(&k.text).into_owned();
+                        self.edit(id, &typed)?;
+                        if self.preferences.hard_wrap && !typed.contains('\n') {
+                            self.hard_wrap(id)?;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -2179,6 +2394,7 @@ impl App {
             foreground: self.colors.0.clone(),
             background: self.colors.1.clone(),
             accent: self.colors.3.clone(),
+            selection: self.colors.2.clone(),
             commands: if graphical {
                 vec![]
             } else {
@@ -2288,33 +2504,35 @@ impl App {
         cols: u16,
         graphical: bool,
     ) -> (Screen, Vec<Vec<text_presentation::TextSpan>>) {
-        let v = self.views.get_mut(&id).unwrap();
-        v.rows = rows;
-        v.cols = cols;
-        let text = &self.documents[&v.document].text;
-        let (row, col) =
-            self.documents[&v.document].line_col(v.cursor, self.preferences.indent_width);
-        let gutter = if self.preferences.line_numbers {
-            6usize.min(cols as usize)
-        } else {
-            0
-        };
-        if !v.manual_scroll {
-            if row < v.top {
-                v.top = row;
-            } else if row >= v.top + rows as usize {
-                v.top = row + 1 - rows as usize;
-            }
+        let tab = self.preferences.indent_width;
+        let wrapping = self.preferences.soft_wrap;
+        {
+            let v = self.views.get_mut(&id).unwrap();
+            v.rows = rows;
+            v.cols = cols;
         }
+        let doc_id = self.views[&id].document;
+        let gutter = self.gutter_width(doc_id, cols);
         let usable = (cols as usize).saturating_sub(gutter).max(1);
-        if col < v.left {
-            v.left = col;
-        } else if col >= v.left + usable {
-            v.left = col + 1 - usable;
+        self.ensure_visible(id);
+        let (cursor_line, cursor_row, cursor_col) =
+            self.visual_position(id, self.views[&id].cursor);
+        if !wrapping {
+            // Horizontal scrolling keeps the cursor column visible.
+            let v = self.views.get_mut(&id).unwrap();
+            if cursor_col < v.left {
+                v.left = cursor_col;
+            } else if cursor_col >= v.left + usable {
+                v.left = cursor_col + 1 - usable;
+            }
+        } else {
+            self.views.get_mut(&id).unwrap().left = 0;
         }
-        v.top = v
-            .top
-            .min(self.documents[&v.document].line_count().saturating_sub(1));
+        let visible = self.visible_rows(id, rows as usize);
+        let v = &self.views[&id];
+        let document = &self.documents[&doc_id];
+        let text = &document.text;
+        let left = if wrapping { 0 } else { v.left };
         let selection = v.anchor.map(|a| (a.min(v.cursor), a.max(v.cursor)));
         let mut blank = Cell::text(" ");
         blank.fg = self.colors.0.clone();
@@ -2325,63 +2543,93 @@ impl App {
             vec![vec![blank; cols as usize]; rows as usize]
         };
         let mut decorations = vec![vec![]; rows as usize];
-        let mut visible_lines = 0;
         let token_data = self
             .tokens
-            .get(&v.document)
-            .filter(|(generation, _, _)| *generation == self.documents[&v.document].generation);
+            .get(&doc_id)
+            .filter(|(generation, _, _)| *generation == document.generation);
         let tokens = token_data.map(|(_, _, t)| t.as_slice()).unwrap_or(&[]);
-        let mut token_index =
-            tokens.partition_point(|t| t.end <= self.documents[&v.document].line_offset(v.top));
         let matches = self.search.regex().ok();
-        let start = self.documents[&v.document].line_offset(v.top);
-        let mut byte = start;
-        for (y, line) in text[start..].split('\n').take(rows as usize).enumerate() {
-            visible_lines = y + 1;
+        let match_margin = self.search.query.len() * 4 + 4;
+        let mut cursor = None;
+        for (y, (line, row_index, row)) in visible.iter().enumerate() {
+            let (line_start_byte, line_end_byte) = document.line_range(*line);
+            let line_text = &text[line_start_byte..line_end_byte];
             if graphical {
                 cells[y].resize_with(gutter, || Cell::text(" "));
             }
-            let number = format!("{:>4}  ", v.top + y + 1);
-            for (x, c) in number.chars().take(gutter).enumerate() {
-                cells[y][x] = Cell::text(c.to_string());
-                cells[y][x].fg = self.colors.0.clone();
-                cells[y][x].bg = self.colors.1.clone();
+            if gutter > 0 {
+                let number = if row.start == 0 {
+                    format!("{:>width$}  ", line + 1, width = gutter.saturating_sub(2))
+                } else {
+                    " ".repeat(gutter)
+                };
+                for (x, c) in number.chars().take(gutter).enumerate() {
+                    cells[y][x] = Cell::text(c.to_string());
+                    cells[y][x].fg = self.colors.0.clone();
+                    cells[y][x].bg = self.colors.1.clone();
+                }
             }
+            // The first byte to draw: the row start, or the horizontal scroll column.
+            let first = if wrapping {
+                row.start
+            } else {
+                document::column_offset(line_text, left, tab)
+            };
+            let mut x = if wrapping {
+                row.col
+            } else {
+                document::display_width_with_tabs(&line_text[..first], tab)
+            };
+            let origin = if wrapping { row.col } else { left };
+            let segment_end = if wrapping { row.end } else { line_text.len() };
+            // Search only near the visible part of very long lines.
+            let window_end = {
+                let mut end = (first + usable * 4 + match_margin).min(segment_end);
+                while !line_text.is_char_boundary(end) {
+                    end += 1;
+                }
+                end
+            };
+            let window_start = {
+                let mut start = first.saturating_sub(match_margin);
+                while !line_text.is_char_boundary(start) {
+                    start -= 1;
+                }
+                start
+            };
             let ranges = matches
                 .as_ref()
                 .map(|r| {
-                    r.find_iter(line)
-                        .map(|m| (m.start(), m.end()))
+                    r.find_iter(&line_text[window_start..window_end])
+                        .map(|m| (window_start + m.start(), window_start + m.end()))
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
             let mut match_index = 0;
-            let mut x = 0;
-            for (i, g) in line.grapheme_indices(true) {
-                if g == "\r" {
+            let mut token_index = tokens.partition_point(|t| t.end <= line_start_byte + first);
+            for (offset_in_segment, g) in line_text[first..segment_end].grapheme_indices(true) {
+                let i = first + offset_in_segment;
+                if g == "\r" || g == "\r\n" {
                     continue;
                 }
-                let width = if g == "\t" {
-                    self.preferences.indent_width - x % self.preferences.indent_width
-                } else {
-                    UnicodeWidthStr::width(g).max(1)
-                };
+                let width = document::grapheme_width(g, x, tab);
                 for offset in 0..width {
                     let column = x + offset;
-                    if column >= v.left && column - v.left + gutter < cols as usize {
+                    if column >= origin && column - origin + gutter < cols as usize {
                         let mut c = Cell::text(if g == "\t" || offset > 0 {
                             " ".to_string()
                         } else {
                             g.chars()
-                                .map(|c| if c.is_control() { '�' } else { c })
+                                .map(|c| if c.is_control() { '\u{fffd}' } else { c })
                                 .collect()
                         });
                         c.fg = self.colors.0.clone();
                         c.bg = self.colors.1.clone();
-                        while token_index < tokens.len() && tokens[token_index].end <= byte + i {
+                        let absolute = line_start_byte + i;
+                        while token_index < tokens.len() && tokens[token_index].end <= absolute {
                             token_index += 1;
                         }
-                        if let Some(token) = tokens.get(token_index).filter(|t| t.start <= byte + i)
+                        if let Some(token) = tokens.get(token_index).filter(|t| t.start <= absolute)
                         {
                             c.fg = token.fg.clone();
                             c.bold = token.bold;
@@ -2396,9 +2644,9 @@ impl App {
                         c.wide = width == 2 && g != "\t" && offset == 0;
                         c.continuation = width == 2 && g != "\t" && offset == 1;
                         let selected = selection
-                            .map(|(a, b)| byte + i >= a && byte + i < b)
+                            .map(|(a, b)| absolute >= a && absolute < b)
                             .unwrap_or(false);
-                        let position = column - v.left + gutter;
+                        let position = column - origin + gutter;
                         if matched || selected {
                             if graphical {
                                 let mut decoration = c.clone();
@@ -2431,27 +2679,32 @@ impl App {
                     }
                 }
                 x += width;
-                if x >= v.left + usable {
+                if x >= origin + usable {
                     break;
                 }
             }
-            byte += line.len() + 1;
+            if *line == cursor_line && *row_index == cursor_row {
+                let column = if wrapping {
+                    cursor_col
+                } else {
+                    cursor_col.saturating_sub(left)
+                };
+                if wrapping || cursor_col >= left {
+                    cursor = Some((
+                        y as u16,
+                        (column + gutter).min((cols as usize).saturating_sub(1)) as u16,
+                    ));
+                }
+            }
         }
         if graphical {
-            cells.truncate(visible_lines);
-            decorations.truncate(visible_lines);
+            cells.truncate(visible.len());
+            decorations.truncate(visible.len());
         }
         (
             Screen {
                 cells,
-                cursor: if row >= v.top && row < v.top + rows as usize && col >= v.left {
-                    Some((
-                        (row - v.top) as u16,
-                        ((col - v.left) + gutter).min(cols as usize - 1) as u16,
-                    ))
-                } else {
-                    None
-                },
+                cursor,
                 rows,
                 cols,
             },
@@ -2664,23 +2917,76 @@ impl App {
             "commit" => Some(Command::GitCommit {
                 message: args.into(),
             }),
+            "save-all" => Some(Command::SaveAll { quit: false }),
+            "save-all-quit" => Some(Command::SaveAll { quit: true }),
+            verb if ACTION_VERBS.contains(&verb) => Some(Command::Action {
+                name: verb.into(),
+                argument: args.into(),
+            }),
             _ => None,
         }
     }
 }
 
+/// Command-line verbs handled by `actions.rs`.
+const ACTION_VERBS: &[&str] = &[
+    "move-left",
+    "move-right",
+    "move-up",
+    "move-down",
+    "word-left",
+    "word-right",
+    "line-start",
+    "line-end",
+    "page-up",
+    "page-down",
+    "document-start",
+    "document-end",
+    "mark",
+    "cut-line",
+    "copy-line",
+    "uncut",
+    "justify",
+    "word-count",
+    "location",
+    "spell-check",
+    "next-misspelling",
+    "help",
+    "insert-file",
+    "reload",
+    "reopen-encoding",
+    "set-encoding",
+    "set-line-ending",
+    "toggle-bom",
+    "toggle-read-only",
+    "toggle-soft-wrap",
+    "toggle-line-numbers",
+    "toggle-mouse",
+    "toggle-backup",
+    "suspend",
+];
 pub fn key_chord(k: &Key) -> String {
+    // Shift is implied by shifted punctuation such as `}` or `_`, and
+    // terminals disagree about reporting it, so it is not part of the chord.
+    let mut chars = k.key.chars();
+    let punctuation =
+        matches!((chars.next(), chars.next()), (Some(c), None) if !c.is_alphanumeric());
     format!(
         "{}{}{}{}",
         if k.ctrl { "Ctrl+" } else { "" },
         if k.alt { "Alt+" } else { "" },
-        if k.shift { "Shift+" } else { "" },
+        if k.shift && !punctuation {
+            "Shift+"
+        } else {
+            ""
+        },
         k.key.to_lowercase()
     )
 }
 impl App {
-    fn finish_open(&mut self, pane: u64, d: Document) {
+    fn finish_open(&mut self, pane: u64, mut d: Document) {
         let path = d.path.clone();
+        let notice = d.notice.take();
         let doc = if let Some((id, _)) = self.documents.iter().find(|(_, old)| old.path == path) {
             *id
         } else {
@@ -2707,50 +3013,96 @@ impl App {
             );
             self.add_tab(View::Editor(id));
         }
-        self.status = format!("Opened {}", path.unwrap().display());
+        self.status = format!(
+            "Opened {}{}",
+            path.unwrap().display(),
+            notice.map(|n| format!(" · {n}")).unwrap_or_default()
+        );
         self.workspace_dirty = true;
     }
     fn location(&self) -> String {
         if let Some(id) = self.active_editor() {
             let v = &self.views[&id];
-            let (line, col) = document::line_col_with_tabs(
-                &self.documents[&v.document].text,
-                v.cursor,
-                self.preferences.indent_width,
-            );
-            format!(
-                "Ln {}, Col {} · {} {}",
-                line + 1,
-                col + 1,
-                if self.preferences.insert_spaces {
-                    "Spaces"
-                } else {
-                    "Tabs"
-                },
-                self.preferences.indent_width
-            )
+            let d = &self.documents[&v.document];
+            let (line, col) = d.line_col(v.cursor, self.preferences.indent_width);
+            let mut parts = vec![
+                format!("Ln {}, Col {}", line + 1, col + 1),
+                format!(
+                    "{} {}",
+                    if self.preferences.insert_spaces {
+                        "Spaces"
+                    } else {
+                        "Tabs"
+                    },
+                    self.preferences.indent_width
+                ),
+                d.format.label(),
+            ];
+            if d.read_only || d.file_read_only {
+                parts.push("Read-only".into());
+            }
+            if v.mark {
+                parts.push("Mark".into());
+            }
+            if self.preferences.soft_wrap {
+                parts.push("Wrap".into());
+            }
+            parts.join(" · ")
         } else {
             self.focused_kind().into()
         }
     }
     fn hints(&self) -> String {
-        let map = match self.focused_kind() {
-            "editor" => &self.preferences.editor_keys,
-            "terminal" => &self.preferences.terminal_keys,
-            _ => &self.preferences.global_keys,
+        let kind = self.focused_kind();
+        let lookup = |verb: &str| {
+            let scoped = match kind {
+                "editor" => Some(&self.preferences.editor_keys),
+                "terminal" => Some(&self.preferences.terminal_keys),
+                _ => None,
+            };
+            scoped
+                .into_iter()
+                .chain([&self.preferences.global_keys])
+                .find_map(|map| map.iter().find(|(_, v)| v.as_str() == verb))
+                .map(|(key, _)| key.clone())
         };
-        let verbs = match self.focused_kind() {
+        if self.preferences.keymap == "nano" && kind == "editor" {
+            // nano's two-line shortcut list, condensed to one line.
+            let caret = |key: String| {
+                let key = key.replace("Ctrl+", "^").replace("Alt+", "M-");
+                match key.rsplit_once(['^', '-']) {
+                    Some((prefix, letter)) if letter.len() == 1 => {
+                        format!("{}{}", &key[..=prefix.len()], letter.to_uppercase())
+                    }
+                    _ => key,
+                }
+            };
+            return [
+                ("help", "Help"),
+                ("save", "Write Out"),
+                ("prompt-find", "Where Is"),
+                ("cut-line", "Cut"),
+                ("uncut", "Paste"),
+                ("quit", "Exit"),
+                ("insert-file", "Read File"),
+                ("prompt-replace", "Replace"),
+                ("justify", "Justify"),
+                ("spell-check", "Spell"),
+                ("prompt-goto", "Go To Line"),
+                ("location", "Location"),
+            ]
+            .iter()
+            .filter_map(|(verb, label)| lookup(verb).map(|key| format!("{} {label}", caret(key))))
+            .collect::<Vec<_>>()
+            .join("  ");
+        }
+        let verbs = match kind {
             "editor" => vec!["save", "prompt-find"],
             "terminal" => vec!["copy", "paste"],
             _ => vec!["next-pane", "next-tab"],
         };
         let mut hints = vec!["F1 commands".to_string(), "F6 pane".to_string()];
-        if let Some((key, _)) = self
-            .preferences
-            .global_keys
-            .iter()
-            .find(|(_, v)| v.as_str() == "toggle-workspace")
-        {
+        if let Some(key) = lookup("toggle-workspace") {
             hints.push(format!(
                 "{key} {}",
                 if self.editor_only {
@@ -2761,22 +3113,17 @@ impl App {
             ));
         }
         for verb in verbs {
-            if let Some((key, _)) = map.iter().find(|(_, v)| v.as_str() == verb) {
+            if let Some(key) = lookup(verb) {
                 hints.push(format!("{key} {}", verb.trim_start_matches("prompt-")));
             }
         }
-        if let Some((key, _)) = self
-            .preferences
-            .global_keys
-            .iter()
-            .find(|(_, v)| v.as_str() == "quit")
-        {
+        if let Some(key) = lookup("quit") {
             hints.push(format!("{key} quit"));
         }
-        if self.focused_kind() == "git" {
+        if kind == "git" {
             hints.push("Enter diff · S stage · U unstage · C commit · R refresh".into());
         }
-        if self.focused_kind() == "terminal" {
+        if kind == "terminal" {
             hints.push("Shift-drag selects · Shift-wheel scrollback".into());
         }
         hints.join(" · ")

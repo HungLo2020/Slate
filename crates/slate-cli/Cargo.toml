@@ -10,3 +10,4 @@ ratatui = "0.30"
 crossterm = "0.29"
 
 base64 = "0.22"
+libc = "0.2"

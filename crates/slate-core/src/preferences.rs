@@ -30,39 +30,67 @@ pub struct Preferences {
     pub theme: String,
     pub file_startup: StartupMode,
     pub directory_startup: StartupMode,
+    /// `default` or `nano`. Choosing a keymap replaces the key tables below.
+    pub keymap: String,
+    /// Wrap long lines at the window edge instead of scrolling horizontally.
+    pub soft_wrap: bool,
+    /// Column used by justify and hard wrapping.
+    pub wrap_column: usize,
+    /// Break lines automatically while typing past `wrap_column`.
+    pub hard_wrap: bool,
+    /// Keep the previous file contents as `NAME~` when saving.
+    pub backup: bool,
+    /// Restore unsaved buffers of individually opened files after a crash.
+    /// Directory workspaces always keep recovery checkpoints.
+    pub file_recovery: bool,
+    /// Capture the mouse in the terminal interface. Off leaves selection to
+    /// the outer terminal.
+    pub tui_mouse: bool,
     pub global_keys: BTreeMap<String, String>,
     pub editor_keys: BTreeMap<String, String>,
     pub terminal_keys: BTreeMap<String, String>,
 }
-impl Default for Preferences {
-    fn default() -> Self {
-        let keys = |entries: &[(&str, &str)]| {
-            entries
-                .iter()
-                .map(|(a, b)| (a.to_string(), b.to_string()))
-                .collect()
-        };
-        Self {
-            indent_width: 4,
-            insert_spaces: true,
-            auto_indent: true,
-            line_numbers: true,
-            theme: "auto".into(),
-            file_startup: StartupMode::EditorOnly,
-            directory_startup: StartupMode::Workspace,
-            global_keys: keys(&[
-                ("f6", "next-pane"),
-                ("f7", "next-tab"),
-                ("f8", "terminal"),
-                ("f9", "split-right"),
-                ("Shift+f9", "split-down"),
-                ("f10", "toggle-workspace"),
-                ("Ctrl+,", "settings"),
+
+fn keys(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+    entries
+        .iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect()
+}
+const TERMINAL_KEYS: &[(&str, &str)] = &[
+    ("Ctrl+Shift+c", "copy"),
+    ("Ctrl+Shift+v", "paste"),
+    ("Alt+c", "copy"),
+    ("Alt+v", "paste"),
+];
+const COMMON_GLOBAL_KEYS: &[(&str, &str)] = &[
+    ("f6", "next-pane"),
+    ("f7", "next-tab"),
+    ("f8", "terminal"),
+    ("f9", "split-right"),
+    ("Shift+f9", "split-down"),
+    ("f10", "toggle-workspace"),
+    ("Ctrl+,", "settings"),
+];
+
+/// Key tables for a named keymap: (global, editor, terminal).
+#[allow(clippy::type_complexity)]
+pub fn keymap(
+    name: &str,
+) -> Result<(
+    BTreeMap<String, String>,
+    BTreeMap<String, String>,
+    BTreeMap<String, String>,
+)> {
+    let mut global = keys(COMMON_GLOBAL_KEYS);
+    let editor = match name {
+        "default" => {
+            global.extend(keys(&[
                 ("Ctrl+q", "quit"),
                 ("Ctrl+o", "open"),
                 ("Ctrl+Shift+o", "open-folder"),
-            ]),
-            editor_keys: keys(&[
+            ]));
+            keys(&[
                 ("Ctrl+s", "save"),
                 ("Ctrl+Shift+s", "save-as"),
                 ("Ctrl+w", "close"),
@@ -81,31 +109,235 @@ impl Default for Preferences {
                 ("Shift+f3", "find-previous"),
                 ("Ctrl+]", "indent"),
                 ("Ctrl+[", "outdent"),
-            ]),
-            terminal_keys: keys(&[
-                ("Ctrl+Shift+c", "copy"),
-                ("Ctrl+Shift+v", "paste"),
-                ("Alt+c", "copy"),
-                ("Alt+v", "paste"),
-            ]),
+                ("Alt+z", "toggle-soft-wrap"),
+            ])
+        }
+        // GNU nano's default bindings (nano 7), mapped onto Slate's actions.
+        "nano" => {
+            global.extend(keys(&[
+                ("Ctrl+x", "quit"),
+                ("Ctrl+r", "insert-file"),
+                ("Ctrl+g", "help"),
+                ("Ctrl+z", "suspend"),
+                ("Alt+m", "toggle-mouse"),
+                ("Alt+s", "toggle-soft-wrap"),
+                ("Alt+n", "toggle-line-numbers"),
+                ("Alt+b", "toggle-backup"),
+            ]));
+            keys(&[
+                ("Ctrl+o", "save"),
+                ("Ctrl+s", "save"),
+                ("Ctrl+w", "prompt-find"),
+                ("Ctrl+q", "find-previous"),
+                ("Alt+w", "find-next"),
+                ("Alt+q", "find-previous"),
+                ("f3", "find-next"),
+                ("Ctrl+\\", "prompt-replace"),
+                ("Alt+r", "prompt-replace"),
+                ("Ctrl+k", "cut-line"),
+                ("Ctrl+u", "uncut"),
+                ("Alt+6", "copy-line"),
+                ("Alt+a", "mark"),
+                ("Ctrl+6", "mark"),
+                ("Ctrl+j", "justify"),
+                ("Ctrl+t", "spell-check"),
+                ("Ctrl+c", "location"),
+                ("Alt+d", "word-count"),
+                ("Ctrl+_", "prompt-goto"),
+                ("Alt+g", "prompt-goto"),
+                ("Alt+u", "undo"),
+                ("Alt+e", "redo"),
+                ("Ctrl+a", "line-start"),
+                ("Ctrl+e", "line-end"),
+                ("Ctrl+f", "move-right"),
+                ("Ctrl+b", "move-left"),
+                ("Ctrl+p", "move-up"),
+                ("Ctrl+n", "move-down"),
+                ("Ctrl+y", "page-up"),
+                ("Ctrl+v", "page-down"),
+                ("Alt+\\", "document-start"),
+                ("Alt+/", "document-end"),
+                ("Alt+}", "indent"),
+                ("Alt+{", "outdent"),
+                ("Ctrl+]", "indent"),
+            ])
+        }
+        _ => bail!("keymap must be default or nano"),
+    };
+    Ok((global, editor, keys(TERMINAL_KEYS)))
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        let (global_keys, editor_keys, terminal_keys) = keymap("default").unwrap();
+        Self {
+            indent_width: 4,
+            insert_spaces: true,
+            auto_indent: true,
+            line_numbers: true,
+            theme: "auto".into(),
+            file_startup: StartupMode::EditorOnly,
+            directory_startup: StartupMode::Workspace,
+            keymap: "default".into(),
+            soft_wrap: false,
+            wrap_column: 80,
+            hard_wrap: false,
+            backup: false,
+            file_recovery: false,
+            tui_mouse: true,
+            global_keys,
+            editor_keys,
+            terminal_keys,
         }
     }
 }
+
+/// How a setting is presented and changed in the TUI settings list.
+pub enum SettingKind {
+    Bool,
+    Number(usize, usize),
+    Choice(&'static [&'static str]),
+}
+pub struct Setting {
+    pub name: &'static str,
+    pub label: &'static str,
+    pub kind: SettingKind,
+}
+pub const SETTINGS: &[Setting] = &[
+    Setting {
+        name: "file-startup",
+        label: "Opening a file",
+        kind: SettingKind::Choice(&["editor-only", "workspace"]),
+    },
+    Setting {
+        name: "directory-startup",
+        label: "Opening a directory",
+        kind: SettingKind::Choice(&["editor-only", "workspace"]),
+    },
+    Setting {
+        name: "indent-width",
+        label: "Indent width",
+        kind: SettingKind::Number(1, 16),
+    },
+    Setting {
+        name: "insert-spaces",
+        label: "Insert spaces",
+        kind: SettingKind::Bool,
+    },
+    Setting {
+        name: "auto-indent",
+        label: "Auto indent",
+        kind: SettingKind::Bool,
+    },
+    Setting {
+        name: "line-numbers",
+        label: "Line numbers",
+        kind: SettingKind::Bool,
+    },
+    Setting {
+        name: "theme",
+        label: "Theme",
+        kind: SettingKind::Choice(&["auto", "dark", "light"]),
+    },
+    Setting {
+        name: "keymap",
+        label: "Keymap",
+        kind: SettingKind::Choice(&["default", "nano"]),
+    },
+    Setting {
+        name: "soft-wrap",
+        label: "Soft wrap long lines",
+        kind: SettingKind::Bool,
+    },
+    Setting {
+        name: "wrap-column",
+        label: "Wrap column (justify / hard wrap)",
+        kind: SettingKind::Number(10, 500),
+    },
+    Setting {
+        name: "hard-wrap",
+        label: "Hard wrap while typing",
+        kind: SettingKind::Bool,
+    },
+    Setting {
+        name: "backup",
+        label: "Keep backup (NAME~) on save",
+        kind: SettingKind::Bool,
+    },
+    Setting {
+        name: "file-recovery",
+        label: "Recover unsaved single files",
+        kind: SettingKind::Bool,
+    },
+    Setting {
+        name: "tui-mouse",
+        label: "Terminal UI captures mouse",
+        kind: SettingKind::Bool,
+    },
+];
+
 impl Preferences {
-    pub fn menu_items(&self) -> Vec<(&'static str, String)> {
-        let mode = |value| match value {
-            StartupMode::EditorOnly => "Editor only",
-            StartupMode::Workspace => "Full workspace",
+    pub fn value(&self, name: &str) -> String {
+        let mode = |m: StartupMode| match m {
+            StartupMode::EditorOnly => "editor-only",
+            StartupMode::Workspace => "workspace",
         };
-        vec![
-            ("Opening a file", mode(self.file_startup).into()),
-            ("Opening a directory", mode(self.directory_startup).into()),
-            ("Indent width", self.indent_width.to_string()),
-            ("Insert spaces", self.insert_spaces.to_string()),
-            ("Auto indent", self.auto_indent.to_string()),
-            ("Line numbers", self.line_numbers.to_string()),
-            ("Theme", self.theme.clone()),
-        ]
+        match name {
+            "file-startup" => mode(self.file_startup).into(),
+            "directory-startup" => mode(self.directory_startup).into(),
+            "indent-width" => self.indent_width.to_string(),
+            "insert-spaces" => self.insert_spaces.to_string(),
+            "auto-indent" => self.auto_indent.to_string(),
+            "line-numbers" => self.line_numbers.to_string(),
+            "theme" => self.theme.clone(),
+            "keymap" => self.keymap.clone(),
+            "soft-wrap" => self.soft_wrap.to_string(),
+            "wrap-column" => self.wrap_column.to_string(),
+            "hard-wrap" => self.hard_wrap.to_string(),
+            "backup" => self.backup.to_string(),
+            "file-recovery" => self.file_recovery.to_string(),
+            "tui-mouse" => self.tui_mouse.to_string(),
+            _ => String::new(),
+        }
+    }
+    pub fn menu_items(&self) -> Vec<(&'static str, String)> {
+        SETTINGS
+            .iter()
+            .map(|s| {
+                let value = self.value(s.name);
+                (
+                    s.label,
+                    match value.as_str() {
+                        "editor-only" => "Editor only".into(),
+                        "workspace" => "Full workspace".into(),
+                        _ => value,
+                    },
+                )
+            })
+            .collect()
+    }
+    /// The value a settings-list step produces.
+    pub fn stepped(&self, index: usize, backwards: bool) -> Option<(&'static str, String)> {
+        let setting = SETTINGS.get(index)?;
+        let current = self.value(setting.name);
+        let value = match setting.kind {
+            SettingKind::Bool => (current != "true").to_string(),
+            SettingKind::Number(min, max) => {
+                let n: usize = current.parse().unwrap_or(min);
+                if backwards {
+                    n.saturating_sub(1).max(min)
+                } else {
+                    (n + 1).min(max)
+                }
+                .to_string()
+            }
+            SettingKind::Choice(options) => {
+                let i = options.iter().position(|o| *o == current).unwrap_or(0);
+                let n = options.len();
+                options[(i + if backwards { n - 1 } else { 1 }) % n].to_string()
+            }
+        };
+        Some((setting.name, value))
     }
     pub fn path() -> PathBuf {
         crate::paths::config_dir().join("settings.toml")
@@ -117,6 +349,12 @@ impl Preferences {
         if !["auto", "dark", "light"].contains(&self.theme.as_str()) {
             bail!("theme must be auto, dark or light");
         }
+        if !["default", "nano"].contains(&self.keymap.as_str()) {
+            bail!("keymap must be default or nano");
+        }
+        if !(10..=500).contains(&self.wrap_column) {
+            bail!("wrap_column must be 10–500");
+        }
         if self.global_keys.len() + self.editor_keys.len() + self.terminal_keys.len() > 256 {
             bail!("Too many key bindings");
         }
@@ -127,30 +365,46 @@ impl Preferences {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let mut settings: Self =
-            toml::from_str(&fs::read_to_string(path)?).context("Invalid settings.toml")?;
+        let source = fs::read_to_string(path)?;
+        let table: toml::Table = toml::from_str(&source).context("Invalid settings.toml")?;
+        let mut settings: Self = toml::from_str(&source).context("Invalid settings.toml")?;
+        // Key tables the file omits come from its chosen keymap.
+        let (global, editor, terminal) = keymap(&settings.keymap)?;
+        for (name, preset, field) in [
+            ("global_keys", global, &mut settings.global_keys),
+            ("editor_keys", editor, &mut settings.editor_keys),
+            ("terminal_keys", terminal, &mut settings.terminal_keys),
+        ] {
+            if !table.contains_key(name) {
+                *field = preset;
+            }
+        }
         // Settings saved by older releases contain the old complete key map.
         // Add the new defaults while preserving explicit user assignments.
-        for (key, action) in [
-            ("f10", "toggle-workspace"),
-            ("Ctrl+,", "settings"),
-            ("Ctrl+q", "quit"),
-            ("Ctrl+o", "open"),
-            ("Ctrl+Shift+o", "open-folder"),
-        ] {
-            settings
-                .global_keys
-                .entry(key.into())
-                .or_insert_with(|| action.into());
+        if settings.keymap == "default" {
+            for (key, action) in [
+                ("f10", "toggle-workspace"),
+                ("Ctrl+,", "settings"),
+                ("Ctrl+q", "quit"),
+                ("Ctrl+o", "open"),
+                ("Ctrl+Shift+o", "open-folder"),
+            ] {
+                settings
+                    .global_keys
+                    .entry(key.into())
+                    .or_insert_with(|| action.into());
+            }
+            for (key, action) in [
+                ("Ctrl+Shift+s", "save-as"),
+                ("Ctrl+w", "close"),
+                ("Alt+z", "toggle-soft-wrap"),
+            ] {
+                settings
+                    .editor_keys
+                    .entry(key.into())
+                    .or_insert_with(|| action.into());
+            }
         }
-        settings
-            .editor_keys
-            .entry("Ctrl+Shift+s".into())
-            .or_insert_with(|| "save-as".into());
-        settings
-            .editor_keys
-            .entry("Ctrl+w".into())
-            .or_insert_with(|| "close".into());
         settings.validate()?;
         Ok(settings)
     }
@@ -170,58 +424,18 @@ use crate::App;
 
 impl App {
     pub(super) fn settings_key(&mut self, key: &crate::Key) -> Result<()> {
-        let count = self.preferences.menu_items().len();
+        let count = SETTINGS.len();
         let prompt = self.prompt.as_mut().unwrap();
         match key.key.as_str() {
             "Escape" => self.prompt = None,
             "Up" => prompt.field = (prompt.field + count - 1) % count,
             "Down" | "Tab" => prompt.field = (prompt.field + 1) % count,
             "Left" | "Right" | "Enter" | "Space" | " " => {
-                let backwards = key.key == "Left";
-                let toggle_mode = |mode| {
-                    if mode == StartupMode::EditorOnly {
-                        "workspace"
-                    } else {
-                        "editor-only"
-                    }
-                };
-                let (name, value) = match prompt.field {
-                    0 => (
-                        "file-startup",
-                        toggle_mode(self.preferences.file_startup).into(),
-                    ),
-                    1 => (
-                        "directory-startup",
-                        toggle_mode(self.preferences.directory_startup).into(),
-                    ),
-                    2 => (
-                        "indent-width",
-                        (if backwards {
-                            self.preferences.indent_width.saturating_sub(1).max(1)
-                        } else {
-                            (self.preferences.indent_width + 1).min(16)
-                        })
-                        .to_string(),
-                    ),
-                    3 => (
-                        "insert-spaces",
-                        (!self.preferences.insert_spaces).to_string(),
-                    ),
-                    4 => ("auto-indent", (!self.preferences.auto_indent).to_string()),
-                    5 => ("line-numbers", (!self.preferences.line_numbers).to_string()),
-                    _ => {
-                        let themes = ["auto", "dark", "light"];
-                        let current = themes
-                            .iter()
-                            .position(|t| *t == self.preferences.theme)
-                            .unwrap_or(0);
-                        (
-                            "theme",
-                            themes[(current + if backwards { 2 } else { 1 }) % 3].into(),
-                        )
-                    }
-                };
-                self.configure(name, &value)?;
+                if let Some((name, value)) =
+                    self.preferences.stepped(prompt.field, key.key == "Left")
+                {
+                    self.configure(name, &value)?;
+                }
             }
             _ => {}
         }
@@ -263,15 +477,40 @@ impl App {
     }
     pub(super) fn configure(&mut self, name: &str, value: &str) -> Result<()> {
         let mut settings = self.preferences.clone();
+        let flag = |value: &str| -> Result<bool> {
+            value
+                .parse()
+                .map_err(|_| anyhow::anyhow!("{name} must be true or false"))
+        };
         match name {
             "indent-width" => settings.indent_width = value.parse()?,
-            "insert-spaces" => settings.insert_spaces = value.parse()?,
-            "auto-indent" => settings.auto_indent = value.parse()?,
-            "line-numbers" => settings.line_numbers = value.parse()?,
+            "insert-spaces" => settings.insert_spaces = flag(value)?,
+            "auto-indent" => settings.auto_indent = flag(value)?,
+            "line-numbers" => settings.line_numbers = flag(value)?,
             "theme" => settings.theme = value.into(),
             "file-startup" => settings.file_startup = value.parse()?,
             "directory-startup" => settings.directory_startup = value.parse()?,
-            _ => bail!("Options: indent-width, insert-spaces, auto-indent, line-numbers, theme, file-startup, directory-startup"),
+            "keymap" => {
+                let (global, editor, terminal) = keymap(value)?;
+                settings.keymap = value.into();
+                settings.global_keys = global;
+                settings.editor_keys = editor;
+                settings.terminal_keys = terminal;
+            }
+            "soft-wrap" => settings.soft_wrap = flag(value)?,
+            "wrap-column" => settings.wrap_column = value.parse()?,
+            "hard-wrap" => settings.hard_wrap = flag(value)?,
+            "backup" => settings.backup = flag(value)?,
+            "file-recovery" => settings.file_recovery = flag(value)?,
+            "tui-mouse" | "mouse" => settings.tui_mouse = flag(value)?,
+            _ => bail!(
+                "Options: {}",
+                SETTINGS
+                    .iter()
+                    .map(|s| s.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         }
         settings.save()?;
         self.load_preferences();
@@ -281,5 +520,30 @@ impl App {
     pub(super) fn light_theme(&self) -> bool {
         let color = u32::from_str_radix(&self.colors.1[1..], 16).unwrap_or(0);
         ((color >> 16) & 255) * 299 + ((color >> 8) & 255) * 587 + (color & 255) * 114 > 128_000
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keymaps_and_settings_steps() {
+        let (global, editor, _) = keymap("nano").unwrap();
+        assert_eq!(global["Ctrl+x"], "quit");
+        assert_eq!(editor["Ctrl+k"], "cut-line");
+        assert_eq!(editor["Ctrl+w"], "prompt-find");
+        assert!(keymap("emacs").is_err());
+        let p = Preferences::default();
+        assert_eq!(p.menu_items().len(), SETTINGS.len());
+        let keymap_index = SETTINGS.iter().position(|s| s.name == "keymap").unwrap();
+        assert_eq!(p.stepped(keymap_index, false).unwrap().1, "nano");
+        let width = SETTINGS
+            .iter()
+            .position(|s| s.name == "indent-width")
+            .unwrap();
+        assert_eq!(p.stepped(width, true).unwrap().1, "3");
+        let wrap = SETTINGS.iter().position(|s| s.name == "soft-wrap").unwrap();
+        assert_eq!(p.stepped(wrap, false).unwrap().1, "true");
     }
 }

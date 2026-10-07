@@ -13,17 +13,17 @@ Runtime dependencies, including Qt and Kirigami, must never require an exact
 version. Use compatible version ranges or minimum API requirements, versionless
 QML imports, and distro-provided runtime packages.
 
-## One executable, two frontends
+## Two executables, shared core
 
-- `slate` opens the terminal user interface (TUI).
-- `slate-gui` opens the Kirigami graphical interface (GUI).
-- Ship one executable containing both frontends. On Linux, install
-  `slate-gui` as a symlink to `slate` and select the frontend by invocation name.
-- Also support `slate --gui` and `slate --tui` as explicit overrides.
-- Accept a file or workspace directory, such as `slate main.rs` or `slate .`.
-- Terminal mode must work without a graphical session. Packaging must account
-  for any Qt dependencies of the combined executable; one executable does not
-  imply a statically linked, dependency-free application.
+- `slate` opens the terminal user interface (TUI). It must not link Qt, so it
+  runs on servers, over SSH and on minimal systems.
+- `slate-gui` opens the Kirigami graphical interface (GUI) and can also run the
+  TUI with `--tui`.
+- `slate --gui` hands over to `slate-gui`; `slate-gui --tui` runs the TUI.
+- Accept files or a workspace directory, such as `slate main.rs` or `slate .`,
+  plus nano-style `+LINE` positions and `-` for standard input.
+- Packaging keeps Qt optional: the terminal executable's libraries are hard
+  dependencies and the graphical components are recommended.
 
 ## Crate structure and responsibilities
 

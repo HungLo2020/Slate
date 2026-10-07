@@ -1,3 +1,7 @@
+use crate::{
+    fsio::{self, save_error, Baseline, SaveErrorKind, WriteOptions},
+    text_format::{self, TextFormat},
+};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -23,6 +27,7 @@ struct Revision {
 pub struct Document {
     pub path: Option<PathBuf>,
     pub(crate) text: String,
+    /// Editing is disabled: inspection views (with a label) and `--view` files.
     #[serde(default)]
     pub read_only: bool,
     #[serde(default)]
@@ -38,10 +43,27 @@ pub struct Document {
     saved: String,
     #[serde(default)]
     unavailable: bool,
+    /// How the text is stored on disk, and how it was last saved.
+    #[serde(default)]
+    pub format: TextFormat,
+    #[serde(default)]
+    saved_format: TextFormat,
+    /// The disk content this buffer was read from or last written to. `None`
+    /// for untitled buffers and files that do not exist yet.
+    #[serde(default)]
+    pub(crate) disk: Option<Baseline>,
+    /// A recovery entry that stores only a reference to a clean file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) reference: bool,
+    /// The file exists but the current user cannot write it.
+    #[serde(skip)]
+    pub file_read_only: bool,
+    #[serde(skip)]
+    pub notice: Option<String>,
     #[serde(skip)]
     pub generation: u64,
     #[serde(skip)]
-    undo: Vec<Revision>,
+    undo: std::collections::VecDeque<Revision>,
     #[serde(skip)]
     redo: Vec<Revision>,
 }
@@ -84,13 +106,13 @@ impl Document {
             && self
                 .typing_at
                 .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(750))
-            && self.undo.last().is_some_and(|r| {
+            && self.undo.back().is_some_and(|r| {
                 r.removed.is_empty() && r.start + r.inserted.len() == start && r.after == cursor
             });
         self.replace(start, end, value, cursor)?;
         if merge && self.undo.len() >= 2 {
-            let tail = self.undo.pop().unwrap();
-            let prior = self.undo.last_mut().unwrap();
+            let tail = self.undo.pop_back().unwrap();
+            let prior = self.undo.back_mut().unwrap();
             prior.inserted.push_str(&tail.inserted);
             prior.after = tail.after;
         }
@@ -125,21 +147,38 @@ impl Document {
             .copied()
             .unwrap_or(self.text.len())
     }
-    pub fn line_col(&self, cursor: usize, tab: usize) -> (usize, usize) {
+    /// The line containing a byte offset.
+    pub fn line_of(&self, offset: usize) -> usize {
         self.ensure_lines();
         let lines = self.lines.borrow();
-        let starts = &lines.as_ref().unwrap().1;
-        let row = starts
-            .partition_point(|start| *start <= cursor)
-            .saturating_sub(1);
-        (
-            row,
-            display_width_with_tabs(&self.text[starts[row]..cursor], tab),
-        )
+        lines
+            .as_ref()
+            .unwrap()
+            .1
+            .partition_point(|start| *start <= offset)
+            .saturating_sub(1)
+    }
+    /// Byte range of a line, excluding its line break.
+    pub fn line_range(&self, row: usize) -> (usize, usize) {
+        let start = self.line_offset(row);
+        let end = if row + 1 < self.line_count() {
+            self.line_offset(row + 1) - 1
+        } else {
+            self.text.len()
+        };
+        (start, end.max(start))
+    }
+    pub fn line_col(&self, cursor: usize, tab: usize) -> (usize, usize) {
+        let row = self.line_of(cursor);
+        let start = self.line_offset(row);
+        (row, display_width_with_tabs(&self.text[start..cursor], tab))
     }
     pub fn at_line_col(&self, row: usize, col: usize, tab: usize) -> usize {
-        let start = self.line_offset(row);
-        start + at_line_col_with_tabs(&self.text[start..], 0, col, tab)
+        if row >= self.line_count() {
+            return self.text.len();
+        }
+        let (start, end) = self.line_range(row);
+        start + column_offset(&self.text[start..end], col, tab)
     }
     fn replace_text(&mut self, start: usize, end: usize, value: &str) {
         self.ensure_lines();
@@ -174,33 +213,70 @@ impl Document {
             text: String::new(),
             saved: String::new(),
             unavailable: false,
+            format: TextFormat::default(),
+            saved_format: TextFormat::default(),
+            disk: None,
+            reference: false,
+            file_read_only: false,
+            notice: None,
             generation: 0,
-            undo: vec![],
+            undo: Default::default(),
             redo: vec![],
         }
     }
+    /// A named buffer for a path that does not exist yet; saving creates it.
+    pub fn new_file(path: &Path) -> Result<Self> {
+        let path = absolute(path)?;
+        if path.is_dir() {
+            bail!("{} is a directory", path.display());
+        }
+        let mut document = Self::scratch();
+        document.notice = Some(format!("New file {}", path.display()));
+        document.path = Some(path);
+        Ok(document)
+    }
+    /// Text that did not come from a file, such as standard input.
+    pub fn from_bytes(bytes: &[u8], label: &str) -> Result<Self> {
+        if bytes.len() > MAX_FILE_BYTES {
+            bail!("Prototype file limit is 16 MiB");
+        }
+        let decoded = text_format::decode(bytes, None)?;
+        let mut document = Self::scratch();
+        document.text = decoded.text;
+        document.format = decoded.format.clone();
+        document.saved_format = decoded.format;
+        document.notice = Some(
+            decoded
+                .notice
+                .unwrap_or_else(|| format!("Read {} bytes from {label}", bytes.len())),
+        );
+        // Unsaved input: closing the buffer asks before discarding it.
+        Ok(document)
+    }
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_encoding(path, None)
+    }
+    pub fn open_with_encoding(path: &Path, encoding: Option<&str>) -> Result<Self> {
         let path = path.canonicalize().context("Cannot resolve file")?;
-        if fs::metadata(&path)?.len() > MAX_FILE_BYTES as u64 {
+        let meta = fs::metadata(&path)?;
+        if meta.is_dir() {
+            bail!("{} is a directory", path.display());
+        }
+        if meta.len() > MAX_FILE_BYTES as u64 {
             bail!("Prototype file limit is 16 MiB");
         }
         let bytes = fs::read(&path)?;
-        let text = String::from_utf8(bytes).context("Slate currently edits UTF-8 text only")?;
-        Ok(Self {
-            path: Some(path),
-            read_only: false,
-            label: None,
-            lines: Default::default(),
-            dirty_cache: Default::default(),
-            typing_at: None,
-            history_size: 0,
-            saved: text.clone(),
-            unavailable: false,
-            text,
-            generation: 0,
-            undo: vec![],
-            redo: vec![],
-        })
+        let decoded = text_format::decode(&bytes, encoding)?;
+        let mut document = Self::scratch();
+        document.file_read_only = !fsio::writable(&path);
+        document.saved = decoded.text.clone();
+        document.text = decoded.text;
+        document.format = decoded.format.clone();
+        document.saved_format = decoded.format;
+        document.disk = Some(Baseline::of(&bytes));
+        document.notice = decoded.notice;
+        document.path = Some(path);
+        Ok(document)
     }
     pub fn dirty(&self) -> bool {
         if self.read_only {
@@ -211,7 +287,7 @@ impl Document {
                 return dirty;
             }
         }
-        let dirty = self.unavailable || self.text != self.saved;
+        let dirty = self.unavailable || self.text != self.saved || self.format != self.saved_format;
         self.dirty_cache.set(Some((self.generation, dirty)));
         dirty
     }
@@ -225,12 +301,28 @@ impl Document {
             .and_then(|p| p.file_name())
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Untitled".into());
-        format!("{}{}", name, if self.dirty() { " *" } else { "" })
+        format!(
+            "{}{}{}",
+            name,
+            if self.read_only || self.file_read_only {
+                " [RO]"
+            } else {
+                ""
+            },
+            if self.dirty() { " *" } else { "" }
+        )
+    }
+    fn locked(&self) -> Result<()> {
+        if self.read_only {
+            if self.label.is_some() {
+                bail!("This inspection view is read-only");
+            }
+            bail!("Document is open read-only; toggle editing with toggle-read-only");
+        }
+        Ok(())
     }
     pub fn replace(&mut self, start: usize, end: usize, value: &str, cursor: usize) -> Result<()> {
-        if self.read_only {
-            bail!("This inspection view is read-only");
-        }
+        self.locked()?;
         self.typing_at = None;
         if start > end
             || end > self.text.len()
@@ -245,7 +337,7 @@ impl Document {
         if &self.text[start..end] == value {
             return Ok(());
         }
-        self.undo.push(Revision {
+        self.undo.push_back(Revision {
             start,
             removed: self.text[start..end].into(),
             inserted: value.into(),
@@ -260,13 +352,13 @@ impl Document {
         );
         self.history_size += self
             .undo
-            .last()
+            .back()
             .map(|r| r.removed.len() + r.inserted.len())
             .unwrap_or(0);
         while self.undo.len() > 1
             && (self.undo.len() > 10_000 || self.history_size > HISTORY_BUDGET)
         {
-            let r = self.undo.remove(0);
+            let r = self.undo.pop_front().unwrap();
             self.history_size -= r.removed.len() + r.inserted.len();
         }
         self.redo.clear();
@@ -275,7 +367,7 @@ impl Document {
     }
     pub fn undo_change(&self) -> Option<(usize, usize, usize)> {
         self.undo
-            .last()
+            .back()
             .map(|r| (r.start, r.inserted.len(), r.removed.len()))
     }
     pub fn redo_change(&self) -> Option<(usize, usize, usize)> {
@@ -288,7 +380,7 @@ impl Document {
             return None;
         }
         self.typing_at = None;
-        let mut r = self.undo.pop()?;
+        let mut r = self.undo.pop_back()?;
         self.replace_text(r.start, r.start + r.inserted.len(), &r.removed);
         r.after = cursor;
         let position = r.before.min(self.text.len());
@@ -304,31 +396,46 @@ impl Document {
         self.replace_text(r.start, r.start + r.removed.len(), &r.inserted);
         r.before = cursor;
         let position = r.after.min(self.text.len());
-        self.undo.push(r);
+        self.undo.push_back(r);
         Some(position)
     }
+    /// A detached copy of the content and its save state, without history.
     pub fn checkpoint(&self) -> Self {
-        Self {
-            path: self.path.clone(),
-            read_only: self.read_only,
-            label: self.label.clone(),
-            lines: Default::default(),
-            dirty_cache: Default::default(),
-            typing_at: None,
-            history_size: 0,
-            text: self.text.clone(),
-            saved: self.saved.clone(),
-            unavailable: self.unavailable,
-            generation: self.generation,
-            undo: vec![],
-            redo: vec![],
+        let mut copy = Self::scratch();
+        copy.path = self.path.clone();
+        copy.read_only = self.read_only;
+        copy.label = self.label.clone();
+        copy.text = self.text.clone();
+        copy.saved = self.saved.clone();
+        copy.unavailable = self.unavailable;
+        copy.format = self.format.clone();
+        copy.saved_format = self.saved_format.clone();
+        copy.disk = self.disk.clone();
+        copy.generation = self.generation;
+        copy
+    }
+    /// The recovery representation: unsaved buffers keep their text and save
+    /// baseline; clean files are stored only as a path to reopen.
+    pub fn recovery_copy(&self) -> Self {
+        if self.dirty() || self.path.is_none() || self.label.is_some() {
+            return self.checkpoint();
         }
+        let mut copy = Self::scratch();
+        copy.path = self.path.clone();
+        copy.read_only = self.read_only;
+        copy.format = self.format.clone();
+        copy.saved_format = self.format.clone();
+        copy.reference = true;
+        copy
     }
     pub fn accept_save(&mut self, saved: Self) {
         self.unavailable = false;
         self.typing_at = None;
         self.path = saved.path;
         self.saved = saved.saved;
+        self.saved_format = saved.saved_format;
+        self.disk = saved.disk;
+        self.file_read_only = saved.file_read_only;
         self.generation += 1;
     }
     pub fn mark_unavailable(&mut self) {
@@ -341,6 +448,7 @@ impl Document {
     pub fn discard_changes(&mut self) {
         self.unavailable = false;
         self.text = self.saved.clone();
+        self.format = self.saved_format.clone();
         self.generation += 1;
         self.undo.clear();
         self.redo.clear();
@@ -349,6 +457,18 @@ impl Document {
     }
     pub fn history_bytes(&self) -> usize {
         self.history_size
+    }
+    /// Change how the document is stored. The change is saved like an edit.
+    pub fn set_format(&mut self, format: TextFormat) -> Result<()> {
+        self.locked()?;
+        text_format::encode(&self.text, &format)?;
+        self.format = format;
+        self.generation += 1;
+        Ok(())
+    }
+    /// The bytes a save would write.
+    pub fn encoded(&self) -> Result<Vec<u8>> {
+        text_format::encode(&self.text, &self.format)
     }
     pub fn save(&mut self, destination: Option<&Path>) -> Result<()> {
         self.save_with_overwrite(destination, false)
@@ -360,70 +480,78 @@ impl Document {
         destination: Option<&Path>,
         overwrite: bool,
     ) -> Result<()> {
-        if self.read_only {
+        self.save_with_options(destination, overwrite, WriteOptions::default())
+    }
+    pub(crate) fn save_with_options(
+        &mut self,
+        destination: Option<&Path>,
+        overwrite: bool,
+        options: WriteOptions,
+    ) -> Result<()> {
+        if self.label.is_some() {
             bail!("Inspection views cannot be saved");
         }
         self.typing_at = None;
-        let mut path = destination
+        let path = destination
             .map(Path::to_path_buf)
             .or_else(|| self.path.clone())
             .context("Use Save As for an untitled document")?;
-        if path.exists() {
-            path = path.canonicalize()?;
+        let path = if path.exists() {
+            path.canonicalize()?
         } else {
-            path = path
-                .parent()
-                .unwrap_or(Path::new("."))
-                .canonicalize()?
-                .join(path.file_name().context("Missing filename")?);
-        }
+            absolute(&path)?
+        };
         let same = self.path.as_ref() == Some(&path);
-        let disk_baseline = if path.exists() {
-            if !same && !overwrite {
-                bail!("Save As refuses to overwrite an existing file");
+        let baseline = if same {
+            self.disk.clone()
+        } else if path.exists() {
+            if !overwrite {
+                return Err(save_error(
+                    SaveErrorKind::Other,
+                    "Save As refuses to overwrite an existing file",
+                ));
             }
-            let contents = fs::read(&path)?;
-            if same && self.saved.as_bytes() != contents.as_slice() {
-                bail!("File changed on disk. Save As to a new path or reopen after preserving your changes");
-            }
-            Some(contents)
-        } else if same {
-            bail!("File was removed externally. Save As to a new path");
+            Some(Baseline::of(&fs::read(&path)?))
         } else {
             None
         };
-        let parent = path.parent().context("Missing parent directory")?;
-        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-        if let Ok(meta) = fs::metadata(&path) {
-            temp.as_file().set_permissions(meta.permissions())?;
-        }
-        use std::io::Write;
-        temp.write_all(self.text.as_bytes())?;
-        temp.as_file().sync_all()?;
-        // Recheck immediately before atomic replacement; ordinary edits are never silently overwritten.
-        if let Some(baseline) = &disk_baseline {
-            if baseline.as_slice()
-                != fs::read(&path)
-                    .context("File removed during save")?
-                    .as_slice()
-            {
-                bail!("File changed during save");
-            }
-        }
-        if disk_baseline.is_some() {
-            temp.persist(&path).map_err(|e| e.error)?;
-        } else {
-            temp.persist_noclobber(&path).map_err(|e| e.error)?;
-        }
-        #[cfg(unix)]
-        fs::File::open(parent)?.sync_all()?;
+        let bytes = self.encoded()?;
+        let written = fsio::write_file(&path, &bytes, baseline.as_ref(), options)?;
+        self.disk = Some(written);
         self.path = Some(path);
         self.saved = self.text.clone();
+        self.saved_format = self.format.clone();
+        self.file_read_only = self.path.as_deref().is_some_and(|p| !fsio::writable(p));
         self.dirty_cache.set(None);
         self.unavailable = false;
-
         Ok(())
     }
+    /// Record a save performed by an elevated helper.
+    pub(crate) fn mark_saved_bytes(&mut self, bytes: &[u8]) {
+        self.disk = Some(Baseline::of(bytes));
+        self.saved = self.text.clone();
+        self.saved_format = self.format.clone();
+        self.dirty_cache.set(None);
+        self.unavailable = false;
+    }
+    pub fn baseline_matches(&self, bytes: &[u8]) -> bool {
+        self.disk.as_ref() == Some(&Baseline::of(bytes))
+    }
+}
+
+/// An absolute, lexically clean path whose parent is canonical when it exists.
+pub fn absolute(path: &Path) -> Result<PathBuf> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let name = path.file_name().context("Missing filename")?.to_owned();
+    let parent = path.parent().unwrap_or(Path::new("/"));
+    Ok(parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf())
+        .join(name))
 }
 
 pub fn previous(text: &str, cursor: usize) -> usize {
@@ -444,11 +572,17 @@ pub fn next(text: &str, cursor: usize) -> usize {
 pub fn line_start(text: &str, cursor: usize) -> usize {
     text[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0)
 }
+/// End of the line containing `cursor`, before any `\r\n` or `\n` break.
 pub fn line_end(text: &str, cursor: usize) -> usize {
-    text[cursor..]
+    let end = text[cursor..]
         .find('\n')
         .map(|i| i + cursor)
-        .unwrap_or(text.len())
+        .unwrap_or(text.len());
+    if end > cursor && text.as_bytes()[end - 1] == b'\r' && end < text.len() {
+        end - 1
+    } else {
+        end
+    }
 }
 pub fn line_col(text: &str, cursor: usize) -> (usize, usize) {
     line_col_with_tabs(text, cursor, 4)
@@ -463,16 +597,55 @@ pub fn line_col_with_tabs(text: &str, cursor: usize, tab: usize) -> (usize, usiz
 pub fn display_width(text: &str) -> usize {
     display_width_with_tabs(text, 4)
 }
+/// Display columns of a line prefix. Plain ASCII avoids grapheme segmentation,
+/// so very long lines stay cheap.
 pub fn display_width_with_tabs(text: &str, tab: usize) -> usize {
+    let tab = tab.max(1);
+    if text.is_ascii() {
+        let mut col = 0;
+        for chunk in text.split('\t').enumerate() {
+            if chunk.0 > 0 {
+                col += tab - col % tab;
+            }
+            // Control characters render as one replacement cell; `\r` is hidden.
+            col += chunk.1.len() - chunk.1.bytes().filter(|b| *b == b'\r').count();
+        }
+        return col;
+    }
     let mut col = 0;
     for g in text.graphemes(true) {
-        col += if g == "\t" {
-            tab - col % tab
-        } else {
-            UnicodeWidthStr::width(g)
-        };
+        col += grapheme_width(g, col, tab);
     }
     col
+}
+pub(crate) fn grapheme_width(g: &str, col: usize, tab: usize) -> usize {
+    if g == "\t" {
+        tab - col % tab
+    } else if g == "\r" || g == "\r\n" {
+        0
+    } else {
+        // Matches the renderer: every visible grapheme occupies at least one cell.
+        UnicodeWidthStr::width(g).max(1)
+    }
+}
+/// Byte offset within a single line closest to a display column.
+pub fn column_offset(line: &str, col: usize, tab: usize) -> usize {
+    let tab = tab.max(1);
+    if line.is_ascii() && !line.contains(['\t', '\r']) {
+        return col.min(line.len());
+    }
+    let mut x = 0;
+    for (i, g) in line.grapheme_indices(true) {
+        if g == "\r" || g == "\r\n" {
+            return i;
+        }
+        let w = grapheme_width(g, x, tab);
+        if x + w > col {
+            return i;
+        }
+        x += w;
+    }
+    line.len()
 }
 pub fn at_line_col(text: &str, row: usize, col: usize) -> usize {
     at_line_col_with_tabs(text, row, col, 4)
@@ -485,17 +658,5 @@ pub fn at_line_col_with_tabs(text: &str, row: usize, col: usize, tab: usize) -> 
         .filter(|_| row > 0)
         .unwrap_or(if row == 0 { 0 } else { text.len() });
     let end = line_end(text, start);
-    let mut x = 0;
-    for (i, g) in text[start..end].grapheme_indices(true) {
-        let w = if g == "\t" {
-            tab - x % tab
-        } else {
-            UnicodeWidthStr::width(g)
-        };
-        if x + w > col {
-            return start + i;
-        }
-        x += w;
-    }
-    end
+    start + column_offset(&text[start..end], col, tab)
 }

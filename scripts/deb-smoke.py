@@ -13,11 +13,15 @@ import tomllib
 root = pathlib.Path(__file__).resolve().parent.parent
 version = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]["package"]["version"]
 artifact = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else root / f"builds/slate_{version}_amd64.deb").resolve()
-fields = subprocess.check_output(["dpkg-deb", "--show", "--showformat=${Package}\n${Version}\n${Architecture}\n${Depends}\n", str(artifact)], text=True).splitlines()
+fields = subprocess.check_output(["dpkg-deb", "--show", "--showformat=${Package}\n${Version}\n${Architecture}\n${Depends}\n${Recommends}\n", str(artifact)], text=True).splitlines()
 assert fields[:3] == ["slate", version, "amd64"], fields
-assert "private-abi" not in fields[3] and " (= " not in fields[3], fields[3]
+depends, recommends = fields[3], fields[4]
+assert "private-abi" not in depends + recommends and " (= " not in depends + recommends, fields
+# The terminal interface installs without Qt; the GUI's needs are recommended.
+assert "qt6" not in depends and "libqt" not in depends.lower(), depends
 for dependency in ("qml6-module-org-kde-kirigami", "qml6-module-qtquick-controls", "qml6-module-qtqml-workerscript", "qt6-svg-plugins", "git"):
-    assert dependency in fields[3], dependency
+    assert dependency in recommends, dependency
+assert "qt6" in recommends.lower(), recommends
 contents = subprocess.check_output(["dpkg-deb", "--fsys-tarfile", str(artifact)])
 with tarfile.open(fileobj=io.BytesIO(contents)) as archive:
     for member in archive:
@@ -30,8 +34,9 @@ with tempfile.TemporaryDirectory(prefix="slate-deb-smoke-") as temporary:
     subprocess.run(["dpkg-deb", "--extract", str(artifact), str(destination)], check=True)
     binary = destination / "usr/bin/slate"
     alias = destination / "usr/bin/slate-gui"
-    assert alias.is_symlink() and os.readlink(alias) == "slate" and alias.resolve() == binary
+    assert not alias.is_symlink() and os.access(alias, os.X_OK), "slate-gui is its own executable"
     assert os.access(binary, os.X_OK)
+    assert "libQt" not in subprocess.check_output(["ldd", str(binary)], text=True)
     assert subprocess.check_output([str(binary), "--version"], text=True).strip() == f"Slate {version}"
     assert (destination / "usr/share/icons/hicolor/scalable/apps/slate.svg").read_bytes() == (root / "resources/slate.svg").read_bytes()
     desktop = destination / "usr/share/applications/slate.desktop"

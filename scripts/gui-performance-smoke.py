@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Release GUI input latency, payload size and retained-layout regression checks.
 
-Build: cargo build --release --features gui-smoke
+Build: cargo build --release -p slate -p slate-gui --features slate-gui/smoke
 Default: isolated offscreen software renderer. SLATE_GUI_PLATFORM=wayland tests
 on the current desktop. No clipboard contents are changed by this driver.
 """

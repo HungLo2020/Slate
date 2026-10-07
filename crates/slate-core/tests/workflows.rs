@@ -1175,7 +1175,7 @@ fn real_tmux_session_preserves_shell_input_and_resize() {
 }
 
 #[test]
-fn discard_quit_writes_valid_state_and_missing_files_are_recoverable() {
+fn discard_quit_writes_valid_state_and_missing_clean_files_reopen_as_new() {
     use slate_core::workspace::WorkspaceStore;
     let dir = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -1210,10 +1210,13 @@ fn discard_quit_writes_valid_state_and_missing_files_are_recoverable() {
         true,
     )
     .unwrap();
-    assert_eq!(app.documents[&10].text(), "base");
-    assert!(app.dirty());
+    // Checkpoints store only a reference to clean files, never their
+    // contents. A clean file deleted meanwhile reopens as a new, empty file.
+    assert_eq!(app.documents[&10].text(), "");
+    assert!(app.documents[&10].path.as_ref().unwrap().ends_with("file"));
+    assert!(!app.dirty());
     app.dispatch(Command::Quit { force: false });
-    assert!(!app.quit);
+    assert!(app.quit);
 }
 #[test]
 fn corrupt_workspace_is_preserved_until_an_explicit_fresh_start() {

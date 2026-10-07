@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check real GUI geometry at small/large sizes, large fonts, and fractional DPI.
 
-Build with --features gui-smoke. Runs 12 window/font combinations per style/scale.
+Build with: cargo build -p slate -p slate-gui --features slate-gui/smoke. Runs 12 window/font combinations per style/scale.
 The C++ driver checks controls for collisions and text/PTY viewport clipping.
 Also check KDE desktop button captions when that style is installed.
 """

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Exercise startup defaults, overrides and settings in real GUI/TUI processes.
 
-Build with --features gui-smoke. Pass --tui-only to test a build without Qt.
+Build with: cargo build -p slate -p slate-gui --features slate-gui/smoke
+Pass --tui-only to test only the terminal interface.
 """
 import fcntl
 import json

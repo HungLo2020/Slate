@@ -165,11 +165,26 @@ atomic replacement/no-clobber persistence. Files and containing directories are
 synced on Unix. These checks detect ordinary external edits; the filesystem does
 not provide a universal compare-and-swap against every concurrent external writer.
 
+Buffers always hold `\n` lines. `text_format` decodes UTF-8 (BOM), UTF-16 (BOM)
+and legacy encodings through encoding_rs, records the dominant line ending and
+re-encodes on save; documents keep a SHA-256 baseline of the bytes last read or
+written, so conflict checks work for any encoding or mixed line endings.
+`fsio::write_file` chooses atomic replacement when the replacement can carry the
+original owner, group and extended attributes, and writes in place for hard
+links, unwritable directories, or when ownership cannot be reproduced. Read-only
+and permission errors are typed so frontends can ask for confirmation or a
+privileged `tee` through sudo (terminal, with the terminal handed over) or
+pkexec (GUI, from the IO worker).
+
 ## Workspace recovery
 
 Each canonical root owns a checkpoint and advisory lock. One instance writes
-recovery for that root. JSON contains document text and save baselines, independent
-views, layout/tab/focus state, browser directory and terminal working directories.
+recovery for that root. JSON contains the text and save baselines of unsaved
+documents (clean documents are path references), independent views,
+layout/tab/focus state, browser directory and terminal working directories.
+Single-file sessions keep no checkpoint unless `file_recovery` is enabled; then
+the checkpoint is keyed by the file. A fingerprint of documents' generations,
+views and layout skips writes when nothing recorded has changed.
 It is written through a private temporary file, synced and atomically replaced.
 The maintenance wake queues changed state at most once a second; shutdown flushes pending I/O
 and the final checkpoint before releasing the lock. Recovery does not save user
@@ -178,7 +193,7 @@ files or replay shell commands.
 Restore validates schema, size, layout, resource references, ID bounds and UTF-8
 cursor offsets before replacing live state. Clean buffers follow current disk
 content; dirty buffers keep their original baseline so saving still detects a
-conflict. Missing files remain recoverable. Discard-and-quit clamps views to the
+conflict. A clean file deleted meanwhile reopens as a new, empty file. Discard-and-quit clamps views to the
 discarded text so the next checkpoint remains valid. Corrupt checkpoints are
 preserved and disabled for the launch; `--fresh` explicitly replaces that state.
 
@@ -205,7 +220,9 @@ payload bounds, save conflicts and background-save races, checkpoint round trips
 current disk content, syntax colors, PTYs, mouse protocols, paste and selection.
 GUI/TUI smoke tests drive real inputs and verify resulting file bytes. A separate
 smoke test kills Slate, restarts it and saves recovered unsaved work. Installation
-checks run the copied executable and verify the GUI symlink/desktop resources.
+checks run the copied executables, verify that `slate` does not link Qt and that
+`slate-gui` and the desktop resources are installed. `tests/tui_nano.rs` drives
+the real terminal executable in a PTY through a VT emulator for nano workflows.
 
 SSH and tmux integration fixtures are isolated and mandatory in the Linux CI
 job. They can report an explicit skip locally when missing tools or restricted

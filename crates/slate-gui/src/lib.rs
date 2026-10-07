@@ -81,7 +81,12 @@ struct GuiUpdate {
     frame: serde_json::Map<String, serde_json::Value>,
     surfaces: Vec<SurfacePatch>,
 }
-pub fn run(app: App) -> i32 {
+pub fn run(mut app: App) -> i32 {
+    app.terminal_frontend = false;
+    // A desktop session authorizes privileged saves through polkit.
+    if slate_core::fsio::which("pkexec").is_some() {
+        app.elevation_mode = slate_core::ElevationMode::Background("pkexec");
+    }
     let mut context = GuiContext::new(app);
     unsafe { slate_qt_run((&mut context as *mut GuiContext).cast()) }
 }
@@ -590,8 +595,13 @@ mod tests {
         request(
             &mut state,
             serde_json::json!({"action":"paste","text":
-                "i=0; while [ \"$i\" -lt 80 ]; do printf '%s\\n' \"$i\"; i=$((i+1)); sleep .001; done; printf '__%s__' TAIL_FINISHED\r"
+                "i=0; while [ \"$i\" -lt 80 ]; do printf '%s\\n' \"$i\"; i=$((i+1)); sleep .001; done; printf '__%s__' TAIL_FINISHED"
             }),
+        );
+        // Shells with bracketed paste treat a pasted line break as text; Enter runs it.
+        request(
+            &mut state,
+            serde_json::json!({"action":"key","key":"Enter"}),
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
