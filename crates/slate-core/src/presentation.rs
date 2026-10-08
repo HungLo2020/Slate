@@ -45,7 +45,13 @@ impl App {
         let mut exited = Vec::new();
         for (id, terminal) in &mut self.terminals {
             if let Some(text) = terminal.take_clipboard() {
-                self.clipboard = text;
+                // A program (perhaps over ssh) may only replace the clipboard
+                // when the user allows it.
+                if self.preferences.terminal_clipboard {
+                    self.clipboard = text;
+                } else {
+                    self.status = "A terminal program tried to copy to the clipboard · allow it with the Terminal clipboard setting".into();
+                }
                 self.revision += 1;
             }
             if let Some(code) = terminal.exit_code() {

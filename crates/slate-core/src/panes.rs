@@ -41,6 +41,24 @@ impl App {
         Some(pane)
     }
 
+    /// Place a view without changing what any pane shows: the pane keeps
+    /// its active tab.
+    pub(crate) fn place_view_background(&mut self, view: View, preferred: u64) -> Option<u64> {
+        let before: Vec<(u64, usize)> = self
+            .layout
+            .panes()
+            .into_iter()
+            .filter_map(|p| self.layout.pane_mut(p).map(|(_, active)| (p, *active)))
+            .collect();
+        let pane = self.place_view(view, preferred)?;
+        if let Some((_, active)) = before.iter().find(|(p, _)| *p == pane) {
+            if let Some((_, current)) = self.layout.pane_mut(pane) {
+                *current = *active;
+            }
+        }
+        Some(pane)
+    }
+
     /// Release a view that could not be placed anywhere.
     fn discard_view(&mut self, view: &View) {
         match view {
@@ -151,6 +169,11 @@ impl App {
         if !self.layout.panes().contains(&self.focus) {
             self.focus = self.layout.panes()[0];
         }
+    }
+
+    /// The pane where new documents open: one already showing an editor.
+    pub(crate) fn pane_showing_editor(&self) -> u64 {
+        self.pane_showing(|v| matches!(v, View::Editor(_)))
     }
 
     /// The first pane with a tab of the given kind, else the focused pane.

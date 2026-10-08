@@ -35,12 +35,13 @@ ApplicationWindow {
     function updateGitFrame() {
         // Row actions also depend on which panes show Git, so pane kinds count.
         var kinds = (frame.panes || []).map(function (p) { return p.id + ":" + p.kind; }).join(",");
-        var key = [frame.git_revision, frame.git_busy, frame.git_error, frame.git_branch, frame.git_repository, frame.focus, frame.editor_only, kinds].join("|");
+        var key = [frame.git_revision, frame.git_busy, frame.git_error, frame.git_branch, frame.git_repository, frame.git_restricted, frame.focus, frame.editor_only, kinds].join("|");
         if (key === gitKey)
             return;
         gitKey = key;
         gitFrame = {
             "git_repository": frame.git_repository,
+            "git_restricted": frame.git_restricted,
             "git_branch": frame.git_branch,
             "git_busy": frame.git_busy,
             "git_error": frame.git_error,
@@ -189,6 +190,16 @@ ApplicationWindow {
             color: commandItem.highlighted ? Theme.highlightColor : "transparent"
         }
         onTriggered: root.invokeAction(actionId, argument, commandPane)
+    }
+    // A label with the characters at `positions` bold and underlined.
+    function marked(label, positions) {
+        var out = "";
+        var chars = Array.from(label);
+        for (var i = 0; i < chars.length; i++) {
+            var c = chars[i].replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+            out += positions.indexOf(i) !== -1 ? "<b><u>" + c + "</u></b>" : c;
+        }
+        return out;
     }
     function paletteWith(text) {
         commandText.text = text || "";
@@ -403,6 +414,31 @@ ApplicationWindow {
             MenuSeparator {}
             CommandMenuItem { actionId: "prompt-find" }
             CommandMenuItem { actionId: "prompt-replace" }
+            CommandMenuItem { actionId: "search-in-files"; label: "Search in Files…" }
+            CommandMenuItem { actionId: "replace-in-files"; label: "Replace in Files…" }
+            CommandMenuItem { actionId: "undo-replace-in-files"; label: "Undo Replace in Files" }
+            MenuSeparator {}
+            CommandMenu {
+                objectName: "selectionMenu"
+                title: "Selection"
+                CommandMenuItem { actionId: "add-next-occurrence"; label: "Add Next Occurrence" }
+                CommandMenuItem { actionId: "select-all-occurrences"; label: "Select All Occurrences" }
+                CommandMenuItem { actionId: "add-cursor-above"; label: "Add Cursor Above" }
+                CommandMenuItem { actionId: "add-cursor-below"; label: "Add Cursor Below" }
+            }
+            CommandMenu {
+                objectName: "codeMenu"
+                title: "Code"
+                CommandMenuItem { actionId: "trigger-completion"; label: "Complete" }
+                CommandMenuItem { actionId: "format-document"; label: "Format Document" }
+                CommandMenuItem { actionId: "rename-symbol"; label: "Rename Symbol…" }
+                CommandMenuItem { actionId: "code-actions"; label: "Code Actions…" }
+                MenuSeparator {}
+                CommandMenuItem { actionId: "fold"; label: "Fold" }
+                CommandMenuItem { actionId: "unfold"; label: "Unfold" }
+                CommandMenuItem { actionId: "fold-all"; label: "Fold All" }
+                CommandMenuItem { actionId: "unfold-all"; label: "Unfold All" }
+            }
             MenuSeparator {}
             CommandMenuItem { actionId: "indent" }
             CommandMenuItem { actionId: "outdent" }
@@ -484,6 +520,9 @@ ApplicationWindow {
             }
             CommandMenuItem { actionId: "files"; label: "File Browser" }
             CommandMenuItem { actionId: "git"; label: "Git Changes" }
+            CommandMenuItem { actionId: "problems"; label: "Problems…" }
+            CommandMenuItem { actionId: "open-documents"; label: "Open Documents…" }
+            CommandMenuItem { actionId: "language-servers"; label: "Language Servers" }
             MenuSeparator {}
             CommandMenuItem { actionId: "toggle-soft-wrap"; label: "Word Wrap"; checkable: true; checked: !!root.settings.soft_wrap }
             CommandMenuItem { actionId: "toggle-whitespace"; label: "Show Whitespace"; checkable: true; checked: !!root.settings.show_whitespace }
@@ -510,16 +549,48 @@ ApplicationWindow {
         CommandMenu {
             objectName: "goMenu"
             title: "&Go"
+            CommandMenuItem { actionId: "quick-open"; label: "Go to File…" }
+            CommandMenuItem { actionId: "go-to-symbol"; label: "Go to Symbol…" }
+            CommandMenuItem { actionId: "workspace-symbols"; label: "Workspace Symbols…" }
             CommandMenuItem { actionId: "prompt-goto" }
+            MenuSeparator {}
+            CommandMenuItem { actionId: "go-to-definition"; label: "Go to Definition" }
+            CommandMenuItem { actionId: "find-references"; label: "Find References" }
+            CommandMenuItem { actionId: "hover"; label: "Show Information" }
+            CommandMenuItem { actionId: "go-to-bracket"; label: "Matching Bracket" }
+            MenuSeparator {}
+            CommandMenuItem { actionId: "go-back"; label: "Back" }
+            CommandMenuItem { actionId: "go-forward"; label: "Forward" }
+            CommandMenuItem { actionId: "next-problem"; label: "Next Problem" }
+            CommandMenuItem { actionId: "previous-problem"; label: "Previous Problem" }
             CommandMenuItem { actionId: "find-next" }
             CommandMenuItem { actionId: "find-previous" }
             MenuSeparator {}
             CommandMenuItem { actionId: "next-tab" }
+            CommandMenuItem { actionId: "previous-tab" }
             CommandMenuItem { actionId: "next-pane" }
         }
         CommandMenu {
-            objectName: "terminalMenu"
-            title: "&Terminal"
+            objectName: "runMenu"
+            title: "&Run"
+            CommandMenuItem { actionId: "debug-start"; label: root.frame.debugging ? "Continue" : "Start Debugging" }
+            CommandMenuItem { actionId: "debug-step-over"; label: "Step Over" }
+            CommandMenuItem { actionId: "debug-step-into"; label: "Step Into" }
+            CommandMenuItem { actionId: "debug-step-out"; label: "Step Out" }
+            CommandMenuItem { actionId: "debug-pause"; label: "Pause" }
+            CommandMenuItem { actionId: "debug-stop"; label: "Stop Debugging" }
+            CommandMenuItem { actionId: "debug-evaluate"; label: "Evaluate…" }
+            CommandMenuItem { actionId: "debug-call-stack"; label: "Call Stack…" }
+            MenuSeparator {}
+            CommandMenuItem { actionId: "toggle-breakpoint"; label: "Toggle Breakpoint" }
+            CommandMenuItem { actionId: "breakpoints"; label: "Breakpoints…" }
+            CommandMenuItem { actionId: "clear-breakpoints"; label: "Remove All Breakpoints" }
+            MenuSeparator {}
+            CommandMenuItem { actionId: "run-build-task"; label: "Run Build Task" }
+            CommandMenuItem { actionId: "run-task"; label: "Run Task…" }
+            CommandMenuItem { actionId: "stop-task"; label: "Stop Tasks" }
+            MenuSeparator {}
+            // Terminals share this menu so the menubar fits narrow windows.
             CommandMenuItem { actionId: "terminal" }
             CommandMenuItem { actionId: "terminate-terminal"; label: "Close Terminal" }
             MenuSeparator {}
@@ -862,7 +933,10 @@ ApplicationWindow {
                     readonly property real anchorY: grid.y + ((info ? info.row : 0) + 1) * slate.cellHeight - grid.scrollPixels
                     visible: !!info && panel.isEditor
                     z: 20
-                    width: Math.min(panel.width - 8, hoverText.implicitWidth + 2 * Theme.largeSpacing, 560)
+                    // Text taller than half the pane scrolls, with room kept for the bar.
+                    readonly property bool overflowing: hoverText.implicitHeight + 2 * Theme.largeSpacing > panel.height / 2
+                    readonly property real barRoom: overflowing ? 12 : 0
+                    width: Math.min(panel.width - 8, hoverText.implicitWidth + 2 * Theme.largeSpacing + barRoom, 560)
                     height: Math.min(panel.height / 2, hoverText.implicitHeight + 2 * Theme.largeSpacing)
                     x: Math.max(2, Math.min(grid.x + (info ? info.col : 0) * slate.cellWidth, panel.width - width - 4))
                     y: anchorY + height <= panel.height - 4 ? anchorY : Math.max(grid.y, anchorY - slate.cellHeight - height)
@@ -870,15 +944,31 @@ ApplicationWindow {
                     border.color: Theme.disabledTextColor
                     radius: 3
                     clip: true
-                    Label {
-                        id: hoverText
-                        objectName: "hoverText_" + panel.paneId
-                        x: Theme.largeSpacing
-                        y: Theme.largeSpacing
-                        width: Math.min(implicitWidth, 560 - 2 * Theme.largeSpacing)
-                        textFormat: Text.PlainText
-                        wrapMode: Text.Wrap
-                        text: hoverBox.info ? hoverBox.info.text : ""
+                    // Long hover text scrolls instead of being cut off.
+                    Flickable {
+                        anchors.fill: parent
+                        anchors.margins: Theme.largeSpacing
+                        anchors.rightMargin: Theme.largeSpacing + hoverBox.barRoom
+                        contentWidth: width
+                        contentHeight: hoverText.implicitHeight
+                        clip: true
+                        boundsBehavior: Flickable.StopAtBounds
+                        ScrollBar.vertical: ScrollBar {
+                            parent: hoverBox
+                            anchors.top: hoverBox.top
+                            anchors.bottom: hoverBox.bottom
+                            anchors.right: hoverBox.right
+                            anchors.margins: 2
+                            policy: hoverBox.overflowing ? ScrollBar.AlwaysOn : ScrollBar.AlwaysOff
+                        }
+                        Label {
+                            id: hoverText
+                            objectName: "hoverText_" + panel.paneId
+                            width: Math.min(implicitWidth, 560 - 2 * Theme.largeSpacing - hoverBox.barRoom)
+                            textFormat: Text.PlainText
+                            wrapMode: Text.Wrap
+                            text: hoverBox.info ? hoverBox.info.text : ""
+                        }
                     }
                 }
                 GitPane {
@@ -1175,6 +1265,13 @@ ApplicationWindow {
         CommandMenuItem { actionId: "paste"; label: "Paste"; commandPane: editorMenu.commandPane }
         CommandMenuItem { actionId: "select-all"; label: "Select All"; commandPane: editorMenu.commandPane }
         MenuSeparator {}
+        CommandMenuItem { actionId: "go-to-definition"; label: "Go to Definition"; commandPane: editorMenu.commandPane }
+        CommandMenuItem { actionId: "find-references"; label: "Find References"; commandPane: editorMenu.commandPane }
+        CommandMenuItem { actionId: "rename-symbol"; label: "Rename Symbol…"; commandPane: editorMenu.commandPane }
+        CommandMenuItem { actionId: "code-actions"; label: "Code Actions…"; commandPane: editorMenu.commandPane }
+        CommandMenuItem { actionId: "format-document"; label: "Format Document"; commandPane: editorMenu.commandPane }
+        CommandMenuItem { actionId: "toggle-breakpoint"; label: "Toggle Breakpoint"; commandPane: editorMenu.commandPane }
+        MenuSeparator {}
         CommandMenuItem { actionId: "prompt-find"; label: "Find…"; commandPane: editorMenu.commandPane }
         CommandMenuItem { actionId: "prompt-goto"; label: "Go to Line…"; commandPane: editorMenu.commandPane }
         MenuSeparator {}
@@ -1211,6 +1308,40 @@ ApplicationWindow {
                     id: statusHover
                 }
             }
+            Row {
+                objectName: "debugToolbar"
+                visible: !!root.frame.debugging
+                spacing: 2
+                Repeater {
+                    model: [
+                        {"id": "debug-start", "text": "▶", "tip": "Continue"},
+                        {"id": "debug-step-over", "text": "↷", "tip": "Step over"},
+                        {"id": "debug-step-into", "text": "↓", "tip": "Step into"},
+                        {"id": "debug-step-out", "text": "↑", "tip": "Step out"},
+                        {"id": "debug-pause", "text": "❚❚", "tip": "Pause"},
+                        {"id": "debug-stop", "text": "■", "tip": "Stop debugging"}
+                    ]
+                    delegate: ActionButton {
+                        required property var modelData
+                        objectName: "debug_" + modelData.id
+                        text: modelData.text
+                        tip: modelData.tip
+                        flat: true
+                        enabled: modelData.id === "debug-pause" ? !root.frame.debug_paused
+                                 : modelData.id === "debug-stop" || !!root.frame.debug_paused
+                        onClicked: root.invokeAction(modelData.id)
+                    }
+                }
+            }
+            Label {
+                objectName: "activity"
+                textFormat: Text.PlainText
+                text: root.frame.activity || ""
+                visible: text.length > 0
+                color: Theme.disabledTextColor
+                Layout.maximumWidth: root.width * 0.25
+                elide: Text.ElideRight
+            }
             Label {
                 objectName: "problemHere"
                 textFormat: Text.PlainText
@@ -1236,6 +1367,14 @@ ApplicationWindow {
                 tip: "Project tools do not run in this folder. Click to trust it."
                 flat: true
                 onClicked: root.invokeAction("trust-workspace")
+            }
+            Label {
+                objectName: "branch"
+                textFormat: Text.PlainText
+                text: root.frame.git_branch ? "⎇ " + root.frame.git_branch : ""
+                visible: text.length > 0
+                Layout.maximumWidth: root.width * 0.2
+                elide: Text.ElideRight
             }
             Label {
                 textFormat: Text.PlainText
@@ -1286,10 +1425,15 @@ ApplicationWindow {
                 "debug-evaluate": "Evaluate expression",
                 "debug-program": "Start debugging"
             })[prompt.kind] || "Input"
-        anchors.centerIn: parent
-        width: Math.min(root.width - 40, 560)
+        // Find and replace sit at the bottom without dimming the text, so
+        // the matches stay visible; other prompts are centred.
+        readonly property bool searching: prompt.kind === "find" || prompt.kind === "replace"
+        x: Math.round((parent.width - width) / 2)
+        y: searching ? parent.height - height - Theme.largeSpacing : Math.round((parent.height - height) / 2)
+        width: Math.min(root.width - 40, searching ? 720 : 560)
         height: Math.min(root.height - 40, implicitHeight)
         modal: true
+        dim: !searching
         closePolicy: Popup.CloseOnEscape
         onRejected: root.send({
             "action": "dismiss_prompt"
@@ -1339,6 +1483,18 @@ ApplicationWindow {
                     onAccepted: root.send({
                         "action": "submit_prompt"
                     })
+                    Keys.onPressed: function (event) {
+                        // Alt+C / Alt+W toggle the options, as in the terminal.
+                        if ((event.modifiers & Qt.AltModifier) && editPrompt.searching
+                                && (event.key === Qt.Key_C || event.key === Qt.Key_W)) {
+                            if (event.key === Qt.Key_C)
+                                matchCase.checked = !matchCase.checked;
+                            else
+                                wholeWord.checked = !wholeWord.checked;
+                            editPrompt.update();
+                            event.accepted = true;
+                        }
+                    }
                 }
                 TextField {
                     id: replacementInput
@@ -1505,6 +1661,11 @@ ApplicationWindow {
                     } else if (event.key === Qt.Key_H && (event.modifiers & Qt.ControlModifier) && pickerDialog.info.kind === "search") {
                         root.send({"action": "action", "name": "replace-in-files", "argument": ""});
                         event.accepted = true;
+                    } else if ((event.modifiers & Qt.AltModifier) && pickerDialog.info.kind === "search"
+                               && [Qt.Key_C, Qt.Key_W, Qt.Key_R].indexOf(event.key) !== -1) {
+                        // Alt+C / Alt+W / Alt+R toggle case, whole word and regex, as in the terminal.
+                        root.send({"action": "picker_option", "name": event.key === Qt.Key_C ? "case" : event.key === Qt.Key_W ? "word" : "regex"});
+                        event.accepted = true;
                     }
                 }
             }
@@ -1542,8 +1703,19 @@ ApplicationWindow {
                 Layout.fillHeight: true
                 clip: true
                 model: pickerDialog.info.items
-                currentIndex: pickerDialog.info.selected
-                onCurrentIndexChanged: positionViewAtIndex(currentIndex, ListView.Contain)
+                // Items are a window of the list starting at `first`.
+                currentIndex: pickerDialog.info.selected - (pickerDialog.info.first || 0)
+                onCurrentIndexChanged: if (currentIndex >= 0 && currentIndex < count) positionViewAtIndex(currentIndex, ListView.Contain)
+                onAtYEndChanged: {
+                    var info = pickerDialog.info;
+                    if (atYEnd && count > 0 && (info.first || 0) + count < info.total)
+                        root.send({"action": "picker_window", "first": (info.first || 0) + Math.floor(count / 2)});
+                }
+                onAtYBeginningChanged: {
+                    var info = pickerDialog.info;
+                    if (atYBeginning && (info.first || 0) > 0)
+                        root.send({"action": "picker_window", "first": Math.max(0, (info.first || 0) - Math.floor(count / 2))});
+                }
                 ScrollBar.vertical: ScrollBar {}
                 delegate: Basic.ItemDelegate {
                     id: pickerItem
@@ -1553,8 +1725,9 @@ ApplicationWindow {
                     highlighted: index === pickerResults.currentIndex
                     contentItem: RowLayout {
                         Label {
-                            textFormat: Text.PlainText
-                            text: pickerItem.modelData.label
+                            // Matched characters are emphasised, as in the terminal.
+                            textFormat: Text.StyledText
+                            text: root.marked(pickerItem.modelData.label, pickerItem.modelData.positions || [])
                             Layout.fillWidth: true
                             Layout.minimumWidth: 0
                             elide: Text.ElideMiddle
@@ -1572,7 +1745,7 @@ ApplicationWindow {
                         color: pickerItem.highlighted ? Theme.highlightColor : "transparent"
                         radius: 4
                     }
-                    onClicked: root.send({"action": "picker_accept", "index": index})
+                    onClicked: root.send({"action": "picker_accept", "index": (pickerDialog.info.first || 0) + index})
                 }
                 Label {
                     textFormat: Text.PlainText
@@ -1812,7 +1985,13 @@ ApplicationWindow {
                         {"label": "Show minimap", "setting": "minimap", "field": "minimap"},
                         {"label": "Reload files changed on disk", "setting": "auto-reload", "field": "auto_reload"},
                         {"label": "Keep a backup (NAME~) when saving", "setting": "backup", "field": "backup"},
-                        {"label": "Recover unsaved single files after a crash", "setting": "file-recovery", "field": "file_recovery"}
+                        {"label": "Recover unsaved single files after a crash", "setting": "file-recovery", "field": "file_recovery"},
+                        {"label": "Close brackets and quotes", "setting": "auto-close-brackets", "field": "auto_close_brackets"},
+                        {"label": "Complete while typing", "setting": "complete-while-typing", "field": "complete_while_typing"},
+                        {"label": "Enter accepts a completion", "setting": "accept-completion-on-enter", "field": "accept_completion_on_enter"},
+                        {"label": "Format on save (trusted folders)", "setting": "format-on-save", "field": "format_on_save"},
+                        {"label": "Hard wrap while typing", "setting": "hard-wrap", "field": "hard_wrap"},
+                        {"label": "Terminal programs may set the clipboard", "setting": "terminal-clipboard", "field": "terminal_clipboard"}
                     ]
                     delegate: CheckBox {
                         required property var modelData
@@ -1820,6 +1999,31 @@ ApplicationWindow {
                         text: modelData.label
                         checked: !!root.settings[modelData.field]
                         onClicked: settingsDialog.configure(modelData.setting, checked.toString())
+                    }
+                }
+                Repeater {
+                    model: [
+                        {"label": "Wrap column (justify and hard wrap)", "setting": "wrap-column", "field": "wrap_column", "from": 10, "to": 500},
+                        {"label": "Terminal scrollback lines", "setting": "terminal-scrollback", "field": "terminal_scrollback", "from": 0, "to": 100000}
+                    ]
+                    delegate: RowLayout {
+                        required property var modelData
+                        Layout.fillWidth: true
+                        Label {
+                            textFormat: Text.PlainText
+                            text: modelData.label
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 0
+                            wrapMode: Text.Wrap
+                        }
+                        SpinBox {
+                            objectName: "settings_" + modelData.field
+                            from: modelData.from
+                            to: modelData.to
+                            editable: true
+                            value: root.settings[modelData.field] || 0
+                            onValueModified: settingsDialog.configure(modelData.setting, value.toString())
+                        }
                     }
                 }
                 RowLayout {

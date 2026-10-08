@@ -1,3 +1,4 @@
+mod common;
 use slate_core::{
     document::{self, Document},
     layout::Axis,
@@ -43,6 +44,7 @@ fn git_ready(app: &mut App) -> slate_core::Snapshot {
 }
 #[test]
 fn indexed_positions_follow_edits_and_history() {
+    common::isolate();
     let mut doc = Document::from_text("a\n猫\n\t👩‍💻\r\n".into()).unwrap();
     let mut seed = 7u64;
     for _ in 0..250 {
@@ -99,6 +101,7 @@ fn indexed_positions_follow_edits_and_history() {
 }
 #[test]
 fn typing_groups_break_at_navigation_and_save_boundaries() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("edit.txt");
     fs::write(&path, "").unwrap();
@@ -113,10 +116,10 @@ fn typing_groups_break_at_navigation_and_save_boundaries() {
         });
     }
     app.dispatch(Command::Undo);
-    assert_eq!(app.documents[&10].text(), "");
+    assert_eq!(app.documents[&common::first_document(&app)].text(), "");
     assert!(!app.dirty());
     app.dispatch(Command::Redo);
-    assert_eq!(app.documents[&10].text(), "a猫b");
+    assert_eq!(app.documents[&common::first_document(&app)].text(), "a猫b");
     app.dispatch(Command::Key {
         key: Key {
             key: "Left".into(),
@@ -131,7 +134,7 @@ fn typing_groups_break_at_navigation_and_save_boundaries() {
         },
     });
     app.dispatch(Command::Undo);
-    assert_eq!(app.documents[&10].text(), "a猫b");
+    assert_eq!(app.documents[&common::first_document(&app)].text(), "a猫b");
     app.dispatch(Command::Save);
     let deadline = Instant::now() + Duration::from_secs(5);
     while app.dirty() {
@@ -146,6 +149,7 @@ fn typing_groups_break_at_navigation_and_save_boundaries() {
 }
 #[test]
 fn unchanged_and_unrelated_views_reuse_their_screens() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("edit.txt");
     fs::write(&path, "hello\n").unwrap();
@@ -165,7 +169,7 @@ fn unchanged_and_unrelated_views_reuse_their_screens() {
     let revision = app.revision() - app.events().generation();
     for _ in 0..20 {
         app.dispatch(Command::Pointer {
-            pane: 3,
+            pane: common::terminal_pane(&app),
             row: 5,
             col: 5,
             kind: "move".into(),
@@ -219,6 +223,7 @@ fn unchanged_and_unrelated_views_reuse_their_screens() {
 }
 #[test]
 fn background_results_and_terminal_output_wake_without_rendering() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("opened.txt");
     fs::write(&path, "ASYNC_OPEN").unwrap();
@@ -235,7 +240,7 @@ fn background_results_and_terminal_output_wake_without_rendering() {
     let terminal = app.terminals.get_mut(&12).unwrap();
     let before = terminal.revision();
     terminal.write(b"printf 'WAKE_FROM_PTY\n'\r").unwrap();
-    while app.terminals[&12].revision() <= before + 1 {
+    while app.terminals[&common::first_terminal(&app)].revision() <= before + 1 {
         let observed = events.generation();
         events.wait(observed, Duration::from_millis(100));
         assert!(Instant::now() < deadline);
@@ -244,6 +249,7 @@ fn background_results_and_terminal_output_wake_without_rendering() {
 }
 #[test]
 fn shared_actions_offer_context_and_argument_forms() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let mut app = App::new(dir.path()).unwrap();
     let actions = app.command_catalog("open file");
@@ -256,7 +262,9 @@ fn shared_actions_offer_context_and_argument_forms() {
     });
     assert_eq!(app.prompt.as_ref().unwrap().kind, "open");
     app.dispatch(Command::DismissPrompt);
-    app.dispatch(Command::Focus { pane: 1 });
+    app.dispatch(Command::Focus {
+        pane: common::side_pane(&app),
+    });
     let undo = app
         .command_catalog("undo")
         .into_iter()
@@ -264,7 +272,9 @@ fn shared_actions_offer_context_and_argument_forms() {
         .unwrap();
     assert!(!undo.enabled);
     assert!(!undo.reason.is_empty());
-    app.dispatch(Command::Focus { pane: 2 });
+    app.dispatch(Command::Focus {
+        pane: common::editor_pane(&app),
+    });
     app.preferences
         .global_keys
         .insert("Ctrl+s".into(), "quit".into());
@@ -283,6 +293,7 @@ fn shared_actions_offer_context_and_argument_forms() {
 }
 #[test]
 fn git_separates_index_worktree_and_untracked_previews() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     git(dir.path(), &["init", "-q"]);
     git(
@@ -298,6 +309,7 @@ fn git_separates_index_worktree_and_untracked_previews() {
     fs::write(dir.path().join("tracked.txt"), "working\n").unwrap();
     fs::write(dir.path().join("new file.txt"), "untracked content\n").unwrap();
     let mut app = App::new(dir.path()).unwrap();
+    app.set_session_trust(true);
     let view = git_ready(&mut app);
     assert!(view.git_repository);
     assert!(!view.git_branch.is_empty());
@@ -339,6 +351,7 @@ fn git_separates_index_worktree_and_untracked_previews() {
 }
 #[test]
 fn input_method_replacements_use_utf16_and_inspections_reject_mutation() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("unicode.txt");
     fs::write(&path, "a😀b").unwrap();
@@ -349,9 +362,9 @@ fn input_method_replacements_use_utf16_and_inspections_reject_mutation() {
         replace_start: -2,
         replace_length: 2,
     });
-    assert_eq!(app.documents[&10].text(), "a猫b");
+    assert_eq!(app.documents[&common::first_document(&app)].text(), "a猫b");
     app.dispatch(Command::Undo);
-    assert_eq!(app.documents[&10].text(), "a😀b");
+    assert_eq!(app.documents[&common::first_document(&app)].text(), "a😀b");
     let mut doc = Document::inspection("Preview".into(), "read only".into());
     assert!(doc.replace(0, 0, "bad", 0).is_err());
     assert!(doc.save(Some(&dir.path().join("bad.txt"))).is_err());
@@ -361,6 +374,7 @@ fn input_method_replacements_use_utf16_and_inspections_reject_mutation() {
 
 #[test]
 fn git_handles_initial_commits_renames_and_failed_operations() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     git(dir.path(), &["init", "-q"]);
     git(
@@ -427,6 +441,7 @@ fn git_handles_initial_commits_renames_and_failed_operations() {
 #[cfg(unix)]
 #[test]
 fn blocked_git_hook_does_not_block_file_browsing_or_editing() {
+    common::isolate();
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     git(dir.path(), &["init", "-q"]);
@@ -490,6 +505,7 @@ fn blocked_git_hook_does_not_block_file_browsing_or_editing() {
 
 #[test]
 fn bulk_git_actions_cover_the_repository_and_preserve_working_files() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     git(root, &["init", "-q"]);
@@ -513,16 +529,26 @@ fn bulk_git_actions_cover_the_repository_and_preserve_working_files() {
     git(root, &["add", "nested/edit.txt"]);
     fs::write(root.join("nested/edit.txt"), "working\n").unwrap();
     fs::write(root.join("new file.txt"), "untracked\n").unwrap();
-    // The application can be opened below the repository root. Bulk actions
-    // still include outside.txt, the rename, the deletion and untracked files.
+    // The application can be opened below the repository root, once the
+    // repository's folder is trusted. Bulk actions stay within the
+    // workspace: outside.txt, the rename and the deletion are left alone.
+    slate_core::trust::set_trusted(root, true).unwrap();
     let mut app = App::new(&root.join("nested")).unwrap();
-    app.set_session_trust(true);
     git_ready(&mut app);
     app.command_line("stage-all");
     let view = git_ready(&mut app);
     assert!(view.git_error.is_empty(), "{}", view.git_error);
-    assert_eq!(view.git.len(), 5);
-    assert!(view.git.iter().all(|e| e.staged));
+    assert!(!view.git.is_empty());
+    assert!(
+        view.git
+            .iter()
+            .all(|e| e.staged && e.path.starts_with("nested/")),
+        "{:?}",
+        view.git
+            .iter()
+            .map(|e| (&e.path, e.staged))
+            .collect::<Vec<_>>()
+    );
     let staged = process::Command::new("git")
         .arg("-C")
         .arg(root)
@@ -530,17 +556,30 @@ fn bulk_git_actions_cover_the_repository_and_preserve_working_files() {
         .output()
         .unwrap();
     assert_eq!(staged.stdout, b"working\n");
+    let cached = |args: &[&str]| {
+        String::from_utf8(
+            process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["diff", "--cached", "--name-only"])
+                .args(args)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+    };
+    assert!(
+        !cached(&[]).contains("outside.txt"),
+        "outside the workspace stays unstaged"
+    );
     app.command_line("unstage-all");
     let view = git_ready(&mut app);
     assert!(view.git_error.is_empty(), "{}", view.git_error);
     assert!(view.git.iter().all(|e| !e.staged));
-    assert!(process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["diff", "--cached", "--quiet"])
-        .status()
-        .unwrap()
-        .success());
+    assert!(cached(&["--", "nested"]).is_empty());
+    // The rename staged outside the workspace is still staged.
+    assert!(cached(&[]).contains("new name.txt"));
     assert_eq!(
         fs::read_to_string(root.join("nested/edit.txt")).unwrap(),
         "working\n"
@@ -556,6 +595,7 @@ fn bulk_git_actions_cover_the_repository_and_preserve_working_files() {
 
 #[test]
 fn staging_a_section_does_not_stage_other_sections() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     git(root, &["init", "-q"]);
@@ -599,6 +639,7 @@ fn staging_a_section_does_not_stage_other_sections() {
 
 #[test]
 fn unstage_all_handles_an_unborn_index_with_new_working_edits() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     git(root, &["init", "-q"]);
@@ -627,9 +668,12 @@ fn unstage_all_handles_an_unborn_index_with_new_working_edits() {
 
 #[test]
 fn reopening_git_and_files_reuses_the_existing_pane_tabs() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let mut app = App::new(dir.path()).unwrap();
-    app.dispatch(Command::Focus { pane: 1 });
+    app.dispatch(Command::Focus {
+        pane: common::side_pane(&app),
+    });
     app.dispatch(Command::AddView { kind: "git".into() });
     let count = snapshot(&mut app)
         .panes
@@ -649,6 +693,7 @@ fn reopening_git_and_files_reuses_the_existing_pane_tabs() {
 
 #[test]
 fn restaging_a_staged_rename_preserves_its_source_removal() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     git(root, &["init", "-q"]);
@@ -699,6 +744,7 @@ fn restaging_a_staged_rename_preserves_its_source_removal() {
 
 #[test]
 fn compact_editor_lines_preserve_tabs_unicode_and_selection_without_padding() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("compact.txt");
     fs::write(&path, "ab\t猫👩‍💻\nsecond\n").unwrap();
@@ -751,6 +797,7 @@ fn compact_editor_lines_preserve_tabs_unicode_and_selection_without_padding() {
 
 #[test]
 fn scoped_catalogs_preserve_focus_and_report_the_requested_git_row() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     git(dir.path(), &["init", "-q"]);
     std::fs::write(dir.path().join("staged.txt"), "staged").unwrap();
@@ -761,10 +808,14 @@ fn scoped_catalogs_preserve_focus_and_report_the_requested_git_row() {
         Some(slate_core::preferences::StartupMode::Workspace),
     )
     .unwrap();
-    app.dispatch(Command::Focus { pane: 1 });
+    app.dispatch(Command::Focus {
+        pane: common::side_pane(&app),
+    });
     app.dispatch(Command::AddView { kind: "git".into() });
     let snapshot = git_ready(&mut app);
-    app.dispatch(Command::Focus { pane: 2 });
+    app.dispatch(Command::Focus {
+        pane: common::editor_pane(&app),
+    });
     let focus = app.focus;
     for (row, entry) in snapshot.git.iter().enumerate() {
         let actions = app.command_catalog_for("", 1, Some(row));

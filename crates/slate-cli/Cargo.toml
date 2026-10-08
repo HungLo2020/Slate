@@ -4,10 +4,10 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-slate-core = { path = "../slate-core" }
-anyhow = "1"
+slate-core.workspace = true
+anyhow.workspace = true
 ratatui = "0.30"
 crossterm = "0.29"
 
 base64 = "0.22"
-libc = "0.2"
+libc.workspace = true

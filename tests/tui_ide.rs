@@ -31,7 +31,7 @@ fn file_picker_and_project_search() {
     tui.command("search-in-files");
     tui.wait_for("Search in files");
     tui.send("search me");
-    tui.wait_for("1 results in 1 files");
+    tui.wait_for("1 result in 1 file");
     tui.wait_for("notes.md:2");
     tui.send(b"\r");
     tui.wait_gone("Search in files");
@@ -97,9 +97,9 @@ fn language_server_diagnostics_hover_and_completion() {
     tui.send(b"\x1b[B");
     tui.send(b"\x1b[F");
     tui.wait_for("error: an error here");
-    // Ctrl+K shows hover text.
+    // Alt+H shows hover text.
     tui.send(b"\x1b[H");
-    tui.send(b"\x0b");
+    tui.send(b"\x1bh");
     tui.wait_for("hover for greet");
     tui.send(b"\x1b");
     tui.wait_gone("hover for greet");

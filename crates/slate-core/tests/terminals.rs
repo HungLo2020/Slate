@@ -48,13 +48,21 @@ fn programs_set_titles_and_copy_and_exited_shells_close() {
     let mut app = App::new_with_startup(dir.path(), Some(StartupMode::Workspace)).unwrap();
     app.dispatch(Command::NewTerminal);
     let id = focused_terminal(&app);
+    // Programs may not set the clipboard unless the user allows it.
     run(
         &mut app,
         r"printf '\033]2;my build\007\033]52;c;aGVsbG8=\007'",
     );
-    wait(&mut app, "title and clipboard", |a| {
-        a.clipboard == "hello" && tab_titles(a).contains(&"my build".to_string())
+    wait(&mut app, "title and refused copy", |a| {
+        a.status.contains("tried to copy") && tab_titles(a).contains(&"my build".to_string())
     });
+    assert!(app.clipboard.is_empty());
+    app.dispatch(Command::Configure {
+        name: "terminal-clipboard".into(),
+        value: "true".into(),
+    });
+    run(&mut app, r"printf '\033]52;c;aGVsbG8=\007'");
+    wait(&mut app, "clipboard", |a| a.clipboard == "hello");
 
     run(&mut app, "exit 3");
     wait(&mut app, "the shell to be reaped", |a| {
@@ -90,4 +98,16 @@ fn scrollback_follows_the_setting() {
         value: "100001".into(),
     });
     assert!(app.status.contains("terminal_scrollback"), "{}", app.status);
+}
+
+#[test]
+fn a_shell_closes_even_when_a_background_job_keeps_the_terminal_open() {
+    let (dir, _serial) = isolated();
+    let mut app = App::new_with_startup(dir.path(), Some(StartupMode::Workspace)).unwrap();
+    app.dispatch(Command::NewTerminal);
+    let id = focused_terminal(&app);
+    run(&mut app, "sleep 30 & exit 0");
+    wait(&mut app, "the shell to be reaped", |a| {
+        !a.terminals.contains_key(&id)
+    });
 }

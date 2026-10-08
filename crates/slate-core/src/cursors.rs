@@ -27,6 +27,39 @@ impl Selection {
     }
 }
 
+/// Carets close together can produce overlapping replacements (word
+/// deletion, a pair deletion, re-indenting one line twice). Overlaps become
+/// one replacement; the primary caret's stays first.
+fn merge_overlaps(typed: Vec<smart::Typed>) -> Vec<smart::Typed> {
+    if typed.len() < 2 {
+        return typed;
+    }
+    let mut order: Vec<usize> = (0..typed.len()).collect();
+    order.sort_by_key(|i| (typed[*i].start, typed[*i].end));
+    let mut merged: Vec<(smart::Typed, bool)> = Vec::with_capacity(typed.len());
+    for i in order {
+        let next = typed[i].clone();
+        let primary = i == 0;
+        match merged.last_mut() {
+            Some((last, last_primary))
+                if next.start < last.end || (next.start == last.start && next.end == last.end) =>
+            {
+                last.end = last.end.max(next.end);
+                if next.text != last.text {
+                    last.text.push_str(&next.text);
+                }
+                *last_primary |= primary;
+            }
+            _ => merged.push((next, primary)),
+        }
+    }
+    let first = merged.iter().position(|(_, p)| *p).unwrap_or(0);
+    let mut out: Vec<smart::Typed> = merged.into_iter().map(|(t, _)| t).collect();
+    let primary = out.remove(first);
+    out.insert(0, primary);
+    out
+}
+
 impl App {
     /// All carets of a view, primary first.
     pub(crate) fn selections(&self, id: u64) -> Vec<Selection> {
@@ -95,6 +128,7 @@ impl App {
 
     /// Apply one replacement per caret as a single undoable change.
     pub(crate) fn apply_typed(&mut self, id: u64, typed: Vec<smart::Typed>) -> Result<()> {
+        let typed = merge_overlaps(typed);
         let doc = self.views[&id].document;
         let before = self.views[&id].cursor;
         let edits: Vec<(usize, usize, String)> = typed
@@ -112,7 +146,7 @@ impl App {
         order.sort_by_key(|i| std::cmp::Reverse(edits[*i].0));
         for i in order {
             let (start, end, text) = &edits[i];
-            self.rebase_views(doc, *start, *end, text.len());
+            self.rebase_views_text(doc, *start, *end, text);
         }
         let selections = typed
             .iter()
@@ -319,7 +353,7 @@ impl App {
         }
         selections.insert(0, Selection::caret(target));
         self.set_selections(id, selections);
-        self.status = format!("{} cursors", self.selections(id).len());
+        self.status = crate::counted(self.selections(id).len(), "cursor", "cursors");
         Ok(())
     }
 
@@ -399,7 +433,7 @@ impl App {
             },
         );
         self.set_selections(id, all);
-        self.status = format!("{} cursors", self.selections(id).len());
+        self.status = crate::counted(self.selections(id).len(), "cursor", "cursors");
         Ok(())
     }
 
@@ -429,7 +463,10 @@ impl App {
         }
         let count = all.len();
         self.set_selections(id, all);
-        self.status = format!("{count} occurrences selected");
+        self.status = format!(
+            "{} selected",
+            crate::counted(count, "occurrence", "occurrences")
+        );
         Ok(())
     }
 }

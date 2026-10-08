@@ -146,12 +146,18 @@ fn symbols_and_open_documents_jump_within_the_workspace() {
         argument: String::new(),
     });
     assert_eq!(active_text(&app).unwrap().1, 28);
-    // The open-documents picker switches between buffers.
+    // The open-documents picker switches between buffers. Opening the file
+    // replaced the empty Untitled tab.
     app.dispatch(Command::OpenPicker {
         kind: "documents".into(),
-        query: "untitled".into(),
+        query: String::new(),
     });
-    assert_eq!(picker(&mut app).total, 1);
+    let names: Vec<String> = picker(&mut app)
+        .items
+        .iter()
+        .map(|i| i.label.clone())
+        .collect();
+    assert_eq!(names, ["util.rs"]);
     press(&mut app, "Escape");
     assert!(app.snapshot(120, 40, 1, 1, 1, 3).picker.is_none());
 }
@@ -280,4 +286,93 @@ fn workbench_keys_never_reach_past_a_terminal() {
         ..Default::default()
     };
     assert_eq!(app.key_binding(&ctrl_d), None);
+}
+
+#[test]
+fn replace_in_files_skips_changed_and_mixed_files_and_can_be_undone() {
+    let (mut app, dir, _serial) = workspace();
+    let root = dir.path().join("project");
+    fs::write(root.join("mixed.txt"), "greet\r\nthere\nok\n").unwrap();
+    fs::write(root.join("later.txt"), "greet later\n").unwrap();
+    app.dispatch(Command::Action {
+        name: "search-in-files".into(),
+        argument: String::new(),
+    });
+    typed(&mut app, "greet");
+    settle(&mut app, "search", |a| !picker(a).busy);
+    // A file changes after the search.
+    fs::write(root.join("later.txt"), "greet changed\n").unwrap();
+    app.dispatch(Command::Action {
+        name: "replace-in-files".into(),
+        argument: String::new(),
+    });
+    app.dispatch(Command::UpdatePrompt {
+        input: "hello".into(),
+        replacement: String::new(),
+        case_sensitive: false,
+        whole_word: false,
+    });
+    app.dispatch(Command::SubmitPrompt { all: false });
+    typed(&mut app, "y");
+    settle(&mut app, "replace", |a| a.status.starts_with("Replaced"));
+    assert!(
+        app.status.contains("later.txt: changed since the search"),
+        "{}",
+        app.status
+    );
+    assert!(
+        app.status.contains("mixed.txt: mixed line endings"),
+        "{}",
+        app.status
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("later.txt")).unwrap(),
+        "greet changed\n"
+    );
+    assert_eq!(
+        fs::read(root.join("mixed.txt")).unwrap(),
+        b"greet\r\nthere\nok\n"
+    );
+    let util = root.join("src/util.rs");
+    assert!(fs::read_to_string(&util).unwrap().contains("fn hello("));
+    // Undo restores what it rewrote on disk.
+    app.dispatch(Command::Action {
+        name: "undo-replace-in-files".into(),
+        argument: String::new(),
+    });
+    assert!(app.status.starts_with("Restored 3 files"), "{}", app.status);
+    assert!(fs::read_to_string(&util).unwrap().contains("fn greet("));
+}
+
+#[test]
+fn going_back_skips_closed_documents() {
+    let (mut app, dir, _serial) = workspace();
+    let root = dir.path().join("project");
+    for name in ["src/main.rs", "src/util.rs"] {
+        app.dispatch(Command::Open {
+            path: root.join(name),
+        });
+        settle(&mut app, "open", |a| a.status.starts_with("Opened"));
+    }
+    // Jump within util.rs, then close main.rs from history's point of view.
+    app.dispatch(Command::OpenPicker {
+        kind: "documents".into(),
+        query: "main".into(),
+    });
+    app.dispatch(Command::PickerAccept { index: Some(0) });
+    app.dispatch(Command::OpenPicker {
+        kind: "documents".into(),
+        query: "util".into(),
+    });
+    app.dispatch(Command::PickerAccept { index: Some(0) });
+    app.dispatch(Command::CloseDocument { force: true });
+    app.dispatch(Command::Action {
+        name: "go-back".into(),
+        argument: String::new(),
+    });
+    assert!(
+        !app.status.starts_with("Error: That document"),
+        "{}",
+        app.status
+    );
 }

@@ -400,6 +400,20 @@ fn copy_xattrs(_source: &Path, _target: &fs::File) -> bool {
 
 /// Write through a privileged helper (`sudo` in a terminal, `pkexec` in a
 /// desktop session) using `tee`, which keeps the file's inode and owner.
+/// Replace an application file (settings, layouts, trust, recovery)
+/// atomically: a private temporary file in the same folder, synced, then
+/// renamed over the old one. The folder is created when missing.
+pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(dir)?;
+    let mut file = tempfile::NamedTempFile::new_in(dir)?;
+    file.write_all(bytes)?;
+    file.as_file().sync_all()?;
+    file.persist(path).map_err(|e| e.error)?;
+    sync_directory(dir);
+    Ok(())
+}
+
 pub fn write_elevated(path: &Path, bytes: &[u8], program: &str, interactive: bool) -> Result<()> {
     let tee = which("tee").unwrap_or_else(|| PathBuf::from("/usr/bin/tee"));
     let mut command = Command::new(program);

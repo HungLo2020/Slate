@@ -74,18 +74,20 @@ pub enum Reply {
     SearchDone(u64, Result<usize, String>),
     /// Grammar-based symbols of a document.
     Outline(u64, Vec<crate::outline::Symbol>),
-    /// Files rewritten by replace-in-files: (files, matches, failures).
-    Replaced(usize, usize, Vec<String>),
-    /// A formatter's output: (document, content version, then save, text).
-    Formatted(u64, u64, bool, Result<String, String>),
+    /// Files rewritten by replace-in-files.
+    Replaced(crate::picker::ReplaceReport),
+    /// A formatter's output: (document, content version, text).
+    Formatted(u64, u64, Result<String, String>),
     /// An external tool finished: (name, output mode, target, result).
     #[allow(clippy::type_complexity)]
     ToolDone(
         String,
-        String,
+        crate::tools::Output,
         Option<(u64, u64, (usize, usize))>,
         Result<String, String>,
     ),
+    /// Preview lines for a location list: (generation, (entry, line)).
+    Previews(u64, Vec<(usize, String)>),
     /// A message from an IDE service (language server, debugger, task).
     Ide(crate::ide::Event),
 }

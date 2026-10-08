@@ -40,7 +40,10 @@ pub struct PickerView {
     pub kind: String,
     pub title: String,
     pub query: String,
+    /// Items `first..first + items.len()` of `total`.
     pub items: Vec<PickerItem>,
+    pub first: usize,
+    /// The selected item, counted over all items.
     pub selected: usize,
     pub total: usize,
     pub busy: bool,
@@ -79,6 +82,10 @@ pub(crate) struct Picker {
     pub local: bool,
     pub options: SearchOptions,
     pub generation: u64,
+    /// For search results: each file's content when it was searched.
+    pub hashes: HashMap<PathBuf, u64>,
+    /// The first item sent to frontends.
+    pub first: usize,
 }
 impl Picker {
     pub fn new(kind: &str, title: &str, local: bool) -> Self {
@@ -94,7 +101,18 @@ impl Picker {
             local,
             options: SearchOptions::default(),
             generation: 0,
+            hashes: HashMap::new(),
+            first: 0,
         }
+    }
+    /// Keep the selection inside the window of items frontends receive.
+    pub fn keep_window(&mut self) {
+        if self.selected < self.first {
+            self.first = self.selected;
+        } else if self.selected >= self.first + SHOWN {
+            self.first = self.selected + 1 - SHOWN;
+        }
+        self.first = self.first.min(self.shown.len().saturating_sub(SHOWN));
     }
     /// Recompute `shown` from the query.
     pub fn filter(&mut self) {
@@ -121,15 +139,15 @@ impl Picker {
             self.shown = scored.into_iter().map(|(_, i, p)| (i, p)).collect();
         }
         self.selected = self.selected.min(self.shown.len().saturating_sub(1));
+        self.first = 0;
+        self.keep_window();
     }
     pub fn view(&self) -> PickerView {
-        // Send a window around the selection so long lists stay cheap.
-        let start = self
-            .selected
-            .saturating_sub(SHOWN / 2)
-            .min(self.shown.len().saturating_sub(SHOWN));
-        let items = self.shown[start..]
+        // A window of the list keeps long lists cheap to send.
+        let items = self
+            .shown
             .iter()
+            .skip(self.first)
             .take(SHOWN)
             .map(|(i, positions)| {
                 let e = &self.entries[*i];
@@ -146,7 +164,8 @@ impl Picker {
             title: self.title.clone(),
             query: self.query.clone(),
             items,
-            selected: self.selected - start,
+            first: self.first,
+            selected: self.selected,
             total: self.shown.len(),
             busy: self.busy,
             message: self.message.clone(),
@@ -178,6 +197,8 @@ impl App {
                     .ok_or_else(|| anyhow::anyhow!("Focus an editor first"))?;
                 let mut p = Picker::new("symbols", "Go to symbol", true);
                 p.busy = true;
+                // Replies are matched to the document they describe.
+                p.generation = self.views[&id].document;
                 self.request_symbols(id);
                 p
             }
@@ -339,10 +360,15 @@ impl App {
 
     pub(crate) fn search_hits(&mut self, generation: u64, hits: Vec<Hit>) {
         let root = self.root.clone();
-        let Some(p) = self.picker.as_mut().filter(|p| p.generation == generation) else {
+        let Some(p) = self
+            .picker
+            .as_mut()
+            .filter(|p| p.kind == "search" && p.generation == generation)
+        else {
             return;
         };
         for hit in hits {
+            p.hashes.insert(hit.path.clone(), hit.hash);
             let relative = hit
                 .path
                 .strip_prefix(&root)
@@ -364,7 +390,11 @@ impl App {
     }
 
     pub(crate) fn search_done(&mut self, generation: u64, result: Result<usize, String>) {
-        let Some(p) = self.picker.as_mut().filter(|p| p.generation == generation) else {
+        let Some(p) = self
+            .picker
+            .as_mut()
+            .filter(|p| p.kind == "search" && p.generation == generation)
+        else {
             return;
         };
         p.busy = false;
@@ -380,9 +410,16 @@ impl App {
         p.message = match result {
             Ok(0) => "No results".into(),
             Ok(n) if n >= crate::project::MATCH_LIMIT => {
-                format!("First {n} results in {files} files · refine the search")
+                format!(
+                    "First {n} results in {} · refine the search",
+                    crate::counted(files, "file", "files")
+                )
             }
-            Ok(n) => format!("{n} results in {files} files"),
+            Ok(n) => format!(
+                "{} in {}",
+                crate::counted(n, "result", "results"),
+                crate::counted(files, "file", "files")
+            ),
             Err(e) => e,
         };
     }
@@ -391,6 +428,21 @@ impl App {
         if let Some(p) = self.picker.as_mut() {
             let last = p.shown.len().saturating_sub(1);
             p.selected = (p.selected as i64 + delta as i64).clamp(0, last as i64) as usize;
+            p.keep_window();
+        }
+    }
+
+    /// Show items from `first` on (a frontend scrolled the list).
+    pub(crate) fn picker_window(&mut self, first: usize) {
+        if let Some(p) = self.picker.as_mut() {
+            p.first = first.min(p.shown.len().saturating_sub(SHOWN));
+        }
+    }
+
+    /// Close the picker, stopping a search it started.
+    pub(crate) fn close_picker(&mut self) {
+        if self.picker.take().is_some_and(|p| p.kind == "search") {
+            self.search_cancel.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -411,17 +463,14 @@ impl App {
         let Some(p) = self.picker.as_ref() else {
             return Ok(());
         };
-        // `index` counts within the items the frontend was sent.
-        let start = p
-            .selected
-            .saturating_sub(SHOWN / 2)
-            .min(p.shown.len().saturating_sub(SHOWN));
-        let chosen = index.map_or(p.selected, |i| start + i);
+        // `index` counts over all items, so items arriving meanwhile
+        // (a streaming search) do not change what was clicked.
+        let chosen = index.unwrap_or(p.selected);
         let Some((entry, _)) = p.shown.get(chosen) else {
             bail!("Nothing selected");
         };
         let target = p.entries[*entry].target.clone();
-        self.picker = None;
+        self.close_picker();
         match target {
             Target::Location(mut location) => {
                 if location.line == usize::MAX {
@@ -453,7 +502,7 @@ impl App {
             return Ok(false);
         }
         match (k.key.as_str(), k.ctrl, k.alt) {
-            ("Escape", _, _) => self.picker = None,
+            ("Escape", _, _) => self.close_picker(),
             ("Enter", _, _) => self.picker_accept(None)?,
             ("Up", _, _) => self.picker_move(-1),
             ("Down", _, _) => self.picker_move(1),
@@ -501,7 +550,11 @@ impl App {
         let Some(path) = self.documents.get(&doc).map(|d| d.path.clone()) else {
             return;
         };
-        let Some(p) = self.picker.as_mut().filter(|p| p.kind == "symbols") else {
+        let Some(p) = self
+            .picker
+            .as_mut()
+            .filter(|p| p.kind == "symbols" && p.generation == doc)
+        else {
             return;
         };
         p.busy = false;
@@ -529,110 +582,136 @@ impl App {
 
     /// Replace every project-search match. Open documents change in the
     /// editor (unsaved, undoable); other files are rewritten on disk.
+    /// Replace every project-search match. Open documents change in the
+    /// editor (unsaved, undoable). Other files are rewritten on disk, unless
+    /// they changed since the search or mix line endings (rewriting would
+    /// normalise them); their previous contents are kept for
+    /// undo-replace-in-files.
     pub(crate) fn replace_in_files(&mut self, replacement: &str) -> Result<()> {
         let options = self
             .last_search
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Search in files first"))?;
         let regex = options.compile().map_err(anyhow::Error::msg)?;
-        let mut changed_open = 0;
-        let mut count = 0;
-        let mut closed: Vec<PathBuf> = Vec::new();
-        for path in self.last_search_files.clone() {
-            if let Some(doc) = self.document_for(&path) {
-                let text = self.documents[&doc].text();
-                let edits: Vec<(usize, usize, String)> = regex
-                    .captures_iter(&text)
-                    .filter_map(|c| {
-                        let m = c.get(0)?;
-                        let mut value = String::new();
-                        if options.regex {
-                            c.expand(replacement, &mut value);
-                        } else {
-                            value.push_str(replacement);
-                        }
-                        (m.start() < m.end()).then_some((m.start(), m.end(), value))
-                    })
-                    .collect();
-                if edits.is_empty() {
-                    continue;
+        let mut report = ReplaceReport::default();
+        let mut closed: Vec<(PathBuf, Option<u64>)> = Vec::new();
+        for (path, hash) in self.last_search_files.clone() {
+            let Some(doc) = self.document_for(&path) else {
+                closed.push((path, hash));
+                continue;
+            };
+            let edits = replacements(
+                &regex,
+                options.regex,
+                &self.documents[&doc].text(),
+                replacement,
+            );
+            if edits.is_empty() {
+                continue;
+            }
+            let title = self.documents[&doc].title();
+            if self.documents[&doc].read_only {
+                report.problems.push(format!("{title}: read-only"));
+                continue;
+            }
+            match self.replace_in_document(doc, &edits) {
+                Ok(_) => {
+                    report.open_files += 1;
+                    report.matches += edits.len();
                 }
-                count += edits.len();
-                changed_open += 1;
-                let view = self.reveal_document(doc);
-                let before = self.views[&view].cursor;
-                self.documents
-                    .get_mut(&doc)
-                    .unwrap()
-                    .replace_many(&edits, before)?;
-                self.clamp_views(doc);
-            } else {
-                closed.push(path);
+                Err(e) => report.problems.push(format!("{title}: {e:#}")),
             }
         }
         let replacement = replacement.to_string();
         self.services.background(move || {
-            let mut files = 0;
-            let mut total = 0;
-            let mut errors = Vec::new();
-            for path in closed {
-                let result = (|| -> anyhow::Result<usize> {
+            for (path, hash) in closed {
+                // (replacements, content before, content after)
+                type Rewrite = (usize, Vec<u8>, Vec<u8>);
+                let result = (|| -> anyhow::Result<Option<Rewrite>> {
+                    let before = std::fs::read(&path)?;
+                    if hash.is_some_and(|h| h != crate::project::content_hash(&before)) {
+                        anyhow::bail!("changed since the search; search again");
+                    }
                     let mut doc = crate::document::Document::open(&path)?;
-                    let text = doc.text();
-                    let edits: Vec<(usize, usize, String)> = regex
-                        .captures_iter(&text)
-                        .filter_map(|c| {
-                            let m = c.get(0)?;
-                            let mut value = String::new();
-                            if options.regex {
-                                c.expand(&replacement, &mut value);
-                            } else {
-                                value.push_str(&replacement);
-                            }
-                            (m.start() < m.end()).then_some((m.start(), m.end(), value))
-                        })
-                        .collect();
+                    if doc.format.mixed_line_endings {
+                        anyhow::bail!("mixed line endings; open it to replace there");
+                    }
+                    let edits = replacements(&regex, options.regex, &doc.text(), &replacement);
                     if edits.is_empty() {
-                        return Ok(0);
+                        return Ok(None);
                     }
                     doc.replace_many(&edits, 0)?;
                     doc.save(None)?;
-                    Ok(edits.len())
+                    let after = std::fs::read(&path)?;
+                    Ok(Some((edits.len(), before, after)))
                 })();
                 match result {
-                    Ok(0) => {}
-                    Ok(n) => {
-                        files += 1;
-                        total += n;
+                    Ok(None) => {}
+                    Ok(Some((count, before, after))) => {
+                        report.files += 1;
+                        report.matches += count;
+                        report.backups.push((path, before, after));
                     }
-                    Err(e) => errors.push(format!("{}: {e:#}", path.display())),
+                    Err(e) => report.problems.push(format!("{}: {e:#}", path.display())),
                 }
             }
-            Reply::Replaced(files, total, errors)
+            Reply::Replaced(report)
         });
-        self.pending_replace = Some((changed_open, count));
         self.status = "Replacing in files…".into();
         Ok(())
     }
 
-    pub(crate) fn replaced(&mut self, files: usize, total: usize, errors: Vec<String>) {
-        let (open_files, open_count) = self.pending_replace.take().unwrap_or((0, 0));
+    pub(crate) fn replaced(&mut self, report: ReplaceReport) {
+        let count = crate::counted;
+        let mut status = format!(
+            "Replaced {} in {}",
+            count(report.matches, "match", "matches"),
+            count(report.files + report.open_files, "file", "files")
+        );
+        if report.open_files > 0 {
+            status.push_str(&format!(
+                " · {} unsaved",
+                count(report.open_files, "open document", "open documents")
+            ));
+        }
+        if !report.backups.is_empty() {
+            status.push_str(" · undo-replace-in-files restores files on disk");
+        }
+        if !report.problems.is_empty() {
+            status.push_str(&format!(" · skipped {}", report.problems.join("; ")));
+        }
+        self.status = status;
+        self.replace_backups = report.backups;
+        self.index_at = None;
+    }
+
+    /// Put back the files the last replace-in-files rewrote, unless they
+    /// changed again since.
+    pub(crate) fn undo_replace_in_files(&mut self) -> Result<()> {
+        let backups = std::mem::take(&mut self.replace_backups);
+        if backups.is_empty() {
+            bail!("No replace-in-files to undo");
+        }
+        let (mut restored, mut kept) = (0, Vec::new());
+        for (path, before, after) in backups {
+            if std::fs::read(&path).ok().as_deref() != Some(after.as_slice()) {
+                kept.push(path.display().to_string());
+                continue;
+            }
+            // Written in place, keeping the file's permissions and links.
+            std::fs::write(&path, &before)?;
+            restored += 1;
+        }
         self.status = format!(
-            "Replaced {} matches in {} files{}{}",
-            total + open_count,
-            files + open_files,
-            if open_files > 0 {
-                format!(" · {open_files} open documents changed (unsaved)")
-            } else {
-                String::new()
-            },
-            if errors.is_empty() {
+            "Restored {restored} file{}{}",
+            if restored == 1 { "" } else { "s" },
+            if kept.is_empty() {
                 String::new()
             } else {
-                format!(" · failed: {}", errors.join("; "))
+                format!(" · changed since, left alone: {}", kept.join(", "))
             }
         );
-        self.index_at = None;
+        Ok(())
     }
 
     /// Remember the accepted search so replace-in-files can repeat it.
@@ -652,6 +731,10 @@ impl App {
                 })
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
+                .map(|path| {
+                    let hash = p.hashes.get(&path).copied();
+                    (path, hash)
+                })
                 .collect();
         }
     }
@@ -671,10 +754,44 @@ impl App {
         if self.last_search_files.is_empty() {
             bail!("No results to replace");
         }
-        self.picker = None;
+        self.close_picker();
         self.prompt = Some(crate::actions::prompt("project-replace", String::new()));
         Ok(())
     }
+}
+
+/// The outcome of replace-in-files.
+#[derive(Default)]
+pub struct ReplaceReport {
+    files: usize,
+    open_files: usize,
+    matches: usize,
+    problems: Vec<String>,
+    /// (file, previous bytes, written bytes) for undo.
+    backups: Vec<(PathBuf, Vec<u8>, Vec<u8>)>,
+}
+
+/// The replacements for every match of `regex` in `text`. In regex mode
+/// `$1`-style groups in `replacement` expand.
+fn replacements(
+    regex: &regex::Regex,
+    expand: bool,
+    text: &str,
+    replacement: &str,
+) -> Vec<(usize, usize, String)> {
+    regex
+        .captures_iter(text)
+        .filter_map(|c| {
+            let m = c.get(0)?;
+            let mut value = String::new();
+            if expand {
+                c.expand(replacement, &mut value);
+            } else {
+                value.push_str(replacement);
+            }
+            (m.start() < m.end()).then_some((m.start(), m.end(), value))
+        })
+        .collect()
 }
 
 #[cfg(test)]

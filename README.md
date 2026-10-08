@@ -162,13 +162,21 @@ the command palette (F1).
 ### Workspace trust
 
 Opening a folder never runs code from it. Language servers, tasks, formatters,
-debugging, project tools and Git hooks wait until you trust the folder. The
-first action that needs trust asks; you can also use **Trust workspace** and
-**Restrict workspace** from the palette. The status bar shows **Restricted**
-until you do. Trusted folders, and everything inside them, are listed one per
-line in `~/.config/slate/trusted-folders`. In restricted mode Git still shows
-status and diffs, with `core.fsmonitor` and hooks disabled; staging and commits
-ask first.
+debugging, project tools and Git wait until you trust the folder. Git is
+included because a repository's own configuration (filters, fsmonitor, hooks)
+can name programs to run, so the Git pane shows **Trust Folder…** instead of
+changes until you trust the repository. The first action that needs trust
+asks; you can also use **Trust workspace**, **Restrict workspace** and
+**Trust this folder…** from the palette. The status bar shows **Restricted** until
+you do.
+
+Trust is decided per folder, not per window: a language server or formatter
+for a file in another folder asks about that folder, and a repository that
+contains the workspace asks about the repository. A single opened file's folder
+is trusted for the session only, so editing a download does not trust all of
+Downloads. Trusted folders, and everything inside them, are listed one per line
+in `~/.config/slate/trusted-folders`; a line starting with `!` restricts a
+folder inside a trusted one, and the most specific line wins.
 
 ### Language servers
 
@@ -189,14 +197,19 @@ roots = ["pyproject.toml"]
 
 Edits are sent to the server as they happen. Errors and warnings are underlined
 in the editor, marked in the gutter and counted in the status bar; the message
-under the caret is shown there too. Completion opens while you type: Up/Down to
-choose, Tab or Enter to accept, Escape to close. Snippet completions put the
-caret in their first field. You can also show hover information, go to a
-definition, find references, rename a symbol across the workspace (closed
-files are rewritten on disk; open ones change in the editor, undoable), apply
-code actions, format the document, and list the document's or workspace's
-symbols. **Format on save** is a setting. Files without a server get an outline
-from their syntax grammar.
+under the caret is shown there too. Completion opens after two typed characters
+or a trigger character such as `.` (setting **Complete while typing**): Up/Down
+to choose, Tab or Enter to accept (setting **Enter accepts a completion**),
+Escape to close. Snippet completions put the caret in their first field. You
+can also show hover information (Alt+H, or rest the mouse on a word in the
+desktop editor), go to a definition, find references, rename a symbol across
+the workspace, apply code actions, format the document, and list the
+document's or workspace's symbols. Renames and code actions open the files they
+change as unsaved tabs, so every change can be reviewed and undone; edits
+computed for an older version of a file, or for files outside the workspace,
+are refused. **Format on save** is a setting. **Language servers** lists the
+running servers and their progress. Files without a server get an outline from
+their syntax grammar.
 
 ### Finding things
 
@@ -209,16 +222,19 @@ from their syntax grammar.
 | Ctrl+E | Open documents |
 | Alt+Left / Alt+Right | Go back / forward after a jump |
 | F12 / Shift+F12 | Go to definition / find references |
-| Ctrl+K | Hover information |
+| Alt+H | Hover information |
 | F2 | Rename symbol |
-| Ctrl+. | Code actions |
-| Ctrl+Shift+I | Format document |
+| Ctrl+. or Alt+Enter | Code actions |
+| Ctrl+Shift+I or Alt+Shift+F | Format document |
 | Ctrl+Space | Complete |
 | Ctrl+F8 / Ctrl+Shift+F8 | Next / previous problem |
 
 Project search runs in the background as you type, searches unsaved documents
-as edited, and skips binary and ignored files. Replace in files changes open
-documents in the editor and rewrites the others.
+as edited, and skips binary and ignored files. Results can be clicked, and long
+lists page in as you scroll. Replace in files changes open documents in the
+editor and rewrites the others. It skips files that changed since the search
+and files with mixed line endings, and says so. **Undo replace in files** puts
+back the files it rewrote on disk, unless they changed again since.
 
 These keys are in the default keymap. The finding keys also work from the file
 and Git panes, but never in a terminal, so shells keep Ctrl+P, Ctrl+E and
@@ -229,11 +245,14 @@ Alt+arrows.
 | Key | Action |
 | --- | --- |
 | Ctrl+D | Select the word, then add its next occurrence as another caret |
-| Ctrl+Shift+L | A caret on every occurrence |
+| Ctrl+Shift+L or Alt+Shift+L | A caret on every occurrence |
 | Ctrl+Alt+Up / Down | Add a caret above / below |
 | Alt+click | Add or remove a caret |
 | Escape | Back to one caret |
-| Ctrl+Shift+[ / Ctrl+Shift+] | Fold / unfold the indented region (or click ▸ in the gutter) |
+| Ctrl+Shift+[ / Ctrl+Shift+] or Alt+- / Alt+= | Fold / unfold the indented region (or click ▾/▸ in the gutter) |
+| Ctrl+Tab / Ctrl+Shift+Tab (or Ctrl+PageDown / PageUp) | Next / previous tab |
+| Ctrl+N | New document |
+| Shift+F1 | Keyboard help |
 | Ctrl+6 | Go to the matching bracket |
 | Tab after a snippet prefix | Expand a snippet; Tab / Shift+Tab move between its fields |
 
@@ -256,11 +275,13 @@ language = "Rust"      # optional
 
 ### Tasks and problems
 
-**Run build task** (Ctrl+Shift+B) and **Run task…** run tasks. Tasks come from
-`.slate/tasks.toml`, or are detected for Cargo, Make, CMake, Go, npm scripts
-and pytest. Output streams into a read-only document, and a problem matcher
-(`gcc`, `rustc`, `tsc`, `python`, `generic`) adds the errors and warnings to
-**Problems**.
+**Run build task** (Ctrl+Shift+B or Alt+Shift+B) and **Run task…** run tasks.
+Tasks come from `.slate/tasks.toml`, or are detected for Cargo, Make, CMake, Go,
+npm scripts and pytest. Output streams into a read-only document (one per task,
+reused on the next run) that opens beside the editor without taking focus, and
+a problem matcher (`gcc`, `rustc`, `tsc`, `python`, `generic`) adds the errors
+and warnings to **Problems**. **Stop tasks** ends a task and everything it
+started; tasks still running when Slate quits are stopped too.
 
 ```toml
 [[task]]
@@ -283,11 +304,18 @@ program = "build/app"
 args = ["--verbose"]
 ```
 
-**Toggle breakpoint** is Ctrl+F9. While debugging, F9 toggles breakpoints, F10
-steps over, F11 steps in, Shift+F11 steps out, F5 continues and Shift+F5
-stops. The editor follows the paused line (▶ in the gutter). A Debug document
-shows the call stack, local variables and program output; **Evaluate…**
-evaluates an expression in the paused frame.
+**Toggle breakpoint** is Ctrl+F9; breakpoints show as ◆ in the gutter, move
+with edits and are remembered with the workspace. **Breakpoints…** lists them
+and **Remove all breakpoints** clears them. While debugging, F9 toggles
+breakpoints, F10 steps over, F11 steps in, Shift+F11 steps out, F5 continues and
+Shift+F5 stops (Alt+Shift+N/I/O/C step over, in, out and continue in terminals
+that do not send function keys). These keys are the `debug_keys` table in
+`settings.toml`. The editor follows the paused line (▶ in the gutter). A Debug
+document shows the call stack, local variables and program output;
+**Call stack…** switches to another frame, and **Evaluate…** evaluates an
+expression in the selected frame. The desktop editor has a **Run** menu and,
+while debugging, continue/step/stop buttons in the status bar. The last launch
+configuration is remembered for the next **Start debugging**.
 
 ### External tools
 
@@ -309,8 +337,12 @@ Tools run with `sh -c` and get `SLATE_FILE`, `SLATE_LINE`, `SLATE_COLUMN`,
 ### Terminals
 
 A terminal whose shell exits closes its tab, and the exit code is shown when
-it is not zero. Programs can set the tab title and copy to the clipboard (OSC
-52). The **Terminal scrollback lines** setting controls history.
+it is not zero. Programs can set the tab title. Programs can copy to the
+clipboard (OSC 52) only with the **Terminal programs may set the clipboard**
+setting (`terminal_clipboard`), since anything printed to a terminal (a `cat`
+of a downloaded file, say) could otherwise replace what you copied. Pasted text
+has control characters removed. The **Terminal scrollback lines** setting
+controls history.
 
 ## Startup and settings
 
@@ -334,7 +366,16 @@ hard_wrap = false
 backup = false            # keep NAME~ on save
 file_recovery = false     # recover unsaved single files after a crash
 tui_mouse = true
+terminal_clipboard = false          # let terminal programs set the clipboard (OSC 52)
+complete_while_typing = true
+accept_completion_on_enter = true
 ```
+
+Keymaps gain new default bindings when Slate adds them, without changing keys
+you set. A configuration file that does not parse (`settings.toml`,
+`languages.toml`, `tools.toml`, `snippets.toml`, `layouts.toml`,
+`.slate/tasks.toml`, `.slate/launch.toml`) is reported in the status bar instead
+of being ignored, and Slate does not overwrite it.
 
 Press **F10** to expand/collapse the workspace. The GUI also has a **Workspace** /
 **Editor only** toolbar button. This keeps the complete split layout, open tabs,
@@ -487,11 +528,15 @@ Both frontends use the same Rust catalog and command handlers. Prefix input with
 `:` to execute an advanced textual command directly.
 
 GUI: double-click a file to open it and drag dividers to resize. The menu bar
-provides **File**, **Edit**, **View**, **Go**, and **Terminal** menus. Menu actions
-show configured shortcuts and are disabled when unavailable in the focused pane.
+provides **File**, **Edit**, **View**, **Go** and **Run** menus (Run holds
+debugging, breakpoints, tasks and terminals). Menu actions show configured
+shortcuts and are disabled when unavailable in the focused pane. Right-clicking
+the text offers go to definition, references, rename, code actions, format and
+breakpoints. Find and replace open at the bottom of the window without dimming
+the text, so matches stay visible; Alt+C and Alt+W toggle their options.
 Settings lives under File; workspace visibility and saved layouts live under View.
 Each pane has a **⋮** action menu for splits, view changes, and relevant document,
-terminal, or Git actions. Right-click opens the pane menu in files/editors and a file action menu in Git.
+terminal, or Git actions. Right-click opens the pane menu in files and a file action menu in Git.
 Tabs fit within their header and show complete names in tooltips. When space is
 limited, the active tab stays visible and a dropdown lists every tab. Headers and file rows grow with the interface font. Pane minimum
 sizes constrain displayed split ratios without changing saved preferences. When
@@ -592,10 +637,11 @@ commands discard unsaved work. GUI window closure asks before discarding.
 `insert-spaces`, `auto-indent`, `line-numbers` (booleans), `theme`
 (`auto`, `dark`, `light`), `keymap` (`default`, `nano`; choosing one replaces the
 key tables), `soft-wrap`, `wrap-column` (10–500), `hard-wrap`, `backup`,
-`file-recovery` and `tui-mouse`. Running as root through `sudo` without `-H`,
+`file-recovery`, `tui-mouse`, `terminal-clipboard`, `complete-while-typing`
+and `accept-completion-on-enter`; `set` with an unknown name lists them all. Running as root through `sudo` without `-H`,
 Slate uses root's own configuration and state directories rather than creating
 root-owned files in your home directory. Run `set indent-width 4` to create a complete settings
-file, edit its `global_keys`, `editor_keys` and `terminal_keys` tables, then run
+file, edit its `global_keys`, `editor_keys`, `terminal_keys` and `debug_keys` tables, then run
 `settings-reload`. Chords use the order `Ctrl+Alt+Shift+key` with lowercase key
 names, such as `Ctrl+s`, `Shift+f3`, or `Alt+r`. A supplied key table replaces that
 scope's defaults; removing an entry disables it. F1/Ctrl+Shift+P remain frontend
@@ -680,6 +726,7 @@ SLATE_GUI_FILE_DIALOG_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debu
 SLATE_GUI_TAB_CLOSE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
 QT_QPA_PLATFORMTHEME=kde SLATE_GUI_PLATFORM=wayland SLATE_GUI_REQUIRE_KDE_DIALOGS=1 SLATE_GUI_FILE_DIALOG_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate # running Plasma desktop
 SLATE_GUI_GIT_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
+SLATE_GUI_COMMAND_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
 cargo build --release -p slate -p slate-gui --features slate-gui/smoke
 python3 scripts/gui-performance-smoke.py target/release/slate
 python3 scripts/idle-smoke.py target/release/slate       # Linux, release GUI/TUI idle CPU

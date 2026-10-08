@@ -89,6 +89,17 @@ pub struct Hit {
     pub length: usize,
     /// The line, shortened around the match.
     pub preview: String,
+    /// The searched file's content, so a later replace can tell whether the
+    /// file changed since.
+    pub hash: u64,
+}
+
+/// A fingerprint of file content (stable within one run of Slate).
+pub fn content_hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Shorten a line around a match for display.
@@ -136,8 +147,8 @@ pub fn search(
             continue;
         }
         let path = entry.path().to_path_buf();
-        let text = match buffers.get(&path) {
-            Some(text) => text.clone(),
+        let (text, hash) = match buffers.get(&path) {
+            Some(text) => (text.clone(), content_hash(text.as_bytes())),
             None => {
                 if entry.metadata().map(|m| m.len()).unwrap_or(0) > SEARCH_FILE_LIMIT {
                     continue;
@@ -149,7 +160,10 @@ pub fn search(
                 if bytes[..bytes.len().min(8192)].contains(&0) {
                     continue;
                 }
-                String::from_utf8_lossy(&bytes).into_owned()
+                (
+                    String::from_utf8_lossy(&bytes).into_owned(),
+                    content_hash(&bytes),
+                )
             }
         };
         let mut line = 0;
@@ -158,8 +172,13 @@ pub fn search(
             if m.start() == m.end() {
                 continue;
             }
-            line += text[line_start..m.start()].matches('\n').count();
-            line_start = text[..m.start()].rfind('\n').map_or(0, |i| i + 1);
+            // Lines and the line start advance from the previous match, so
+            // a long file costs one pass however many matches it has.
+            let between = &text[line_start..m.start()];
+            if let Some(last) = between.rfind('\n') {
+                line += between.matches('\n').count();
+                line_start += last + 1;
+            }
             let line_end = text[m.start()..]
                 .find('\n')
                 .map_or(text.len(), |i| m.start() + i);
@@ -172,6 +191,7 @@ pub fn search(
                 column,
                 length,
                 preview,
+                hash,
             });
             total += 1;
             if total >= MATCH_LIMIT {

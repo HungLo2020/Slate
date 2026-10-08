@@ -76,6 +76,14 @@ impl Fixture {
         fs::read_to_string(self.dir.path().join("dump/main.fk")).ok()
     }
     /// Wait until the server's copy of the document matches the editor's.
+    /// Wait until the server's diagnostics for the text have arrived, so
+    /// requests that depend on them (code actions) see them.
+    fn diagnosed(&mut self) {
+        self.wait("diagnostics", |a| {
+            let (errors, warnings) = a.snapshot(120, 40, 0, 1, 1, 0).problems;
+            errors + warnings > 0
+        });
+    }
     fn synced(&mut self) {
         let dump = self.dir.path().join("dump/main.fk");
         let doc = self.app.views[&self.editor()].document;
@@ -247,7 +255,8 @@ fn diagnostics_hover_and_navigation() {
 fn rename_format_code_actions_and_completion_edit_the_workspace() {
     let mut f = fixture(SOURCE, true);
     f.synced();
-    // Rename edits the open document and rewrites a closed file.
+    // Rename edits the open document and opens the closed file with its
+    // edit applied, unsaved, so the whole rename can be reviewed and undone.
     f.goto(1, 5);
     f.action("rename-symbol", "");
     assert_eq!(f.app.prompt.as_ref().unwrap().input, "greet");
@@ -263,8 +272,22 @@ fn rename_format_code_actions_and_completion_edit_the_workspace() {
     assert!(f.text().contains("main calls welcome"));
     let other = f.file.with_file_name("other.fk");
     assert_eq!(
-        fs::read_to_string(other).unwrap(),
-        "welcome from a closed file\n"
+        fs::read_to_string(&other).unwrap(),
+        "greet from a closed file\n",
+        "nothing is written behind the user's back"
+    );
+    let opened = f
+        .app
+        .documents
+        .values()
+        .find(|d| d.path.as_deref() == Some(other.as_path()))
+        .expect("the closed file opened");
+    assert_eq!(opened.text(), "welcome from a closed file\n");
+    assert!(opened.dirty());
+    assert!(
+        f.app.status.contains("Renamed in 2 files"),
+        "{}",
+        f.app.status
     );
     // Undo restores every occurrence in one step.
     f.app.dispatch(Command::Undo);
@@ -291,6 +314,7 @@ fn rename_format_code_actions_and_completion_edit_the_workspace() {
 
     // A quick fix from a diagnostic, and a command that edits via the server.
     f.synced();
+    f.diagnosed();
     f.goto(3, "main calls welcome 👩‍💻 ER".len());
     f.action("code-actions", "");
     f.wait("code actions", |a| {
@@ -370,12 +394,11 @@ fn restricted_workspaces_start_no_language_server() {
     }
     assert!(f.server_text().is_none());
     assert!(f.app.language_servers().is_empty());
+    // Asking for language features asks to trust the project.
     f.action("hover", "");
-    assert!(
-        f.app.status.contains("Trust the workspace"),
-        "{}",
-        f.app.status
-    );
+    assert_eq!(f.app.prompt.as_ref().unwrap().kind, "trust");
+    f.app.dispatch(Command::DismissPrompt);
+    assert!(f.server_text().is_none());
     // Trusting starts it.
     f.app.set_session_trust(true);
     f.synced();
@@ -383,4 +406,96 @@ fn restricted_workspaces_start_no_language_server() {
     f.app.set_session_trust(false);
     f.app.process_events();
     assert!(f.app.language_servers().is_empty());
+}
+
+#[test]
+fn edits_for_changed_text_or_outside_the_workspace_are_refused() {
+    let mut f = fixture(SOURCE, true);
+    f.synced();
+    f.diagnosed();
+    // A code action computed before the user typed is not applied.
+    f.goto(3, "main calls greet 👩‍💻 ER".len());
+    f.action("code-actions", "");
+    f.wait("code actions", |a| {
+        a.snapshot(120, 40, 0, 1, 1, 0)
+            .picker
+            .is_some_and(|p| p.total == 2)
+    });
+    // The document changes while the list is open.
+    let before = f.text();
+    let id = f.editor();
+    let doc = f.app.views[&id].document;
+    f.app
+        .documents
+        .get_mut(&doc)
+        .unwrap()
+        .replace(0, 0, "x", 0)
+        .unwrap();
+    f.app.dispatch(Command::PickerAccept { index: Some(0) });
+    assert!(f.app.status.contains("changed since"), "{}", f.app.status);
+    assert_eq!(f.text(), format!("x{before}"), "nothing was applied");
+
+    // A rename that would touch a file outside the workspace changes nothing.
+    let outside = f.dir.path().join("outside.fk");
+    fs::write(&outside, "greet outside\n").unwrap();
+    std::env::set_var("FAKE_LSP_EXTRA", &outside);
+    f.app.dispatch(Command::Action {
+        name: "restart-language-servers".into(),
+        argument: String::new(),
+    });
+    f.synced();
+    let before = f.text();
+    f.goto(1, 5);
+    f.action("rename-symbol", "renamed");
+    f.wait("refusal", |a| a.status.contains("outside the workspace"));
+    assert_eq!(f.text(), before);
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "greet outside\n");
+}
+
+#[test]
+fn a_format_cut_short_by_a_stopped_server_leaves_the_document_saveable() {
+    let mut f = fixture(SOURCE, true);
+    f.synced();
+    f.app.dispatch(Command::Configure {
+        name: "format-on-save".into(),
+        value: "true".into(),
+    });
+    f.goto(2, 8);
+    f.typed("   ");
+    // Save starts a format; the server goes away before answering.
+    f.app.dispatch(Command::Save);
+    assert_eq!(f.app.status, "Formatting…");
+    f.action("restart-language-servers", "");
+    // Format-on-save still saves (unformatted), and saving works again.
+    f.wait("save", |a| a.status == "Saved");
+    assert!(fs::read_to_string(&f.file)
+        .unwrap()
+        .contains("def main   \n"));
+    f.typed("x");
+    f.app.dispatch(Command::Save);
+    assert_ne!(f.app.status, "Error: Wait for formatting to finish");
+}
+
+#[test]
+fn servers_for_projects_outside_trusted_folders_do_not_start() {
+    let mut f = fixture(SOURCE, true);
+    f.synced();
+    // A file from an untrusted folder, opened in this trusted workspace.
+    let elsewhere = f.dir.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let file = elsewhere.join("other.fk");
+    fs::write(&file, "def x\n").unwrap();
+    f.app.dispatch(Command::Open { path: file.clone() });
+    f.wait("open", |a| a.status.starts_with("Opened"));
+    for _ in 0..30 {
+        f.app.process_events();
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !f.dir.path().join("dump/other.fk").exists(),
+        "no server saw it"
+    );
+    f.action("hover", "");
+    let prompt = f.app.prompt.clone().expect("asks to trust that folder");
+    assert!(prompt.input.contains("elsewhere"), "{}", prompt.input);
 }

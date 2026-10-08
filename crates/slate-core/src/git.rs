@@ -5,10 +5,9 @@
 use serde::Serialize;
 use std::{
     ffi::{OsStr, OsString},
-    io::Read,
-    path::PathBuf,
-    process::{Command, Output, Stdio},
-    time::{Duration, Instant},
+    path::{Path, PathBuf},
+    process::{Command, Output},
+    time::Duration,
 };
 
 /// Reads (status, diff) and writes (stage, commit) have separate budgets.
@@ -60,6 +59,9 @@ pub(crate) struct Panel {
     /// A status read is running; another was requested meanwhile.
     pub status_running: bool,
     pub status_again: bool,
+    /// The repository is in a folder the user has not trusted, so Git (which
+    /// can run programs named by repository configuration) does not run.
+    pub restricted: bool,
 }
 impl Default for Panel {
     fn default() -> Self {
@@ -73,15 +75,30 @@ impl Default for Panel {
             revision: 1,
             status_running: false,
             status_again: false,
+            restricted: false,
         }
     }
 }
 
-/// Where and how to run Git.
+/// Where to run Git: the repository's top folder, and the workspace's path
+/// inside it when the repository is larger than the workspace (status and
+/// "stage all" stay within the workspace).
 #[derive(Clone)]
 pub struct Context {
     pub root: PathBuf,
-    pub trusted: bool,
+    pub scope: Option<OsString>,
+}
+
+/// The repository containing `folder`: the nearest folder with a `.git`
+/// entry. Found without running Git, so nothing executes before trust.
+pub fn find_repository(folder: &Path) -> Option<PathBuf> {
+    let folder = folder
+        .canonicalize()
+        .unwrap_or_else(|_| folder.to_path_buf());
+    folder
+        .ancestors()
+        .find(|d| d.join(".git").exists())
+        .map(Path::to_path_buf)
 }
 
 pub enum GitJob {
@@ -112,112 +129,28 @@ fn os(bytes: &[u8]) -> OsString {
     String::from_utf8_lossy(bytes).into_owned().into()
 }
 
-/// Run git, killing it (and anything it started) after `timeout`.
+/// Run git in the repository, killing it (and anything it started) after
+/// `timeout`. Only called for trusted repositories.
 pub fn run(context: &Context, args: &[OsString], timeout: Duration) -> Result<Output, String> {
     let mut command = Command::new("git");
-    command.arg("-C").arg(&context.root);
-    if !context.trusted {
-        // Repository configuration can name programs to run. A folder the
-        // user has not trusted must not execute them.
-        command.args([
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "diff.external=",
-        ]);
-    }
     command
+        .arg("-C")
+        .arg(&context.root)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         // Status must not take the index lock away from the user's own Git.
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let mut child = command.spawn().map_err(|e| format!("git: {e}"))?;
-    let drain = |pipe: Option<Box<dyn Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut bytes);
-            }
-            bytes
-        })
-    };
-    let stdout = drain(
-        child
-            .stdout
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    let label = format!(
+        "git {}",
+        args.first()
+            .map(|a| a.to_string_lossy().into_owned())
+            .unwrap_or_default()
     );
-    let stderr = drain(
-        child
-            .stderr
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let started = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < timeout => std::thread::sleep(Duration::from_millis(5)),
-            Ok(None) => {
-                #[cfg(unix)]
-                unsafe {
-                    libc::kill(-(child.id() as i32), libc::SIGKILL);
-                }
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "git {} timed out after {} s",
-                    args.first()
-                        .map(|a| a.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                    timeout.as_secs()
-                ));
-            }
-            Err(e) => return Err(e.to_string()),
-        }
-    };
-    Ok(Output {
-        status,
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
-    })
+    crate::process::run(&mut command, None, timeout, &label)
 }
 
 fn args(list: &[&str]) -> Vec<OsString> {
     list.iter().map(OsString::from).collect()
-}
-
-/// The repository root containing `context.root`, or the root itself.
-fn toplevel(context: &Context) -> Context {
-    let root = run(
-        context,
-        &args(&["rev-parse", "--show-toplevel"]),
-        READ_TIMEOUT,
-    )
-    .ok()
-    .filter(|r| r.status.success())
-    .map(|r| {
-        let mut out = r.stdout;
-        while out.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
-            out.pop();
-        }
-        PathBuf::from(os(&out))
-    })
-    .unwrap_or_else(|| context.root.clone());
-    Context {
-        root,
-        trusted: context.trusted,
-    }
 }
 
 pub fn handle(job: GitJob) -> GitReply {
@@ -235,10 +168,9 @@ pub fn handle(job: GitJob) -> GitReply {
 }
 
 fn operation(context: &Context, mut list: Vec<OsString>) -> Result<String, String> {
-    let context = toplevel(context);
     if list.first().is_some_and(|a| a == "reset")
         && !run(
-            &context,
+            context,
             &args(&["rev-parse", "--verify", "HEAD"]),
             READ_TIMEOUT,
         )
@@ -254,7 +186,7 @@ fn operation(context: &Context, mut list: Vec<OsString>) -> Result<String, Strin
         list = args(&["rm", "--cached", "-r", "--force", "--"]);
         list.extend(paths);
     }
-    match run(&context, &list, WRITE_TIMEOUT)? {
+    match run(context, &list, WRITE_TIMEOUT)? {
         result if result.status.success() => {
             Ok(String::from_utf8_lossy(&result.stdout).trim().to_string())
         }
@@ -269,7 +201,6 @@ fn diff(
     staged: bool,
     untracked: bool,
 ) -> GitReply {
-    let context = toplevel(context);
     let mut list = args(&["diff", "--no-ext-diff", "--no-textconv"]);
     if untracked {
         list.extend(args(&["--no-index", "--", "/dev/null"]));
@@ -281,7 +212,7 @@ fn diff(
         list.push("--".into());
         list.push(path);
     }
-    match run(&context, &list, READ_TIMEOUT) {
+    match run(context, &list, READ_TIMEOUT) {
         Ok(result) if result.status.success() || (untracked && result.status.code() == Some(1)) => {
             let mut text = String::from_utf8_lossy(&result.stdout).into_owned();
             if text.is_empty() {
@@ -314,12 +245,12 @@ fn diff(
 }
 
 fn status(context: &Context) -> Result<GitState, String> {
-    let context = toplevel(context);
-    let result = run(
-        &context,
-        &args(&["status", "--porcelain=v1", "--untracked-files=all", "-z"]),
-        READ_TIMEOUT,
-    )?;
+    let mut list = args(&["status", "--porcelain=v1", "--untracked-files=all", "-z"]);
+    if let Some(scope) = &context.scope {
+        list.push("--".into());
+        list.push(scope.clone());
+    }
+    let result = run(context, &list, READ_TIMEOUT)?;
     if !result.status.success() {
         let error = String::from_utf8_lossy(&result.stderr).trim().to_string();
         if error.contains("not a git repository") {
@@ -332,7 +263,7 @@ fn status(context: &Context) -> Result<GitState, String> {
         return Err(error);
     }
     let branch = run(
-        &context,
+        context,
         &args(&["symbolic-ref", "--short", "HEAD"]),
         READ_TIMEOUT,
     )
@@ -426,20 +357,10 @@ fn os_args(list: &[&str]) -> Vec<OsString> {
 impl App {
     /// Git pane commands: staging, diffs and commits.
     pub(crate) fn git_command(&mut self, cmd: crate::Command) -> Result<()> {
+        let Some(context) = self.git_ready(cmd.clone()) else {
+            return Ok(());
+        };
         match cmd {
-            crate::Command::GitStage { .. }
-            | crate::Command::GitUnstage { .. }
-            | crate::Command::GitStageAll
-            | crate::Command::GitUnstageAll
-            | crate::Command::GitStageGroup { .. }
-            | crate::Command::GitCommit { .. }
-                if !self.trusted =>
-            {
-                self.ask_trust(
-                    "Git staging and commits run this repository's hooks and filters",
-                    cmd,
-                );
-            }
             crate::Command::GitStage { path } => {
                 let mut args: Vec<OsString> = vec!["add".into(), "--all".into(), "--".into()];
                 match self.git.entries.iter().find(|e| e.path == path) {
@@ -462,11 +383,16 @@ impl App {
                 }
                 self.git_action(args)?;
             }
+            // Within the workspace, when the repository is larger.
             crate::Command::GitStageAll => {
-                self.git_action(os_args(&["add", "--all", "--", "."]))?;
+                let mut args = os_args(&["add", "--all", "--"]);
+                args.push(context.scope.clone().unwrap_or_else(|| ".".into()));
+                self.git_action(args)?;
             }
             crate::Command::GitUnstageAll => {
-                self.git_action(os_args(&["reset", "HEAD", "--", "."]))?;
+                let mut args = os_args(&["reset", "HEAD", "--"]);
+                args.push(context.scope.clone().unwrap_or_else(|| ".".into()));
+                self.git_action(args)?;
             }
             crate::Command::GitStageGroup { group } => {
                 let paths: std::collections::BTreeSet<OsString> = self
@@ -490,7 +416,7 @@ impl App {
                     .iter()
                     .any(|e| e.path == path && e.untracked);
                 self.services.tx.send(Job::Git(GitJob::Diff {
-                    context: self.git_context(),
+                    context,
                     path: raw_path(&self.git.entries, &path),
                     display: path,
                     staged,
@@ -575,13 +501,77 @@ impl App {
             self.refresh_git();
         }
     }
-    pub(crate) fn git_context(&self) -> Context {
-        Context {
-            root: self.root.clone(),
-            trusted: self.trusted,
+    /// The repository for the workspace and whether Git may run in it:
+    /// (context, trusted). `None` outside a repository.
+    pub(crate) fn git_context(&self) -> Option<(Context, bool)> {
+        let top = find_repository(&self.root)?;
+        let root = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.clone());
+        let scope = root
+            .strip_prefix(&top)
+            .ok()
+            .filter(|rest| !rest.as_os_str().is_empty())
+            .map(|rest| rest.as_os_str().to_os_string());
+        let trusted = self.trusted_path(&top);
+        Some((Context { root: top, scope }, trusted))
+    }
+    /// The context for a Git command, or `None` after asking to trust the
+    /// repository (`retry` runs once it is trusted).
+    pub(crate) fn git_ready(&mut self, retry: crate::Command) -> Option<Context> {
+        match self.git_context() {
+            None => {
+                self.status = "Not a Git repository".into();
+                None
+            }
+            Some((context, false)) => {
+                let reason = if context.scope.is_some() {
+                    "Git runs programs named by this repository's configuration (it contains the workspace)"
+                } else {
+                    "Git runs programs named by this repository's configuration"
+                };
+                let folder = context.root.clone();
+                self.ask_trust_for(&folder, reason, retry);
+                None
+            }
+            Some((context, true)) => Some(context),
         }
     }
     pub(crate) fn refresh_git(&mut self) {
+        let (context, trusted) = match self.git_context() {
+            Some(found) => found,
+            None => {
+                if self.git.repository || self.git.restricted || !self.git.entries.is_empty() {
+                    self.git = Panel {
+                        jobs: self.git.jobs,
+                        revision: self.git.revision + 1,
+                        ..Panel::default()
+                    };
+                }
+                return;
+            }
+        };
+        if !trusted {
+            if !self.git.restricted {
+                self.git.entries.clear();
+                self.git.branch.clear();
+                self.git.selected = 0;
+                self.git.repository = true;
+                self.git.restricted = true;
+                self.git.error = format!(
+                    "Git is off until you trust {}: repository configuration can run programs.",
+                    context.root.display()
+                );
+                self.git.revision += 1;
+            }
+            return;
+        }
+        if self.git.restricted {
+            self.git.restricted = false;
+            self.git.error.clear();
+            self.git.revision += 1;
+        }
         // Status reads are coalesced: one runs at a time, and requests made
         // meanwhile become a single follow-up read.
         if self.git.status_running {
@@ -591,17 +581,38 @@ impl App {
         if self
             .services
             .tx
-            .send(Job::Git(GitJob::Status(self.git_context())))
+            .send(Job::Git(GitJob::Status(context)))
             .is_ok()
         {
             self.git.status_running = true;
             self.git.jobs += 1;
         }
     }
+    /// Ask to trust the folder Git needs (the repository, else the
+    /// workspace).
+    pub(crate) fn request_trust(&mut self) {
+        match self.git_context() {
+            Some((context, false)) => {
+                let folder = context.root.clone();
+                self.ask_trust_for(
+                    &folder,
+                    "Trust it to use Git and project tools",
+                    crate::Command::Refresh,
+                );
+            }
+            _ if !self.trusted => {
+                self.ask_trust("Trust it to use project tools", crate::Command::Refresh)
+            }
+            _ => self.status = "This folder is already trusted".into(),
+        }
+    }
     pub(crate) fn git_action(&mut self, args: Vec<OsString>) -> Result<()> {
+        let Some((context, true)) = self.git_context() else {
+            bail!("Git is not available here");
+        };
         self.services
             .tx
-            .send(Job::Git(GitJob::Run(self.git_context(), args)))?;
+            .send(Job::Git(GitJob::Run(context, args)))?;
         self.git.error.clear();
         self.git.jobs += 1;
         self.status = "Running Git…".into();
@@ -618,10 +629,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let context = Context {
             root: dir.path().into(),
-            trusted: true,
+            scope: None,
         };
         // An alias that sleeps stands in for a hung helper.
-        let started = Instant::now();
+        let started = std::time::Instant::now();
         let result = run(
             &context,
             &args(&["-c", "alias.hang=!sleep 30", "hang"]),

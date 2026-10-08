@@ -121,6 +121,14 @@ impl Tui {
         }
         panic!("Timed out waiting for {text:?}:\n{}", self.screen());
     }
+    /// Wait until the raw output after byte `from` contains `needle`.
+    pub fn wait_raw(&mut self, from: usize, needle: &str) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !String::from_utf8_lossy(&self.raw()[from.min(self.raw().len())..]).contains(needle) {
+            assert!(Instant::now() < deadline, "No {needle:?} in the output");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
     pub fn wait_gone(&mut self, text: &str) {
         let deadline = Instant::now() + Duration::from_secs(8);
         while self.screen().contains(text) {

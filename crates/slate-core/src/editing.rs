@@ -64,7 +64,10 @@ impl App {
                 position = *end;
             }
             self.edit_range(id, first, last, &value, v.cursor)?;
-            self.status = format!("Replaced {} matches", matches.len());
+            self.status = format!(
+                "Replaced {}",
+                crate::counted(matches.len(), "match", "matches")
+            );
         } else {
             let selected = v.anchor.map(|a| (a.min(v.cursor), a.max(v.cursor)));
             let matching = selected.is_some_and(|range| matches.binary_search(&range).is_ok());

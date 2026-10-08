@@ -1,6 +1,7 @@
 mod actions;
 pub mod cli;
 pub mod commands;
+pub mod config;
 mod cursors;
 pub mod dap;
 pub mod desktop;
@@ -24,6 +25,7 @@ pub mod paths;
 pub mod picker;
 pub mod preferences;
 mod presentation;
+pub mod process;
 pub mod project;
 mod render;
 pub mod rpc;
@@ -50,7 +52,6 @@ use services::{Entry, GitEntry, IoJob, Job, Reply, Services};
 use std::time::{Duration, Instant};
 use std::{
     collections::BTreeMap,
-    fs,
     path::{Path, PathBuf},
 };
 use terminal::{Cell, Screen, TerminalSession};
@@ -328,7 +329,7 @@ pub enum Command {
     PickerMove {
         delta: i32,
     },
-    /// Accept the selected item, or `index` within the items sent.
+    /// Accept the selected item, or item `index` (counted over all items).
     PickerAccept {
         #[serde(default)]
         index: Option<usize>,
@@ -338,6 +339,18 @@ pub enum Command {
         name: String,
     },
     PickerClose,
+    /// Send items from `first` on (the frontend scrolled the list).
+    PickerWindow {
+        first: usize,
+    },
+    /// Show hover text for the text under the mouse.
+    HoverAt {
+        pane: u64,
+        row: usize,
+        col: usize,
+    },
+    /// The mouse left: hide hover text.
+    HoverClear,
     /// Accept a completion by its index in the list sent.
     CompletionAccept {
         index: usize,
@@ -424,16 +437,28 @@ pub struct Snapshot {
     pub picker: Option<picker::PickerView>,
     /// Restricted mode: project tools do not run.
     pub trusted: bool,
+    /// The repository's folder is not trusted, so Git does not run.
+    pub git_restricted: bool,
     pub completion: Option<lsp::CompletionView>,
     pub hover: Option<lsp::HoverView>,
     /// Errors and warnings in the workspace.
     pub problems: (usize, usize),
     /// The diagnostic under the caret.
     pub problem: String,
+    /// What language servers are busy with.
+    pub activity: String,
+    pub debugging: bool,
+    pub debug_paused: bool,
 }
+/// Saved layouts (`layouts.toml`).
 #[derive(Serialize, Deserialize)]
-struct Settings {
+struct Layouts {
     presets: BTreeMap<String, Node>,
+}
+
+/// `n` and a noun in the right number: "1 file", "3 files".
+pub(crate) fn counted(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 pub struct App {
@@ -456,6 +481,8 @@ pub struct App {
     services: Services,
     ids: u64,
     presets: BTreeMap<String, Node>,
+    /// Why `layouts.toml` could not be read; saving would overwrite it.
+    layouts_unreadable: Option<String>,
     pub preferences: Preferences,
     pub prompt: Option<Prompt>,
     search: Search,
@@ -523,13 +550,13 @@ pub struct App {
     search_cancel: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The search that replace-in-files repeats, and the files it matched.
     last_search: Option<project::SearchOptions>,
-    last_search_files: Vec<PathBuf>,
-    /// Replacements made in open documents while files are rewritten.
-    pending_replace: Option<(usize, usize)>,
+    last_search_files: Vec<(PathBuf, Option<u64>)>,
+    /// Files the last replace-in-files rewrote: (file, before, after).
+    replace_backups: Vec<(PathBuf, Vec<u8>, Vec<u8>)>,
     /// Language servers, their documents and diagnostics.
     lsp: lsp::Lsp,
     /// Documents being formatted.
-    formatting: std::collections::BTreeSet<u64>,
+    formatting: BTreeMap<u64, format::Formatting>,
     /// Running tasks.
     tasks: BTreeMap<u64, tasks::Running>,
     /// The debug session and breakpoints.
@@ -539,7 +566,9 @@ pub struct App {
     /// Project tools (language servers, tasks, formatters, Git hooks) may run.
     trusted: bool,
     /// A command waiting for the user to trust the workspace.
-    pending_trust: Option<Command>,
+    pending_trust: Option<(PathBuf, Command)>,
+    /// Trust decisions for folders outside the workspace.
+    trust_cache: std::sync::Mutex<std::collections::HashMap<PathBuf, bool>>,
     /// Hidden line ranges per view, keyed by what they were computed from.
     #[allow(clippy::type_complexity)]
     fold_cache: std::sync::Mutex<BTreeMap<u64, ((u64, Vec<usize>, usize), folding::Hidden)>>,
@@ -669,7 +698,7 @@ impl App {
             editor_only: false,
             layout,
             focus: 2,
-            status: "F1 commands · F6 focus · Ctrl-S save".into(),
+            status: String::new(),
             quit: false,
             clipboard: String::new(),
             files: vec![],
@@ -684,6 +713,7 @@ impl App {
             typing: false,
             ids,
             presets: BTreeMap::new(),
+            layouts_unreadable: None,
             preferences: Preferences::default(),
             prompt: None,
             search: Search::default(),
@@ -732,7 +762,7 @@ impl App {
             search_cancel: Default::default(),
             last_search: None,
             last_search_files: Vec::new(),
-            pending_replace: None,
+            replace_backups: Vec::new(),
             lsp: Default::default(),
             formatting: Default::default(),
             tasks: BTreeMap::new(),
@@ -740,9 +770,10 @@ impl App {
             tools: Vec::new(),
             trusted: trust::is_trusted(&root),
             pending_trust: None,
+            trust_cache: Default::default(),
             fold_cache: Default::default(),
         };
-        app.read_settings();
+        app.read_layouts();
         app.load_preferences();
         app.reload_tools();
         app.editor_only = launch.startup.unwrap_or(if file_mode {
@@ -786,6 +817,9 @@ impl App {
         self.drain_inbox();
         self.reap_terminals();
         self.lsp_sync();
+        self.expire_formatting();
+        self.expire_tasks();
+        self.debug_flush();
         self.watch_files();
         self.schedule_highlight();
         if self.workspace_dirty && self.checkpoint_at.elapsed() >= Duration::from_secs(1) {
@@ -919,6 +953,59 @@ impl App {
         self.status = format!("Closed {title}");
         Ok(())
     }
+    /// Opening a file replaces an untouched, empty Untitled tab in the same
+    /// pane, as desktop editors do.
+    fn drop_pristine_scratch(&mut self, pane: u64, keep: u64) {
+        let pristine: Vec<u64> = self
+            .layout
+            .tabs(pane)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|t| match t {
+                View::Editor(id) if *id != keep => Some(*id),
+                _ => None,
+            })
+            .filter(|id| {
+                let doc = self.views[id].document;
+                let d = &self.documents[&doc];
+                d.path.is_none()
+                    && d.label.is_none()
+                    && d.is_empty()
+                    && !d.dirty()
+                    && self.views.values().filter(|v| v.document == doc).count() == 1
+            })
+            .collect();
+        for view in pristine {
+            let doc = self.views[&view].document;
+            if let Some((tabs, active)) = self.layout.pane_mut(pane) {
+                if let Some(index) = tabs.iter().position(|t| *t == View::Editor(view)) {
+                    tabs.remove(index);
+                    if index < *active {
+                        *active -= 1;
+                    }
+                    *active = (*active).min(tabs.len().saturating_sub(1));
+                }
+            }
+            self.views.remove(&view);
+            self.documents.remove(&doc);
+            self.highlights.remove(&doc);
+        }
+    }
+    /// Activate the tab `step` places after (or before) the current one.
+    pub(crate) fn cycle_tab(&mut self, step: isize) -> Result<()> {
+        let next = self.layout.pane_mut(self.focus).map(|(tabs, active)| {
+            let len = tabs.len() as isize;
+            let index = ((*active as isize + step).rem_euclid(len)) as usize;
+            (index, !matches!(tabs[index], View::Editor(_)))
+        });
+        if let Some((index, tool)) = next {
+            if self.editor_only && tool {
+                self.expand_workspace()?;
+            }
+            *self.layout.pane_mut(self.focus).unwrap().1 = index;
+        }
+        Ok(())
+    }
     fn add_tab(&mut self, view: View) {
         // Files and Git are singleton views within a pane. Reopening them
         // should reveal the existing tab instead of crowding the tab bar.
@@ -963,6 +1050,264 @@ impl App {
         }
         self.typing = false;
         self.schedule_highlight();
+    }
+    /// Open a prompt of `kind`, filled with the selection for find and replace.
+    fn open_prompt(&mut self, kind: String) -> Result<()> {
+        if ![
+            "find",
+            "replace",
+            "goto",
+            "open",
+            "open-folder",
+            "save-as",
+            "commit",
+            "layout-save",
+            "layout-load",
+            "move-pane",
+            "settings",
+            "insert-file",
+            "set-encoding",
+            "reopen-encoding",
+            "set-line-ending",
+            "open-recent",
+        ]
+        .contains(&kind.as_str())
+        {
+            bail!("Unknown prompt");
+        }
+        let input = if ["find", "replace", "goto"].contains(&kind.as_str()) {
+            let id = self.active_editor().context("Focus an editor first")?;
+            let v = &self.views[&id];
+            if kind == "goto" {
+                String::new()
+            } else {
+                v.anchor
+                    .map(|a| {
+                        self.documents[&v.document]
+                            .slice(a.min(v.cursor), a.max(v.cursor))
+                            .to_string()
+                    })
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| self.search.query.clone())
+            }
+        } else {
+            String::new()
+        };
+        self.prompt = Some(Prompt {
+            kind,
+            input,
+            replacement: String::new(),
+            field: 0,
+            case_sensitive: self.search.case_sensitive,
+            whole_word: self.search.whole_word,
+        });
+        Ok(())
+    }
+    /// Act on the open prompt (`all`: the "all" choice, e.g. Replace All).
+    fn submit_prompt(&mut self, all: bool) -> Result<()> {
+        let p = self.prompt.clone().context("No active prompt")?;
+        match p.kind.as_str() {
+            // Graphical frontends answer confirmations through
+            // dialogs: `all` selects the alternative button.
+            "save-read-only" | "save-elevated" | "reload-changed" => {
+                self.prompt = None;
+                self.confirm_pending(&p.kind)?;
+            }
+            "file-changed" => self.resolve_disk_conflict(!all),
+            "trust" => self.answer_trust(true)?,
+            "project-replace" => {
+                let files = self.last_search_files.len();
+                self.prompt = Some(search::Prompt {
+                    kind: "confirm-replace".into(),
+                    input: format!("{files} file{}", if files == 1 { "" } else { "s" }),
+                    replacement: p.input,
+                    field: 0,
+                    case_sensitive: false,
+                    whole_word: false,
+                });
+            }
+            "confirm-replace" => {
+                self.prompt = None;
+                self.replace_in_files(&p.replacement)?;
+            }
+            "quit" => {
+                self.prompt = None;
+                if all {
+                    self.execute(Command::Quit { force: true })?;
+                } else {
+                    self.save_all(true)?;
+                }
+            }
+            "close-tab" => {
+                let target = self.pending_close.take();
+                self.prompt = None;
+                if all {
+                    if let Some((pane, view)) = target {
+                        self.close_tab(pane, view, true)?;
+                    }
+                }
+            }
+            "open" | "open-folder" | "save-as" | "commit" | "layout-save" | "layout-load"
+            | "move-pane" | "settings" => {
+                if p.input.trim().is_empty() {
+                    bail!("Enter {}", p.kind);
+                }
+                self.prompt = None;
+                let line = format!(
+                    "{} {}",
+                    if p.kind == "settings" { "set" } else { &p.kind },
+                    p.input
+                );
+                // A failure keeps the prompt open with what was typed.
+                if let Err(e) = self
+                    .resolve_command_input(&line)
+                    .and_then(|cmd| self.execute(cmd))
+                {
+                    self.prompt = Some(p);
+                    return Err(e);
+                }
+            }
+            "insert-file" | "set-encoding" | "reopen-encoding" | "set-line-ending"
+            | "open-recent" | "rename-symbol" | "debug-evaluate" | "debug-program" => {
+                if p.input.trim().is_empty() {
+                    bail!("Enter a value");
+                }
+                self.prompt = None;
+                if let Err(e) = self.run_action(&p.kind, &p.input) {
+                    self.prompt = Some(p);
+                    return Err(e);
+                }
+            }
+            "goto" => {
+                self.execute(Command::GoToLine {
+                    line: p.input.parse().context("Enter a line number")?,
+                })?;
+                self.prompt = None;
+            }
+            "replace" => self.execute(Command::Replace {
+                query: p.input,
+                replacement: p.replacement,
+                all,
+                case_sensitive: p.case_sensitive,
+                whole_word: p.whole_word,
+            })?,
+            _ => self.execute(Command::Search {
+                query: p.input,
+                case_sensitive: p.case_sensitive,
+                whole_word: p.whole_word,
+                backward: false,
+            })?,
+        }
+        Ok(())
+    }
+    /// A mouse event in a pane: terminals get it when they ask for mouse input.
+    #[allow(clippy::too_many_arguments)]
+    fn pointer(
+        &mut self,
+        pane: u64,
+        row: usize,
+        col: usize,
+        kind: String,
+        button: u8,
+        shift: bool,
+        ctrl: bool,
+        alt: bool,
+    ) -> Result<()> {
+        if kind == "press" {
+            self.focus = pane;
+        }
+        if let Some(View::Terminal(id)) = self.layout.view(pane).cloned() {
+            self.terminals
+                .get_mut(&id)
+                .unwrap()
+                .pointer(terminal::Pointer {
+                    row,
+                    col,
+                    kind: &kind,
+                    button,
+                    shift,
+                    ctrl,
+                    alt,
+                })?;
+        } else if let (true, "press", Some(View::Editor(id))) =
+            (alt, kind.as_str(), self.layout.view(pane).cloned())
+        {
+            // Alt+click adds (or removes) a caret.
+            let offset = self.click_offset(id, row, col);
+            self.toggle_cursor_at(id, offset);
+        } else if kind == "press" || kind == "drag" {
+            self.execute(Command::Click {
+                pane,
+                row,
+                col,
+                shift: shift || kind == "drag",
+            })?;
+        } else if kind == "double" || kind == "triple" {
+            self.execute(Command::Click {
+                pane,
+                row,
+                col,
+                shift: false,
+            })?;
+            if let Some(View::Editor(id)) = self.layout.view(pane).cloned() {
+                self.select_unit(id, kind == "triple");
+            }
+        }
+        Ok(())
+    }
+    /// A click in a pane's text: moves the caret, or extends the selection with Shift.
+    fn click(&mut self, pane: u64, row: usize, col: usize, shift: bool) -> Result<()> {
+        self.focus = pane;
+        match self.focused() {
+            Some(View::Editor(id)) => {
+                let v = &self.views[&id];
+                if col < self.gutter_width(v.document, v.cols.max(1)) {
+                    let shown = self.visible_rows(id, row + 1);
+                    if let Some((line, 0, _)) = shown.get(row).copied() {
+                        // The fold mark (▸ folded, ▾ foldable) toggles.
+                        let doc = v.document;
+                        let start = self.documents[&doc].line_offset(line);
+                        if self.folded_header(id, line) {
+                            self.views
+                                .get_mut(&id)
+                                .unwrap()
+                                .folds
+                                .retain(|f| *f != start);
+                            return Ok(());
+                        }
+                        let gutter = self.gutter_width(doc, self.views[&id].cols.max(1));
+                        let rope = self.documents[&doc].rope();
+                        if col + 2 >= gutter
+                            && smart::foldable(rope, line, self.preferences.indent_width)
+                        {
+                            self.views.get_mut(&id).unwrap().folds.push(start);
+                            return Ok(());
+                        }
+                    }
+                }
+                let cursor = self.click_offset(id, row, col);
+                let v = self.views.get_mut(&id).unwrap();
+                v.manual_scroll = false;
+                v.goal = None;
+                v.extra.clear();
+                v.stops.clear();
+                if shift || v.mark {
+                    v.anchor.get_or_insert(v.cursor);
+                } else {
+                    v.anchor = None;
+                }
+                v.cursor = cursor;
+            }
+            Some(View::Files) => self.selected = row.min(self.files.len().saturating_sub(1)),
+            Some(View::Git) => {
+                self.git.selected = row.min(self.git.entries.len().saturating_sub(1))
+            }
+            Some(View::Terminal(id)) => {
+                self.terminals.get_mut(&id).unwrap().select(row, col, shift)
+            }
+            _ => {}
+        }
+        Ok(())
     }
     fn execute(&mut self, cmd: Command) -> Result<()> {
         match cmd {
@@ -1061,56 +1406,7 @@ impl App {
                 v.manual_scroll = false;
             }
             Command::Indent { outdent } => self.indent(outdent)?,
-            Command::Prompt { kind } => {
-                if ![
-                    "find",
-                    "replace",
-                    "goto",
-                    "open",
-                    "open-folder",
-                    "save-as",
-                    "commit",
-                    "layout-save",
-                    "layout-load",
-                    "move-pane",
-                    "settings",
-                    "insert-file",
-                    "set-encoding",
-                    "reopen-encoding",
-                    "set-line-ending",
-                    "open-recent",
-                ]
-                .contains(&kind.as_str())
-                {
-                    bail!("Unknown prompt");
-                }
-                let input = if ["find", "replace", "goto"].contains(&kind.as_str()) {
-                    let id = self.active_editor().context("Focus an editor first")?;
-                    let v = &self.views[&id];
-                    if kind == "goto" {
-                        String::new()
-                    } else {
-                        v.anchor
-                            .map(|a| {
-                                self.documents[&v.document]
-                                    .slice(a.min(v.cursor), a.max(v.cursor))
-                                    .to_string()
-                            })
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or_else(|| self.search.query.clone())
-                    }
-                } else {
-                    String::new()
-                };
-                self.prompt = Some(Prompt {
-                    kind,
-                    input,
-                    replacement: String::new(),
-                    field: 0,
-                    case_sensitive: self.search.case_sensitive,
-                    whole_word: self.search.whole_word,
-                });
-            }
+            Command::Prompt { kind } => self.open_prompt(kind)?,
             Command::UpdatePrompt {
                 input,
                 replacement,
@@ -1124,96 +1420,7 @@ impl App {
                     p.whole_word = whole_word;
                 }
             }
-            Command::SubmitPrompt { all } => {
-                let p = self.prompt.clone().context("No active prompt")?;
-                match p.kind.as_str() {
-                    // Graphical frontends answer confirmations through
-                    // dialogs: `all` selects the alternative button.
-                    "save-read-only" | "save-elevated" | "reload-changed" => {
-                        self.prompt = None;
-                        self.confirm_pending(&p.kind)?;
-                    }
-                    "file-changed" => self.resolve_disk_conflict(!all),
-                    "trust" => self.answer_trust(true)?,
-                    "project-replace" => {
-                        let files = self.last_search_files.len();
-                        self.prompt = Some(search::Prompt {
-                            kind: "confirm-replace".into(),
-                            input: format!("{files} file{}", if files == 1 { "" } else { "s" }),
-                            replacement: p.input,
-                            field: 0,
-                            case_sensitive: false,
-                            whole_word: false,
-                        });
-                    }
-                    "confirm-replace" => {
-                        self.prompt = None;
-                        self.replace_in_files(&p.replacement)?;
-                    }
-                    "quit" => {
-                        self.prompt = None;
-                        if all {
-                            self.execute(Command::Quit { force: true })?;
-                        } else {
-                            self.save_all(true)?;
-                        }
-                    }
-                    "close-tab" => {
-                        let target = self.pending_close.take();
-                        self.prompt = None;
-                        if all {
-                            if let Some((pane, view)) = target {
-                                self.close_tab(pane, view, true)?;
-                            }
-                        }
-                    }
-                    "open" | "open-folder" | "save-as" | "commit" | "layout-save"
-                    | "layout-load" | "move-pane" | "settings" => {
-                        if p.input.trim().is_empty() {
-                            bail!("Enter {}", p.kind);
-                        }
-                        self.prompt = None;
-                        self.command_line(&format!(
-                            "{} {}",
-                            if p.kind == "settings" { "set" } else { &p.kind },
-                            p.input
-                        ));
-                        if self.status.starts_with("Error:") || self.status.starts_with("Unknown") {
-                            self.prompt = Some(p);
-                        }
-                    }
-                    "insert-file" | "set-encoding" | "reopen-encoding" | "set-line-ending"
-                    | "open-recent" | "rename-symbol" | "debug-evaluate" | "debug-program" => {
-                        if p.input.trim().is_empty() {
-                            bail!("Enter a value");
-                        }
-                        self.prompt = None;
-                        if let Err(e) = self.run_action(&p.kind, &p.input) {
-                            self.prompt = Some(p);
-                            return Err(e);
-                        }
-                    }
-                    "goto" => {
-                        self.execute(Command::GoToLine {
-                            line: p.input.parse().context("Enter a line number")?,
-                        })?;
-                        self.prompt = None;
-                    }
-                    "replace" => self.execute(Command::Replace {
-                        query: p.input,
-                        replacement: p.replacement,
-                        all,
-                        case_sensitive: p.case_sensitive,
-                        whole_word: p.whole_word,
-                    })?,
-                    _ => self.execute(Command::Search {
-                        query: p.input,
-                        case_sensitive: p.case_sensitive,
-                        whole_word: p.whole_word,
-                        backward: false,
-                    })?,
-                }
-            }
+            Command::SubmitPrompt { all } => self.submit_prompt(all)?,
             Command::DismissPrompt => {
                 let kind = self.prompt.take().map(|p| p.kind).unwrap_or_default();
                 self.pending_close = None;
@@ -1283,48 +1490,7 @@ impl App {
                 shift,
                 ctrl,
                 alt,
-            } => {
-                if kind == "press" {
-                    self.focus = pane;
-                }
-                if let Some(View::Terminal(id)) = self.layout.view(pane).cloned() {
-                    self.terminals
-                        .get_mut(&id)
-                        .unwrap()
-                        .pointer(terminal::Pointer {
-                            row,
-                            col,
-                            kind: &kind,
-                            button,
-                            shift,
-                            ctrl,
-                            alt,
-                        })?;
-                } else if let (true, "press", Some(View::Editor(id))) =
-                    (alt, kind.as_str(), self.layout.view(pane).cloned())
-                {
-                    // Alt+click adds (or removes) a caret.
-                    let offset = self.click_offset(id, row, col);
-                    self.toggle_cursor_at(id, offset);
-                } else if kind == "press" || kind == "drag" {
-                    self.execute(Command::Click {
-                        pane,
-                        row,
-                        col,
-                        shift: shift || kind == "drag",
-                    })?;
-                } else if kind == "double" || kind == "triple" {
-                    self.execute(Command::Click {
-                        pane,
-                        row,
-                        col,
-                        shift: false,
-                    })?;
-                    if let Some(View::Editor(id)) = self.layout.view(pane).cloned() {
-                        self.select_unit(id, kind == "triple");
-                    }
-                }
-            }
+            } => self.pointer(pane, row, col, kind, button, shift, ctrl, alt)?,
             Command::Key { key } => self.key(key)?,
             Command::OpenPicker { kind, query } => self.open_picker(&kind, &query)?,
             Command::PickerQuery { query } => self.picker_query(query)?,
@@ -1336,8 +1502,13 @@ impl App {
                 self.picker_accept(index)?
             }
             Command::PickerOption { name } => self.picker_option(&name)?,
-            Command::PickerClose => self.picker = None,
+            Command::PickerClose => self.close_picker(),
+            Command::PickerWindow { first } => self.picker_window(first),
             Command::CompletionAccept { index } => self.completion_select(index)?,
+            Command::HoverAt { pane, row, col } => self.hover_at(pane, row, col),
+            Command::HoverClear => {
+                self.dismiss_hover();
+            }
             Command::Paste { text } if self.picker.is_some() => {
                 let query = format!(
                     "{}{}",
@@ -1374,50 +1545,7 @@ impl App {
                 row,
                 col,
                 shift,
-            } => {
-                self.focus = pane;
-                match self.focused() {
-                    Some(View::Editor(id)) => {
-                        let v = &self.views[&id];
-                        if col < self.gutter_width(v.document, v.cols.max(1)) {
-                            let shown = self.visible_rows(id, row + 1);
-                            if let Some((line, 0, _)) = shown.get(row).copied() {
-                                if self.folded_header(id, line) {
-                                    let start = self.documents[&v.document].line_offset(line);
-                                    self.views
-                                        .get_mut(&id)
-                                        .unwrap()
-                                        .folds
-                                        .retain(|f| *f != start);
-                                    return Ok(());
-                                }
-                            }
-                        }
-                        let cursor = self.click_offset(id, row, col);
-                        let v = self.views.get_mut(&id).unwrap();
-                        v.manual_scroll = false;
-                        v.goal = None;
-                        v.extra.clear();
-                        v.stops.clear();
-                        if shift || v.mark {
-                            v.anchor.get_or_insert(v.cursor);
-                        } else {
-                            v.anchor = None;
-                        }
-                        v.cursor = cursor;
-                    }
-                    Some(View::Files) => {
-                        self.selected = row.min(self.files.len().saturating_sub(1))
-                    }
-                    Some(View::Git) => {
-                        self.git.selected = row.min(self.git.entries.len().saturating_sub(1))
-                    }
-                    Some(View::Terminal(id)) => {
-                        self.terminals.get_mut(&id).unwrap().select(row, col, shift)
-                    }
-                    _ => {}
-                }
-            }
+            } => self.click(pane, row, col, shift)?,
             Command::Scroll { pane, delta } => match self.layout.view(pane).cloned() {
                 Some(View::Editor(id)) => self.scroll_view(id, delta),
                 Some(View::Terminal(id)) => self.terminals.get_mut(&id).unwrap().scroll(delta),
@@ -1472,7 +1600,7 @@ impl App {
                         kind: "save-as".into(),
                     });
                 }
-                if self.formatting.contains(&doc) {
+                if self.formatting.contains_key(&doc) {
                     bail!("Wait for formatting to finish");
                 }
                 if destination.is_none()
@@ -1588,18 +1716,7 @@ impl App {
                     }
                 }
             }
-            Command::NextTab => {
-                let next = self.layout.pane_mut(self.focus).map(|(tabs, active)| {
-                    let index = (*active + 1) % tabs.len();
-                    (index, !matches!(tabs[index], View::Editor(_)))
-                });
-                if let Some((index, tool)) = next {
-                    if self.editor_only && tool {
-                        self.expand_workspace()?;
-                    }
-                    *self.layout.pane_mut(self.focus).unwrap().1 = index;
-                }
-            }
+            Command::NextTab => self.cycle_tab(1)?,
             Command::NewTerminal => {
                 self.expand_workspace()?;
                 let id = self.new_terminal()?;
@@ -1676,7 +1793,7 @@ impl App {
                     bail!("Layout name must be 1–80 characters");
                 }
                 self.presets.insert(name.clone(), self.layout.clone());
-                self.write_settings()?;
+                self.write_layouts()?;
                 self.status = format!("Saved layout {name}");
             }
             Command::LoadLayout { name } => {
@@ -1827,14 +1944,13 @@ impl App {
                 Reply::SearchHits(generation, hits) => self.search_hits(generation, hits),
                 Reply::SearchDone(generation, result) => self.search_done(generation, result),
                 Reply::Outline(doc, symbols) => self.symbols_ready(doc, symbols),
-                Reply::Replaced(files, total, errors) => self.replaced(files, total, errors),
+                Reply::Replaced(report) => self.replaced(report),
                 Reply::Ide(event) => self.ide_event(event),
+                Reply::Previews(generation, previews) => self.previews_ready(generation, previews),
                 Reply::ToolDone(name, output, target, result) => {
                     self.tool_done(name, output, target, result)
                 }
-                Reply::Formatted(doc, content, then_save, result) => {
-                    self.formatted(doc, content, then_save, result)
-                }
+                Reply::Formatted(doc, content, result) => self.formatted(doc, content, result),
                 Reply::Spelling(result) => self.spelling_result(result),
                 Reply::Disk(changes) => self.disk_changes(changes),
                 Reply::Output(_, _) if self.quit => {
@@ -1960,34 +2076,33 @@ impl App {
             .unwrap();
         Ok(())
     }
-    fn settings_path() -> PathBuf {
+    fn layouts_path() -> PathBuf {
         paths::config_dir().join("layouts.toml")
     }
-    fn read_settings(&mut self) {
-        if let Ok(s) = fs::read_to_string(Self::settings_path()) {
-            if let Ok(settings) = toml::from_str::<Settings>(&s) {
-                self.presets = settings
-                    .presets
+    fn read_layouts(&mut self) {
+        match config::read::<Layouts>(&Self::layouts_path()) {
+            Ok(layouts) => {
+                self.presets = layouts
+                    .map(|l| l.presets)
+                    .unwrap_or_default()
                     .into_iter()
                     .filter(|(_, n)| n.validate())
                     .collect();
             }
+            Err(error) => {
+                self.status = format!("Error in {error}");
+                self.layouts_unreadable = Some(error);
+            }
         }
     }
-    fn write_settings(&self) -> Result<()> {
-        let path = Self::settings_path();
-        fs::create_dir_all(path.parent().unwrap())?;
-        use std::io::Write;
-        let mut temp = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
-        temp.write_all(
-            toml::to_string_pretty(&Settings {
-                presets: self.presets.clone(),
-            })?
-            .as_bytes(),
-        )?;
-        temp.as_file().sync_all()?;
-        temp.persist(path).map_err(|e| e.error)?;
-        Ok(())
+    fn write_layouts(&self) -> Result<()> {
+        if let Some(error) = &self.layouts_unreadable {
+            bail!("Not saving layouts over {error}");
+        }
+        let text = toml::to_string_pretty(&Layouts {
+            presets: self.presets.clone(),
+        })?;
+        fsio::write_private(&Self::layouts_path(), text.as_bytes())
     }
     fn restore_layout(&mut self, mut node: Node) -> Result<()> {
         if !node.validate() {
@@ -2078,7 +2193,26 @@ impl App {
         self.adopt_orphans();
         Ok(())
     }
+    /// Keep views of a document within its text without resetting carets,
+    /// folds or snippet fields (after edits that rebased them).
+    fn clamp_views_soft(&mut self, doc: u64) {
+        let Some(d) = self.documents.get(&doc) else {
+            return;
+        };
+        let lines = d.line_count();
+        for v in self.views.values_mut().filter(|v| v.document == doc) {
+            v.cursor = d.floor_boundary(v.cursor.min(d.len()));
+            v.anchor = v.anchor.map(|a| d.floor_boundary(a.min(d.len())));
+            for s in &mut v.extra {
+                s.cursor = d.floor_boundary(s.cursor.min(d.len()));
+                s.anchor = s.anchor.map(|a| d.floor_boundary(a.min(d.len())));
+            }
+            v.folds.retain(|f| *f <= d.len());
+            v.top = v.top.min(lines.saturating_sub(1));
+        }
+    }
     fn clamp_views(&mut self, doc: u64) {
+        self.reset_breakpoints(doc);
         let d = &self.documents[&doc];
         let lines = d.line_count();
         for v in self.views.values_mut().filter(|v| v.document == doc) {
@@ -2099,7 +2233,50 @@ impl App {
         let end = v.cursor.max(anchor);
         self.edit_range(id, start, end, value, v.cursor)
     }
+    /// Apply several replacements to a document as one undoable edit and
+    /// move every view (carets, folds, snippet fields) along with them.
+    pub(crate) fn replace_in_document(
+        &mut self,
+        doc: u64,
+        edits: &[(usize, usize, String)],
+    ) -> Result<Vec<(usize, usize)>> {
+        let cursor = self
+            .views
+            .values()
+            .find(|v| v.document == doc)
+            .map_or(0, |v| v.cursor);
+        let placed = self
+            .documents
+            .get_mut(&doc)
+            .context("The document was closed")?
+            .replace_many(edits, cursor)?;
+        // From the end, each range is still in the original coordinates.
+        let mut order: Vec<usize> = (0..edits.len()).collect();
+        order.sort_by_key(|i| std::cmp::Reverse((edits[*i].0, edits[*i].1)));
+        for i in order {
+            let (start, end, text) = &edits[i];
+            self.rebase_views_text(doc, *start, *end, text);
+        }
+        self.clamp_views_soft(doc);
+        Ok(placed)
+    }
+    /// Move everything that points into a document across an edit that
+    /// replaced `start..end` with `length` bytes (already applied).
     fn rebase_views(&mut self, doc: u64, start: usize, end: usize, length: usize) {
+        self.rebase_views_for(doc, start, end, length, None);
+    }
+    /// `rebase_views` for an edit whose inserted text is known.
+    fn rebase_views_text(&mut self, doc: u64, start: usize, end: usize, text: &str) {
+        self.rebase_views_for(doc, start, end, text.len(), Some(text));
+    }
+    fn rebase_views_for(
+        &mut self,
+        doc: u64,
+        start: usize,
+        end: usize,
+        length: usize,
+        inserted: Option<&str>,
+    ) {
         let position = |p: usize| {
             if p <= start {
                 p
@@ -2109,6 +2286,20 @@ impl App {
                 start + length
             }
         };
+        let insertion = start == end;
+        // Text inserted at a line start that contains a line break pushes
+        // that line down: marks on it (folds, breakpoints) follow the line.
+        let pushed_line = inserted.and_then(|text| text.rfind('\n').map(|i| start + i + 1));
+        let line_mark = |p: usize| -> Option<usize> {
+            if insertion && p == start {
+                Some(pushed_line.unwrap_or(p))
+            } else if start <= p && p < end {
+                // The line's start was replaced: the mark goes with it.
+                None
+            } else {
+                Some(position(p))
+            }
+        };
         for other in self.views.values_mut().filter(|o| o.document == doc) {
             other.cursor = position(other.cursor);
             other.anchor = other.anchor.map(position);
@@ -2116,27 +2307,28 @@ impl App {
                 s.cursor = position(s.cursor);
                 s.anchor = s.anchor.map(position);
             }
-            for stop in other
-                .stops
-                .iter_mut()
-                .chain(other.visited.iter_mut())
-                .chain(std::iter::once(&mut other.current_stop))
-            {
+            // The field being typed in grows with text typed at its end;
+            // a later field that starts where the text went moves right.
+            for (a, b) in other.current_stop.iter_mut() {
+                let grows = *b == start && *a <= start;
+                *a = position(*a);
+                *b = if grows { start + length } else { position(*b) };
+            }
+            for stop in other.stops.iter_mut().chain(other.visited.iter_mut()) {
                 for (a, b) in stop.iter_mut() {
-                    // A stop grows with text typed at its end.
-                    let grows = *b == start && *a <= start;
-                    *a = position(*a);
-                    *b = if grows { start + length } else { position(*b) };
+                    let follows = insertion && *a == start;
+                    *b = if follows { *b + length } else { position(*b) };
+                    *a = if follows { *a + length } else { position(*a) };
                 }
             }
-            // A fold whose header line was replaced is dropped.
-            other
-                .folds
-                .retain(|f| *f < start || *f >= end || *f == start);
-            for f in &mut other.folds {
-                *f = position(*f);
+            other.folds = other.folds.iter().filter_map(|f| line_mark(*f)).collect();
+        }
+        for (history_doc, offset) in self.back.iter_mut().chain(self.forward.iter_mut()) {
+            if *history_doc == doc {
+                *offset = position(*offset);
             }
         }
+        self.rebase_breakpoints(doc, |p| line_mark(p).unwrap_or(start));
     }
     /// Apply one smart replacement at the primary caret.
     fn apply_single(&mut self, id: u64, typed: smart::Typed) -> Result<()> {
@@ -2162,7 +2354,7 @@ impl App {
         } else {
             document.replace(start, end, value, before)?;
         }
-        self.rebase_views(doc, start, end, value.len());
+        self.rebase_views_text(doc, start, end, value);
         let view = self.views.get_mut(&id).unwrap();
         view.cursor = start + value.len();
         view.anchor = None;
@@ -2189,18 +2381,10 @@ impl App {
         }) {
             return Some(&tool.id);
         }
-        // Debugger keys take over F9–F11 while a session runs.
+        // Debugger keys (F9–F11…) take over while a session runs.
         if self.debugging() {
-            let action = match chord.as_str() {
-                "f9" => Some("toggle-breakpoint"),
-                "f10" => Some("debug-step-over"),
-                "f11" => Some("debug-step-into"),
-                "Shift+f11" => Some("debug-step-out"),
-                "Shift+f5" => Some("debug-stop"),
-                _ => None,
-            };
-            if action.is_some() {
-                return action;
+            if let Some(action) = self.preferences.debug_keys.get(&chord) {
+                return Some(action);
             }
         }
         self.preferences
@@ -2814,6 +2998,7 @@ const ACTION_VERBS: &[&str] = &[
     "print",
     "trust-workspace",
     "restrict-workspace",
+    "request-trust",
     "add-cursor-above",
     "add-cursor-below",
     "add-next-occurrence",
@@ -2828,6 +3013,7 @@ const ACTION_VERBS: &[&str] = &[
     "go-to-symbol",
     "search-in-files",
     "replace-in-files",
+    "undo-replace-in-files",
     "open-documents",
     "problems",
     "go-back",
@@ -2856,6 +3042,12 @@ const ACTION_VERBS: &[&str] = &[
     "debug-stop",
     "debug-evaluate",
     "toggle-breakpoint",
+    "clear-breakpoints",
+    "breakpoints",
+    "debug-call-stack",
+    "debug-frame",
+    "previous-tab",
+    "language-servers",
     "run-tool",
 ];
 /// Editor-table actions that are not about the focused text, so their keys
@@ -2918,6 +3110,7 @@ impl App {
                 },
             );
             self.add_tab(View::Editor(id));
+            self.drop_pristine_scratch(self.focus, id);
         }
         let path = path.unwrap();
         if let Some((line, column)) = self.pending_positions.remove(&path) {

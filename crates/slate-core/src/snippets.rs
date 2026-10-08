@@ -123,6 +123,7 @@ pub fn expand(body: &str, indent: &str, unit: &str) -> Expansion {
         let mut parser = Parser {
             chars: &chars,
             i: 0,
+            depth: 0,
             out: &mut text,
             stops: &mut stops,
             indent,
@@ -147,6 +148,7 @@ pub fn expand(body: &str, indent: &str, unit: &str) -> Expansion {
     Parser {
         chars: &chars,
         i: 0,
+        depth: 0,
         out: &mut text,
         stops: &mut stops,
         indent,
@@ -157,9 +159,16 @@ pub fn expand(body: &str, indent: &str, unit: &str) -> Expansion {
     Expansion { text, stops }
 }
 
+/// Placeholders nest at most this deep; a snippet from a language server
+/// is untrusted input.
+const NESTING: usize = 16;
+/// Expansions stop growing past this size.
+const EXPANSION_LIMIT: usize = 256 * 1024;
+
 struct Parser<'a> {
     chars: &'a [char],
     i: usize,
+    depth: usize,
     out: &'a mut String,
     stops: &'a mut BTreeMap<usize, Vec<(usize, usize)>>,
     indent: &'a str,
@@ -169,6 +178,10 @@ struct Parser<'a> {
 impl Parser<'_> {
     fn parse(&mut self, nested: bool) {
         while self.i < self.chars.len() {
+            if self.out.len() > EXPANSION_LIMIT {
+                self.i = self.chars.len();
+                return;
+            }
             let c = self.chars[self.i];
             match c {
                 '\\' if self.i + 1 < self.chars.len() => {
@@ -218,7 +231,24 @@ impl Parser<'_> {
             if self.chars.get(self.i) == Some(&':') {
                 self.i += 1;
                 placeholder = true;
-                self.parse(true);
+                if self.depth < NESTING {
+                    self.depth += 1;
+                    self.parse(true);
+                    self.depth -= 1;
+                } else {
+                    // Too deep: skip the rest of this placeholder.
+                    let mut level = 1;
+                    while self.i < self.chars.len() && level > 0 {
+                        match self.chars[self.i] {
+                            '{' => level += 1,
+                            '}' => level -= 1,
+                            _ => {}
+                        }
+                        if level > 0 {
+                            self.i += 1;
+                        }
+                    }
+                }
             }
             if self.chars.get(self.i) == Some(&'}') {
                 self.i += 1;
@@ -236,14 +266,40 @@ impl Parser<'_> {
     }
 }
 
-/// Snippets for a syntax: user ones first, then built-in ones.
-pub fn available(language: &str) -> Vec<Snippet> {
+/// The user's snippets, read again only when `snippets.toml` changes (it
+/// is consulted on every completion).
+#[derive(Default)]
+struct Cache {
+    path: std::path::PathBuf,
+    stamp: Option<(std::time::SystemTime, u64)>,
+    snippets: Vec<Snippet>,
+}
+static CACHE: std::sync::Mutex<Option<Cache>> = std::sync::Mutex::new(None);
+
+/// Snippets for a syntax: user ones first, then built-in ones. A
+/// `snippets.toml` that does not parse is added to `errors` when read.
+pub fn available(language: &str, errors: &mut Vec<String>) -> Vec<Snippet> {
     let path = crate::paths::config_dir().join("snippets.toml");
-    let mut list: Vec<Snippet> = std::fs::read_to_string(path)
+    let stamp = std::fs::metadata(&path)
         .ok()
-        .and_then(|s| toml::from_str::<File>(&s).ok())
-        .map(|f| f.snippet)
+        .and_then(|m| Some((m.modified().ok()?, m.len())));
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let fresh = cache
+        .as_ref()
+        .is_some_and(|c| c.path == path && c.stamp == stamp && stamp.is_some());
+    if !fresh {
+        let snippets = crate::config::list(&path, |f: File| f.snippet, errors);
+        *cache = Some(Cache {
+            path,
+            stamp,
+            snippets,
+        });
+    }
+    let mut list = cache
+        .as_ref()
+        .map(|c| c.snippets.clone())
         .unwrap_or_default();
+    drop(cache);
     list.extend(BUILTIN.iter().map(|(language, prefix, body)| Snippet {
         prefix: prefix.to_string(),
         body: body.to_string(),
@@ -359,10 +415,14 @@ impl App {
         if word.is_empty() {
             return Ok(false);
         }
-        let Some(snippet) = available(&self.language_of(v.document))
+        let cursor = v.cursor;
+        let language = self.language_of(v.document);
+        let mut errors = Vec::new();
+        let found = available(&language, &mut errors)
             .into_iter()
-            .find(|s| s.prefix == word)
-        else {
+            .find(|s| s.prefix == word);
+        self.config_errors(errors);
+        let Some(snippet) = found else {
             return Ok(false);
         };
         let indent: String = before
@@ -370,8 +430,7 @@ impl App {
             .take_while(|c| *c == ' ' || *c == '\t')
             .collect();
         let expansion = expand(&snippet.body, &indent, &self.indent_unit());
-        let word_start = v.cursor - word.len();
-        let cursor = v.cursor;
+        let word_start = cursor - word.len();
         self.insert_expansion(id, word_start, cursor, expansion)?;
         self.status = format!("Snippet {} · Tab: next field", snippet.prefix);
         Ok(true)
@@ -381,6 +440,36 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_snippets_are_reread_only_when_the_file_changes() {
+        let _env = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        std::fs::create_dir_all(dir.path().join("slate")).unwrap();
+        let file = dir.path().join("slate/snippets.toml");
+        let mine = |errors: &mut Vec<String>| {
+            available("Rust", errors)
+                .into_iter()
+                .filter(|s| s.prefix.starts_with("my"))
+                .map(|s| s.prefix)
+                .collect::<Vec<_>>()
+        };
+        let mut errors = Vec::new();
+        std::fs::write(&file, "[[snippet]]\nprefix = \"mya\"\nbody = \"a\"\n").unwrap();
+        assert_eq!(mine(&mut errors), ["mya"]);
+        std::fs::write(&file, "[[snippet]]\nprefix = \"myabc\"\nbody = \"abc\"\n").unwrap();
+        assert_eq!(mine(&mut errors), ["myabc"]);
+        assert!(errors.is_empty());
+        // A broken file is reported once, when read.
+        std::fs::write(&file, "[[snippet]\n").unwrap();
+        assert!(mine(&mut errors).is_empty());
+        assert!(mine(&mut errors).is_empty());
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("snippets.toml"));
+    }
 
     #[test]
     fn bodies_expand_with_stops_defaults_mirrors_and_indentation() {
@@ -393,6 +482,16 @@ mod tests {
         assert_eq!(nested.text, "a b $x");
         assert_eq!(nested.stops[&1], vec![(0, 3)]);
         assert_eq!(nested.stops[&2], vec![(2, 3)]);
+    }
+
+    #[test]
+    fn hostile_snippets_stay_bounded() {
+        let deep = "${1:".repeat(100_000) + &"}".repeat(100_000);
+        let e = expand(&deep, "", "    ");
+        assert!(e.text.len() < 1000);
+        let wide = "$1".repeat(10_000) + "${1:" + &"x".repeat(1000) + "}";
+        let e = expand(&wide, "", "    ");
+        assert!(e.text.len() <= EXPANSION_LIMIT + 2000, "{}", e.text.len());
     }
 
     #[test]

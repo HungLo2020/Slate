@@ -58,6 +58,8 @@ with tempfile.TemporaryDirectory(prefix='slate-gui-offscreen-') as temporary:
         (root/'config/slate').mkdir(parents=True, exist_ok=True)
         (root/'config/slate/settings.toml').write_text(
             '[global_keys]\n"f5" = "quit"\n"f4" = "discard-document"\n"f2" = "settings"\n"f3" = "layout-save"\n')
+        # Command routing reads Git rows; the trust prompt is covered by the Git smoke.
+        (root/'config/slate/trusted-folders').write_text(f'{workspace.resolve()}\n')
     (root/'runtime').mkdir(mode=0o700)
     platform = os.environ.get('SLATE_GUI_PLATFORM', 'offscreen')
     environment = {**os.environ, 'SLATE_GUI_SMOKE_DIR':temporary,

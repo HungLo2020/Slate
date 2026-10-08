@@ -34,18 +34,7 @@ impl App {
         header: u16,
         minimum: (u16, u16),
     ) -> Snapshot {
-        self.snapshot_with_revisions(area, gap, cell, header, minimum, None)
-    }
-    pub fn snapshot_with_revisions(
-        &mut self,
-        area: Rect,
-        gap: u16,
-        cell: (u16, u16),
-        header: u16,
-        minimum: (u16, u16),
-        known: Option<(u64, u64)>,
-    ) -> Snapshot {
-        self.snapshot_presentation(area, gap, cell, header, minimum, known, false)
+        self.snapshot_presentation(area, gap, cell, header, minimum, None, false)
     }
     pub fn gui_snapshot(
         &mut self,
@@ -252,10 +241,14 @@ impl App {
             git_revision: self.git.revision,
             picker: self.picker_view(),
             trusted: self.trusted,
+            git_restricted: self.git.restricted,
             completion: self.completion_view(),
             hover: self.hover_view(),
             problems: self.problem_counts(),
             problem: self.problem_here().unwrap_or_default(),
+            activity: self.activity(),
+            debugging: self.debugging(),
+            debug_paused: self.debug_paused(),
         }
     }
     pub fn editor_input_context(&self, pane: u64) -> Option<EditorPresentation> {
@@ -326,7 +319,7 @@ impl App {
                 return screen.clone();
             }
         }
-        let screen = std::sync::Arc::new(self.editor_screen(id, rows, cols));
+        let screen = std::sync::Arc::new(self.render_editor(id, rows, cols, false).0);
         self.screen_builds += 1;
         self.render_cache.insert(
             id,
@@ -355,9 +348,6 @@ impl App {
         self.render_cache
             .insert(id, (key, self.screen_builds, screen.clone()));
         screen
-    }
-    pub(crate) fn editor_screen(&mut self, id: u64, rows: u16, cols: u16) -> Screen {
-        self.render_editor(id, rows, cols, false).0
     }
     pub(crate) fn render_editor(
         &mut self,
@@ -402,6 +392,13 @@ impl App {
             .iter()
             .map(|(line, index, _)| *index == 0 && self.folded_header(id, *line))
             .collect();
+        let foldable: Vec<bool> = {
+            let rope = self.documents[&doc_id].rope();
+            visible
+                .iter()
+                .map(|(line, index, _)| *index == 0 && smart::foldable(rope, *line, tab))
+                .collect()
+        };
         let v = &self.views[&id];
         let document = &self.documents[&doc_id];
         let left = if wrapping { 0 } else { v.left };
@@ -442,14 +439,28 @@ impl App {
             }
             .into()
         };
+        // Spans are sorted by start and may nest; the running maximum of
+        // their ends bounds how far back an enclosing span can begin.
+        let reach: Vec<usize> = problems
+            .iter()
+            .scan(0, |max, (_, end, _)| {
+                *max = (*max).max(*end);
+                Some(*max)
+            })
+            .collect();
         let problem_at = |offset: usize| -> Option<u8> {
-            let i = problems.partition_point(|(_, end, _)| *end <= offset);
-            problems[i..]
-                .iter()
-                .take_while(|(start, _, _)| *start <= offset)
-                .filter(|(start, end, _)| *start <= offset && offset < *end)
-                .map(|(_, _, severity)| *severity)
-                .min()
+            let j = problems.partition_point(|(start, _, _)| *start <= offset);
+            let mut best: Option<u8> = None;
+            for k in (0..j).rev() {
+                if reach[k] <= offset {
+                    break;
+                }
+                let (_, end, severity) = problems[k];
+                if offset < end {
+                    best = Some(best.map_or(severity, |b| b.min(severity)));
+                }
+            }
+            best
         };
         let caret_fg = self.colors.1.clone();
         let accent = self.colors.3.clone();
@@ -496,11 +507,16 @@ impl App {
                         mark.text = "▶".into();
                         mark.fg = self.colors.3.clone();
                     } else if breakpoints.contains(line) {
-                        mark.text = "●".into();
+                        // A diamond, so breakpoints never look like errors.
+                        mark.text = "◆".into();
                         mark.fg = severity_color(1);
                     } else if let (Some(severity), false) = (problem_lines.get(line), folded[y]) {
                         mark.text = "●".into();
                         mark.fg = severity_color(*severity);
+                    } else if !folded[y] && foldable[y] {
+                        // Click to fold.
+                        mark.text = "▾".into();
+                        mark.fg = whitespace_color.clone();
                     }
                 }
             }

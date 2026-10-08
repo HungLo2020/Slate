@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs, io::Write, path::PathBuf};
+use std::{collections::BTreeMap, fs, path::PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -62,10 +62,39 @@ pub struct Preferences {
     pub auto_close_brackets: bool,
     /// Format documents before saving them (trusted workspaces only).
     pub format_on_save: bool,
+    /// Let programs in terminals set the clipboard (OSC 52).
+    pub terminal_clipboard: bool,
+    /// Open completions automatically while typing.
+    pub complete_while_typing: bool,
+    /// Enter accepts the selected completion (Tab always does).
+    pub accept_completion_on_enter: bool,
     pub global_keys: BTreeMap<String, String>,
     pub editor_keys: BTreeMap<String, String>,
     pub terminal_keys: BTreeMap<String, String>,
+    /// Keys that act only while debugging, ahead of the other tables.
+    pub debug_keys: BTreeMap<String, String>,
+    /// The key tables' revision; older files gain new default bindings.
+    /// Files written before revisions existed have none (0).
+    #[serde(default)]
+    pub keys_revision: u32,
 }
+
+/// Debugger keys: VS Code's function keys, and Alt+Shift letters for
+/// terminals that keep F10/F11 for themselves.
+pub const DEBUG_KEYS: &[(&str, &str)] = &[
+    ("f9", "toggle-breakpoint"),
+    ("f10", "debug-step-over"),
+    ("f11", "debug-step-into"),
+    ("Shift+f11", "debug-step-out"),
+    ("Shift+f5", "debug-stop"),
+    ("Alt+Shift+n", "debug-step-over"),
+    ("Alt+Shift+i", "debug-step-into"),
+    ("Alt+Shift+o", "debug-step-out"),
+    ("Alt+Shift+c", "debug-continue"),
+];
+
+/// Bumped whenever a keymap gains default bindings.
+pub const KEYS_REVISION: u32 = 3;
 
 fn keys(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
     entries
@@ -134,7 +163,7 @@ pub fn keymap(
                 ("Ctrl+{", "fold"),
                 ("Ctrl+}", "unfold"),
                 ("Ctrl+r", "go-to-symbol"),
-                ("Ctrl+k", "hover"),
+                ("Alt+h", "hover"),
                 ("f12", "go-to-definition"),
                 ("Shift+f12", "find-references"),
                 ("f2", "rename-symbol"),
@@ -154,6 +183,22 @@ pub fn keymap(
                 ("Ctrl+Shift+b", "run-build-task"),
                 ("f5", "debug-start"),
                 ("Ctrl+f9", "toggle-breakpoint"),
+                // Desktop editor basics.
+                ("Ctrl+n", "new"),
+                ("Ctrl+tab", "next-tab"),
+                ("Ctrl+pagedown", "next-tab"),
+                ("Ctrl+Shift+tab", "previous-tab"),
+                ("Ctrl+pageup", "previous-tab"),
+                ("Shift+f1", "help"),
+                // Alternatives for chords most terminals cannot send
+                // (Ctrl+Shift+letter, Ctrl+., Ctrl+Shift+[).
+                ("Alt+Shift+f", "format-document"),
+                ("Alt+enter", "code-actions"),
+                ("Alt+Shift+l", "select-all-occurrences"),
+                ("Alt+Shift+b", "run-build-task"),
+                ("Alt+Shift+s", "search-in-files"),
+                ("Alt+-", "fold"),
+                ("Alt+=", "unfold"),
             ])
         }
         // GNU nano's default bindings (nano 7), mapped onto Slate's actions.
@@ -204,6 +249,12 @@ pub fn keymap(
                 ("Alt+}", "indent"),
                 ("Alt+{", "outdent"),
                 ("Ctrl+]", "indent"),
+                // IDE features on keys nano leaves free.
+                ("f12", "go-to-definition"),
+                ("Shift+f12", "find-references"),
+                ("f5", "debug-start"),
+                ("Ctrl+f9", "toggle-breakpoint"),
+                ("Shift+f1", "help"),
             ])
         }
         _ => bail!("keymap must be default or nano"),
@@ -237,9 +288,14 @@ impl Default for Preferences {
             terminal_scrollback: crate::terminal::DEFAULT_SCROLLBACK,
             auto_close_brackets: true,
             format_on_save: false,
+            terminal_clipboard: false,
+            complete_while_typing: true,
+            accept_completion_on_enter: true,
             global_keys,
             editor_keys,
             terminal_keys,
+            debug_keys: keys(DEBUG_KEYS),
+            keys_revision: KEYS_REVISION,
         }
     }
 }
@@ -347,6 +403,21 @@ pub const SETTINGS: &[Setting] = &[
         kind: SettingKind::Bool,
     },
     Setting {
+        name: "complete-while-typing",
+        label: "Complete while typing",
+        kind: SettingKind::Bool,
+    },
+    Setting {
+        name: "accept-completion-on-enter",
+        label: "Enter accepts a completion",
+        kind: SettingKind::Bool,
+    },
+    Setting {
+        name: "terminal-clipboard",
+        label: "Terminal programs may set the clipboard",
+        kind: SettingKind::Bool,
+    },
+    Setting {
         name: "terminal-scrollback",
         label: "Terminal scrollback lines",
         kind: SettingKind::Number(0, 100_000),
@@ -379,6 +450,9 @@ impl Preferences {
             "terminal-scrollback" => self.terminal_scrollback.to_string(),
             "auto-close-brackets" => self.auto_close_brackets.to_string(),
             "format-on-save" => self.format_on_save.to_string(),
+            "terminal-clipboard" => self.terminal_clipboard.to_string(),
+            "complete-while-typing" => self.complete_while_typing.to_string(),
+            "accept-completion-on-enter" => self.accept_completion_on_enter.to_string(),
             "minimap" => self.minimap.to_string(),
             "font-family" => self.font_family.clone(),
             "font-size" => self.font_size.to_string(),
@@ -449,7 +523,12 @@ impl Preferences {
         if self.font_family.len() > 200 {
             bail!("font_family is too long");
         }
-        if self.global_keys.len() + self.editor_keys.len() + self.terminal_keys.len() > 256 {
+        if self.global_keys.len()
+            + self.editor_keys.len()
+            + self.terminal_keys.len()
+            + self.debug_keys.len()
+            > 320
+        {
             bail!("Too many key bindings");
         }
         Ok(())
@@ -465,52 +544,38 @@ impl Preferences {
         // Key tables the file omits come from its chosen keymap.
         let (global, editor, terminal) = keymap(&settings.keymap)?;
         for (name, preset, field) in [
-            ("global_keys", global, &mut settings.global_keys),
-            ("editor_keys", editor, &mut settings.editor_keys),
-            ("terminal_keys", terminal, &mut settings.terminal_keys),
+            ("global_keys", &global, &mut settings.global_keys),
+            ("editor_keys", &editor, &mut settings.editor_keys),
+            ("terminal_keys", &terminal, &mut settings.terminal_keys),
         ] {
             if !table.contains_key(name) {
-                *field = preset;
+                *field = preset.clone();
             }
         }
-        // Settings saved by older releases contain the old complete key map.
-        // Add the new defaults while preserving explicit user assignments.
-        if settings.keymap == "default" {
-            for (key, action) in [
-                ("f10", "toggle-workspace"),
-                ("Ctrl+,", "settings"),
-                ("Ctrl+q", "quit"),
-                ("Ctrl+o", "open"),
-                ("Ctrl+Shift+o", "open-folder"),
+        if !table.contains_key("debug_keys") {
+            settings.debug_keys = keys(DEBUG_KEYS);
+        }
+        // Settings saved by older releases contain that release's complete
+        // key tables. Add the keymap's newer defaults on keys the file does
+        // not assign, keeping every explicit assignment.
+        if settings.keys_revision < KEYS_REVISION {
+            for (field, preset) in [
+                (&mut settings.global_keys, &global),
+                (&mut settings.editor_keys, &editor),
+                (&mut settings.terminal_keys, &terminal),
             ] {
-                settings
-                    .global_keys
-                    .entry(key.into())
-                    .or_insert_with(|| action.into());
+                for (key, action) in preset {
+                    field.entry(key.clone()).or_insert_with(|| action.clone());
+                }
             }
-            for (key, action) in [
-                ("Ctrl+Shift+s", "save-as"),
-                ("Ctrl+w", "close"),
-                ("Alt+z", "toggle-soft-wrap"),
-            ] {
-                settings
-                    .editor_keys
-                    .entry(key.into())
-                    .or_insert_with(|| action.into());
-            }
+            settings.keys_revision = KEYS_REVISION;
         }
         settings.validate()?;
         Ok(settings)
     }
     pub fn save(&self) -> Result<()> {
         self.validate()?;
-        let path = Self::path();
-        fs::create_dir_all(path.parent().unwrap())?;
-        let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
-        file.write_all(toml::to_string_pretty(self)?.as_bytes())?;
-        file.as_file().sync_all()?;
-        file.persist(path).map_err(|e| e.error)?;
-        Ok(())
+        crate::fsio::write_private(&Self::path(), toml::to_string_pretty(self)?.as_bytes())
     }
 }
 
@@ -571,6 +636,12 @@ impl App {
         self.highlight_pending.clear();
     }
     pub(super) fn configure(&mut self, name: &str, value: &str) -> Result<()> {
+        // Saving writes the whole file; never replace one the user can still fix.
+        if Preferences::path().exists() {
+            if let Err(e) = Preferences::load() {
+                bail!("Not saving over settings.toml until it is fixed: {e:#}");
+            }
+        }
         let mut settings = self.preferences.clone();
         let flag = |value: &str| -> Result<bool> {
             value
@@ -603,6 +674,9 @@ impl App {
             "terminal-scrollback" => settings.terminal_scrollback = value.parse()?,
             "auto-close-brackets" => settings.auto_close_brackets = flag(value)?,
             "format-on-save" => settings.format_on_save = flag(value)?,
+            "terminal-clipboard" => settings.terminal_clipboard = flag(value)?,
+            "complete-while-typing" => settings.complete_while_typing = flag(value)?,
+            "accept-completion-on-enter" => settings.accept_completion_on_enter = flag(value)?,
             "minimap" => settings.minimap = flag(value)?,
             "font-family" => settings.font_family = value.trim().into(),
             "font-size" => settings.font_size = value.parse()?,
@@ -629,6 +703,31 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_settings_gain_new_default_keys_without_losing_their_own() {
+        let _env = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        std::fs::create_dir_all(dir.path().join("slate")).unwrap();
+        // Saved by an older release: complete tables, no revision, one change.
+        std::fs::write(
+            dir.path().join("slate/settings.toml"),
+            "keymap = \"default\"\n[global_keys]\n\"Ctrl+q\" = \"quit\"\n[editor_keys]\n\"Ctrl+s\" = \"save\"\n\"Ctrl+p\" = \"print\"\n[terminal_keys]\n",
+        )
+        .unwrap();
+        let loaded = Preferences::load().unwrap();
+        assert_eq!(
+            loaded.editor_keys["Ctrl+p"], "print",
+            "the user's own binding stays"
+        );
+        assert_eq!(loaded.editor_keys["f12"], "go-to-definition");
+        assert_eq!(loaded.editor_keys["Ctrl+d"], "add-next-occurrence");
+        assert_eq!(loaded.debug_keys["f10"], "debug-step-over");
+        assert_eq!(loaded.keys_revision, KEYS_REVISION);
+    }
 
     #[test]
     fn keymaps_and_settings_steps() {

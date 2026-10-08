@@ -51,7 +51,7 @@ fn a_build_task_reports_compiler_problems() {
     settle(&mut app, "the task", |a| a.status.starts_with("compile "));
     assert!(
         app.status
-            .starts_with("compile failed (exit 1) · 1 errors, 1 warnings"),
+            .starts_with("compile failed (exit 1) · 1 error, 1 warning"),
         "{}",
         app.status
     );
@@ -122,4 +122,49 @@ fn a_build_task_reports_compiler_problems() {
         "{}",
         app.status
     );
+}
+
+#[test]
+fn tasks_stop_when_slate_exits_and_output_reuses_its_tab() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("XDG_CONFIG_HOME", dir.path().join("config"));
+    std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
+    let root = dir.path().join("project");
+    fs::create_dir_all(root.join(".slate")).unwrap();
+    let marker = dir.path().join("still-running");
+    fs::write(
+        root.join(".slate/tasks.toml"),
+        format!(
+            "[[task]]\nname = \"serve\"\ncommand = \"sleep 1; touch '{}'\"\n\n[[task]]\nname = \"hello\"\ncommand = \"printf 'h\\\\303\\\\251llo\\\\n'\"\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let mut app = App::new(&root).unwrap();
+    app.set_session_trust(true);
+    // Output arrives whole (no split UTF-8) and a second run reuses the tab.
+    for _ in 0..2 {
+        app.dispatch(Command::Action {
+            name: "run-task".into(),
+            argument: "hello".into(),
+        });
+        settle(&mut app, "hello", |a| a.status.starts_with("hello "));
+    }
+    let outputs: Vec<_> = app
+        .documents
+        .values()
+        .filter(|d| d.title().starts_with("Task: hello"))
+        .collect();
+    assert_eq!(outputs.len(), 1, "one output document per task");
+    assert!(outputs[0].text().contains("héllo"), "{}", outputs[0].text());
+    // A running task is stopped when the editor goes away.
+    app.dispatch(Command::Action {
+        name: "run-task".into(),
+        argument: "serve".into(),
+    });
+    assert!(app.tasks_running());
+    drop(app);
+    thread::sleep(Duration::from_millis(1500));
+    assert!(!marker.exists(), "the task outlived Slate");
 }

@@ -132,6 +132,8 @@ pub struct TerminalSession {
     revision: Arc<AtomicU64>,
     events: Arc<Mutex<Option<crate::events::Events>>>,
     finished: Arc<AtomicBool>,
+    /// The shell's exit code and when it was seen.
+    exit: Option<(u32, std::time::Instant)>,
     pub title: String,
     size: (u16, u16),
     initial_cwd: PathBuf,
@@ -225,6 +227,7 @@ impl TerminalSession {
             revision,
             events,
             finished,
+            exit: None,
             master: pair.master,
             input,
             child,
@@ -253,14 +256,17 @@ impl TerminalSession {
     }
     /// The exit code once the shell has exited and its output is drained.
     pub fn exit_code(&mut self) -> Option<u32> {
-        if !self.finished.load(Ordering::Acquire) {
-            return None;
+        // The shell is reaped as soon as it exits (no zombie). Its last
+        // output is waited for briefly; a background process that keeps the
+        // terminal open does not keep a dead tab around.
+        if self.exit.is_none() {
+            let status = self.child.try_wait().ok().flatten()?;
+            self.exit = Some((status.exit_code(), std::time::Instant::now()));
         }
-        self.child
-            .try_wait()
-            .ok()
-            .flatten()
-            .map(|status| status.exit_code())
+        let (code, at) = self.exit?;
+        (self.finished.load(Ordering::Acquire)
+            || at.elapsed() > std::time::Duration::from_millis(300))
+        .then_some(code)
     }
     pub fn set_events(&mut self, events: crate::events::Events) {
         *self.events.lock().unwrap() = Some(events);
@@ -307,7 +313,9 @@ impl TerminalSession {
         if bracketed {
             self.write(b"\x1b[200~")?;
         }
-        self.write(text.as_bytes())?;
+        // Control characters in pasted text could end bracketed paste early
+        // (ESC [201~) and run what follows; keep text, tabs and line breaks.
+        self.write(paste_text(text).as_bytes())?;
         if bracketed {
             self.write(b"\x1b[201~")?;
         }
@@ -544,6 +552,13 @@ fn color(c: vt100::Color, background: bool) -> String {
     }
 }
 
+/// Pasted text without control characters other than tab and line breaks.
+pub fn paste_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| matches!(c, '\t' | '\n' | '\r') || !c.is_control())
+        .collect()
+}
+
 /// The local directory named by an OSC 7 `file://host/path` URL.
 fn cwd_from_url(url: &str) -> Option<PathBuf> {
     let location = url.strip_prefix("file://")?;
@@ -613,6 +628,12 @@ fn decode_base64(data: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pasted_control_sequences_are_removed() {
+        assert_eq!(paste_text("ls\x1b[201~curl x|sh\n"), "ls[201~curl x|sh\n");
+        assert_eq!(paste_text("a\tb\r\nc\u{9b}d\x07"), "a\tb\r\ncd");
+    }
 
     #[test]
     fn base64_and_osc7_urls() {

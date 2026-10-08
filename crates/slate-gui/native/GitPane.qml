@@ -117,7 +117,7 @@ FocusScope {
             Layout.preferredHeight: Math.ceil(Math.max(66, metrics.height * 2 + 20))
             Layout.minimumHeight: Layout.preferredHeight
             Layout.maximumHeight: Layout.preferredHeight
-            visible: view.frame.git_repository && !view.compactHeight
+            visible: view.frame.git_repository && !view.frame.git_restricted && !view.compactHeight
             clip: true
             contentWidth: availableWidth
             background: Rectangle {
@@ -166,7 +166,7 @@ FocusScope {
             objectName: "gitCommit_" + view.paneId
             Layout.fillWidth: true
             Layout.minimumWidth: 0
-            visible: view.frame.git_repository
+            visible: view.frame.git_repository && !view.frame.git_restricted
             highlighted: enabled
             text: view.committing ? "Committing…" : (view.compactHeight ? "Commit…" : "Commit") + (view.stagedCount ? " (" + view.stagedCount + ")" : "")
             tip: !view.stagedCount ? "Stage changes before committing" : !view.draft.trim().length ? "Enter a commit message" : "Commit staged changes (Ctrl+Enter)"
@@ -184,7 +184,7 @@ FocusScope {
             Layout.fillWidth: true
             Layout.preferredHeight: implicitHeight
             spacing: 6
-            visible: view.frame.git_repository
+            visible: view.frame.git_repository && !view.frame.git_restricted
             ActionButton {
                 objectName: "gitStageAll_" + view.paneId
                 text: "Stage all"
@@ -217,7 +217,7 @@ FocusScope {
             objectName: "gitNotice_" + view.paneId
             Layout.fillWidth: true
             Layout.minimumWidth: 0
-            visible: view.frame.git_busy || !!view.frame.git_error
+            visible: view.frame.git_busy || (!!view.frame.git_error && !view.frame.git_restricted)
             text: view.frame.git_error || (view.committing ? "Creating commit…" : "Updating changes…")
             textFormat: Text.PlainText
             wrapMode: Text.Wrap
@@ -412,10 +412,31 @@ FocusScope {
                     }
                 }
             }
+            // Git runs nothing until the repository is trusted.
+            ColumnLayout {
+                anchors.centerIn: parent
+                width: Math.max(0, parent.width - 16)
+                visible: !!view.frame.git_restricted
+                spacing: Theme.largeSpacing
+                Label {
+                    Layout.fillWidth: true
+                    text: "Git is off in restricted mode: a repository's configuration can run programs."
+                    textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
+                    horizontalAlignment: Text.AlignHCenter
+                    color: Theme.disabledTextColor
+                }
+                Button {
+                    objectName: "gitTrust_" + view.paneId
+                    Layout.alignment: Qt.AlignHCenter
+                    text: "Trust Folder…"
+                    onClicked: view.invokeAction("request-trust")
+                }
+            }
             Label {
                 anchors.centerIn: parent
                 width: Math.max(0, parent.width - 16)
-                visible: changes.count === 0 && !view.frame.git_busy
+                visible: changes.count === 0 && !view.frame.git_busy && !view.frame.git_restricted
                 text: view.frame.git_repository ? "Working tree clean\nYour changes will appear here." : "Open a folder containing a Git repository."
                 textFormat: Text.PlainText
                 wrapMode: Text.Wrap

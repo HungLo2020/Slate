@@ -124,8 +124,8 @@ editor views, multiple terminals, and a shared Git viewer incrementally.
 Language servers, incremental syntax highlighting, diagnostics, formatting,
 debugging (DAP), build tasks with problem matching, project search, and
 external tools are in place. Each is a service with its own state that reports
-to the main loop as typed events, and none of them runs until the user trusts
-the workspace. External agent integration is still future work; any agent
+to the main loop as typed events, and none of them, including Git, runs until
+the user trusts the folder it would run in. External agent integration is still future work; any agent
 harness remains a separate system that Slate can integrate with.
 
 ## Quality goals

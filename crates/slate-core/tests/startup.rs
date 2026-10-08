@@ -1,3 +1,4 @@
+mod common;
 use slate_core::{
     layout::View,
     preferences::{Preferences, StartupMode},
@@ -24,6 +25,7 @@ fn key(app: &mut App, name: &str) {
 
 #[test]
 fn explicit_startup_modes_work_for_files_and_directories() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("edit.txt");
     fs::write(&file, "original").unwrap();
@@ -36,7 +38,10 @@ fn explicit_startup_modes_work_for_files_and_directories() {
             assert_eq!(app.terminals.len(), if view.editor_only { 0 } else { 1 });
             assert_eq!(app.layout.panes().len(), 3);
             if path == file {
-                assert_eq!(app.documents[&10].text(), "original");
+                assert_eq!(
+                    app.documents[&common::first_document(&app)].text(),
+                    "original"
+                );
             }
         }
     }
@@ -44,6 +49,7 @@ fn explicit_startup_modes_work_for_files_and_directories() {
 
 #[test]
 fn collapse_preserves_tabs_dirty_buffers_geometry_and_live_shells() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let mut app = App::new_with_startup(dir.path(), Some(StartupMode::Workspace)).unwrap();
     app.dispatch(Command::New);
@@ -80,7 +86,7 @@ fn collapse_preserves_tabs_dirty_buffers_geometry_and_live_shells() {
         .write(b"printf 'SHELL_%s' \"$SLATE_LAYOUT_TEST\"\r")
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
-    while !app.terminals[&12]
+    while !app.terminals[&common::first_terminal(&app)]
         .screen()
         .cells
         .iter()
@@ -97,7 +103,9 @@ fn collapse_preserves_tabs_dirty_buffers_geometry_and_live_shells() {
     }
     app.dispatch(Command::Undo);
     assert!(!app.dirty());
-    app.dispatch(Command::Focus { pane: 3 });
+    app.dispatch(Command::Focus {
+        pane: common::terminal_pane(&app),
+    });
     key(&mut app, "F10");
     assert!(matches!(app.layout.view(app.focus), Some(View::Editor(_))));
     assert_eq!(snapshot(&mut app).panes[0].kind, "editor");
@@ -105,6 +113,7 @@ fn collapse_preserves_tabs_dirty_buffers_geometry_and_live_shells() {
 
 #[test]
 fn editor_only_recovery_defers_shells_and_retains_requested_dirty_file() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let file = dir.path().join("edit.txt");
@@ -121,7 +130,9 @@ fn editor_only_recovery_defers_shells_and_retains_requested_dirty_file() {
             text: "unsaved ".into(),
         });
         app.dispatch(Command::ResizeSplit { id: 5, ratio: 0.6 });
-        app.dispatch(Command::Focus { pane: 3 });
+        app.dispatch(Command::Focus {
+            pane: common::terminal_pane(&app),
+        });
         layout = serde_json::to_string(&app.layout).unwrap();
     }
     let mut app = App::new_with_startup(&file, Some(StartupMode::EditorOnly)).unwrap();
@@ -141,7 +152,10 @@ fn editor_only_recovery_defers_shells_and_retains_requested_dirty_file() {
     assert!(view.editor_only);
     assert_eq!(view.panes.len(), 1);
     assert_eq!(view.panes[0].kind, "editor");
-    assert_eq!(app.documents[&10].text(), "unsaved original");
+    assert_eq!(
+        app.documents[&common::first_document(&app)].text(),
+        "unsaved original"
+    );
     assert_eq!(fs::read_to_string(&file).unwrap(), "original");
     key(&mut app, "F10");
     assert_eq!(snapshot(&mut app).panes.len(), 3);
@@ -151,6 +165,7 @@ fn editor_only_recovery_defers_shells_and_retains_requested_dirty_file() {
 
 #[test]
 fn legacy_settings_get_startup_defaults_and_invalid_modes_are_rejected() {
+    common::isolate();
     let settings: Preferences = toml::from_str("indent_width = 2\ntheme = 'light'").unwrap();
     assert_eq!(settings.file_startup, StartupMode::EditorOnly);
     assert_eq!(settings.directory_startup, StartupMode::Workspace);
@@ -165,6 +180,7 @@ fn legacy_settings_get_startup_defaults_and_invalid_modes_are_rejected() {
 
 #[test]
 fn selecting_a_remembered_tool_tab_expands_and_starts_its_deferred_shell() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     for next_tab in [false, true] {
         let mut app = App::new_with_startup(dir.path(), Some(StartupMode::EditorOnly)).unwrap();
@@ -173,7 +189,10 @@ fn selecting_a_remembered_tool_tab_expands_and_starts_its_deferred_shell() {
         if next_tab {
             app.dispatch(Command::NextTab);
         } else {
-            app.dispatch(Command::SwitchTab { pane: 2, index: 1 });
+            app.dispatch(Command::SwitchTab {
+                pane: common::editor_pane(&app),
+                index: 1,
+            });
         }
         assert!(!app.editor_only);
         assert_eq!(app.terminals.len(), 1);

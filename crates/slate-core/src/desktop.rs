@@ -142,25 +142,15 @@ impl App {
         }
         self.offer_disk_conflict();
     }
+    /// Put `path` first in the recent files list and save the list.
     pub(crate) fn remember_recent(&mut self, path: &Path) {
         let path = path.to_string_lossy().into_owned();
         self.recent.retain(|p| *p != path);
         self.recent.insert(0, path);
         self.recent.truncate(RECENT_LIMIT);
-        let target = recent_path();
-        if let Some(parent) = target.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         if let Ok(json) = serde_json::to_vec(&self.recent) {
-            let _ = crate::fsio::write_file(
-                &target,
-                &json,
-                std::fs::read(&target)
-                    .ok()
-                    .map(|b| crate::fsio::Baseline::of(&b))
-                    .as_ref(),
-                Default::default(),
-            );
+            // The list is a convenience; failing to save it is not an error.
+            let _ = crate::fsio::write_private(&recent_path(), &json);
         }
     }
     pub fn recent_files(&self) -> &[String] {

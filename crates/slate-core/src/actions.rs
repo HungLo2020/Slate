@@ -3,7 +3,6 @@
 use crate::{
     document::{previous, Document},
     fsio::{SaveErrorKind, WriteOptions},
-    layout::View,
     search::{Prompt, Search},
     services::{IoJob, Job, SaveFailure},
     text_format::{self, LineEnding},
@@ -80,7 +79,17 @@ impl App {
     }
     pub(crate) fn gutter_width(&self, doc: u64, cols: u16) -> usize {
         if !self.preferences.line_numbers {
-            return 0;
+            // Without line numbers, a narrow margin still shows breakpoints,
+            // the paused line, problems and folds when there are any.
+            let (breakpoints, paused) = self.debug_marks(doc);
+            let marked = !breakpoints.is_empty()
+                || paused.is_some()
+                || !self.diagnostic_lines(doc).is_empty()
+                || self
+                    .views
+                    .values()
+                    .any(|v| v.document == doc && !v.folds.is_empty());
+            return if marked { 2.min(cols as usize) } else { 0 };
         }
         let digits = self.documents[&doc].line_count().to_string().len().max(4);
         (digits + 2).min(cols as usize)
@@ -227,6 +236,17 @@ impl App {
         view.cursor = cursor;
         view.goal = keep_goal.then_some(goal);
         view.manual_scroll = false;
+        // Leaving a snippet's fields ends it, so Tab indents again.
+        let inside = view
+            .current_stop
+            .iter()
+            .chain(view.stops.iter().flatten())
+            .any(|(a, b)| *a <= cursor && cursor <= *b);
+        if !inside {
+            view.stops.clear();
+            view.visited.clear();
+            view.current_stop.clear();
+        }
         Ok(())
     }
     /// Scroll so the cursor is visible, in visual rows when wrapping.
@@ -354,28 +374,30 @@ impl App {
     /// Scroll an editor by visual rows without moving the cursor.
     pub(crate) fn scroll_view(&mut self, id: u64, delta: i32) {
         let v = self.views[&id].clone();
-        let lines = self.documents[&v.document].line_count();
-        let view = self.views.get_mut(&id).unwrap();
-        view.manual_scroll = true;
-        if !self.preferences.soft_wrap {
-            view.top =
-                (v.top as i64 - delta as i64).clamp(0, lines.saturating_sub(1) as i64) as usize;
-            return;
-        }
+        self.views.get_mut(&id).unwrap().manual_scroll = true;
         let width = self.text_width(id);
-        let (mut line, mut row) = (v.top, v.top_row);
+        let wrapping = self.preferences.soft_wrap;
+        // Steps go by shown rows: a folded region is one step, not many.
+        let (mut line, mut row) = (
+            self.shown_at_or_after(id, v.top),
+            if wrapping { v.top_row } else { 0 },
+        );
         for _ in 0..delta.unsigned_abs() {
             if delta > 0 {
-                if row > 0 {
+                if wrapping && row > 0 {
                     row -= 1;
-                } else if line > 0 {
-                    line -= 1;
-                    row = self.line_rows(v.document, line, width).len() - 1;
+                } else if let Some(previous) = self.previous_shown_line(id, line) {
+                    line = previous;
+                    row = if wrapping {
+                        self.line_rows(v.document, line, width).len() - 1
+                    } else {
+                        0
+                    };
                 }
-            } else if row + 1 < self.line_rows(v.document, line, width).len() {
+            } else if wrapping && row + 1 < self.line_rows(v.document, line, width).len() {
                 row += 1;
-            } else if line + 1 < lines {
-                line += 1;
+            } else if let Some(next) = self.next_shown_line(id, line) {
+                line = next;
                 row = 0;
             }
         }
@@ -646,13 +668,8 @@ impl App {
         self.edit_range(id, start, end, "", v.cursor)?;
         self.last_cut = Some((id, self.documents[&doc].generation, self.views[&id].cursor));
         self.status = format!(
-            "Cut {} line{}",
-            self.clipboard.matches('\n').count().max(1),
-            if self.clipboard.matches('\n').count() > 1 {
-                "s"
-            } else {
-                ""
-            }
+            "Cut {}",
+            crate::counted(self.clipboard.matches('\n').count().max(1), "line", "lines")
         );
         Ok(())
     }
@@ -713,7 +730,7 @@ impl App {
         self.edit_range(id, start, end, &value, v.cursor)?;
         let view = self.views.get_mut(&id).unwrap();
         view.cursor = start + value.len();
-        self.status = format!("Justified {} line(s)", lines.len());
+        self.status = format!("Justified {}", crate::counted(lines.len(), "line", "lines"));
         Ok(())
     }
     /// Break the current line at the last space before the wrap column.
@@ -754,15 +771,16 @@ impl App {
             Some(a) if a != v.cursor => (d.slice(a.min(v.cursor), a.max(v.cursor)), "Selection"),
             _ => (std::borrow::Cow::Owned(d.text()), "Document"),
         };
+        let lines = if text.is_empty() {
+            0
+        } else {
+            text.matches('\n').count() + usize::from(!text.ends_with('\n'))
+        };
         Ok(format!(
-            "{scope}: {} lines, {} words, {} characters",
-            if text.is_empty() {
-                0
-            } else {
-                text.matches('\n').count() + usize::from(!text.ends_with('\n'))
-            },
-            text.split_whitespace().count(),
-            text.chars().count()
+            "{scope}: {}, {}, {}",
+            crate::counted(lines, "line", "lines"),
+            crate::counted(text.split_whitespace().count(), "word", "words"),
+            crate::counted(text.chars().count(), "character", "characters")
         ))
     }
     fn location_report(&self) -> Result<String> {
@@ -793,8 +811,12 @@ impl App {
         let catalog = self.command_catalog("");
         for (title, map) in [
             ("Global keys", &p.global_keys),
-            ("Editor keys", &p.editor_keys),
+            (
+                "Editor keys (also the file and Git panes for finding and running)",
+                &p.editor_keys,
+            ),
             ("Terminal keys", &p.terminal_keys),
+            ("While debugging", &p.debug_keys),
         ] {
             out.push_str(&format!("{title}\n"));
             for (key, action) in map {
@@ -803,11 +825,16 @@ impl App {
                     .find(|c| c.id == *action)
                     .map(|c| c.name.as_str())
                     .unwrap_or(action);
-                out.push_str(&format!("  {key:<16} {name}\n"));
+                out.push_str(&format!(
+                    "  {:<18} {name}\n",
+                    crate::commands::display_chord(key)
+                ));
             }
             out.push('\n');
         }
-        out.push_str("Other keys\n  Shift+arrows    Select\n  Ctrl+arrows     Move by word\n  Ctrl+Backspace  Delete previous word\n  Tab/Shift+Tab   Indent/outdent selection\n  F6              Next pane (also leaves terminal input)\n\nSettings are stored in settings.toml; choose keymap = \"nano\" for nano bindings.\n");
+        out.push_str(
+            "Other keys\n  Shift+arrows       Select\n  Ctrl+arrows        Move by word\n  Ctrl+Backspace     Delete previous word\n  Tab / Shift+Tab    Indent / outdent a selection; next / previous snippet field\n  Tab after a prefix Expand a snippet\n  Up/Down, Tab/Enter Choose and accept a completion; Escape closes it\n  Escape             Back to one caret; closes hover text\n  Alt+click          Add or remove a caret\n  F6                 Next pane (also leaves terminal input)\n\nSettings are stored in settings.toml; choose keymap = \"nano\" for nano bindings.\n",
+        );
         out
     }
     fn insert_file(&mut self, path: &str) -> Result<()> {
@@ -936,22 +963,34 @@ impl App {
             "spell-check" => self.spell_check()?,
             "next-misspelling" => self.next_misspelling(false)?,
             "help" => {
-                let doc = self.id();
-                self.documents.insert(
-                    doc,
-                    Document::inspection("Help · read-only".into(), self.help_text()),
-                );
-                self.editor_target();
-                let view = self.id();
-                self.views.insert(
-                    view,
-                    EditorView {
-                        document: doc,
-                        ..Default::default()
-                    },
-                );
-                self.add_tab(View::Editor(view));
+                // One Help document, refreshed (key tables may have changed).
+                let label = "Help · read-only";
+                let text = self.help_text();
+                let existing = self
+                    .documents
+                    .iter()
+                    .find(|(_, d)| d.label.as_deref() == Some(label))
+                    .map(|(id, _)| *id);
+                let doc = match existing {
+                    Some(doc) => {
+                        let d = self.documents.get_mut(&doc).unwrap();
+                        let len = d.len();
+                        d.replace_inspection(0, len, &text);
+                        d.generation += 1;
+                        self.clamp_views(doc);
+                        doc
+                    }
+                    None => {
+                        let doc = self.id();
+                        self.documents
+                            .insert(doc, Document::inspection(label.into(), text));
+                        doc
+                    }
+                };
+                self.reveal_document(doc);
             }
+            "previous-tab" => self.cycle_tab(-1)?,
+            "language-servers" => self.show_language_servers(),
             "insert-file" if argument.trim().is_empty() => {
                 self.prompt = Some(prompt("insert-file", String::new()));
             }
@@ -1152,6 +1191,7 @@ impl App {
                 self.open_picker("search", query)?
             }
             "replace-in-files" => self.begin_replace_in_files()?,
+            "undo-replace-in-files" => self.undo_replace_in_files()?,
             "open-documents" => self.open_picker("documents", argument)?,
             "problems" => self.open_picker("diagnostics", argument)?,
             "hover" => self.lsp_hover()?,
@@ -1196,6 +1236,10 @@ impl App {
             }
             "debug-evaluate" => self.debug_evaluate(argument)?,
             "toggle-breakpoint" => self.toggle_breakpoint()?,
+            "clear-breakpoints" => self.clear_breakpoints()?,
+            "breakpoints" => self.breakpoint_picker()?,
+            "debug-call-stack" => self.frame_picker()?,
+            "debug-frame" => self.select_frame(argument.trim().parse()?)?,
             "run-tool" => self.run_tool(argument)?,
             "run-task" if argument.is_empty() => self.task_picker()?,
             "run-task" => self.run_task(argument)?,
@@ -1203,6 +1247,7 @@ impl App {
             "stop-task" => self.stop_tasks()?,
             "go-back" => self.go_back(false)?,
             "go-forward" => self.go_back(true)?,
+            "request-trust" => self.request_trust(),
             "trust-workspace" => self.set_workspace_trust(true)?,
             "restrict-workspace" => self.set_workspace_trust(false)?,
             _ => bail!("Unknown action: {name}"),

@@ -67,16 +67,14 @@ fn main() -> Result<()> {
     if launch.frontend == Some(Frontend::Tui) {
         return slate_cli::run(cli::start(&launch)?);
     }
+    let smoke = std::env::var_os("SLATE_GUI_SMOKE_DIR").is_some();
     // Files go to a running window, like other desktop editors. Directories,
     // standard input and --new-instance always open a new window.
-    let single = !launch.new_instance
-        && launch.directory.is_none()
-        && launch.stdin.is_none()
-        && std::env::var_os("SLATE_GUI_SMOKE_DIR").is_none();
+    let single =
+        !launch.new_instance && launch.directory.is_none() && launch.stdin.is_none() && !smoke;
     if single && !launch.files.is_empty() && slate_core::instance::forward(&launch.files) {
         return Ok(());
     }
-    let smoke = std::env::var_os("SLATE_GUI_SMOKE_DIR").is_some();
     if smoke {
         eprintln!("Smoke startup: constructing shared core");
     }

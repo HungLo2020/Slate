@@ -1,5 +1,6 @@
 //! Pane and layout changes never lose documents or shells, and the limits
 //! that saved layouts must satisfy hold while editing.
+mod common;
 use slate_core::{
     layout::{Axis, View, MAX_TABS},
     preferences::StartupMode,
@@ -7,14 +8,7 @@ use slate_core::{
 };
 use std::{collections::BTreeSet, fs};
 
-static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-fn isolated() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
-    let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = tempfile::tempdir().unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", dir.path().join("config"));
-    std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
-    (dir, guard)
-}
+use common::isolated;
 fn workspace(dir: &std::path::Path) -> App {
     App::new_with_startup(dir, Some(StartupMode::Workspace)).unwrap()
 }

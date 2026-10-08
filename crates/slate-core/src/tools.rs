@@ -27,14 +27,41 @@ use std::{path::Path, time::Duration};
 
 const TIMEOUT: Duration = Duration::from_secs(60);
 
+/// What a tool reads on standard input.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Input {
+    /// The selection, or the whole document without one.
+    #[default]
+    Selection,
+    Document,
+    None,
+}
+
+/// What happens to a tool's output.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Output {
+    /// Replaces what the tool read.
+    #[default]
+    Replace,
+    /// Inserted after the selection or caret.
+    Insert,
+    /// Opens as a new document.
+    Document,
+    /// The first line is shown in the status bar.
+    Status,
+    None,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct Tool {
     pub name: String,
     pub command: String,
-    #[serde(default = "selection")]
-    pub input: String,
-    #[serde(default = "replace")]
-    pub output: String,
+    #[serde(default)]
+    pub input: Input,
+    #[serde(default)]
+    pub output: Output,
     #[serde(default)]
     pub key: String,
     #[serde(default)]
@@ -46,17 +73,18 @@ pub struct Tool {
     #[serde(skip)]
     pub id: String,
 }
-fn selection() -> String {
-    "selection".into()
-}
-fn replace() -> String {
-    "replace".into()
+impl Tool {
+    /// Whether the tool reads or changes the focused document.
+    fn needs_editor(&self) -> bool {
+        self.input != Input::None || matches!(self.output, Output::Replace | Output::Insert)
+    }
 }
 
+/// Entries are parsed one by one, so one mistake does not hide every tool.
 #[derive(Deserialize)]
 struct File {
     #[serde(default)]
-    tool: Vec<Tool>,
+    tool: Vec<toml::Value>,
 }
 
 fn slug(name: &str) -> String {
@@ -70,18 +98,27 @@ fn slug(name: &str) -> String {
         .join("-")
 }
 
-fn read(path: &Path, project: bool) -> Vec<Tool> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| toml::from_str::<File>(&s).ok())
-        .map(|f| f.tool)
-        .unwrap_or_default()
+fn read(path: &Path, project: bool, errors: &mut Vec<String>) -> Vec<Tool> {
+    crate::config::list(path, |f: File| f.tool, errors)
         .into_iter()
-        .filter(|t| {
-            ["selection", "document", "none"].contains(&t.input.as_str())
-                && ["replace", "insert", "document", "status", "none"].contains(&t.output.as_str())
+        .filter_map(|entry| {
+            let name = entry
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("?")
+                .to_string();
+            entry
+                .try_into::<Tool>()
+                .map_err(|e| {
+                    errors.push(format!("{}: tool {name}: {}", path.display(), e.message()))
+                })
+                .ok()
         })
         .map(|mut t| {
+            // A project cannot take over keys (Ctrl+S and the like).
+            if project {
+                t.key.clear();
+            }
             t.project = project;
             t.id = format!("tool:{}", slug(&t.name));
             t
@@ -91,9 +128,14 @@ fn read(path: &Path, project: bool) -> Vec<Tool> {
 
 /// Personal tools, then project tools (a project tool never replaces a
 /// personal one of the same name).
-pub fn load(root: &Path) -> Vec<Tool> {
-    let mut tools = read(&crate::paths::config_dir().join("tools.toml"), false);
-    for tool in read(&root.join(".slate/tools.toml"), true) {
+/// Files that do not parse are added to `errors`.
+pub fn load(root: &Path, errors: &mut Vec<String>) -> Vec<Tool> {
+    let mut tools = read(
+        &crate::paths::config_dir().join("tools.toml"),
+        false,
+        errors,
+    );
+    for tool in read(&root.join(".slate/tools.toml"), true, errors) {
         if !tools.iter().any(|t| t.id == tool.id) {
             tools.push(tool);
         }
@@ -103,7 +145,9 @@ pub fn load(root: &Path) -> Vec<Tool> {
 
 impl App {
     pub(crate) fn reload_tools(&mut self) {
-        self.tools = load(&self.root);
+        let mut errors = Vec::new();
+        self.tools = load(&self.root, &mut errors);
+        self.config_errors(errors);
     }
 
     pub fn tools(&self) -> &[Tool] {
@@ -129,9 +173,7 @@ impl App {
             return Ok(());
         }
         let editor = self.active_editor();
-        if editor.is_none()
-            && (tool.input != "none" || matches!(tool.output.as_str(), "replace" | "insert"))
-        {
+        if editor.is_none() && tool.needs_editor() {
             bail!("Focus an editor to run {}", tool.name);
         }
         let mut env: Vec<(String, String)> = vec![(
@@ -159,15 +201,15 @@ impl App {
             env.push(("SLATE_COLUMN".into(), (column + 1).to_string()));
             env.push(("SLATE_SELECTION".into(), d.slice(a, b).into_owned()));
             // A selection tool without a selection works on the document.
-            let range = match tool.input.as_str() {
-                "selection" if a < b => (a, b),
-                "selection" | "document" => (0, d.len()),
-                _ => (a, b),
+            let range = match tool.input {
+                Input::Selection if a < b => (a, b),
+                Input::Selection | Input::Document => (0, d.len()),
+                Input::None => (a, b),
             };
-            if tool.input != "none" {
+            if tool.input != Input::None {
                 input = d.slice(range.0, range.1).into_owned();
             }
-            let range = if tool.output == "insert" {
+            let range = if tool.output == Output::Insert {
                 (b, b)
             } else {
                 range
@@ -176,7 +218,7 @@ impl App {
         }
         let command = vec!["sh".to_string(), "-c".into(), tool.command.clone()];
         let name = tool.name.clone();
-        let output = tool.output.clone();
+        let output = tool.output;
         self.services.background(move || {
             let result = crate::format::pipe_env(&command, &cwd, &input, &env, TIMEOUT);
             Reply::ToolDone(name, output, target, result)
@@ -188,14 +230,14 @@ impl App {
     pub(crate) fn tool_done(
         &mut self,
         name: String,
-        output: String,
+        output: Output,
         target: Option<(u64, u64, (usize, usize))>,
         result: Result<String, String>,
     ) {
         let outcome = (|| -> Result<()> {
             let text = result.map_err(anyhow::Error::msg)?;
-            match output.as_str() {
-                "replace" | "insert" => {
+            match output {
+                Output::Replace | Output::Insert => {
                     let (doc, content, (start, end)) =
                         target.ok_or_else(|| anyhow::anyhow!("No document"))?;
                     let d = self
@@ -214,10 +256,10 @@ impl App {
                         .get_mut(&doc)
                         .unwrap()
                         .replace(start, end, &text, cursor)?;
-                    self.rebase_views(doc, start, end, text.len());
+                    self.rebase_views_text(doc, start, end, &text);
                     self.status = format!("{name} done");
                 }
-                "document" => {
+                Output::Document => {
                     let doc = self.id();
                     self.documents.insert(
                         doc,
@@ -226,13 +268,13 @@ impl App {
                     self.reveal_document(doc);
                     self.status = format!("{name} done");
                 }
-                "status" => {
+                Output::Status => {
                     self.status = format!(
                         "{name}: {}",
                         text.trim().lines().next().unwrap_or("(no output)")
                     );
                 }
-                _ => self.status = format!("{name} done"),
+                Output::None => self.status = format!("{name} done"),
             }
             Ok(())
         })();
@@ -247,8 +289,7 @@ impl App {
         self.tools
             .iter()
             .map(|t| {
-                let needs_editor =
-                    t.input != "none" || matches!(t.output.as_str(), "replace" | "insert");
+                let needs_editor = t.needs_editor();
                 crate::commands::CommandInfo {
                     id: t.id.clone(),
                     name: format!("Tool: {}", t.name),
@@ -295,7 +336,14 @@ mod tests {
             "[[tool]]\nname = \"Lint\"\ncommand = \"lint\"\ninput = \"document\"\noutput = \"status\"\n\n[[tool]]\nname = \"sort lines\"\ncommand = \"evil\"\n",
         )
         .unwrap();
-        let tools = load(&root);
+        let mut errors = Vec::new();
+        let tools = load(&root, &mut errors);
+        // The bad entry is reported; the others still load.
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("tool Bad") && errors[0].contains("explode"),
+            "{errors:?}"
+        );
         let ids: Vec<&str> = tools.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, ["tool:sort-lines", "tool:lint"]);
         assert_eq!(
@@ -304,8 +352,12 @@ mod tests {
         );
         assert!(!tools[0].project && tools[1].project);
         assert_eq!(
-            (tools[0].input.as_str(), tools[0].output.as_str()),
-            ("selection", "replace")
+            (tools[0].input, tools[0].output),
+            (Input::Selection, Output::Replace)
+        );
+        assert_eq!(
+            (tools[1].input, tools[1].output),
+            (Input::Document, Output::Status)
         );
     }
 }

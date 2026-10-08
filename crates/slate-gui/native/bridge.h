@@ -183,6 +183,7 @@ class CellView : public QQuickPaintedItem {
     void mouseReleaseEvent(QMouseEvent *event) override;
     void mouseDoubleClickEvent(QMouseEvent *event) override;
     void hoverMoveEvent(QHoverEvent *event) override;
+    void hoverLeaveEvent(QHoverEvent *event) override;
     void wheelEvent(QWheelEvent *event) override;
     void inputMethodEvent(QInputMethodEvent *event) override;
     void focusInEvent(QFocusEvent *event) override;
@@ -209,6 +210,11 @@ class CellView : public QQuickPaintedItem {
     qreal m_wheelColumns = 0, m_wheelTerminal = 0, m_wheelZoom = 0;
     QTimer m_blink;
     bool m_cursorShown = true;
+    // Language-server hover text for the text the mouse rests on.
+    QTimer m_hoverTimer;
+    QPointF m_hoverAt;
+    bool m_hoverRequested = false;
+    int columnAt(int row, qreal x) const;
     QElapsedTimer m_doubleClick;
     QPointF m_doubleClickAt;
     void layoutText() const;

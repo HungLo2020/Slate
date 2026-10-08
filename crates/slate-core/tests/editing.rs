@@ -307,3 +307,98 @@ fn snippets_expand_and_tab_visits_their_fields() {
     app.dispatch(Command::Undo);
     assert!(text(&app).ends_with("<span></span>"));
 }
+
+#[test]
+fn folds_follow_their_header_line_and_vanish_with_it() {
+    let (mut app, _dir, _serial) =
+        editor("fn a() {\n    one\n    two\n}\nfn b() {\n    three\n}\n");
+    action(&mut app, "fold");
+    // Enter at the start of the header pushes it (and its fold) down.
+    press(&mut app, "Home");
+    press(&mut app, "Enter");
+    assert!(
+        row(&mut app, 1).contains("fn a") && row(&mut app, 1).contains("▸"),
+        "{}",
+        row(&mut app, 1)
+    );
+    assert!(row(&mut app, 2).contains("}"));
+    // Deleting the header line drops its fold instead of folding another
+    // block.
+    app.dispatch(Command::GoToLine { line: 2 });
+    action(&mut app, "cut-line");
+    assert!(row(&mut app, 1).contains("one"), "{}", row(&mut app, 1));
+    assert!(!row(&mut app, 0).contains("▸"));
+}
+
+#[test]
+fn leaving_a_snippet_ends_it_and_adjacent_fields_stay_separate() {
+    let (mut app, dir, _serial) = editor("");
+    typed(&mut app, "fn");
+    press(&mut app, "Tab");
+    // Move away with the keyboard: Tab indents again.
+    chord(&mut app, "End", true, false);
+    press(&mut app, "Enter");
+    press(&mut app, "Tab");
+    assert!(text(&app).ends_with("\n    "), "{:?}", text(&app));
+
+    let config = dir.path().join("config/slate");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(
+        config.join("snippets.toml"),
+        "[[snippet]]\nprefix = \"kv\"\nbody = \"${1:k}${2:v}$0\"\n",
+    )
+    .unwrap();
+    press(&mut app, "Enter");
+    typed(&mut app, "kv");
+    press(&mut app, "Tab");
+    typed(&mut app, "key");
+    press(&mut app, "Tab");
+    // The second field is still exactly "v", not "v" plus what was typed.
+    let v = &app.views[&id(&app)];
+    assert_eq!(&text(&app)[v.anchor.unwrap()..v.cursor], "v");
+    typed(&mut app, "=1");
+    assert!(text(&app).ends_with("key=1"), "{:?}", text(&app));
+}
+
+#[test]
+fn carets_close_together_delete_without_conflict() {
+    let (mut app, _dir, _serial) = editor("foo bar\n()\n");
+    // Two carets inside one word: Ctrl+Backspace deletes back from both.
+    app.dispatch(Command::Click {
+        pane: app.focus,
+        row: 0,
+        col: 6 + 5,
+        shift: false,
+    });
+    app.dispatch(Command::Pointer {
+        pane: app.focus,
+        row: 0,
+        col: 6 + 7,
+        kind: "press".into(),
+        button: 0,
+        shift: false,
+        ctrl: false,
+        alt: true,
+    });
+    chord(&mut app, "Backspace", true, false);
+    assert_eq!(text(&app), "foo \n()\n");
+    assert!(!app.status.starts_with("Error"), "{}", app.status);
+}
+
+#[test]
+fn the_wheel_steps_over_folded_regions() {
+    let mut text_lines = String::from("fn a() {\n");
+    for i in 0..200 {
+        text_lines.push_str(&format!("    line {i}\n"));
+    }
+    text_lines.push_str("}\nafter\n");
+    let (mut app, _dir, _serial) = editor(&text_lines);
+    action(&mut app, "fold");
+    let pane = app.focus;
+    app.dispatch(Command::Scroll { pane, delta: -1 });
+    assert!(
+        row(&mut app, 0).contains("}"),
+        "one notch passes the fold: {}",
+        row(&mut app, 0)
+    );
+}

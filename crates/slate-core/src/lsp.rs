@@ -20,6 +20,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Diagnostics kept per file and publication.
+const DIAGNOSTIC_LIMIT: usize = 2_000;
 /// Completion items kept per request.
 const COMPLETION_LIMIT: usize = 2_000;
 
@@ -34,6 +36,13 @@ pub struct Diagnostic {
     pub source: String,
     #[serde(skip)]
     pub raw: Value,
+}
+
+impl Diagnostic {
+    /// Found by a task's problem matcher rather than a language server.
+    pub fn is_from_task(&self) -> bool {
+        self.source == "task" && self.raw.is_null()
+    }
 }
 
 struct Server {
@@ -60,6 +69,8 @@ enum Pending {
     Hover {
         doc: u64,
         offset: usize,
+        /// From the mouse: say nothing when there is nothing to show.
+        quiet: bool,
     },
     Definition,
     References,
@@ -68,11 +79,11 @@ enum Pending {
         doc: u64,
         offset: usize,
     },
-    Rename,
+    /// Content versions of open documents when the request was sent.
+    Rename(BTreeMap<u64, u64>),
     Formatting {
         doc: u64,
         content: u64,
-        then_save: bool,
     },
     DocumentSymbols {
         doc: u64,
@@ -80,7 +91,7 @@ enum Pending {
     WorkspaceSymbols {
         generation: u64,
     },
-    CodeActions,
+    CodeActions(BTreeMap<u64, u64>),
     Ignore,
 }
 
@@ -151,16 +162,26 @@ pub(crate) struct Lsp {
     pub revision: u64,
     hover: Option<Hover>,
     completion: Option<Completion>,
-    progress: BTreeMap<String, String>,
+    /// Work a server reports: token → (title, text shown).
+    progress: BTreeMap<String, (String, String)>,
     /// Messages a server showed the user.
     pub messages: Vec<String>,
+    /// Document versions when the shown code actions were computed.
+    action_versions: BTreeMap<u64, u64>,
 }
 
 // ----- URIs and positions -----
 
 pub fn uri(path: &Path) -> String {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(not(unix))]
+    let bytes = path.to_string_lossy().into_owned().into_bytes();
     let mut out = String::from("file://");
-    for b in path.to_string_lossy().bytes() {
+    for b in bytes {
         if b.is_ascii_alphanumeric() || b"/-_.~".contains(&b) {
             out.push(b as char);
         } else {
@@ -174,12 +195,14 @@ pub fn path_of(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
     let rest = rest.strip_prefix("localhost").unwrap_or(rest);
     let bytes = rest.as_bytes();
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
+        // Decoded byte by byte: a malformed escape is kept as text.
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(&rest[i + 1..i + 3], 16) {
-                out.push(b);
+            if let (Some(a), Some(b)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(a * 16 + b);
                 i += 3;
                 continue;
             }
@@ -187,6 +210,12 @@ pub fn path_of(uri: &str) -> Option<PathBuf> {
         out.push(bytes[i]);
         i += 1;
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(&out)))
+    }
+    #[cfg(not(unix))]
     Some(PathBuf::from(String::from_utf8_lossy(&out).into_owned()))
 }
 
@@ -247,6 +276,63 @@ fn symbol_kind(kind: u64) -> &'static str {
         23 => "struct",
         _ => "symbol",
     }
+}
+
+/// The given lines of closed files, for location previews. Only regular
+/// files of reasonable size are read, and at most a few hundred.
+fn read_previews(wanted: Vec<(usize, PathBuf, usize)>) -> Vec<(usize, String)> {
+    const FILE_LIMIT: u64 = 4 * 1024 * 1024;
+    let mut cache: HashMap<PathBuf, Option<Vec<String>>> = HashMap::new();
+    let mut out = Vec::new();
+    for (index, path, line) in wanted {
+        if !cache.contains_key(&path) && cache.len() >= 300 {
+            continue;
+        }
+        let lines = cache.entry(path.clone()).or_insert_with(|| {
+            let meta = std::fs::metadata(&path).ok()?;
+            if !meta.is_file() || meta.len() > FILE_LIMIT {
+                return None;
+            }
+            let text = String::from_utf8_lossy(&std::fs::read(&path).ok()?).into_owned();
+            Some(text.lines().map(str::to_string).collect())
+        });
+        if let Some(text) = lines.as_ref().and_then(|l| l.get(line)) {
+            let preview: String = text.trim().chars().take(200).collect();
+            if !preview.is_empty() {
+                out.push((index, preview));
+            }
+        }
+    }
+    out
+}
+
+/// LSP TextEdits as byte-range replacements in a document, in order.
+/// Replacements as (start, end, new text) in byte offsets.
+type Replacements = Vec<(usize, usize, String)>;
+
+/// Where a request goes: (view, document, server, offset, LSP parameters).
+type RequestAt = (u64, u64, u64, usize, Value);
+
+fn text_edits(d: &crate::document::Document, edits: &Value) -> Replacements {
+    let mut out: Vec<(usize, usize, String)> = edits
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|e| {
+            let (sl, sc) = position(&e["range"]["start"]);
+            let (el, ec) = position(&e["range"]["end"]);
+            let start = d.offset_of(sl, sc);
+            let end = d.offset_of(el, ec).max(start);
+            (
+                start,
+                end,
+                e["newText"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    // Edits at the same position apply in the order given.
+    out.sort_by_key(|(start, end, _)| (*start, *end));
+    out
 }
 
 /// Hover contents as plain text.
@@ -312,7 +398,9 @@ fn shift_diagnostics(list: &mut [Diagnostic], change: &crate::document::TextChan
 impl App {
     fn languages(&mut self) -> &[Language] {
         if self.lsp.languages.is_none() {
-            self.lsp.languages = Some(crate::languages::all());
+            let mut errors = Vec::new();
+            self.lsp.languages = Some(crate::languages::all(&mut errors));
+            self.config_errors(errors);
         }
         self.lsp.languages.as_deref().unwrap()
     }
@@ -327,13 +415,7 @@ impl App {
         let syntax = crate::highlight::syntax_for(Some(&path), &d.line_text(0))
             .name
             .clone();
-        let extension = path.extension().map(|e| e.to_string_lossy().into_owned());
-        let languages = self.languages();
-        languages
-            .iter()
-            .find(|l| extension.as_ref().is_some_and(|e| l.extensions.contains(e)))
-            .or_else(|| languages.iter().find(|l| l.name == syntax))
-            .cloned()
+        crate::languages::find(self.languages(), &path, &syntax).cloned()
     }
 
     fn server_for(&mut self, doc: u64) -> Option<u64> {
@@ -478,11 +560,16 @@ impl App {
     /// Keep servers and their documents in step with the editor. Runs on
     /// every pass of the event loop; it does nothing when nothing changed.
     pub(crate) fn lsp_sync(&mut self) {
-        if !self.trusted {
-            if !self.lsp.servers.is_empty() {
-                self.lsp_stop_all();
-            }
-            return;
+        // Servers whose project is no longer trusted stop.
+        let untrusted: Vec<u64> = self
+            .lsp
+            .servers
+            .iter()
+            .filter(|(_, s)| !self.trusted_path(&s.root))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in untrusted {
+            self.lsp_stop(id);
         }
         // Documents that closed or changed path leave their server.
         let gone: Vec<u64> = self
@@ -515,6 +602,10 @@ impl App {
             };
             let path = self.documents[&doc].path.clone().unwrap();
             let root = language.root_for(&path, &self.root);
+            // A server runs the project's code (build scripts, plugins).
+            if !self.trusted_path(&root) {
+                continue;
+            }
             let Some(server) = self.start_server(&language, root) else {
                 continue;
             };
@@ -624,18 +715,58 @@ impl App {
 
     fn lsp_stop(&mut self, server: u64) {
         if let Some(mut s) = self.lsp.servers.remove(&server) {
-            // Ask politely, then make sure.
+            // Ask politely, then make sure: a short, bounded wait here
+            // rather than a thread that may never run when Slate exits.
             s.process
                 .send(&json!({"jsonrpc": "2.0", "id": 0, "method": "shutdown"}));
             s.process.send(&json!({"jsonrpc": "2.0", "method": "exit"}));
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                s.process.kill();
-            });
+            s.process.stop(std::time::Duration::from_millis(200));
         }
+        self.forget_server(server, "the language server stopped");
+    }
+
+    /// Drop a server's documents and requests, finishing what waited on it.
+    fn forget_server(&mut self, server: u64, reason: &str) {
         self.lsp.keys.retain(|_, id| *id != server);
         self.lsp.docs.retain(|_, d| d.server != server);
-        self.lsp.pending.retain(|(s, _), _| *s != server);
+        let dropped: Vec<Pending> = {
+            let keys: Vec<(u64, i64)> = self
+                .lsp
+                .pending
+                .keys()
+                .filter(|(s, _)| *s == server)
+                .copied()
+                .collect();
+            keys.into_iter()
+                .filter_map(|k| self.lsp.pending.remove(&k))
+                .collect()
+        };
+        for pending in dropped {
+            self.abandon(pending, reason);
+        }
+    }
+
+    /// A request that will never be answered.
+    fn abandon(&mut self, pending: Pending, reason: &str) {
+        match pending {
+            Pending::Formatting { doc, .. } => {
+                self.end_format(doc, Err(anyhow::anyhow!("{reason}")));
+            }
+            Pending::DocumentSymbols { .. } | Pending::WorkspaceSymbols { .. } => {
+                if let Some(p) = self.picker.as_mut() {
+                    p.busy = false;
+                    p.message = reason.to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Forget a formatting request that timed out.
+    pub(crate) fn lsp_cancel_formatting(&mut self, doc: u64) {
+        self.lsp
+            .pending
+            .retain(|_, p| !matches!(p, Pending::Formatting { doc: d, .. } if *d == doc));
     }
 
     pub(crate) fn lsp_event(&mut self, event: Event) {
@@ -647,9 +778,7 @@ impl App {
                     // Do not restart a crashing server in a loop.
                     self.lsp.failed.insert((s.language, s.root));
                 }
-                self.lsp.keys.retain(|_, id| *id != server);
-                self.lsp.docs.retain(|_, d| d.server != server);
-                self.lsp.pending.retain(|(s, _), _| *s != server);
+                self.forget_server(server, "the language server stopped");
             }
             _ => {}
         }
@@ -674,20 +803,14 @@ impl App {
                     return;
                 };
                 if let Some(error) = message.get("error") {
-                    if let Pending::Formatting { doc, then_save, .. } = pending {
-                        self.formatting.remove(&doc);
-                        if then_save {
-                            let _ = self.finish_format_on_save(doc);
-                        }
-                    }
-                    if !matches!(pending, Pending::Ignore | Pending::Completion { .. }) {
-                        self.status = format!(
-                            "Language server: {}",
-                            error["message"].as_str().unwrap_or("request failed")
-                        );
-                    }
-                    if let Some(p) = self.picker.as_mut() {
-                        p.busy = false;
+                    let text = error["message"]
+                        .as_str()
+                        .unwrap_or("request failed")
+                        .to_string();
+                    let quiet = matches!(pending, Pending::Ignore | Pending::Completion { .. });
+                    self.abandon(pending, &text);
+                    if !quiet {
+                        self.status = format!("Language server: {text}");
                     }
                     return;
                 }
@@ -708,7 +831,7 @@ impl App {
                     .unwrap_or_default(),
             ),
             "workspace/applyEdit" => {
-                let applied = self.apply_workspace_edit(&params["edit"]);
+                let applied = self.apply_workspace_edit(&params["edit"], None);
                 if let Err(e) = &applied {
                     self.status = format!("Error: {e:#}");
                 }
@@ -725,11 +848,21 @@ impl App {
                 let Some(path) = params["uri"].as_str().and_then(path_of) else {
                     return;
                 };
+                // Results for text older than the editor's are out of date;
+                // the server publishes again for the current version.
+                if let (Some(version), Some(doc)) =
+                    (params["version"].as_i64(), self.document_for(&path))
+                {
+                    if self.lsp.docs.get(&doc).is_some_and(|o| o.version > version) {
+                        return;
+                    }
+                }
                 let list: Vec<Diagnostic> = params["diagnostics"]
                     .as_array()
                     .map(|items| {
                         items
                             .iter()
+                            .take(DIAGNOSTIC_LIMIT)
                             .map(|d| Diagnostic {
                                 start: position(&d["range"]["start"]),
                                 end: position(&d["range"]["end"]),
@@ -742,10 +875,18 @@ impl App {
                     })
                     .unwrap_or_default();
                 let key = self.diagnostic_key(&path);
-                if list.is_empty() {
-                    self.lsp.diagnostics.remove(&key);
-                } else {
-                    self.lsp.diagnostics.insert(key, list);
+                // A server replaces its own diagnostics, not a task's.
+                let mut merged: Vec<Diagnostic> = self
+                    .lsp
+                    .diagnostics
+                    .remove(&key)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(Diagnostic::is_from_task)
+                    .collect();
+                merged.extend(list);
+                if !merged.is_empty() {
+                    self.lsp.diagnostics.insert(key, merged);
                 }
                 self.lsp.revision += 1;
                 self.revision += 1;
@@ -761,33 +902,27 @@ impl App {
                 }
             }
             "$/progress" => {
+                // Progress is shown as activity beside the status, so it
+                // never hides a message such as "Saved".
                 let token = params["token"].to_string();
                 let value = &params["value"];
-                match value["kind"].as_str() {
-                    Some("end") => {
-                        if let Some(title) = self.lsp.progress.remove(&token) {
-                            if self.status.starts_with(&title) {
-                                self.status = format!("{title} done");
-                            }
-                        }
-                    }
-                    _ => {
-                        let title =
-                            value["title"]
-                                .as_str()
-                                .map(str::to_owned)
-                                .unwrap_or_else(|| {
-                                    self.lsp.progress.get(&token).cloned().unwrap_or_default()
-                                });
-                        let detail = value["message"].as_str().unwrap_or_default();
-                        let percent = value["percentage"]
-                            .as_u64()
-                            .map(|p| format!(" {p}%"))
-                            .unwrap_or_default();
-                        self.lsp.progress.insert(token, title.clone());
-                        self.status = format!("{title}{percent} {detail}").trim().to_string();
-                    }
+                if value["kind"].as_str() == Some("end") {
+                    self.lsp.progress.remove(&token);
+                } else {
+                    let title = value["title"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .or_else(|| self.lsp.progress.get(&token).map(|(t, _)| t.clone()))
+                        .unwrap_or_default();
+                    let detail = value["message"].as_str().unwrap_or_default();
+                    let percent = value["percentage"]
+                        .as_u64()
+                        .map(|p| format!(" {p}%"))
+                        .unwrap_or_default();
+                    let text = format!("{title}{percent} {detail}").trim().to_string();
+                    self.lsp.progress.insert(token, (title, text));
                 }
+                self.revision += 1;
             }
             _ => {}
         }
@@ -818,10 +953,12 @@ impl App {
                     self.status = format!("{name} ready");
                 }
             }
-            Pending::Hover { doc, offset } => {
+            Pending::Hover { doc, offset, quiet } => {
                 let text = hover_text(&result["contents"]);
                 if text.is_empty() {
-                    self.status = "No information here".into();
+                    if !quiet {
+                        self.status = "No information here".into();
+                    }
                 } else {
                     self.lsp.hover = Some(Hover { doc, offset, text });
                 }
@@ -845,43 +982,26 @@ impl App {
             Pending::Completion { view, doc, offset } => {
                 self.completion_results(view, doc, offset, result)
             }
-            Pending::Rename => {
-                let files = self.apply_workspace_edit(result)?;
-                self.status = format!("Renamed in {files} files");
+            Pending::Rename(versions) => {
+                let files = self.apply_workspace_edit(result, Some(&versions))?;
+                self.status = format!(
+                    "Renamed in {files} file{} · unsaved, undo with Ctrl+Z",
+                    if files == 1 { "" } else { "s" }
+                );
             }
-            Pending::Formatting {
-                doc,
-                content,
-                then_save,
-            } => {
-                if self.documents.get(&doc).map(|d| d.content_version()) != Some(content) {
-                    self.formatting.remove(&doc);
-                    if then_save {
-                        self.finish_format_on_save(doc)?;
+            Pending::Formatting { doc, content } => {
+                let outcome = (|| -> Result<&str> {
+                    if self.documents.get(&doc).map(|d| d.content_version()) != Some(content) {
+                        bail!("the document changed while formatting; format again");
                     }
-                    bail!("The document changed while formatting; format again");
-                }
-                let edits = self.text_edits(doc, result);
-                let count = edits.len();
-                if count > 0 {
-                    let view = self.reveal_document(doc);
-                    let before = self.views[&view].cursor;
-                    self.documents
-                        .get_mut(&doc)
-                        .unwrap()
-                        .replace_many(&edits, before)?;
-                    self.clamp_views(doc);
-                }
-                self.status = if count == 0 {
-                    "Already formatted".into()
-                } else {
-                    "Formatted".into()
-                };
-                if then_save {
-                    self.finish_format_on_save(doc)?;
-                } else {
-                    self.formatting.remove(&doc);
-                }
+                    let edits = self.text_edits(doc, result);
+                    if edits.is_empty() {
+                        return Ok("Already formatted");
+                    }
+                    self.replace_in_document(doc, &edits)?;
+                    Ok("Formatted")
+                })();
+                self.end_format(doc, outcome);
             }
             Pending::DocumentSymbols { doc } => {
                 let mut symbols = Vec::new();
@@ -905,9 +1025,12 @@ impl App {
                 }
                 walk(result, 0, &mut symbols);
                 let path = self.documents.get(&doc).and_then(|d| d.path.clone());
-                if let (Some(p), Some(path)) =
-                    (self.picker.as_mut().filter(|p| p.kind == "symbols"), path)
-                {
+                if let (Some(p), Some(path)) = (
+                    self.picker
+                        .as_mut()
+                        .filter(|p| p.kind == "symbols" && p.generation == doc),
+                    path,
+                ) {
                     p.busy = false;
                     p.entries = symbols
                         .into_iter()
@@ -975,7 +1098,8 @@ impl App {
                     p.filter();
                 }
             }
-            Pending::CodeActions => {
+            Pending::CodeActions(versions) => {
+                self.lsp.action_versions = versions;
                 let actions: Vec<Value> = result.as_array().cloned().unwrap_or_default();
                 if actions.is_empty() {
                     self.status = "No code actions here".into();
@@ -1030,9 +1154,13 @@ impl App {
 
     fn location_picker(&mut self, title: &str, locations: Vec<Location>) {
         let mut picker = Picker::new("locations", title, true);
+        // Previews of closed files are read on a worker; until then the
+        // label is the file name.
+        let mut unread: Vec<(usize, PathBuf, usize)> = Vec::new();
         picker.entries = locations
             .into_iter()
-            .map(|l| {
+            .enumerate()
+            .map(|(i, l)| {
                 let relative = l
                     .path
                     .strip_prefix(&self.root)
@@ -1041,133 +1169,217 @@ impl App {
                     .into_owned();
                 let preview = self
                     .document_for(&l.path)
-                    .map(|doc| self.documents[&doc].line_text(l.line).trim().to_string())
-                    .or_else(|| {
-                        std::fs::read_to_string(&l.path)
-                            .ok()
-                            .and_then(|t| t.lines().nth(l.line).map(|s| s.trim().to_string()))
-                    })
-                    .unwrap_or_default();
+                    .map(|doc| self.documents[&doc].line_text(l.line).trim().to_string());
+                if preview.is_none() {
+                    unread.push((i, l.path.clone(), l.line));
+                }
                 Entry {
-                    label: if preview.is_empty() {
-                        relative.clone()
-                    } else {
-                        preview
-                    },
+                    label: preview
+                        .filter(|p| !p.is_empty())
+                        .unwrap_or_else(|| relative.clone()),
                     detail: format!("{relative}:{}", l.line + 1),
                     kind: "location".into(),
                     target: Target::Location(l),
                 }
             })
             .collect();
+        self.lsp.next_id += 1;
+        picker.generation = self.lsp.next_id as u64;
+        let generation = picker.generation;
         picker.filter();
         self.picker = Some(picker);
+        if !unread.is_empty() {
+            self.services
+                .background(move || Reply::Previews(generation, read_previews(unread)));
+        }
+    }
+
+    pub(crate) fn previews_ready(&mut self, generation: u64, previews: Vec<(usize, String)>) {
+        let Some(p) = self
+            .picker
+            .as_mut()
+            .filter(|p| p.kind == "locations" && p.generation == generation)
+        else {
+            return;
+        };
+        for (i, preview) in previews {
+            if let Some(entry) = p.entries.get_mut(i) {
+                entry.label = preview;
+            }
+        }
+        p.filter();
     }
 
     /// TextEdits as byte-range replacements in a document.
-    fn text_edits(&self, doc: u64, edits: &Value) -> Vec<(usize, usize, String)> {
-        let d = &self.documents[&doc];
-        let mut out: Vec<(usize, usize, String)> = edits
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|e| {
-                let (sl, sc) = position(&e["range"]["start"]);
-                let (el, ec) = position(&e["range"]["end"]);
-                let start = d.offset_of(sl, sc);
-                let end = d.offset_of(el, ec).max(start);
-                (
-                    start,
-                    end,
-                    e["newText"].as_str().unwrap_or_default().to_string(),
-                )
-            })
-            .collect();
-        // Edits at the same position apply in the order given.
-        out.sort_by_key(|(start, end, _)| (*start, *end));
-        out
+    fn text_edits(&self, doc: u64, edits: &Value) -> Replacements {
+        text_edits(&self.documents[&doc], edits)
     }
 
-    /// Apply a WorkspaceEdit: open documents change in the editor (undoable,
-    /// unsaved); other files are rewritten on disk. Returns the files changed.
-    pub(crate) fn apply_workspace_edit(&mut self, edit: &Value) -> Result<usize> {
-        let mut per_file: Vec<(PathBuf, Value)> = Vec::new();
-        if let Some(changes) = edit["changes"].as_object() {
-            for (uri, edits) in changes {
-                if let Some(path) = path_of(uri) {
-                    per_file.push((path, edits.clone()));
+    /// Content versions of every open document, to detect edits computed
+    /// for text that has changed since.
+    fn content_versions(&self) -> BTreeMap<u64, u64> {
+        self.documents
+            .iter()
+            .map(|(id, d)| (*id, d.content_version()))
+            .collect()
+    }
+
+    /// Apply a WorkspaceEdit. Every file is checked first and nothing is
+    /// changed unless all of it applies: files must be inside the workspace,
+    /// and open documents must still have the text the edit was computed
+    /// for (`expected` versions from the request, or the edit's own LSP
+    /// versions). Open documents change in the editor; closed files open as
+    /// unsaved documents, so the whole edit can be reviewed, undone or
+    /// saved. Returns the number of files changed.
+    pub(crate) fn apply_workspace_edit(
+        &mut self,
+        edit: &Value,
+        expected: Option<&BTreeMap<u64, u64>>,
+    ) -> Result<usize> {
+        // `documentChanges` supersedes `changes` when a server sends both.
+        let mut per_file: Vec<(PathBuf, Option<i64>, Value)> = Vec::new();
+        if let Some(changes) = edit["documentChanges"].as_array() {
+            for change in changes {
+                if change["kind"].is_string() {
+                    bail!("Edits that create, rename or delete files are not supported");
                 }
+                let path = change["textDocument"]["uri"]
+                    .as_str()
+                    .and_then(path_of)
+                    .ok_or_else(|| anyhow::anyhow!("The edit names an invalid file"))?;
+                per_file.push((
+                    path,
+                    change["textDocument"]["version"].as_i64(),
+                    change["edits"].clone(),
+                ));
+            }
+        } else if let Some(changes) = edit["changes"].as_object() {
+            for (uri, edits) in changes {
+                let path = path_of(uri)
+                    .ok_or_else(|| anyhow::anyhow!("The edit names an invalid file"))?;
+                per_file.push((path, None, edits.clone()));
             }
         }
-        for change in edit["documentChanges"].as_array().into_iter().flatten() {
-            if change["kind"].is_string() {
-                bail!("File operations in edits are not supported yet");
+        let root = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.clone());
+        enum Target {
+            Open(u64),
+            Closed(Box<crate::document::Document>),
+        }
+        let mut plan: Vec<(Target, Replacements)> = Vec::new();
+        for (path, version, edits) in per_file {
+            let real = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if !real.starts_with(&root) {
+                bail!(
+                    "The edit changes {} outside the workspace; nothing was changed",
+                    path.display()
+                );
             }
-            if let Some(path) = change["textDocument"]["uri"].as_str().and_then(path_of) {
-                per_file.push((path, change["edits"].clone()));
+            match self.document_for(&path) {
+                Some(doc) => {
+                    let stale = expected.is_some_and(|v| {
+                        v.get(&doc)
+                            .is_some_and(|c| *c != self.documents[&doc].content_version())
+                    }) || version
+                        .is_some_and(|v| self.lsp.docs.get(&doc).is_some_and(|o| o.version != v));
+                    if stale {
+                        bail!(
+                            "{} changed since the language server computed this edit; nothing was changed",
+                            self.documents[&doc].title()
+                        );
+                    }
+                    if self.documents[&doc].read_only {
+                        bail!(
+                            "{} is read-only; nothing was changed",
+                            self.documents[&doc].title()
+                        );
+                    }
+                    let replacements = self.text_edits(doc, &edits);
+                    plan.push((Target::Open(doc), replacements));
+                }
+                None => {
+                    let d = crate::document::Document::open(&path)?;
+                    let replacements = text_edits(&d, &edits);
+                    plan.push((Target::Closed(Box::new(d)), replacements));
+                }
             }
         }
         let mut files = 0;
-        for (path, edits) in per_file {
-            match self.document_for(&path) {
-                Some(doc) => {
-                    let replacements = self.text_edits(doc, &edits);
-                    if replacements.is_empty() {
-                        continue;
-                    }
-                    let cursor = self
-                        .views
-                        .values()
-                        .find(|v| v.document == doc)
-                        .map_or(0, |v| v.cursor);
-                    self.documents
-                        .get_mut(&doc)
-                        .unwrap()
-                        .replace_many(&replacements, cursor)?;
-                    self.clamp_views(doc);
+        for (target, replacements) in plan {
+            if replacements.is_empty() {
+                continue;
+            }
+            match target {
+                Target::Open(doc) => {
+                    self.replace_in_document(doc, &replacements)?;
                 }
-                None => {
-                    let mut d = crate::document::Document::open(&path)?;
-                    let replacements: Vec<(usize, usize, String)> = {
-                        let mut list: Vec<(usize, usize, String)> = edits
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .map(|e| {
-                                let (sl, sc) = position(&e["range"]["start"]);
-                                let (el, ec) = position(&e["range"]["end"]);
-                                let start = d.offset_of(sl, sc);
-                                (
-                                    start,
-                                    d.offset_of(el, ec).max(start),
-                                    e["newText"].as_str().unwrap_or_default().to_string(),
-                                )
-                            })
-                            .collect();
-                        list.sort_by_key(|(s, e, _)| (*s, *e));
-                        list
-                    };
+                Target::Closed(mut d) => {
                     d.replace_many(&replacements, 0)?;
-                    d.save(None)?;
+                    let doc = self.id();
+                    self.documents.insert(doc, *d);
+                    // A tab without taking focus from the current document.
+                    let view = self.id();
+                    self.views.insert(
+                        view,
+                        crate::EditorView {
+                            document: doc,
+                            ..Default::default()
+                        },
+                    );
+                    let focus = self.focus;
+                    let preferred = self.pane_showing_editor();
+                    if self
+                        .place_view_background(crate::layout::View::Editor(view), preferred)
+                        .is_none()
+                    {
+                        self.views.remove(&view);
+                    }
+                    self.focus = focus;
                 }
             }
             files += 1;
         }
         self.revision += 1;
+        self.workspace_dirty = true;
         Ok(files)
     }
 
     // ----- Requests the user makes -----
 
-    fn editor_position(&mut self) -> Result<(u64, u64, u64, usize, Value)> {
+    /// The project folder a document's language server would run in.
+    pub(crate) fn document_root(&mut self, doc: u64) -> Option<PathBuf> {
+        let language = self.language_for(doc)?;
+        let path = self.documents[&doc].path.clone()?;
+        Some(language.root_for(&path, &self.root))
+    }
+
+    /// The caret position for a request, or `None` after asking to trust the
+    /// project (then `action` runs again).
+    fn editor_position(&mut self, action: &str) -> Result<Option<RequestAt>> {
         let id = self
             .active_editor()
             .ok_or_else(|| anyhow::anyhow!("Focus an editor first"))?;
-        let v = &self.views[&id];
-        let doc = v.document;
-        let offset = v.cursor;
-        if !self.trusted {
-            bail!("Language servers run code from this folder. Trust the workspace first (trust-workspace)");
+        let offset = self.views[&id].cursor;
+        self.position_in(id, offset, action)
+    }
+
+    /// A request position at `offset` in view `id`.
+    fn position_in(&mut self, id: u64, offset: usize, action: &str) -> Result<Option<RequestAt>> {
+        let doc = self.views[&id].document;
+        if let Some(root) = self.document_root(doc).filter(|r| !self.trusted_path(r)) {
+            if !action.is_empty() {
+                self.ask_trust_for(
+                    &root,
+                    "Language servers run code from the project (build scripts, plugins)",
+                    Command::Action {
+                        name: action.into(),
+                        argument: String::new(),
+                    },
+                );
+            }
+            return Ok(None);
         }
         self.lsp_sync();
         let server = self
@@ -1178,22 +1390,55 @@ impl App {
             "textDocument": {"uri": open.uri},
             "position": json_position(self.documents[&doc].position(offset)),
         });
-        Ok((id, doc, server, offset, params))
+        Ok(Some((id, doc, server, offset, params)))
     }
 
     pub(crate) fn lsp_hover(&mut self) -> Result<()> {
-        let (_, doc, server, offset, params) = self.editor_position()?;
+        let Some((_, doc, server, offset, params)) = self.editor_position("hover")? else {
+            return Ok(());
+        };
         self.request(
             server,
             "textDocument/hover",
             params,
-            Pending::Hover { doc, offset },
+            Pending::Hover {
+                doc,
+                offset,
+                quiet: false,
+            },
         );
         Ok(())
     }
 
+    /// Hover text for the text under the mouse (quietly: nothing shown
+    /// when there is no server or nothing to say).
+    pub(crate) fn hover_at(&mut self, pane: u64, row: usize, col: usize) {
+        let Some(crate::layout::View::Editor(id)) = self.layout.view(pane).cloned() else {
+            return;
+        };
+        let offset = self.click_offset(id, row, col);
+        if self.lsp.hover.as_ref().is_some_and(|h| h.offset == offset) {
+            return;
+        }
+        self.lsp.hover = None;
+        if let Ok(Some((_, doc, server, offset, params))) = self.position_in(id, offset, "") {
+            self.request(
+                server,
+                "textDocument/hover",
+                params,
+                Pending::Hover {
+                    doc,
+                    offset,
+                    quiet: true,
+                },
+            );
+        }
+    }
+
     pub(crate) fn lsp_definition(&mut self) -> Result<()> {
-        let (_, _, server, _, params) = self.editor_position()?;
+        let Some((_, _, server, _, params)) = self.editor_position("go-to-definition")? else {
+            return Ok(());
+        };
         self.request(
             server,
             "textDocument/definition",
@@ -1204,7 +1449,9 @@ impl App {
     }
 
     pub(crate) fn lsp_references(&mut self) -> Result<()> {
-        let (_, _, server, _, mut params) = self.editor_position()?;
+        let Some((_, _, server, _, mut params)) = self.editor_position("find-references")? else {
+            return Ok(());
+        };
         params["context"] = json!({"includeDeclaration": true});
         self.request(
             server,
@@ -1219,17 +1466,27 @@ impl App {
         if name.trim().is_empty() {
             bail!("Enter the new name");
         }
-        let (_, _, server, _, mut params) = self.editor_position()?;
+        let Some((_, _, server, _, mut params)) = self.editor_position("")? else {
+            bail!("Trust this project to use its language server (trust-workspace)");
+        };
         if !self.capability(server, "renameProvider") {
             bail!("This language server cannot rename");
         }
         params["newName"] = json!(name);
-        self.request(server, "textDocument/rename", params, Pending::Rename);
+        let versions = self.content_versions();
+        self.request(
+            server,
+            "textDocument/rename",
+            params,
+            Pending::Rename(versions),
+        );
         Ok(())
     }
 
     pub(crate) fn lsp_code_actions(&mut self) -> Result<()> {
-        let (id, doc, server, _, _) = self.editor_position()?;
+        let Some((id, doc, server, _, _)) = self.editor_position("code-actions")? else {
+            return Ok(());
+        };
         let v = &self.views[&id];
         let d = &self.documents[&doc];
         let (a, b) = {
@@ -1257,7 +1514,7 @@ impl App {
                 "range": {"start": json_position(start), "end": json_position(end)},
                 "context": {"diagnostics": diagnostics}
             }),
-            Pending::CodeActions,
+            Pending::CodeActions(self.content_versions()),
         );
         Ok(())
     }
@@ -1270,7 +1527,8 @@ impl App {
         let server: u64 = server.parse()?;
         let action: Value = serde_json::from_str(action)?;
         if action["edit"].is_object() {
-            self.apply_workspace_edit(&action["edit"])?;
+            let versions = std::mem::take(&mut self.lsp.action_versions);
+            self.apply_workspace_edit(&action["edit"], Some(&versions))?;
         }
         // A bare Command, or a CodeAction carrying one.
         let command = if action["command"].is_string() {
@@ -1291,10 +1549,7 @@ impl App {
     }
 
     /// Format with the language server. Returns false when it cannot.
-    pub(crate) fn lsp_format(&mut self, doc: u64, then_save: bool) -> bool {
-        if !self.trusted {
-            return false;
-        }
+    pub(crate) fn lsp_format(&mut self, doc: u64) -> bool {
         self.lsp_sync();
         let Some(server) = self.server_for(doc) else {
             return false;
@@ -1313,19 +1568,12 @@ impl App {
             server,
             "textDocument/formatting",
             json!({"textDocument": {"uri": uri}, "options": options}),
-            Pending::Formatting {
-                doc,
-                content,
-                then_save,
-            },
+            Pending::Formatting { doc, content },
         );
         true
     }
 
     pub(crate) fn lsp_document_symbols(&mut self, doc: u64) -> bool {
-        if !self.trusted {
-            return false;
-        }
         self.lsp_sync();
         let Some(server) = self.server_for(doc) else {
             return false;
@@ -1383,10 +1631,13 @@ impl App {
 
     /// Ask for completions at the caret. `manual` comes from Ctrl+Space.
     pub(crate) fn lsp_complete(&mut self, manual: bool) -> Result<()> {
-        let (view, doc, server, offset, params) = match self.editor_position() {
+        let found = match self.editor_position(if manual { "trigger-completion" } else { "" }) {
             Ok(p) => p,
             Err(e) if manual => return Err(e),
             Err(_) => return Ok(()),
+        };
+        let Some((view, doc, server, offset, params)) = found else {
+            return Ok(());
         };
         if !self.capability(server, "completionProvider") {
             if manual {
@@ -1419,7 +1670,13 @@ impl App {
     }
 
     fn completion_results(&mut self, view: u64, doc: u64, offset: usize, result: &Value) {
-        if !self.views.contains_key(&view) || self.views[&view].cursor < offset {
+        // The answer may arrive after the view moved on.
+        if !self.documents.contains_key(&doc)
+            || !self
+                .views
+                .get(&view)
+                .is_some_and(|v| v.document == doc && v.cursor >= offset)
+        {
             return;
         }
         let (items, incomplete) = match result {
@@ -1490,7 +1747,8 @@ impl App {
         let language = crate::highlight::syntax_for(d.path.as_deref(), &d.line_text(0))
             .name
             .clone();
-        for s in crate::snippets::available(&language) {
+        let mut snippet_errors = Vec::new();
+        for s in crate::snippets::available(&language, &mut snippet_errors) {
             candidates.push(Candidate {
                 item: CompletionItem {
                     label: s.prefix.clone(),
@@ -1508,6 +1766,7 @@ impl App {
                 additional: vec![],
             });
         }
+        self.config_errors(snippet_errors);
         if candidates.is_empty() {
             self.lsp.completion = None;
             return;
@@ -1577,38 +1836,45 @@ impl App {
         let Some(c) = self.lsp.completion.take() else {
             return Ok(());
         };
-        let Some(index) = c.shown.get(c.selected) else {
+        let (Some(index), Some(view)) = (c.shown.get(c.selected), self.views.get(&c.view)) else {
             return Ok(());
         };
+        if view.document != c.doc || !self.documents.contains_key(&c.doc) {
+            return Ok(());
+        }
         let candidate = &c.candidates[*index];
-        let cursor = self.views[&c.view].cursor;
+        let cursor = view.cursor;
         let (start, end) = match candidate.range {
             // The server's range was computed before more was typed.
             Some((a, b)) => (a.min(c.start), b.max(cursor)),
             None => (c.start, cursor),
         };
+        let additional = candidate.additional.clone();
         if candidate.snippet {
+            let insert = candidate.insert.clone();
+            // Additional edits (auto-imports) first; they sit outside the
+            // completed word, so its range moves by their size changes.
+            let shift: isize = additional
+                .iter()
+                .filter(|(_, e, _)| *e <= start)
+                .map(|(s, e, text)| text.len() as isize - (e - s) as isize)
+                .sum();
+            if !additional.is_empty() {
+                self.replace_in_document(c.doc, &additional)?;
+            }
+            let (start, end) = (
+                (start as isize + shift) as usize,
+                (end as isize + shift) as usize,
+            );
             let line = self.documents[&c.doc].line_of(start);
-            let indent: String = self.documents[&c.doc]
-                .line_text(line)
-                .chars()
-                .take_while(|ch| *ch == ' ' || *ch == '\t')
-                .collect();
-            let expansion =
-                crate::snippets::expand(&candidate.insert, &indent, &self.indent_unit());
+            let indent = self.documents[&c.doc].indent_of(line);
+            let expansion = crate::snippets::expand(&insert, &indent, &self.indent_unit());
             self.insert_expansion(c.view, start, end, expansion)?;
         } else {
-            let mut edits = candidate.additional.clone();
+            let mut edits = additional;
             edits.push((start, end, candidate.insert.clone()));
-            let placed = self
-                .documents
-                .get_mut(&c.doc)
-                .unwrap()
-                .replace_many(&edits, cursor)?;
+            let placed = self.replace_in_document(c.doc, &edits)?;
             let (_, after) = *placed.last().unwrap();
-            for (s, e, text) in edits.iter().rev() {
-                self.rebase_views(c.doc, *s, *e, text.len());
-            }
             let v = self.views.get_mut(&c.view).unwrap();
             v.cursor = after;
             v.anchor = None;
@@ -1643,7 +1909,13 @@ impl App {
             "Down" => c.selected = (c.selected + 1).min(c.shown.len().saturating_sub(1)),
             "PageUp" => c.selected = c.selected.saturating_sub(8),
             "PageDown" => c.selected = (c.selected + 8).min(c.shown.len().saturating_sub(1)),
-            "Enter" | "Tab" => self.accept_completion()?,
+            "Tab" => self.accept_completion()?,
+            "Enter" if self.preferences.accept_completion_on_enter => self.accept_completion()?,
+            // Enter starts a new line; the list closes.
+            "Enter" => {
+                self.lsp.completion = None;
+                return Ok(false);
+            }
             "Escape" => self.lsp.completion = None,
             _ => return Ok(false),
         }
@@ -1653,9 +1925,6 @@ impl App {
     /// After typing: narrow open completions, or ask for new ones after an
     /// identifier character or a trigger character.
     pub(crate) fn after_typing(&mut self, typed: &str) {
-        if !self.trusted {
-            return;
-        }
         let word = typed.chars().all(|c| c.is_alphanumeric() || c == '_');
         if self.lsp.completion.is_some() {
             if word {
@@ -1688,7 +1957,13 @@ impl App {
             .into_iter()
             .filter_map(|t| t.as_str().map(str::to_owned))
             .collect();
-        if word || triggers.iter().any(|t| t == typed) {
+        // While typing, completions open after two identifier characters
+        // (or a trigger character such as `.`), when enabled.
+        let trigger = triggers.iter().any(|t| t == typed);
+        let id = self.active_editor().unwrap();
+        let cursor = self.views[&id].cursor;
+        let prefix = cursor - self.word_start(doc, cursor);
+        if self.preferences.complete_while_typing && (trigger || (word && prefix >= 2)) {
             let _ = self.lsp_complete(false);
         }
     }
@@ -1901,15 +2176,84 @@ impl App {
     /// Diagnostics for a file from a task's problem matcher.
     pub(crate) fn set_task_diagnostics(&mut self, results: BTreeMap<PathBuf, Vec<Diagnostic>>) {
         self.lsp.diagnostics.retain(|_, list| {
-            list.retain(|d| d.source != "task");
+            list.retain(|d| !d.is_from_task());
             !list.is_empty()
         });
         for (path, list) in results {
             let key = self.diagnostic_key(&path);
-            self.lsp.diagnostics.entry(key).or_default().extend(list);
+            self.lsp
+                .diagnostics
+                .entry(key)
+                .or_default()
+                .extend(list.into_iter().take(DIAGNOSTIC_LIMIT));
         }
         self.lsp.revision += 1;
         self.revision += 1;
+    }
+
+    /// What language servers are busy with, for the status bar.
+    pub fn activity(&self) -> String {
+        self.lsp
+            .progress
+            .values()
+            .map(|(_, text)| text.as_str())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+
+    /// A document describing the running language servers and what they
+    /// said.
+    pub(crate) fn show_language_servers(&mut self) {
+        let mut text = String::new();
+        if self.lsp.servers.is_empty() {
+            text.push_str("No language server is running.\n\nServers start for documents whose language has one installed (see languages.toml), in trusted folders.\n");
+        }
+        for s in self.lsp.servers.values() {
+            text.push_str(&format!(
+                "{} · {} · {}\n",
+                s.language,
+                s.root.display(),
+                if s.ready { "ready" } else { "starting" }
+            ));
+        }
+        if !self.lsp.failed.is_empty() {
+            text.push_str("\nNot running (not installed or stopped):\n");
+            for (language, root) in &self.lsp.failed {
+                text.push_str(&format!("  {language} · {}\n", root.display()));
+            }
+        }
+        if !self.lsp.messages.is_empty() {
+            text.push_str("\nMessages\n");
+            for m in &self.lsp.messages {
+                text.push_str(&format!("  {m}\n"));
+            }
+        }
+        let label = "Language servers · read-only";
+        let existing = self
+            .documents
+            .iter()
+            .find(|(_, d)| d.label.as_deref() == Some(label))
+            .map(|(id, _)| *id);
+        let doc = match existing {
+            Some(doc) => {
+                let d = self.documents.get_mut(&doc).unwrap();
+                let len = d.len();
+                d.replace_inspection(0, len, &text);
+                d.generation += 1;
+                self.clamp_views(doc);
+                doc
+            }
+            None => {
+                let doc = self.id();
+                self.documents.insert(
+                    doc,
+                    crate::document::Document::inspection(label.into(), text),
+                );
+                doc
+            }
+        };
+        self.reveal_document(doc);
     }
 
     pub(crate) fn lsp_revision(&self) -> u64 {
@@ -1938,6 +2282,16 @@ mod tests {
         assert_eq!(path_of(&u).unwrap(), path);
         assert_eq!(path_of("file://localhost/x/y").unwrap(), Path::new("/x/y"));
         assert!(path_of("https://example.com").is_none());
+        // Malformed escapes stay as text instead of panicking.
+        assert_eq!(path_of("file:///a%1é").unwrap(), Path::new("/a%1é"));
+        assert_eq!(path_of("file:///a%").unwrap(), Path::new("/a%"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/caf\xe9.rs"));
+            assert_eq!(uri(raw), "file:///tmp/caf%E9.rs");
+            assert_eq!(path_of(&uri(raw)).unwrap(), raw);
+        }
     }
 
     #[test]

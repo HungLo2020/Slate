@@ -1,3 +1,4 @@
+mod common;
 use slate_core::{
     document::Document,
     layout::{Axis, Node, Rect, View},
@@ -18,6 +19,7 @@ fn key(app: &mut App, name: &str) {
 }
 #[test]
 fn unicode_edit_undo_redo_and_shared_split_views() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("code.rs");
     fs::write(&path, "a👩‍💻界\n").unwrap();
@@ -25,18 +27,24 @@ fn unicode_edit_undo_redo_and_shared_split_views() {
     key(&mut app, "Right");
     key(&mut app, "Right");
     key(&mut app, "Backspace");
-    assert_eq!(app.documents[&10].text(), "a界\n");
+    assert_eq!(app.documents[&common::first_document(&app)].text(), "a界\n");
     app.dispatch(Command::Undo);
-    assert_eq!(app.documents[&10].text(), "a👩‍💻界\n");
+    assert_eq!(
+        app.documents[&common::first_document(&app)].text(),
+        "a👩‍💻界\n"
+    );
     app.dispatch(Command::Redo);
-    assert_eq!(app.documents[&10].text(), "a界\n");
+    assert_eq!(app.documents[&common::first_document(&app)].text(), "a界\n");
     app.dispatch(Command::Split {
         axis: Axis::Vertical,
         kind: None,
     });
     assert_eq!(app.views.len(), 2);
     app.dispatch(Command::Paste { text: "x".into() });
-    assert_eq!(app.documents[&10].text(), "ax界\n");
+    assert_eq!(
+        app.documents[&common::first_document(&app)].text(),
+        "ax界\n"
+    );
     assert!(app.views.values().all(|v| v.document == 10));
     app.dispatch(Command::Save);
     wait_app(&mut app, |a| a.status == "Saved");
@@ -51,6 +59,7 @@ fn unicode_edit_undo_redo_and_shared_split_views() {
 }
 #[test]
 fn save_preserves_permissions_and_rejects_external_changes_and_clobber() {
+    common::isolate();
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("file");
@@ -78,6 +87,7 @@ fn save_preserves_permissions_and_rejects_external_changes_and_clobber() {
 }
 #[test]
 fn symlink_save_changes_target_without_replacing_link() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("target");
     let link = dir.path().join("link");
@@ -91,6 +101,7 @@ fn symlink_save_changes_target_without_replacing_link() {
 }
 #[test]
 fn nested_layout_geometry_resize_remove_and_validation() {
+    common::isolate();
     let mut layout = Node::default_layout(11, 12);
     assert!(layout.validate());
     layout.split(2, Axis::Vertical, 6, 7, View::Editor(13));
@@ -143,6 +154,7 @@ fn wait_for(term: &TerminalSession, needle: &str) {
 }
 #[test]
 fn real_pty_shell_color_resize_and_alternate_screen() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let mut term = TerminalSession::spawn(dir.path(), None, 24, 80).unwrap();
     term.write(b"printf '\\033[31mSLATE_RED\\033[0m\\n'\r")
@@ -183,6 +195,7 @@ fn real_pty_shell_color_resize_and_alternate_screen() {
 }
 #[test]
 fn closing_background_tabs_keeps_the_active_document_and_last_tab_leaves_an_editor() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let first = dir.path().join("first.txt");
     let second = dir.path().join("second.txt");
@@ -195,7 +208,7 @@ fn closing_background_tabs_keeps_the_active_document_and_last_tab_leaves_an_edit
     wait_app(&mut app, |a| a.status.starts_with("Opened"));
     let active = app.layout.view(2).unwrap().clone();
     app.dispatch(Command::CloseTab {
-        pane: 2,
+        pane: common::editor_pane(&app),
         view: 11,
         force: false,
     });
@@ -222,6 +235,7 @@ fn closing_background_tabs_keeps_the_active_document_and_last_tab_leaves_an_edit
 
 #[test]
 fn closing_one_shared_view_keeps_dirty_edits_and_last_view_prompts() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("shared.txt");
     fs::write(&path, "original").unwrap();
@@ -238,13 +252,16 @@ fn closing_one_shared_view_keeps_dirty_edits_and_last_view_prompts() {
         text: "dirty ".into(),
     });
     app.dispatch(Command::CloseTab {
-        pane: 2,
+        pane: common::editor_pane(&app),
         view: 11,
         force: false,
     });
     assert!(app.prompt.is_none());
     assert_eq!(app.focus, pane);
-    assert_eq!(app.documents[&10].text(), "dirty original");
+    assert_eq!(
+        app.documents[&common::first_document(&app)].text(),
+        "dirty original"
+    );
     app.dispatch(Command::CloseTab {
         pane,
         view: other,
@@ -265,6 +282,7 @@ fn closing_one_shared_view_keeps_dirty_edits_and_last_view_prompts() {
 
 #[test]
 fn closing_last_live_tab_prompts_even_if_a_removed_pane_has_a_cached_view() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("shared.txt");
     fs::write(&path, "original").unwrap();
@@ -278,7 +296,7 @@ fn closing_last_live_tab_prompts_even_if_a_removed_pane_has_a_cached_view() {
     });
     app.dispatch(Command::ClosePane);
     app.dispatch(Command::CloseTab {
-        pane: 2,
+        pane: common::editor_pane(&app),
         view: 11,
         force: false,
     });
@@ -290,13 +308,14 @@ fn closing_last_live_tab_prompts_even_if_a_removed_pane_has_a_cached_view() {
 
 #[test]
 fn close_tab_rejects_stale_targets_and_pending_saves() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("file.txt");
     fs::write(&path, "original").unwrap();
     let mut app = App::new(&path).unwrap();
     app.dispatch(Command::Save);
     app.dispatch(Command::CloseTab {
-        pane: 2,
+        pane: common::editor_pane(&app),
         view: 11,
         force: true,
     });
@@ -304,13 +323,13 @@ fn close_tab_rejects_stale_targets_and_pending_saves() {
     assert!(app.views.contains_key(&11));
     wait_app(&mut app, |a| a.status == "Saved");
     app.dispatch(Command::CloseTab {
-        pane: 2,
+        pane: common::editor_pane(&app),
         view: 11,
         force: false,
     });
     let replacement = app.layout.view(2).unwrap().clone();
     app.dispatch(Command::CloseTab {
-        pane: 2,
+        pane: common::editor_pane(&app),
         view: 11,
         force: true,
     });
@@ -320,9 +339,12 @@ fn close_tab_rejects_stale_targets_and_pending_saves() {
 
 #[test]
 fn closing_terminal_tabs_stops_only_the_target_shell_and_preserves_focus() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let mut app = App::new(dir.path()).unwrap();
-    app.dispatch(Command::Focus { pane: 3 });
+    app.dispatch(Command::Focus {
+        pane: common::terminal_pane(&app),
+    });
     app.terminals
         .get_mut(&12)
         .unwrap()
@@ -339,12 +361,14 @@ fn closing_terminal_tabs_stops_only_the_target_shell_and_preserves_focus() {
     let next = app.layout.view(3).unwrap().clone();
     app.dispatch(Command::NewTerminal);
     let active = app.layout.view(3).unwrap().clone();
-    app.dispatch(Command::Focus { pane: 2 });
+    app.dispatch(Command::Focus {
+        pane: common::editor_pane(&app),
+    });
     app.dispatch(Command::Paste {
         text: "keep unsaved".into(),
     });
     app.dispatch(Command::CloseTab {
-        pane: 3,
+        pane: common::terminal_pane(&app),
         view: 12,
         force: false,
     });
@@ -360,13 +384,15 @@ fn closing_terminal_tabs_stops_only_the_target_shell_and_preserves_focus() {
     assert!(app.dirty());
     assert!(app.prompt.is_none());
     app.dispatch(Command::CloseTab {
-        pane: 3,
+        pane: common::terminal_pane(&app),
         view: 12,
         force: false,
     });
     assert!(app.status.contains("no longer open"));
     assert_eq!(app.layout.view(3), Some(&active));
-    app.dispatch(Command::Focus { pane: 3 });
+    app.dispatch(Command::Focus {
+        pane: common::terminal_pane(&app),
+    });
     assert!(app
         .command_catalog("close")
         .iter()
@@ -383,6 +409,7 @@ fn closing_terminal_tabs_stops_only_the_target_shell_and_preserves_focus() {
 
 #[test]
 fn closing_deferred_terminal_prevents_it_from_starting_on_expansion() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("file.txt");
     fs::write(&path, "original").unwrap();
@@ -390,7 +417,7 @@ fn closing_deferred_terminal_prevents_it_from_starting_on_expansion() {
     assert!(app.editor_only);
     assert!(app.terminals.is_empty());
     app.dispatch(Command::CloseTab {
-        pane: 3,
+        pane: common::terminal_pane(&app),
         view: 12,
         force: false,
     });
@@ -402,6 +429,7 @@ fn closing_deferred_terminal_prevents_it_from_starting_on_expansion() {
 
 #[test]
 fn close_and_quit_protect_unsaved_work() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let mut app = App::new(dir.path()).unwrap();
     app.preferences = Default::default();
@@ -417,13 +445,14 @@ fn close_and_quit_protect_unsaved_work() {
     });
     assert!(!app.quit);
     app.dispatch(Command::CloseDocument { force: false });
-    assert!(app.documents[&10].dirty());
+    assert!(app.documents[&common::first_document(&app)].dirty());
     app.dispatch(Command::Quit { force: true });
     assert!(app.quit);
 }
 
 #[test]
 fn footer_quit_shortcut_tracks_binding_and_exits_cleanly() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let mut app = App::new(dir.path()).unwrap();
     app.preferences = Default::default();
@@ -448,6 +477,7 @@ fn footer_quit_shortcut_tracks_binding_and_exits_cleanly() {
 
 #[test]
 fn git_status_stage_diff_commit_and_unstage_in_nested_workspace() {
+    common::isolate();
     use std::process::Command as Process;
     let dir = tempfile::tempdir().unwrap();
     let run = |args: &[&str]| {
@@ -468,8 +498,9 @@ fn git_status_stage_diff_commit_and_unstage_in_nested_workspace() {
     run(&["config", "user.name", "Slate Tests"]);
     fs::create_dir(dir.path().join("nested")).unwrap();
     fs::write(dir.path().join("nested/code.rs"), "old\n").unwrap();
+    // The repository's folder contains the workspace; Git needs it trusted.
+    slate_core::trust::set_trusted(dir.path(), true).unwrap();
     let mut app = App::new(&dir.path().join("nested")).unwrap();
-    app.set_session_trust(true);
     fn wait_status(app: &mut App, needle: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -532,6 +563,7 @@ fn git_status_stage_diff_commit_and_unstage_in_nested_workspace() {
 
 #[test]
 fn terminal_can_run_fullscreen_vim_and_htop() {
+    common::isolate();
     // These optional integration checks run when the programs exist on the host.
     let dir = tempfile::tempdir().unwrap();
     if std::process::Command::new("vim.tiny")
@@ -542,7 +574,12 @@ fn terminal_can_run_fullscreen_vim_and_htop() {
         let mut term =
             TerminalSession::spawn(dir.path(), Some("vim.tiny -Nu NONE -n edited.txt"), 24, 80)
                 .unwrap();
-        thread::sleep(Duration::from_millis(150));
+        // Type once Vim has drawn its screen.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !term.screen().cells.iter().flatten().any(|c| c.text == "~") {
+            assert!(Instant::now() < deadline, "Vim did not start");
+            thread::sleep(Duration::from_millis(20));
+        }
         term.write(b"iVT_EDITOR_OK\x1b:wq\r").unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !term.exited() {
@@ -583,6 +620,7 @@ fn wait_app(app: &mut App, check: impl Fn(&App) -> bool) {
 }
 #[test]
 fn search_replace_unicode_whole_words_literal_replacement_and_indentation() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("code.rs");
     fs::write(&path, "cat CAT scatter 猫猫\n    fn main() {\n}").unwrap();
@@ -593,12 +631,12 @@ fn search_replace_unicode_whole_words_literal_replacement_and_indentation() {
         whole_word: true,
         backward: false,
     });
-    assert_eq!(app.views[&11].anchor, Some(0));
-    assert_eq!(app.views[&11].cursor, 3);
+    assert_eq!(app.views[&common::first_view(&app)].anchor, Some(0));
+    assert_eq!(app.views[&common::first_view(&app)].cursor, 3);
     app.command_line("find-next");
-    assert_eq!(app.views[&11].anchor, Some(4));
+    assert_eq!(app.views[&common::first_view(&app)].anchor, Some(4));
     app.command_line("find-previous");
-    assert_eq!(app.views[&11].anchor, Some(0));
+    assert_eq!(app.views[&common::first_view(&app)].anchor, Some(0));
     app.dispatch(Command::Replace {
         query: "cat".into(),
         replacement: "$1猫".into(),
@@ -606,24 +644,34 @@ fn search_replace_unicode_whole_words_literal_replacement_and_indentation() {
         case_sensitive: false,
         whole_word: true,
     });
-    assert!(app.documents[&10].text().starts_with("$1猫 $1猫 scatter"));
+    assert!(app.documents[&common::first_document(&app)]
+        .text()
+        .starts_with("$1猫 $1猫 scatter"));
     app.dispatch(Command::Undo);
-    assert!(app.documents[&10].text().starts_with("cat CAT scatter"));
+    assert!(app.documents[&common::first_document(&app)]
+        .text()
+        .starts_with("cat CAT scatter"));
     app.dispatch(Command::GoToLine { line: 2 });
     key(&mut app, "End");
     key(&mut app, "Enter");
     // Enter after an opening brace indents one level deeper.
-    assert!(app.documents[&10]
+    assert!(app.documents[&common::first_document(&app)]
         .text()
         .contains("    fn main() {\n        \n}"));
     app.preferences.indent_width = 2;
     key(&mut app, "Tab");
-    assert!(app.documents[&10].text().contains("{\n          \n}"));
+    assert!(app.documents[&common::first_document(&app)]
+        .text()
+        .contains("{\n          \n}"));
     app.dispatch(Command::GoToLine { line: 2 });
     app.dispatch(Command::Indent { outdent: false });
-    assert!(app.documents[&10].text().contains("      fn main()"));
+    assert!(app.documents[&common::first_document(&app)]
+        .text()
+        .contains("      fn main()"));
     app.dispatch(Command::Indent { outdent: true });
-    assert!(app.documents[&10].text().contains("    fn main()"));
+    assert!(app.documents[&common::first_document(&app)]
+        .text()
+        .contains("    fn main()"));
     app.dispatch(Command::GoToLine { line: 999 });
     assert!(app.status.starts_with("Error:"));
     app.command_line("prompt-find");
@@ -635,12 +683,16 @@ fn search_replace_unicode_whole_words_literal_replacement_and_indentation() {
     });
     app.dispatch(Command::SubmitPrompt { all: false });
     assert_eq!(
-        &app.documents[&10].text()[app.views[&11].anchor.unwrap()..app.views[&11].cursor],
+        &app.documents[&common::first_document(&app)].text()[app.views[&common::first_view(&app)]
+            .anchor
+            .unwrap()
+            ..app.views[&common::first_view(&app)].cursor],
         "猫猫"
     );
 }
 #[test]
 fn undo_memory_is_proportional_to_edits_in_a_large_buffer() {
+    common::isolate();
     let mut d = Document::from_text("x".repeat(8 * 1024 * 1024)).unwrap();
     for _ in 0..100 {
         d.replace(0, 0, "猫", 0).unwrap();
@@ -658,6 +710,7 @@ fn undo_memory_is_proportional_to_edits_in_a_large_buffer() {
 }
 #[test]
 fn file_actions_request_paths_and_untitled_save_survives_cancellation() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("file.txt");
     fs::write(&path, "original").unwrap();
@@ -694,6 +747,7 @@ fn file_actions_request_paths_and_untitled_save_survives_cancellation() {
 
 #[test]
 fn save_as_requires_explicit_overwrite_and_normal_saves_keep_conflict_checks() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let original = dir.path().join("original.txt");
     let destination = dir.path().join("existing.txt");
@@ -723,6 +777,7 @@ fn save_as_requires_explicit_overwrite_and_normal_saves_keep_conflict_checks() {
 
 #[test]
 fn background_save_preserves_newer_edits_and_external_conflicts() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("file");
     fs::write(&path, "old").unwrap();
@@ -737,7 +792,10 @@ fn background_save_preserves_newer_edits_and_external_conflicts() {
     });
     wait_app(&mut app, |a| a.status.starts_with("Saved"));
     assert_eq!(fs::read_to_string(&path).unwrap(), "saved");
-    assert_eq!(app.documents[&10].text(), "saved newer");
+    assert_eq!(
+        app.documents[&common::first_document(&app)].text(),
+        "saved newer"
+    );
     assert!(app.dirty());
     fs::write(&path, "external").unwrap();
     app.dispatch(Command::Save);
@@ -747,10 +805,14 @@ fn background_save_preserves_newer_edits_and_external_conflicts() {
     app.dispatch(Command::Open { path: path.clone() });
     wait_app(&mut app, |a| a.status.starts_with("Opened"));
     assert_eq!(app.documents.len(), 1);
-    assert_eq!(app.documents[&10].text(), "saved newer");
+    assert_eq!(
+        app.documents[&common::first_document(&app)].text(),
+        "saved newer"
+    );
 }
 #[test]
 fn recovery_preserves_unsaved_baselines_layout_and_cursors_with_fresh_shells() {
+    common::isolate();
     use slate_core::workspace::WorkspaceStore;
     let dir = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -782,7 +844,10 @@ fn recovery_preserves_unsaved_baselines_layout_and_cursors_with_fresh_shells() {
         .unwrap();
     assert_eq!(restored.focus, focus);
     assert_eq!(restored.layout.panes().len(), 4);
-    assert_eq!(restored.documents[&10].text(), "unsaved 猫disk");
+    assert_eq!(
+        restored.documents[&common::first_document(&restored)].text(),
+        "unsaved 猫disk"
+    );
     assert!(restored.dirty());
     assert!(restored
         .views
@@ -802,6 +867,7 @@ fn recovery_preserves_unsaved_baselines_layout_and_cursors_with_fresh_shells() {
 }
 #[test]
 fn preferences_remap_shared_shortcuts_and_validate_options() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let mut app = App::new(dir.path()).unwrap();
     app.preferences
@@ -823,6 +889,7 @@ fn preferences_remap_shared_shortcuts_and_validate_options() {
 }
 #[test]
 fn highlighting_is_shared_and_refreshes_after_editing() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("code.rs");
     fs::write(&path, "// comment\nlet value = 42;\n").unwrap();
@@ -863,6 +930,7 @@ fn highlighting_is_shared_and_refreshes_after_editing() {
 
 #[test]
 fn terminal_mouse_modes_bracketed_paste_and_frozen_scrollback_selection() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let probe = dir.path().join("probe.py");
     fs::write(
@@ -960,6 +1028,7 @@ Path('input.bin').write_bytes(data)
 }
 #[test]
 fn terminal_cwd_and_workspace_clean_file_refresh() {
+    common::isolate();
     use slate_core::workspace::WorkspaceStore;
     let dir = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -979,11 +1048,11 @@ fn terminal_cwd_and_workspace_clean_file_refresh() {
         .unwrap()
         .write(b"cd nested; printf '\\033]7;file://localhost%s\\007CWD_READY' \"$PWD\"\r")
         .unwrap();
-    wait_for(&app.terminals[&12], "CWD_READY");
+    wait_for(&app.terminals[&common::first_terminal(&app)], "CWD_READY");
     #[cfg(target_os = "linux")]
     {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while app.terminals[&12].cwd() != dir.path().join("nested") {
+        while app.terminals[&common::first_terminal(&app)].cwd() != dir.path().join("nested") {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(10));
         }
@@ -996,12 +1065,15 @@ fn terminal_cwd_and_workspace_clean_file_refresh() {
         true,
     )
     .unwrap();
-    assert_eq!(app.documents[&10].text(), "new disk content");
+    assert_eq!(
+        app.documents[&common::first_document(&app)].text(),
+        "new disk content"
+    );
     assert!(!app.dirty());
     #[cfg(target_os = "linux")]
     {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while app.terminals[&12].cwd() != dir.path().join("nested") {
+        while app.terminals[&common::first_terminal(&app)].cwd() != dir.path().join("nested") {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(10));
         }
@@ -1010,6 +1082,7 @@ fn terminal_cwd_and_workspace_clean_file_refresh() {
 
 #[test]
 fn real_ssh_session_forwards_input_colors_and_terminal_resize() {
+    common::isolate();
     use std::process::Command as Process;
     if !std::path::Path::new("/usr/sbin/sshd").exists() {
         assert!(
@@ -1095,6 +1168,7 @@ fn real_ssh_session_forwards_input_colors_and_terminal_resize() {
 }
 #[test]
 fn real_tmux_session_preserves_shell_input_and_resize() {
+    common::isolate();
     use std::process::Command as Process;
     let executable = std::env::var("SLATE_TMUX_BINARY").unwrap_or_else(|_| "tmux".into());
     if Process::new(&executable).arg("-V").output().is_err() {
@@ -1178,6 +1252,7 @@ fn real_tmux_session_preserves_shell_input_and_resize() {
 
 #[test]
 fn discard_quit_writes_valid_state_and_missing_clean_files_reopen_as_new() {
+    common::isolate();
     use slate_core::workspace::WorkspaceStore;
     let dir = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -1201,7 +1276,7 @@ fn discard_quit_writes_valid_state_and_missing_clean_files_reopen_as_new() {
         true,
     )
     .unwrap();
-    assert_eq!(app.documents[&10].text(), "base");
+    assert_eq!(app.documents[&common::first_document(&app)].text(), "base");
     assert!(!app.dirty());
     assert!(app.views.values().all(|v| v.cursor <= 4));
     drop(app);
@@ -1214,14 +1289,19 @@ fn discard_quit_writes_valid_state_and_missing_clean_files_reopen_as_new() {
     .unwrap();
     // Checkpoints store only a reference to clean files, never their
     // contents. A clean file deleted meanwhile reopens as a new, empty file.
-    assert_eq!(app.documents[&10].text(), "");
-    assert!(app.documents[&10].path.as_ref().unwrap().ends_with("file"));
+    assert_eq!(app.documents[&common::first_document(&app)].text(), "");
+    assert!(app.documents[&common::first_document(&app)]
+        .path
+        .as_ref()
+        .unwrap()
+        .ends_with("file"));
     assert!(!app.dirty());
     app.dispatch(Command::Quit { force: false });
     assert!(app.quit);
 }
 #[test]
 fn corrupt_workspace_is_preserved_until_an_explicit_fresh_start() {
+    common::isolate();
     use slate_core::workspace::WorkspaceStore;
     let dir = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -1238,12 +1318,24 @@ fn corrupt_workspace_is_preserved_until_an_explicit_fresh_start() {
         false,
     )
     .unwrap();
+    // The fresh start kept the old checkpoint beside the new one.
+    assert_eq!(
+        fs::read_to_string(path.with_file_name("session.previous.json")).unwrap(),
+        "broken checkpoint"
+    );
+    // Output and inspection documents are not part of the checkpoint.
+    app.dispatch(Command::Action {
+        name: "help".into(),
+        argument: String::new(),
+    });
     app.flush_workspace().unwrap();
-    assert!(serde_json::from_slice::<serde_json::Value>(&fs::read(path).unwrap()).is_ok());
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(!saved.to_string().contains("Help · read-only"));
 }
 
 #[test]
 fn damaged_checkpoints_still_recover_unsaved_buffers() {
+    common::isolate();
     use slate_core::workspace::WorkspaceStore;
     let dir = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -1311,6 +1403,7 @@ fn damaged_checkpoints_still_recover_unsaved_buffers() {
 }
 #[test]
 fn constrained_layout_keeps_nested_panes_usable_without_changing_saved_ratios() {
+    common::isolate();
     let mut layout = Node::default_layout(10, 20);
     // Extreme requested ratios must not squeeze pane chrome out of existence.
     if let Node::Split { ratio, .. } = &mut layout {
@@ -1351,6 +1444,7 @@ fn constrained_layout_keeps_nested_panes_usable_without_changing_saved_ratios() 
 
 #[test]
 fn compact_gui_preserves_layout_and_reserves_measured_header_space() {
+    common::isolate();
     let dir = tempfile::tempdir().unwrap();
     let mut app = App::new(dir.path()).unwrap();
     let before = serde_json::to_string(&app.layout).unwrap();

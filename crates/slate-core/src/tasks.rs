@@ -54,13 +54,10 @@ fn task(name: &str, command: &str, group: &str, matcher: &str) -> Task {
     }
 }
 
-/// Tasks for a workspace: configured ones, else detected ones.
-pub fn tasks(root: &Path) -> Vec<Task> {
-    let configured = std::fs::read_to_string(root.join(".slate/tasks.toml"))
-        .ok()
-        .and_then(|s| toml::from_str::<File>(&s).ok())
-        .map(|f| f.task)
-        .unwrap_or_default();
+/// Tasks for a workspace: configured ones, else detected ones. A
+/// `tasks.toml` that does not parse is added to `errors`.
+pub fn tasks(root: &Path, errors: &mut Vec<String>) -> Vec<Task> {
+    let configured = crate::config::list(&root.join(".slate/tasks.toml"), |f: File| f.task, errors);
     if !configured.is_empty() {
         return configured;
     }
@@ -112,9 +109,16 @@ pub fn tasks(root: &Path) -> Vec<Task> {
     detected
 }
 
+/// A regular expression compiled once.
+macro_rules! regex {
+    ($pattern:expr) => {{
+        static REGEX: OnceLock<Regex> = OnceLock::new();
+        REGEX.get_or_init(|| Regex::new($pattern).unwrap())
+    }};
+}
+
 fn ansi() -> &'static Regex {
-    static ANSI: OnceLock<Regex> = OnceLock::new();
-    ANSI.get_or_init(|| Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\r").unwrap())
+    regex!(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\r")
 }
 
 /// Remove colour codes and carriage returns from tool output.
@@ -161,16 +165,18 @@ pub fn problems(matcher: &str, output: &str, cwd: &Path) -> BTreeMap<PathBuf, Ve
     let lines: Vec<&str> = output.lines().collect();
     match matcher {
         "rustc" => {
-            let head = Regex::new(r"^(error|warning)(?:\[\w+\])?: (.+)$").unwrap();
-            let arrow = Regex::new(r"^\s*--> (.+?):(\d+):(\d+)$").unwrap();
+            let head = regex!(r"^(error|warning)(?:\[\w+\])?: (.+)$");
+            let arrow = regex!(r"^\s*--> (.+?):(\d+):(\d+)$");
             for (i, line) in lines.iter().enumerate() {
                 let Some(h) = head.captures(line) else {
                     continue;
                 };
-                // The location follows within a few lines.
+                // The location follows within a few lines, before the next
+                // message (summaries such as "generated 2 warnings" have none).
                 if let Some(a) = lines[i + 1..]
                     .iter()
                     .take(4)
+                    .take_while(|l| !head.is_match(l))
                     .find_map(|l| arrow.captures(l))
                 {
                     add(
@@ -186,10 +192,9 @@ pub fn problems(matcher: &str, output: &str, cwd: &Path) -> BTreeMap<PathBuf, Ve
             }
         }
         "gcc" => {
-            let re = Regex::new(
-                r"^([^:\s][^:]*):(\d+):(?:(\d+):)?\s+(fatal error|error|warning|note):\s+(.*)$",
-            )
-            .unwrap();
+            let re = regex!(
+                r"^([^:\s][^:]*):(\d+):(?:(\d+):)?\s+(fatal error|error|warning|note):\s+(.*)$"
+            );
             for line in &lines {
                 if let Some(c) = re.captures(line) {
                     if &c[4] == "note" {
@@ -204,9 +209,8 @@ pub fn problems(matcher: &str, output: &str, cwd: &Path) -> BTreeMap<PathBuf, Ve
             }
         }
         "tsc" => {
-            let re = Regex::new(r"^(.+?)\((\d+),(\d+)\): (error|warning) \w*\d*:? ?(.*)$").unwrap();
-            let colon =
-                Regex::new(r"^(.+?):(\d+):(\d+) - (error|warning) \w*\d*:? ?(.*)$").unwrap();
+            let re = regex!(r"^(.+?)\((\d+),(\d+)\): (error|warning) \w*\d*:? ?(.*)$");
+            let colon = regex!(r"^(.+?):(\d+):(\d+) - (error|warning) \w*\d*:? ?(.*)$");
             for line in &lines {
                 if let Some(c) = re.captures(line).or_else(|| colon.captures(line)) {
                     add(
@@ -222,7 +226,7 @@ pub fn problems(matcher: &str, output: &str, cwd: &Path) -> BTreeMap<PathBuf, Ve
             }
         }
         "python" => {
-            let frame = Regex::new(r#"^\s*File "(.+)", line (\d+)"#).unwrap();
+            let frame = regex!(r#"^\s*File "(.+)", line (\d+)"#);
             let mut last: Option<(String, usize)> = None;
             for line in &lines {
                 if let Some(c) = frame.captures(line) {
@@ -241,7 +245,7 @@ pub fn problems(matcher: &str, output: &str, cwd: &Path) -> BTreeMap<PathBuf, Ve
             }
         }
         "generic" => {
-            let re = Regex::new(r"^([^:\s][^:]*\.\w+):(\d+):(?:(\d+):)?\s*(.+)$").unwrap();
+            let re = regex!(r"^([^:\s][^:]*\.\w+):(\d+):(?:(\d+):)?\s*(.+)$");
             for line in &lines {
                 if let Some(c) = re.captures(line) {
                     let column = c.get(3).map_or(1, |m| m.as_str().parse().unwrap_or(1));
@@ -269,16 +273,31 @@ pub(crate) struct Running {
     doc: u64,
     output: String,
     cwd: PathBuf,
+    /// Output reached the limit; the rest is dropped.
+    truncated: bool,
+    /// When a stop was requested.
+    stopping: Option<std::time::Instant>,
 }
 
 impl App {
-    pub(crate) fn workspace_tasks(&self) -> Vec<Task> {
-        tasks(&self.root)
+    pub fn tasks_running(&self) -> bool {
+        !self.tasks.is_empty()
+    }
+
+    /// The workspace's tasks; a broken `tasks.toml` is an error rather
+    /// than silently replaced by detected tasks.
+    pub(crate) fn workspace_tasks(&self) -> Result<Vec<Task>> {
+        let mut errors = Vec::new();
+        let found = tasks(&self.root, &mut errors);
+        match errors.into_iter().next() {
+            Some(error) => bail!("{error}"),
+            None => Ok(found),
+        }
     }
 
     /// Run a task by name (empty: the default build task).
     pub(crate) fn run_task(&mut self, name: &str) -> Result<()> {
-        let all = self.workspace_tasks();
+        let all = self.workspace_tasks()?;
         let chosen = if name.is_empty() {
             all.iter()
                 .find(|t| t.group == "build")
@@ -319,15 +338,13 @@ impl App {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
+        crate::process::isolate(&mut command);
         let mut child = command.spawn()?;
         let id = self.id();
         let output = self.services.reply_sender();
-        for pipe in [
+        // Each stream is delivered in whole lines, so stdout and stderr
+        // interleave only between lines and UTF-8 is never split.
+        let readers: Vec<std::thread::JoinHandle<()>> = [
             child
                 .stdout
                 .take()
@@ -339,31 +356,43 @@ impl App {
         ]
         .into_iter()
         .flatten()
-        {
+        .map(|mut pipe| {
             let output = output.clone();
-            let mut pipe = pipe;
             std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
+                let mut pending: Vec<u8> = Vec::new();
+                let send = |bytes: &[u8]| {
+                    let text = String::from_utf8_lossy(bytes).into_owned();
+                    output
+                        .send(Reply::Ide(Event::TaskOutput { task: id, text }))
+                        .is_ok()
+                };
                 while let Ok(n) = pipe.read(&mut buf) {
                     if n == 0 {
                         break;
                     }
-                    let text = String::from_utf8_lossy(&buf[..n]).into_owned();
-                    if output
-                        .send(Reply::Ide(Event::TaskOutput { task: id, text }))
-                        .is_err()
-                    {
-                        break;
+                    pending.extend_from_slice(&buf[..n]);
+                    if let Some(end) = pending.iter().rposition(|b| *b == b'\n') {
+                        let lines: Vec<u8> = pending.drain(..=end).collect();
+                        if !send(&lines) {
+                            return;
+                        }
                     }
                 }
-            });
-        }
+                if !pending.is_empty() {
+                    send(&pending);
+                }
+            })
+        })
+        .collect();
         let pid = child.id();
         let exit = output.clone();
         std::thread::spawn(move || {
             let status = child.wait();
-            // Let the output readers deliver what remains.
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            // Everything the task printed arrives before its exit.
+            for reader in readers {
+                let _ = reader.join();
+            }
             let (code, error) = match status {
                 Ok(s) => (s.code(), String::new()),
                 Err(e) => (None, e.to_string()),
@@ -374,37 +403,41 @@ impl App {
                 error,
             }));
         });
-        // The output document opens next to the terminals.
-        let doc = self.id();
-        self.documents.insert(
-            doc,
-            crate::document::Document::inspection(
-                format!("Task: {} · running", task.name),
-                format!("$ {}\n", task.command),
-            ),
-        );
-        let view = self.id();
-        self.views.insert(
-            view,
-            crate::EditorView {
-                document: doc,
-                ..Default::default()
-            },
-        );
-        let preferred = self
-            .layout
-            .panes()
-            .into_iter()
-            .find(|p| {
-                self.layout.tabs(*p).is_some_and(|t| {
-                    t.iter()
-                        .any(|v| matches!(v, crate::layout::View::Terminal(_)))
-                })
+        // One output document per task, reused by later runs, shown next to
+        // the terminals without taking focus from the editor.
+        let label = format!("Task: {}", task.name);
+        let start = format!("$ {}\n", task.command);
+        let existing = self
+            .documents
+            .iter()
+            .find(|(_, d)| {
+                d.label
+                    .as_deref()
+                    .is_some_and(|l| l == label || l.starts_with(&format!("{label} · ")))
             })
-            .unwrap_or(self.focus);
-        if let Some(pane) = self.place_view(crate::layout::View::Editor(view), preferred) {
-            self.focus = pane;
+            .map(|(id, _)| *id);
+        let doc = match existing {
+            Some(doc) => {
+                let d = self.documents.get_mut(&doc).unwrap();
+                let len = d.len();
+                d.replace_inspection(0, len, &start);
+                doc
+            }
+            None => {
+                let doc = self.id();
+                self.documents.insert(
+                    doc,
+                    crate::document::Document::inspection(label.clone(), start),
+                );
+                doc
+            }
+        };
+        if let Some(d) = self.documents.get_mut(&doc) {
+            d.label = Some(format!("{label} · running"));
+            d.generation += 1;
         }
+        self.clamp_views(doc);
+        self.show_output(doc);
         self.status = format!("Running {}…", task.name);
         self.tasks.insert(
             id,
@@ -414,9 +447,56 @@ impl App {
                 doc,
                 output: String::new(),
                 cwd,
+                truncated: false,
+                stopping: None,
             },
         );
         Ok(())
+    }
+
+    /// Show an output document (task or debugger) beside the terminals, or
+    /// in a split below the editor, keeping focus and the editor visible.
+    pub(crate) fn show_output(&mut self, doc: u64) {
+        let shown = self.layout.views().iter().any(|v| {
+            matches!(v, crate::layout::View::Editor(id) if self.views.get(id).is_some_and(|v| v.document == doc))
+        });
+        if shown {
+            return;
+        }
+        let view = self.id();
+        self.views.insert(
+            view,
+            crate::EditorView {
+                document: doc,
+                ..Default::default()
+            },
+        );
+        let terminals = self.layout.panes().into_iter().find(|p| {
+            self.layout.tabs(*p).is_some_and(|t| {
+                t.iter()
+                    .any(|v| matches!(v, crate::layout::View::Terminal(_)))
+            })
+        });
+        let focus = self.focus;
+        let placed = match terminals {
+            Some(pane) => self.place_view(crate::layout::View::Editor(view), pane),
+            None if self.can_split() && !self.editor_only => {
+                let (pane, split) = (self.id(), self.id());
+                self.layout.split(
+                    focus,
+                    crate::layout::Axis::Vertical,
+                    pane,
+                    split,
+                    crate::layout::View::Editor(view),
+                );
+                Some(pane)
+            }
+            None => self.place_view_background(crate::layout::View::Editor(view), focus),
+        };
+        if placed.is_none() {
+            self.views.remove(&view);
+        }
+        self.focus = focus;
     }
 
     pub(crate) fn task_event(&mut self, event: Event) {
@@ -425,18 +505,33 @@ impl App {
                 let Some(running) = self.tasks.get_mut(&task) else {
                     return;
                 };
-                let text = plain(&text);
-                if running.output.len() + text.len() > OUTPUT_LIMIT {
+                if running.truncated {
                     return;
                 }
-                running.output.push_str(&text);
-                let doc = running.doc;
-                if let Some(d) = self.documents.get_mut(&doc) {
-                    d.append_inspection(&text);
+                let mut text = plain(&text);
+                if running.output.len() + text.len() > OUTPUT_LIMIT {
+                    running.truncated = true;
+                    text = format!(
+                        "\n[Output beyond {} MiB is not shown]\n",
+                        OUTPUT_LIMIT / (1024 * 1024)
+                    );
+                } else {
+                    running.output.push_str(&text);
                 }
-                // Follow the output in views that are at its end.
-                let len = self.documents.get(&doc).map_or(0, |d| d.len());
-                for v in self.views.values_mut().filter(|v| v.document == doc) {
+                let doc = running.doc;
+                let Some(d) = self.documents.get_mut(&doc) else {
+                    return;
+                };
+                let old_len = d.len();
+                d.append_inspection(&text);
+                let len = d.len();
+                // Follow the output only in views already at its end, so
+                // reading or selecting earlier output is not disturbed.
+                for v in self
+                    .views
+                    .values_mut()
+                    .filter(|v| v.document == doc && v.cursor == old_len && v.anchor.is_none())
+                {
                     v.cursor = len;
                     v.manual_scroll = false;
                 }
@@ -469,7 +564,11 @@ impl App {
                     "{} {outcome}{}",
                     running.task.name,
                     if errors + warnings > 0 {
-                        format!(" · {errors} errors, {warnings} warnings (problems)")
+                        format!(
+                            " · {}, {} (problems)",
+                            crate::counted(errors, "error", "errors"),
+                            crate::counted(warnings, "warning", "warnings")
+                        )
                     } else {
                         String::new()
                     }
@@ -479,24 +578,54 @@ impl App {
         }
     }
 
-    /// Stop running tasks.
+    /// Stop running tasks: ask them to end, then force them (see
+    /// `expire_tasks`).
     pub(crate) fn stop_tasks(&mut self) -> Result<()> {
         if self.tasks.is_empty() {
             bail!("No task is running");
         }
-        for running in self.tasks.values() {
+        for running in self.tasks.values_mut() {
             #[cfg(unix)]
-            unsafe {
-                libc::kill(-(running.pid as i32), libc::SIGTERM);
-            }
+            crate::process::kill_group(running.pid, libc::SIGTERM);
+            running.stopping.get_or_insert_with(std::time::Instant::now);
         }
         self.status = "Stopping tasks…".into();
         Ok(())
     }
 
+    /// Force tasks that ignored a stop request.
+    pub(crate) fn expire_tasks(&mut self) {
+        for running in self.tasks.values() {
+            if running
+                .stopping
+                .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(3))
+            {
+                #[cfg(unix)]
+                crate::process::kill_group(running.pid, libc::SIGKILL);
+            }
+        }
+    }
+
+    /// Stop every task now (when Slate exits).
+    pub(crate) fn kill_tasks(&mut self) {
+        if self.tasks.is_empty() {
+            return;
+        }
+        for running in self.tasks.values() {
+            #[cfg(unix)]
+            crate::process::kill_group(running.pid, libc::SIGTERM);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        for running in self.tasks.values() {
+            #[cfg(unix)]
+            crate::process::kill_group(running.pid, libc::SIGKILL);
+        }
+        self.tasks.clear();
+    }
+
     /// The task picker.
     pub(crate) fn task_picker(&mut self) -> Result<()> {
-        let tasks = self.workspace_tasks();
+        let tasks = self.workspace_tasks()?;
         if tasks.is_empty() {
             bail!(
                 "No tasks. Add .slate/tasks.toml or open a Cargo, Make, CMake, Go or npm project"
@@ -576,7 +705,10 @@ mod tests {
             r#"{"scripts": {"build": "tsc", "lint": "eslint ."}}"#,
         )
         .unwrap();
-        let names: Vec<String> = tasks(dir.path()).into_iter().map(|t| t.name).collect();
+        let names: Vec<String> = tasks(dir.path(), &mut Vec::new())
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
         assert!(
             names.contains(&"cargo build".into()) && names.contains(&"npm run lint".into()),
             "{names:?}"
@@ -587,7 +719,7 @@ mod tests {
             "[[task]]\nname = \"all\"\ncommand = \"make all\"\ngroup = \"build\"\nmatcher = \"gcc\"\n",
         )
         .unwrap();
-        let configured = tasks(dir.path());
+        let configured = tasks(dir.path(), &mut Vec::new());
         assert_eq!(configured.len(), 1);
         assert_eq!(configured[0].matcher, "gcc");
     }

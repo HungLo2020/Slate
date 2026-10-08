@@ -11,6 +11,58 @@ pub struct CommandInfo {
     pub enabled: bool,
     pub reason: String,
 }
+/// A key chord as people write it: `F12`, `Ctrl+Space`, `Ctrl+Shift+[`.
+pub fn display_chord(chord: &str) -> String {
+    let (modifiers, key) = match chord.rfind('+') {
+        // `Ctrl++` binds the plus key.
+        Some(i) if i + 1 == chord.len() && i > 0 => (&chord[..i - 1], "+"),
+        Some(i) => (&chord[..i], &chord[i + 1..]),
+        None => ("", chord),
+    };
+    let mut parts: Vec<String> = modifiers
+        .split('+')
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .collect();
+    let shifted = match key {
+        "{" => Some("["),
+        "}" => Some("]"),
+        "|" => Some("\\"),
+        "_" => Some("-"),
+        ":" => Some(";"),
+        "\"" => Some("'"),
+        "<" => Some(","),
+        ">" => Some("."),
+        "?" => Some("/"),
+        _ => None,
+    };
+    let name = match (key, shifted) {
+        (_, Some(base)) => {
+            if !parts.iter().any(|p| p == "Shift") {
+                parts.push("Shift".into());
+            }
+            base.to_string()
+        }
+        (" ", _) => "Space".into(),
+        (k, _)
+            if k.len() > 1 && k.starts_with('f') && k[1..].chars().all(|c| c.is_ascii_digit()) =>
+        {
+            k.to_uppercase()
+        }
+        (k, _) if k.chars().count() == 1 => k.to_uppercase(),
+        (k, _) => {
+            let mut c = k.chars();
+            c.next()
+                .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+                .unwrap_or_default()
+                .replace("Pageup", "PageUp")
+                .replace("Pagedown", "PageDown")
+        }
+    };
+    parts.push(name);
+    parts.join("+")
+}
+
 // IDs also retain the existing command-line spelling for scripting compatibility.
 const ACTIONS: &[(&str, &str, &str, &str, &str)] = &[
     (
@@ -352,6 +404,13 @@ const ACTIONS: &[(&str, &str, &str, &str, &str)] = &[
         "any",
     ),
     (
+        "previous-tab",
+        "Previous tab",
+        "Activate the previous view in this pane",
+        "",
+        "any",
+    ),
+    (
         "toggle-workspace",
         "Expand / collapse workspace",
         "Switch between the editor and the full workspace without closing views",
@@ -667,6 +726,13 @@ const ACTIONS: &[(&str, &str, &str, &str, &str)] = &[
         "any",
     ),
     (
+        "undo-replace-in-files",
+        "Undo replace in files",
+        "Restore the files the last replace in files rewrote on disk",
+        "",
+        "any",
+    ),
+    (
         "open-documents",
         "Open documents…",
         "Switch to another open document",
@@ -779,7 +845,7 @@ const ACTIONS: &[(&str, &str, &str, &str, &str)] = &[
         "",
         "any",
     ),
-    ("stop-task", "Stop tasks", "Stop running tasks", "", "any"),
+    ("stop-task", "Stop tasks", "Stop running tasks", "", "tasks"),
     (
         "debug-start",
         "Start debugging",
@@ -792,49 +858,49 @@ const ACTIONS: &[(&str, &str, &str, &str, &str)] = &[
         "Continue",
         "Resume the paused program",
         "",
-        "any",
+        "paused",
     ),
     (
         "debug-step-over",
         "Step over",
         "Run to the next line",
         "",
-        "any",
+        "paused",
     ),
     (
         "debug-step-into",
         "Step into",
         "Step into the call on this line",
         "",
-        "any",
+        "paused",
     ),
     (
         "debug-step-out",
         "Step out",
         "Run until the current function returns",
         "",
-        "any",
+        "paused",
     ),
     (
         "debug-pause",
         "Pause",
         "Pause the running program",
         "",
-        "any",
+        "running",
     ),
     (
         "debug-stop",
         "Stop debugging",
         "End the debug session and the program",
         "",
-        "any",
+        "debugging",
     ),
     (
         "debug-evaluate",
         "Evaluate…",
         "Evaluate an expression in the paused frame",
         "",
-        "any",
+        "paused",
     ),
     (
         "toggle-breakpoint",
@@ -842,6 +908,41 @@ const ACTIONS: &[(&str, &str, &str, &str, &str)] = &[
         "Set or remove a breakpoint on the current line",
         "",
         "editor",
+    ),
+    (
+        "request-trust",
+        "Trust this folder…",
+        "Ask to trust the folder Git and project tools need",
+        "",
+        "any",
+    ),
+    (
+        "clear-breakpoints",
+        "Remove all breakpoints",
+        "Clear every breakpoint in every file",
+        "",
+        "any",
+    ),
+    (
+        "breakpoints",
+        "Breakpoints…",
+        "List breakpoints and jump to one",
+        "",
+        "any",
+    ),
+    (
+        "debug-call-stack",
+        "Call stack…",
+        "Choose the frame whose locals are shown and where expressions evaluate",
+        "",
+        "paused",
+    ),
+    (
+        "language-servers",
+        "Language servers",
+        "Show running language servers, missing ones and their messages",
+        "",
+        "any",
     ),
     (
         "trust-workspace",
@@ -951,6 +1052,10 @@ impl App {
                 "graphical" => !self.terminal_frontend,
                 "graphical-editor" => !self.terminal_frontend && editor.is_some(),
                 "trusted" => self.trusted(),
+                "debugging" => self.debugging(),
+                "paused" => self.debug_paused(),
+                "running" => self.debugging() && !self.debug_paused(),
+                "tasks" => self.tasks_running(),
                 "untrusted" => !self.trusted(),
                 _ => true,
             };
@@ -991,7 +1096,13 @@ impl App {
                             .get(*key)
                             .is_none_or(|binding| binding.as_str() == id)
                 })
-                .map(|(key, _)| key.clone())
+                .or_else(|| {
+                    self.preferences
+                        .debug_keys
+                        .iter()
+                        .find(|(_, value)| value.as_str() == id)
+                })
+                .map(|(key, _)| display_chord(key))
                 .unwrap_or_default();
             let reason = if enabled {
                 ""
@@ -1019,6 +1130,10 @@ impl App {
                     "graphical" => "Only available in the graphical interface",
                     "graphical-editor" => "Focus a document in the graphical interface",
                     "trusted" => "The workspace is already restricted",
+                    "debugging" => "Start debugging first",
+                    "paused" => "Pause the program first (or start debugging)",
+                    "running" => "The program is not running",
+                    "tasks" => "No task is running",
                     "untrusted" => "The workspace is already trusted",
                     _ => "Focus an editor or terminal",
                 }
@@ -1141,5 +1256,23 @@ impl Command {
             _ => return None,
         };
         Some(id.into())
+    }
+}
+
+#[cfg(test)]
+mod chord_tests {
+    use super::display_chord;
+
+    #[test]
+    fn chords_display_as_people_write_them() {
+        assert_eq!(display_chord("f12"), "F12");
+        assert_eq!(display_chord("Shift+f12"), "Shift+F12");
+        assert_eq!(display_chord("Ctrl+ "), "Ctrl+Space");
+        assert_eq!(display_chord("Ctrl+p"), "Ctrl+P");
+        assert_eq!(display_chord("Ctrl+{"), "Ctrl+Shift+[");
+        assert_eq!(display_chord("Ctrl+Alt+up"), "Ctrl+Alt+Up");
+        assert_eq!(display_chord("Ctrl+pagedown"), "Ctrl+PageDown");
+        assert_eq!(display_chord("Ctrl++"), "Ctrl++");
+        assert_eq!(display_chord("Alt+Shift+n"), "Alt+Shift+N");
     }
 }

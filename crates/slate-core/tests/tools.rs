@@ -52,7 +52,7 @@ output = "insert"
     fs::create_dir_all(root.join(".slate")).unwrap();
     fs::write(
         root.join(".slate/tools.toml"),
-        "[[tool]]\nname = \"Shout\"\ncommand = \"sed s/$/!/\"\ninput = \"document\"\n",
+        "[[tool]]\nname = \"Shout\"\ncommand = \"sed s/$/!/\"\ninput = \"document\"\nkey = \"Ctrl+s\"\n",
     )
     .unwrap();
     let file = root.join("notes.txt");
@@ -100,6 +100,15 @@ output = "insert"
     settle(&mut app, "where", |a| a.status == "Where done");
     assert_eq!(text(&app), "one\nnotes.txt:2two\nthree\n");
 
+    // A project cannot bind keys: Ctrl+S still saves.
+    assert_eq!(
+        app.key_binding(&Key {
+            key: "s".into(),
+            ctrl: true,
+            ..Default::default()
+        }),
+        Some("save")
+    );
     // A project tool asks for trust first.
     app.command_line("tool:shout");
     assert_eq!(app.prompt.as_ref().unwrap().kind, "trust");

@@ -65,7 +65,7 @@ static bool openMenu(QQuickWindow *window, QTimer *driver, const QString &name) 
     // QtTest injects input faster than desktop menu animations. Block the
     // workflow timer while waiting so its next step cannot run recursively.
     QSignalBlocker block(driver);
-    const QStringList names{"fileMenu", "editMenu", "viewMenu", "goMenu", "terminalMenu"};
+    const QStringList names{"fileMenu", "editMenu", "viewMenu", "goMenu", "runMenu"};
     for (const auto &name : names)
         if (auto menu = window->findChild<QObject *>(name))
             if (menu->property("visible").toBool()) QMetaObject::invokeMethod(menu, "close");
@@ -414,8 +414,10 @@ static void startGitSmoke(Bridge *state, QQuickWindow *window) {
     auto timer = new QTimer(state);
     auto step = new int(0), ticks = new int(0);
     auto rowPath = new QString;
-    // Restricted mode asks once before the first staging; 1 = dialog seen, 2 = trusted.
+    // An untrusted repository asks once before Git runs; 1 = dialog seen, 2 = trusted.
     auto trust = new int(0);
+    auto shownGit = new bool(false);
+    auto settling = new int(0);
     const auto baseFont = window->property("font").value<QFont>();
     auto finish = [=](bool pass, const QString &detail) {
         QFile report(dir + "/report.json");
@@ -463,8 +465,12 @@ static void startGitSmoke(Bridge *state, QQuickWindow *window) {
             QTest::keyClick(window, c.toLatin1());
     };
     auto check = [=](const QString &name) {
-        window->grabWindow().save(dir + "/" + name + ".png");
         const auto error = checkGitLayout(state, window);
+        // Resizes and font changes can take a few frames to lay out.
+        if (!error.isEmpty() && ++*settling < 8)
+            return false;
+        *settling = 0;
+        window->grabWindow().save(dir + "/" + name + ".png");
         if (!error.isEmpty()) {
             finish(false, name + ": " + error);
             return false;
@@ -473,9 +479,14 @@ static void startGitSmoke(Bridge *state, QQuickWindow *window) {
     };
     QObject::connect(timer, &QTimer::timeout, state, [=]() {
         if (++*ticks > 150) {
-            finish(false, QString("Populated Git timeout at step %1: %2")
+            const auto frame = state->frame();
+            finish(false, QString("Populated Git timeout at step %1: %2 (repository=%3 restricted=%4 entries=%5 error=%6)")
                               .arg(*step)
-                              .arg(state->frame().value("status").toString()));
+                              .arg(frame.value("status").toString())
+                              .arg(frame.value("git_repository").toBool())
+                              .arg(frame.value("git_restricted").toBool())
+                              .arg(frame.value("git").toList().size())
+                              .arg(frame.value("git_error").toString()));
             return;
         }
         const auto frame = state->frame();
@@ -510,11 +521,35 @@ static void startGitSmoke(Bridge *state, QQuickWindow *window) {
         auto view = findItem(window->contentItem(), "gitView_1");
         switch (*step) {
         case 0:
-            if (!frame.value("git_repository").toBool() || entries.size() < 35)
+            if (!frame.value("git_repository").toBool())
                 return;
-            state->send({{"action", "focus"}, {"pane", 1}});
-            state->command("git");
-            state->refresh();
+            // An untrusted repository shows no changes until it is trusted.
+            if (frame.value("git_restricted").toBool()) {
+                if (!entries.isEmpty()) {
+                    finish(false, "Git ran in an untrusted repository");
+                    return;
+                }
+                if (*trust != 0)
+                    return;
+                auto button = findItem(window->contentItem(), "gitTrust_1");
+                if (button && button->isVisible()) {
+                    window->grabWindow().save(dir + "/git-restricted.png");
+                    click("gitTrust_1");
+                } else if (!*shownGit) {
+                    *shownGit = true;
+                    state->send({{"action", "focus"}, {"pane", 1}});
+                    state->command("git");
+                    state->refresh();
+                }
+                return;
+            }
+            if (entries.size() < 35)
+                return;
+            if (!*shownGit) {
+                state->send({{"action", "focus"}, {"pane", 1}});
+                state->command("git");
+                state->refresh();
+            }
             break;
         case 1:
             if (!check("git-normal"))
@@ -705,7 +740,7 @@ static void startGitSmoke(Bridge *state, QQuickWindow *window) {
             if (!check("git-clean"))
                 return;
             if (*trust != 2) {
-                finish(false, "Staging in an untrusted folder did not ask for trust");
+                finish(false, "An untrusted repository did not ask for trust");
                 return;
             }
             finish(true, "Populated Git: trust prompt, normal/narrow/short/large fonts, separate scrollbar "
@@ -1486,7 +1521,7 @@ static void startTabCloseSmoke(Bridge *state, QQuickWindow *window) {
             state->refresh(); window->resize(1360, 820); break;
         case 11:
         case 12:
-            if (!clickMenuAction(window, timer, "Terminal", "terminal")) {
+            if (!clickMenuAction(window, timer, "Run", "terminal")) {
                 finish(false, "Terminal > New Terminal menu action unavailable"); return;
             }
             break;
@@ -1988,7 +2023,7 @@ static void startIdeSmoke(Bridge *state, QQuickWindow *window) {
             key(Qt::Key_Right);
             key(Qt::Key_Right);
             key(Qt::Key_Right);
-            key(Qt::Key_K, Qt::ControlModifier);
+            key(Qt::Key_H, Qt::AltModifier);
             break;
         case 6: {
             auto hover = shown("hover_" + pane);
@@ -2047,7 +2082,31 @@ static void startIdeSmoke(Bridge *state, QQuickWindow *window) {
         case 12:
             if (!text().contains("Xdef greet") || !text().contains("Xgreet ERROR")) return;
             window->grabWindow().save(dir + "/ide-carets.png");
-            finish(true, "Quick open picker, hover, completion, problems list and status count, several carets");
+            key(Qt::Key_Escape);
+            // Resting the mouse on a word shows its hover text.
+            QTest::mouseMove(window, grid()->mapToScene(QPointF(
+                1 + 8 * state->cellWidth(), 1 + state->cellHeight() / 2.0)).toPoint());
+            break;
+        case 13: {
+            auto hover = shown("hover_" + pane);
+            if (!hover || !shown("hoverText_" + pane)->property("text").toString().contains("hover for")) return;
+            // Leaving the text hides it again.
+            QTest::mouseMove(window, QPoint(window->width() / 2, window->height() - 4));
+            break;
+        }
+        case 14:
+            if (shown("hover_" + pane)) return;
+            if (!frame.value("title").toString().contains("main.fk")) {
+                finish(false, "Expected main.fk before switching tabs");
+                return;
+            }
+            // Ctrl+Tab reaches the editor instead of moving keyboard focus.
+            grid()->forceActiveFocus();
+            key(Qt::Key_Tab, Qt::ControlModifier);
+            break;
+        case 15:
+            if (frame.value("title").toString().contains("main.fk")) return;
+            finish(true, "Quick open picker, hover, completion, problems list and status count, several carets, mouse hover, Ctrl+Tab");
             return;
         }
         ++*step;

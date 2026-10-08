@@ -141,13 +141,18 @@ impl App {
         } else {
             (&mut self.back, &mut self.forward)
         };
+        // Positions in documents closed since are skipped.
+        let documents = &self.documents;
+        while from
+            .last()
+            .is_some_and(|(doc, _)| !documents.contains_key(doc))
+        {
+            from.pop();
+        }
         let Some((doc, offset)) = from.pop() else {
             anyhow::bail!("No {} position", if forward { "next" } else { "previous" });
         };
         to.extend(current);
-        if !self.documents.contains_key(&doc) {
-            anyhow::bail!("That document was closed");
-        }
         let view = self.reveal_document(doc);
         let offset = self.documents[&doc].floor_boundary(offset.min(self.documents[&doc].len()));
         self.place_caret(view, offset);

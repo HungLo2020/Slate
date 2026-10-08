@@ -594,6 +594,19 @@ CellView::CellView(QQuickItem *parent) : QQuickPaintedItem(parent) {
         m_cursorShown = !m_cursorShown;
         update();
     });
+    m_hoverTimer.setSingleShot(true);
+    m_hoverTimer.setInterval(600);
+    connect(&m_hoverTimer, &QTimer::timeout, this, [this]() {
+        if (!bridge || !isEditor())
+            return;
+        const int row = rowAt(m_hoverAt.y());
+        m_hoverRequested = true;
+        bridge->send({{"action", "hover_at"},
+                      {"pane", m_pane.value("id")},
+                      {"row", row},
+                      {"col", columnAt(row, m_hoverAt.x())}});
+        bridge->scheduleRefresh();
+    });
 }
 CellView::~CellView() { if (bridge) bridge->detachView(m_paneId, this); }
 void CellView::setPaneId(int id) {
@@ -951,15 +964,7 @@ void CellView::click(QMouseEvent *e, const QString &kind) {
     if (!m_preedit.isEmpty())
         QGuiApplication::inputMethod()->commit();
     const int row = rowAt(e->position().y());
-    int column = qMax(0, int(e->position().x() - 1) / bridge->cellWidth());
-    if (isEditor()) {
-        layoutText();
-        if (row < int(m_lines.size()) && m_lines[row] && m_lines[row]->lineCount() > 0) {
-            const int position =
-                m_lines[row]->lineAt(0).xToCursor(qMax(0.0, e->position().x() - 1));
-            column = m_columns[row].value(position, column);
-        }
-    }
+    const int column = columnAt(row, e->position().x());
     const auto button =
         e->button() == Qt::MiddleButton || e->buttons().testFlag(Qt::MiddleButton) ? 1
         : e->button() == Qt::RightButton || e->buttons().testFlag(Qt::RightButton) ? 2
@@ -1023,7 +1028,38 @@ void CellView::mouseReleaseEvent(QMouseEvent *e) {
     click(e, "release");
     e->accept();
 }
+int CellView::columnAt(int row, qreal x) const {
+    int column = qMax(0, int(x - 1) / bridge->cellWidth());
+    if (isEditor()) {
+        layoutText();
+        if (row < int(m_lines.size()) && m_lines[row] && m_lines[row]->lineCount() > 0) {
+            const int position = m_lines[row]->lineAt(0).xToCursor(qMax(0.0, x - 1));
+            column = m_columns[row].value(position, column);
+        }
+    }
+    return column;
+}
+void CellView::hoverLeaveEvent(QHoverEvent *e) {
+    m_hoverTimer.stop();
+    if (m_hoverRequested && bridge) {
+        m_hoverRequested = false;
+        bridge->send({{"action", "hover_clear"}});
+        bridge->scheduleRefresh();
+    }
+    e->accept();
+}
 void CellView::hoverMoveEvent(QHoverEvent *e) {
+    if (bridge && isEditor()) {
+        // Resting the mouse on text asks for hover information. Qt repeats
+        // hover events when the scene repaints; only real movement restarts
+        // the wait.
+        if (e->position() != m_hoverAt || !m_hoverTimer.isActive() && !m_hoverRequested) {
+            m_hoverAt = e->position();
+            m_hoverTimer.start();
+        }
+        e->accept();
+        return;
+    }
     if (!bridge || m_pane.value("kind") != "terminal" ||
         !m_pane.value("terminal_mouse_motion").toBool())
         return;

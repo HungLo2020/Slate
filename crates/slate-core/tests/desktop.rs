@@ -1,17 +1,11 @@
 //! Desktop-editor behaviour shared by both frontends: external file changes,
 //! recent files, word/line selection, horizontal scrolling, the minimap
 //! outline and requests that only a graphical frontend can fulfil.
+mod common;
 use slate_core::{App, Command};
 use std::{fs, path::Path, thread, time::Duration};
 
-static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-fn isolated() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
-    let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = tempfile::tempdir().unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", dir.path().join("config"));
-    std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
-    (dir, guard)
-}
+use common::isolated;
 fn wait(app: &mut App, what: &str, check: impl Fn(&App) -> bool) {
     for _ in 0..600 {
         app.process_events();
@@ -309,4 +303,36 @@ fn files_handed_over_by_another_invocation_open_at_their_line() {
     assert_eq!(text(&app), "a\nb\nc\n");
     assert_eq!(app.views[&editor(&app)].cursor, 4, "Line 3");
     assert_eq!(app.take_frontend_requests(), ["raise"]);
+}
+
+#[test]
+fn broken_configuration_files_are_reported_and_never_overwritten() {
+    let (dir, _serial) = isolated();
+    let config = dir.path().join("config/slate");
+    fs::create_dir_all(&config).unwrap();
+    let settings = "indent_width = \"four\"\n";
+    let layouts = "[presets.main\n";
+    fs::write(config.join("settings.toml"), settings).unwrap();
+    fs::write(config.join("layouts.toml"), layouts).unwrap();
+    let path = dir.path().join("a.txt");
+    fs::write(&path, "a\n").unwrap();
+    let mut app = App::new(&path).unwrap();
+    assert!(app.status.contains("rror"), "{}", app.status);
+    app.dispatch(Command::Configure {
+        name: "soft-wrap".into(),
+        value: "true".into(),
+    });
+    assert!(app.status.contains("settings.toml"), "{}", app.status);
+    app.dispatch(Command::SaveLayout {
+        name: "mine".into(),
+    });
+    assert!(app.status.contains("layouts.toml"), "{}", app.status);
+    assert_eq!(
+        fs::read_to_string(config.join("settings.toml")).unwrap(),
+        settings
+    );
+    assert_eq!(
+        fs::read_to_string(config.join("layouts.toml")).unwrap(),
+        layouts
+    );
 }

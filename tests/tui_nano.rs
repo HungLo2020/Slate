@@ -331,7 +331,9 @@ fn colour_depth_follows_the_terminal() {
         }
         let mut tui = Tui::spawn(command, 80, 20);
         tui.wait_for("fn main");
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        for r in &required {
+            tui.wait_raw(0, r);
+        }
         let raw = String::from_utf8_lossy(&tui.raw()).into_owned();
         for f in forbidden {
             assert!(!raw.contains(f), "{vars:?} produced {f}");
@@ -355,8 +357,7 @@ fn mouse_capture_toggles() {
     let mut tui = env.slate(&[path.to_str().unwrap()]);
     assert!(String::from_utf8_lossy(&tui.raw()).contains("\x1b[?1000h"));
     tui.send(b"\x1bm"); // M-M
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    assert!(String::from_utf8_lossy(&tui.raw()).contains("\x1b[?1000l"));
+    tui.wait_raw(0, "\x1b[?1000l");
     assert!(fs::read_to_string(env.path("config/slate/settings.toml"))
         .unwrap()
         .contains("tui_mouse = false"));
@@ -391,12 +392,11 @@ fn suspend_stops_the_process_and_resume_redraws() {
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    let before = tui.raw().len();
     unsafe { libc::kill(pid as i32, libc::SIGCONT) };
-    // Keys typed before Slate retakes the terminal go through cooked mode.
-    while state() == "T" {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    std::thread::sleep(std::time::Duration::from_millis(400));
+    // Keys typed before Slate retakes the terminal go through cooked mode,
+    // so wait for it to return to its screen.
+    tui.wait_raw(before, "\x1b[?1049h");
     tui.send("y");
     tui.send(b"\x0f");
     wait_file(&path, b"yx\n");
@@ -509,7 +509,6 @@ fn external_changes_reload_clean_files_and_ask_about_modified_ones() {
     let path = env.path("watched.txt");
     fs::write(&path, "first\n").unwrap();
     let mut tui = env.slate(&[path.to_str().unwrap()]);
-    std::thread::sleep(std::time::Duration::from_millis(50));
     fs::write(&path, "second\n").unwrap();
     tui.wait_for("reloaded");
     tui.wait_for("second");

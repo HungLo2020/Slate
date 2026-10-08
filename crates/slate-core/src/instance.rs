@@ -151,6 +151,10 @@ mod tests {
 
     #[test]
     fn a_second_invocation_hands_files_to_the_first() {
+        // Other tests change the environment too.
+        let _serial = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let runtime = tempfile::tempdir().unwrap();
         std::env::set_var("XDG_RUNTIME_DIR", runtime.path());
         let woke = Arc::new(std::sync::atomic::AtomicBool::new(false));

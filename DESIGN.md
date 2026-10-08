@@ -310,9 +310,37 @@ line; expressions are evaluated in the `watch` context, because GDB's `repl`
 context runs commands.
 
 Workspace trust gates every service that runs code from the folder: language
-servers, formatters, tasks, debugging, project tools and Git staging. A
-restricted Git still reads status with `core.fsmonitor=false` and hooks
-disabled.
+servers, formatters, tasks, debugging, project tools and Git. Git is gated as a
+whole, not just staging: `git status` alone can run a repository's clean
+filters and fsmonitor hook, so no Git process starts until the repository's
+folder is trusted (finding the repository walks up to `.git` without running
+Git). Trust is decided for the folder a service would run in. The most
+specific `trusted-folders` entry wins, so a `!` entry restricts a folder inside
+a trusted one; `App::trusted_path` caches the decision until trust changes. A
+language server for a file outside the trusted workspace, a formatter, or Git
+for a repository that contains the workspace each ask about their own folder
+and retry the action once trusted. Git status and bulk staging are scoped to
+the workspace's subtree of a parent repository.
+
+Child processes that Slate waits for (Git, formatters, tools) run in their own
+process group with a deadline (`process::run`); on timeout the whole group is
+killed, so a hung `git` or a formatter's grandchildren do not linger. Tasks,
+language servers and debug adapters are stopped the same way when they end or
+Slate quits.
+
+Edits computed elsewhere (formatters, rename, code actions, tools) are tagged
+with the document's content version when requested and refused if the document
+changed meanwhile. Workspace edits validate the whole plan, and refuse files
+outside the workspace, before changing anything; closed files open as unsaved
+background tabs so the change can be reviewed and undone. Edits applied to a
+document rebase every view's carets, snippet fields, folds, breakpoints and
+navigation history in one pass (`App::replace_in_document`).
+
+Configuration files are read through `config::read`, which distinguishes a
+missing file from one that does not parse; parse errors reach the status bar,
+and files that failed to parse (`settings.toml`, `layouts.toml`) are never
+overwritten. Small private files are written atomically with
+`fsio::write_private` (temporary file, fsync, rename, directory fsync).
 
 ## Layout integrity
 

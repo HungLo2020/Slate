@@ -4,9 +4,8 @@
 use crate::{services::Reply, App};
 use anyhow::{bail, Result};
 use std::{
-    io::{Read, Write},
     path::Path,
-    process::{Command, Stdio},
+    process::Command,
     time::{Duration, Instant},
 };
 
@@ -31,49 +30,17 @@ pub fn pipe_env(
     timeout: Duration,
 ) -> Result<String, String> {
     let (program, args) = command.split_first().ok_or("Empty command")?;
-    let mut child = Command::new(program)
-        .args(args)
-        .envs(env.iter().map(|(k, v)| (k, v)))
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("{program}: {e}"))?;
-    let mut stdin = child.stdin.take().ok_or("No standard input")?;
-    let input = input.to_string();
-    std::thread::spawn(move || {
-        let _ = stdin.write_all(input.as_bytes());
-    });
-    let mut stdout = child.stdout.take().ok_or("No standard output")?;
-    let mut stderr = child.stderr.take().ok_or("No standard error")?;
-    let out = std::thread::spawn(move || {
-        let mut s = Vec::new();
-        let _ = stdout.read_to_end(&mut s);
-        s
-    });
-    let err = std::thread::spawn(move || {
-        let mut s = Vec::new();
-        let _ = stderr.read_to_end(&mut s);
-        s
-    });
-    let started = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < timeout => std::thread::sleep(Duration::from_millis(5)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("{program} timed out"));
-            }
-            Err(e) => return Err(e.to_string()),
-        }
-    };
-    let stdout = out.join().unwrap_or_default();
-    let stderr = err.join().unwrap_or_default();
-    if !status.success() {
-        let message = String::from_utf8_lossy(&stderr);
+    let output = crate::process::run(
+        Command::new(program)
+            .args(args)
+            .envs(env.iter().map(|(k, v)| (k, v)))
+            .current_dir(cwd),
+        Some(input.as_bytes().to_vec()),
+        timeout,
+        program,
+    )?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
             "{program}: {}",
             message
@@ -82,7 +49,7 @@ pub fn pipe_env(
                 .unwrap_or("failed")
         ));
     }
-    String::from_utf8(stdout).map_err(|_| format!("{program} wrote invalid UTF-8"))
+    String::from_utf8(output.stdout).map_err(|_| format!("{program} wrote invalid UTF-8"))
 }
 
 /// The smallest single replacement turning `old` into `new`.
@@ -120,20 +87,33 @@ impl App {
     /// Start formatting a document. Returns false when no formatter applies
     /// (only possible with `then_save`, which then saves unformatted).
     pub(crate) fn format_document(&mut self, doc: u64, then_save: bool) -> Result<bool> {
-        if !self.trusted {
+        // Formatters read (and some execute) project configuration found
+        // from the file's folder upwards.
+        let folder = self.documents[&doc]
+            .path
+            .as_ref()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| self.root.clone());
+        if !self.trusted_path(&folder) {
             if then_save {
                 return Ok(false);
             }
-            bail!(
-                "Formatters run code from this folder. Trust the workspace first (trust-workspace)"
+            let root = self.document_root(doc).unwrap_or(folder);
+            self.ask_trust_for(
+                &root,
+                "Formatters read and can run the project's configuration",
+                crate::Command::Action {
+                    name: "format-document".into(),
+                    argument: String::new(),
+                },
             );
+            return Ok(false);
         }
         if self.documents[&doc].read_only {
             bail!("The document is read-only");
         }
-        if self.lsp_format(doc, then_save) {
-            self.formatting.insert(doc);
-            self.status = "Formatting…".into();
+        if self.lsp_format(doc) {
+            self.begin_format(doc, then_save);
             return Ok(true);
         }
         let formatter = self.language_for(doc).and_then(|l| l.formatter);
@@ -156,74 +136,93 @@ impl App {
         let text = d.text();
         let content = d.content_version();
         self.services.background(move || {
-            Reply::Formatted(
-                doc,
-                content,
-                then_save,
-                pipe(&command, &cwd, &text, TIMEOUT),
-            )
+            Reply::Formatted(doc, content, pipe(&command, &cwd, &text, TIMEOUT))
         });
-        self.formatting.insert(doc);
-        self.status = "Formatting…".into();
+        self.begin_format(doc, then_save);
         Ok(true)
     }
 
-    pub(crate) fn formatted(
-        &mut self,
-        doc: u64,
-        content: u64,
-        then_save: bool,
-        result: Result<String, String>,
-    ) {
-        let outcome = (|| -> Result<()> {
+    pub(crate) fn begin_format(&mut self, doc: u64, then_save: bool) {
+        self.formatting.insert(
+            doc,
+            Formatting {
+                started: Instant::now(),
+                then_save,
+            },
+        );
+        self.status = "Formatting…".into();
+    }
+
+    /// Finish a format request however it ended: release the document and,
+    /// for format-on-save, save it (formatted or not).
+    pub(crate) fn end_format(&mut self, doc: u64, outcome: Result<&str>) {
+        let Some(request) = self.formatting.remove(&doc) else {
+            return;
+        };
+        self.status = match outcome {
+            Ok(message) => message.to_string(),
+            Err(e) => format!("Format failed: {e:#}"),
+        };
+        if request.then_save && self.documents.contains_key(&doc) {
+            if let Err(e) = self.start_save(doc, None, false, false) {
+                self.status = format!("Error: {e:#}");
+            }
+        }
+    }
+
+    /// Give up on formatters that did not answer.
+    pub(crate) fn expire_formatting(&mut self) {
+        let expired: Vec<u64> = self
+            .formatting
+            .iter()
+            .filter(|(_, f)| f.started.elapsed() > REQUEST_TIMEOUT)
+            .map(|(doc, _)| *doc)
+            .collect();
+        for doc in expired {
+            self.lsp_cancel_formatting(doc);
+            self.end_format(doc, Err(anyhow::anyhow!("the formatter did not answer")));
+        }
+    }
+
+    pub(crate) fn formatted(&mut self, doc: u64, content: u64, result: Result<String, String>) {
+        if !self.formatting.contains_key(&doc) {
+            return;
+        }
+        let outcome = (|| -> Result<&str> {
             let text = result.map_err(anyhow::Error::msg)?;
             let d = self
                 .documents
                 .get(&doc)
-                .ok_or_else(|| anyhow::anyhow!("The document was closed"))?;
+                .ok_or_else(|| anyhow::anyhow!("the document was closed"))?;
             if d.content_version() != content {
-                bail!("The document changed while formatting; format again");
+                bail!("the document changed while formatting; format again");
             }
-            match minimal_edit(&d.text(), &text) {
-                Some((start, end, value)) => {
-                    let cursor = self
-                        .views
-                        .values()
-                        .find(|v| v.document == doc)
-                        .map_or(0, |v| v.cursor);
-                    self.documents
-                        .get_mut(&doc)
-                        .unwrap()
-                        .replace(start, end, &value, cursor)?;
-                    self.rebase_views(doc, start, end, value.len());
-                    self.clamp_views(doc);
-                    self.status = "Formatted".into();
+            let current = d.text();
+            // An empty answer for real content is a broken formatter, not a
+            // request to delete the document.
+            if text.trim().is_empty() && !current.trim().is_empty() {
+                bail!("the formatter printed nothing");
+            }
+            match minimal_edit(&current, &text) {
+                Some(edit) => {
+                    self.replace_in_document(doc, &[edit])?;
+                    Ok("Formatted")
                 }
-                None => self.status = "Already formatted".into(),
+                None => Ok("Already formatted"),
             }
-            Ok(())
         })();
-        if let Err(e) = outcome {
-            self.status = format!("Format failed: {e:#}");
-        }
-        if then_save {
-            if let Err(e) = self.finish_format_on_save(doc) {
-                self.status = format!("Error: {e:#}");
-            }
-        } else {
-            self.formatting.remove(&doc);
-        }
-    }
-
-    /// Save after format-on-save, whatever the formatter did.
-    pub(crate) fn finish_format_on_save(&mut self, doc: u64) -> Result<()> {
-        self.formatting.remove(&doc);
-        if self.documents.contains_key(&doc) {
-            self.start_save(doc, None, false, false)?;
-        }
-        Ok(())
+        self.end_format(doc, outcome);
     }
 }
+
+/// A format request in flight.
+pub(crate) struct Formatting {
+    started: Instant,
+    then_save: bool,
+}
+
+/// How long a formatter (or language server) may take to format.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
 
 #[cfg(test)]
 mod tests {

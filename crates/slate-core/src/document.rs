@@ -21,6 +21,9 @@ const HISTORY_BUDGET: usize = 64 * 1024 * 1024;
 /// Changes kept for language servers between drains; beyond this they
 /// receive the whole document instead.
 const CHANGE_LIMIT: usize = 4096;
+/// Inserted text recorded for language servers before falling back to a
+/// full update.
+const CHANGE_BYTES: usize = 8 * 1024 * 1024;
 
 static VERSIONS: AtomicU64 = AtomicU64::new(1);
 fn new_version() -> u64 {
@@ -135,6 +138,13 @@ pub struct Document {
     /// Line-level edits for the highlighter: (first line, old lines, new lines).
     #[serde(skip)]
     line_edits: Option<Vec<(usize, usize, usize)>>,
+    /// Text held in `changes`, bounded like its length.
+    #[serde(skip)]
+    change_bytes: usize,
+    /// Inspection documents (output, debugger) are never synchronized to a
+    /// language server, so their edits are not recorded.
+    #[serde(skip)]
+    quiet: bool,
 }
 
 impl Document {
@@ -176,6 +186,8 @@ impl Document {
         doc.saved = doc.text.clone();
         doc.label = Some(label);
         doc.read_only = true;
+        doc.quiet = true;
+        doc.changes = None;
         doc
     }
     pub fn set_text(&mut self, text: String) -> Result<()> {
@@ -238,6 +250,13 @@ impl Document {
         (start, end.max(start))
     }
     /// A line's text without its line break.
+    /// The leading spaces and tabs of a line.
+    pub fn indent_of(&self, row: usize) -> String {
+        self.line_text(row)
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect()
+    }
     pub fn line_text(&self, row: usize) -> Cow<'_, str> {
         let (start, end) = self.line_range(row);
         self.slice(start, end)
@@ -321,9 +340,15 @@ impl Document {
     }
 
     fn replace_text(&mut self, start: usize, end: usize, value: &str) {
+        if self.quiet {
+            self.changes = None;
+        }
         if let Some(changes) = &mut self.changes {
-            if changes.len() >= CHANGE_LIMIT {
+            self.change_bytes += value.len();
+            if changes.len() >= CHANGE_LIMIT || self.change_bytes > CHANGE_BYTES {
+                // Too much to replay: the next sync sends the whole text.
                 self.changes = None;
+                self.change_bytes = 0;
             } else {
                 let change = TextChange {
                     start,
@@ -373,6 +398,10 @@ impl Document {
     /// Edits since the last call, for incremental language-server sync.
     /// `None` means too much changed: send the whole document.
     pub fn take_changes(&mut self) -> Option<Vec<TextChange>> {
+        self.change_bytes = 0;
+        if self.quiet {
+            return None;
+        }
         self.changes.replace(Vec::new())
     }
     /// Line-level edits since the last call; `None` means "everything".
@@ -404,6 +433,8 @@ impl Document {
             undo: Default::default(),
             redo: vec![],
             changes: Some(Vec::new()),
+            change_bytes: 0,
+            quiet: false,
             line_edits: Some(Vec::new()),
         }
     }
@@ -588,19 +619,24 @@ impl Document {
             shift += text.len() as isize - (end - start) as isize;
         }
         let group = new_version();
-        let before = self.undo.len();
+        let mut applied = 0;
         // Apply from the end so earlier offsets stay valid.
         for &i in order.iter().rev() {
             let (start, end, text) = &edits[i];
+            let version = self.version;
             if let Err(e) = self.replace(*start, *end, text, cursor) {
-                // Roll back what was applied so the document stays consistent.
-                if self.undo.len() > before {
+                // Roll back what was applied (one undo: they share a group)
+                // so the document stays consistent.
+                if applied > 0 {
                     self.undo(cursor);
                 }
                 self.redo.clear();
                 return Err(e);
             }
-            if self.undo.len() > before {
+            // `replace` records a revision whenever the text changed; the
+            // version tells, even when history trimmed its oldest entries.
+            if self.version != version {
+                applied += 1;
                 if let Some(last) = self.undo.back_mut() {
                     last.group = group;
                 }
@@ -1112,4 +1148,40 @@ pub fn at_line_col_with_tabs(text: &str, row: usize, col: usize, tab: usize) -> 
         .unwrap_or(if row == 0 { 0 } else { text.len() });
     let end = line_end(text, start);
     start + column_offset(&text[start..end], col, tab)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grouped_edits_undo_together_even_with_full_history() {
+        let mut d = Document::from_text("abc".into()).unwrap();
+        // Fill the history past its 10,000-revision limit.
+        for i in 0..10_050 {
+            let len = d.len();
+            d.replace(len, len, if i % 2 == 0 { "x" } else { "y" }, 0)
+                .unwrap();
+        }
+        let text = d.text();
+        d.replace_many(
+            &[(0, 1, "A".into()), (1, 2, "B".into()), (2, 3, "C".into())],
+            0,
+        )
+        .unwrap();
+        assert!(d.text().starts_with("ABC"));
+        d.undo(0);
+        assert_eq!(d.text(), text, "one undo reverts every part");
+        d.redo(0);
+        assert!(d.text().starts_with("ABC"));
+        // A failing part rolls back the parts already applied.
+        let before = d.text();
+        assert!(d
+            .replace_many(
+                &[(0, 1, "1".into()), (d.len() + 5, d.len() + 6, "2".into())],
+                0
+            )
+            .is_err());
+        assert_eq!(d.text(), before);
+    }
 }

@@ -26,6 +26,9 @@ pub struct Workspace {
     pub focus: u64,
     pub browser: PathBuf,
     pub ids: u64,
+    /// Breakpoint lines (zero-based) by file.
+    #[serde(default)]
+    pub breakpoints: BTreeMap<PathBuf, Vec<usize>>,
 }
 impl Workspace {
     pub fn validate(&self, root: &Path) -> Result<()> {
@@ -182,6 +185,10 @@ impl Workspace {
             .max(value.get("ids").and_then(Value::as_u64).unwrap_or(0))
             .min(u64::MAX - 20_000);
         let mut w = Workspace {
+            breakpoints: value
+                .get("breakpoints")
+                .and_then(|b| serde_json::from_value(b.clone()).ok())
+                .unwrap_or_default(),
             version: 1,
             root: root.to_path_buf(),
             documents,
@@ -369,6 +376,12 @@ impl App {
     }
     pub fn attach_workspace(&mut self, store: WorkspaceStore, recover: bool) -> Result<()> {
         let requested = self.documents.values().find_map(|d| d.path.clone());
+        // A fresh start replaces the checkpoint; keep the old one (which may
+        // hold unsaved work from a crash) beside it.
+        if !recover && store.path.exists() {
+            let previous = store.path.with_file_name("session.previous.json");
+            let _ = fs::rename(&store.path, previous);
+        }
         if recover {
             if let Some((mut w, damaged)) = store.load_tolerant(&self.root)? {
                 // Content versions are not stored; dirty means text differs.
@@ -418,6 +431,7 @@ impl App {
                 self.layout = w.layout;
                 self.focus = w.focus;
                 self.ids = w.ids;
+                self.restore_breakpoints(w.breakpoints);
                 self.browser = if w.browser.is_dir() {
                     w.browser
                 } else {
@@ -454,15 +468,45 @@ impl App {
         Ok(())
     }
     pub(super) fn workspace(&self) -> Workspace {
+        // Output and inspection documents (task output, the debugger, Help,
+        // diffs) describe a moment that has passed; they are not restored.
+        let transient: std::collections::BTreeSet<u64> = self
+            .documents
+            .iter()
+            .filter(|(_, d)| d.label.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        let keep_all = transient.len() == self.documents.len();
+        let dropped = |doc: &u64| !keep_all && transient.contains(doc);
+        let views: BTreeMap<u64, EditorView> = self
+            .views
+            .iter()
+            .filter(|(_, v)| !dropped(&v.document))
+            .map(|(id, v)| (*id, v.clone()))
+            .collect();
+        let mut layout = self.layout.clone();
+        for pane in layout.panes() {
+            if let Some((tabs, active)) = layout.pane_mut(pane) {
+                let before = tabs.len();
+                tabs.retain(|t| !matches!(t, View::Editor(id) if !views.contains_key(id)));
+                if tabs.is_empty() {
+                    tabs.push(View::Files);
+                }
+                if tabs.len() != before {
+                    *active = (*active).min(tabs.len() - 1);
+                }
+            }
+        }
         Workspace {
             version: 1,
             root: self.root.clone(),
             documents: self
                 .documents
                 .iter()
+                .filter(|(id, _)| !dropped(id))
                 .map(|(id, d)| (*id, d.recovery_copy()))
                 .collect(),
-            views: self.views.clone(),
+            views,
             terminals: self
                 .terminals
                 .iter()
@@ -473,10 +517,11 @@ impl App {
                         .map(|(id, cwd)| (*id, cwd.clone())),
                 )
                 .collect(),
-            layout: self.layout.clone(),
+            layout,
             focus: self.focus,
             browser: self.browser.clone(),
             ids: self.ids,
+            breakpoints: self.saved_breakpoints(),
         }
     }
     /// A cheap fingerprint of everything a checkpoint records, so unchanged
@@ -500,6 +545,7 @@ impl App {
             (id, t.cwd()).hash(&mut hasher);
         }
         self.deferred_terminals.hash(&mut hasher);
+        self.saved_breakpoints().hash(&mut hasher);
         hasher.finish()
     }
     pub(super) fn checkpoint(&mut self) {
@@ -541,6 +587,8 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        // Tasks run in their own process groups, so nothing else stops them.
+        self.kill_tasks();
         if self.store.is_some() {
             if let Err(e) = self.flush_workspace() {
                 eprintln!("Could not persist Slate workspace: {e:#}");

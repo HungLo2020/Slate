@@ -345,7 +345,7 @@ fn insert_file_help_and_statistics() {
     action(&mut app, "help", "");
     let help = text(&app);
     assert!(
-        help.contains("Ctrl+s") && help.contains("Save document"),
+        help.contains("Ctrl+S") && help.contains("Save document"),
         "{help}"
     );
     assert!(app

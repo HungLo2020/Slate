@@ -12,13 +12,14 @@ use std::{
 
 /// Messages larger than this end the connection.
 const MESSAGE_LIMIT: usize = 64 * 1024 * 1024;
+/// Longest header line accepted.
+const HEADER_LIMIT: u64 = 8 * 1024;
 /// Standard error kept for error reports.
 const STDERR_TAIL: usize = 4096;
 
 pub struct Process {
     child: Child,
     input: mpsc::Sender<Vec<u8>>,
-    stderr: Arc<Mutex<Vec<u8>>>,
 }
 
 pub fn frame(message: &Value) -> Vec<u8> {
@@ -32,9 +33,14 @@ pub fn frame(message: &Value) -> Vec<u8> {
 pub fn read_message(reader: &mut impl BufRead) -> io::Result<Option<Value>> {
     let mut length = None;
     loop {
+        // Header lines are short; a peer that never sends a newline must
+        // not grow this without bound.
         let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
+        if reader.take(HEADER_LIMIT).read_line(&mut line)? == 0 {
             return Ok(None);
+        }
+        if !line.ends_with('\n') && line.len() as u64 >= HEADER_LIMIT {
+            return Err(io::Error::other("header line too long"));
         }
         let line = line.trim_end();
         if line.is_empty() {
@@ -119,7 +125,7 @@ impl Process {
                 t.drain(..excess);
             }
         });
-        let tail = stderr.clone();
+        let tail = stderr;
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             let reason = loop {
@@ -145,23 +151,16 @@ impl Process {
                 format!("{reason}: {last}")
             });
         });
-        Ok(Self {
-            child,
-            input,
-            stderr,
-        })
+        Ok(Self { child, input })
     }
 
     pub fn send(&self, message: &Value) -> bool {
         self.input.send(frame(message)).is_ok()
     }
 
-    pub fn pid(&self) -> u32 {
-        self.child.id()
-    }
-
-    pub fn stderr(&self) -> String {
-        String::from_utf8_lossy(&self.stderr.lock().unwrap()).into_owned()
+    /// Stop the process group: give it `grace` to exit, then force it.
+    pub fn stop(&mut self, grace: std::time::Duration) {
+        crate::process::stop_group(&mut self.child, grace);
     }
 
     /// Stop the process (and its process group) now.

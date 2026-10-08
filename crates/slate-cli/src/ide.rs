@@ -35,14 +35,63 @@ fn marked(label: &str, positions: &[u32], emphasis: Style) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The picker's box on a screen of `size`.
+fn picker_area(size: Rect) -> Rect {
+    let height = size.height.saturating_sub(4).min(20);
+    let width = size.width.saturating_sub(4).min(100);
+    Rect::new((size.width - width) / 2, 1, width, height)
+}
+
+/// The picker's list rows and the first item (counted over all items)
+/// drawn at the top, so clicks map to the items drawn.
+fn picker_rows(size: Rect, p: &slate_core::picker::PickerView) -> (Rect, usize) {
+    let area = picker_area(size);
+    let rows = Rect::new(
+        area.x + 1,
+        area.y + 2,
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(3),
+    );
+    let selected = p.selected.saturating_sub(p.first);
+    let height = rows.height.max(1) as usize;
+    let offset = (selected + 1).saturating_sub(height);
+    (rows, p.first + offset)
+}
+
+/// The picker command for a mouse event at a screen cell, if any.
+pub fn picker_mouse(
+    size: Rect,
+    p: &slate_core::picker::PickerView,
+    kind: crossterm::event::MouseEventKind,
+    x: u16,
+    y: u16,
+) -> Option<slate_core::Command> {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    use slate_core::Command;
+    match kind {
+        MouseEventKind::ScrollUp => Some(Command::PickerMove { delta: -3 }),
+        MouseEventKind::ScrollDown => Some(Command::PickerMove { delta: 3 }),
+        MouseEventKind::Down(MouseButton::Left) => {
+            let (rows, top) = picker_rows(size, p);
+            if !rows.contains(Position::new(x, y)) {
+                // A click outside the box closes it, as Escape does.
+                let outside = !picker_area(size).contains(Position::new(x, y));
+                return outside.then_some(Command::PickerClose);
+            }
+            let index = top + (y - rows.y) as usize;
+            (index < p.first + p.items.len())
+                .then_some(Command::PickerAccept { index: Some(index) })
+        }
+        _ => None,
+    }
+}
+
 pub fn render_picker(frame: &mut Frame, s: &Snapshot, colors: ColorMode) -> bool {
     let Some(p) = &s.picker else {
         return false;
     };
     let size = frame.area();
-    let height = size.height.saturating_sub(4).min(20);
-    let width = size.width.saturating_sub(4).min(100);
-    let area = Rect::new((size.width - width) / 2, 1, width, height);
+    let area = picker_area(size);
     frame.render_widget(Clear, area);
     let mut title = format!(" {} ", p.title);
     if p.kind == "search" {
@@ -58,7 +107,7 @@ pub fn render_picker(frame: &mut Frame, s: &Snapshot, colors: ColorMode) -> bool
             .borders(Borders::ALL)
             .title(title)
             .title_bottom(format!(
-                " {}{} · ↑↓ · Enter opens · Esc closes ",
+                " {}{} · ↑↓ · Enter or click opens · Esc closes ",
                 if p.busy { "… " } else { "" },
                 if p.message.is_empty() {
                     format!("{} item{}", p.total, if p.total == 1 { "" } else { "s" })
@@ -94,15 +143,14 @@ pub fn render_picker(frame: &mut Frame, s: &Snapshot, colors: ColorMode) -> bool
             ListItem::new(line)
         })
         .collect();
-    let mut state = ListState::default().with_selected((!p.items.is_empty()).then_some(p.selected));
+    // Items are a window of the list starting at `first`.
+    let (rows, top) = picker_rows(size, p);
+    let mut state = ListState::default()
+        .with_offset(top - p.first)
+        .with_selected((!p.items.is_empty()).then_some(p.selected.saturating_sub(p.first)));
     frame.render_stateful_widget(
         List::new(items).highlight_style(colors.highlight()),
-        Rect::new(
-            inner.x,
-            inner.y + 1,
-            inner.width,
-            inner.height.saturating_sub(1),
-        ),
+        rows,
         &mut state,
     );
     frame.set_cursor_position((
@@ -144,7 +192,14 @@ pub fn render_completion(frame: &mut Frame, s: &Snapshot, colors: ColorMode) {
     let widest = c
         .items
         .iter()
-        .map(|i| i.label.chars().count() + i.detail.chars().count().min(30) + 4)
+        .map(|i| {
+            let info = if i.detail.is_empty() {
+                &i.kind
+            } else {
+                &i.detail
+            };
+            i.label.chars().count() + info.chars().count().min(30) + 4
+        })
         .max()
         .unwrap_or(10)
         .clamp(22, 60) as u16;
@@ -157,9 +212,15 @@ pub fn render_completion(frame: &mut Frame, s: &Snapshot, colors: ColorMode) {
         .items
         .iter()
         .map(|i| {
+            // The type or signature when the server sends one, else the kind.
+            let info = if i.detail.is_empty() {
+                &i.kind
+            } else {
+                &i.detail
+            };
             ListItem::new(Line::from(vec![
                 Span::raw(clean(&i.label)),
-                Span::styled(format!("  {}", clean(&i.detail)), detail),
+                Span::styled(format!("  {}", clean(info)), detail),
             ]))
         })
         .collect();
@@ -177,9 +238,20 @@ pub fn render_completion(frame: &mut Frame, s: &Snapshot, colors: ColorMode) {
     );
 }
 
+/// Hover lines shown before the text is cut short.
+const HOVER_LINES: usize = 20;
+
 pub fn render_hover(frame: &mut Frame, s: &Snapshot) {
     let Some(h) = &s.hover else { return };
-    let text = clean(&h.text);
+    let mut text = clean(&h.text);
+    if text.lines().count() > HOVER_LINES {
+        text = text
+            .lines()
+            .take(HOVER_LINES)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n…";
+    }
     let width = text
         .lines()
         .map(|l| l.chars().count())
@@ -195,7 +267,7 @@ pub fn render_hover(frame: &mut Frame, s: &Snapshot) {
                 .max(1)
         })
         .sum::<u16>()
-        .min(12)
+        .min(HOVER_LINES as u16 + 1)
         + 2;
     let Some(area) = popup_area(s, h.pane, h.row, h.col, width, lines) else {
         return;
@@ -209,10 +281,26 @@ pub fn render_hover(frame: &mut Frame, s: &Snapshot) {
     );
 }
 
-/// Problems, restricted mode and the diagnostic under the caret, for the
-/// status line.
+/// Debugging, language-server activity, the branch, problems, restricted
+/// mode and the diagnostic under the caret, for the status line.
 pub fn status_suffix(s: &Snapshot) -> String {
     let mut parts = Vec::new();
+    if s.debugging {
+        parts.push(
+            if s.debug_paused {
+                "Debug: paused"
+            } else {
+                "Debug: running"
+            }
+            .into(),
+        );
+    }
+    if !s.activity.is_empty() {
+        parts.push(clean(&s.activity));
+    }
+    if !s.git_branch.is_empty() {
+        parts.push(format!("⎇ {}", clean(&s.git_branch)));
+    }
     let (errors, warnings) = s.problems;
     if errors + warnings > 0 {
         parts.push(format!("✖ {errors} ⚠ {warnings}"));
@@ -227,5 +315,65 @@ pub fn status_suffix(s: &Snapshot) -> String {
         String::new()
     } else {
         format!(" · {}", parts.join(" · "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{MouseButton, MouseEventKind};
+    use slate_core::{
+        picker::{PickerItem, PickerView},
+        Command,
+    };
+
+    fn picker(first: usize, selected: usize, shown: usize) -> PickerView {
+        PickerView {
+            kind: "files".into(),
+            title: "Files".into(),
+            query: String::new(),
+            items: (first..first + shown)
+                .map(|i| PickerItem {
+                    label: format!("file{i}"),
+                    detail: String::new(),
+                    kind: String::new(),
+                    positions: Vec::new(),
+                })
+                .collect(),
+            first,
+            selected,
+            total: 500,
+            busy: false,
+            message: String::new(),
+            case_sensitive: false,
+            whole_word: false,
+            regex: false,
+        }
+    }
+
+    #[test]
+    fn clicks_choose_the_item_drawn_under_the_mouse() {
+        let size = Rect::new(0, 0, 80, 30);
+        let click = MouseEventKind::Down(MouseButton::Left);
+        // The first list row is below the border and the query line.
+        let accept = |p: &PickerView, row| match picker_mouse(size, p, click, 10, 3 + row) {
+            Some(Command::PickerAccept { index }) => index,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(accept(&picker(0, 0, 40), 0), Some(0));
+        assert_eq!(accept(&picker(0, 0, 40), 4), Some(4));
+        // A window further down the list, scrolled to keep the selection in view.
+        let p = picker(200, 230, 40);
+        let (rows, top) = picker_rows(size, &p);
+        assert_eq!(top + rows.height as usize - 1, 230);
+        assert_eq!(accept(&p, rows.height - 1), Some(230));
+        assert!(matches!(
+            picker_mouse(size, &p, click, 0, 29),
+            Some(Command::PickerClose)
+        ));
+        assert!(matches!(
+            picker_mouse(size, &p, MouseEventKind::ScrollDown, 10, 5),
+            Some(Command::PickerMove { delta: 3 })
+        ));
     }
 }

@@ -500,13 +500,7 @@ pub fn run(mut app: App) -> Result<()> {
                                 {
                                     let id = action.id.clone();
                                     palette = None;
-                                    if id == "paste" {
-                                        refresh_clipboard(&mut app);
-                                    }
-                                    app.dispatch(Command::InvokeAction {
-                                        id,
-                                        argument: String::new(),
-                                    });
+                                    run_palette_action(&mut app, id);
                                 }
                             }
                             KeyCode::Up => palette_index = palette_index.saturating_sub(1),
@@ -554,7 +548,45 @@ pub fn run(mut app: App) -> Result<()> {
                     }
                 }
                 Event::Mouse(m) => {
-                    if app.prompt.is_some() || palette.is_some() || snapshot.picker.is_some() {
+                    if palette.is_some() && app.prompt.is_none() {
+                        let size = terminal.size()?;
+                        let rows = palette_rows(Rect::new(0, 0, size.width, size.height));
+                        let top = palette_top(rows, palette_index);
+                        match m.kind {
+                            MouseEventKind::ScrollUp => {
+                                palette_index = palette_index.saturating_sub(1)
+                            }
+                            MouseEventKind::ScrollDown => {
+                                palette_index =
+                                    (palette_index + 1).min(catalog.len().saturating_sub(1))
+                            }
+                            MouseEventKind::Down(event::MouseButton::Left)
+                                if rows.contains(Position::new(m.column, m.row)) =>
+                            {
+                                // Each command takes two rows.
+                                let index = top + (m.row - rows.y) as usize / 2;
+                                if let Some(action) = catalog.get(index).filter(|c| c.enabled) {
+                                    let id = action.id.clone();
+                                    palette = None;
+                                    run_palette_action(&mut app, id);
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    if let Some(picker) = snapshot.picker.as_ref().filter(|_| app.prompt.is_none())
+                    {
+                        let size = terminal.size()?;
+                        let size = Rect::new(0, 0, size.width, size.height);
+                        if let Some(command) =
+                            ide::picker_mouse(size, picker, m.kind, m.column, m.row)
+                        {
+                            app.dispatch(command);
+                        }
+                        continue;
+                    }
+                    if app.prompt.is_some() || palette.is_some() {
                         continue;
                     }
                     let x = m.column;
@@ -1063,18 +1095,12 @@ fn render(
         }
     }
     if let Some(text) = palette {
-        let height = size.height.saturating_sub(4).min(16);
-        let area = Rect::new(
-            1,
-            size.height.saturating_sub(height + 1),
-            size.width.saturating_sub(2),
-            height,
-        );
+        let area = palette_area(size);
         frame.render_widget(Clear, area);
         frame.render_widget(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Commands · ↑↓ select · Enter runs · Escape closes"),
+                .title("Commands · ↑↓ select · Enter or click runs · Escape closes"),
             area,
         );
         frame.render_widget(
@@ -1093,15 +1119,13 @@ fn render(
                 .style(colors.palette_item(c.enabled))
             })
             .collect::<Vec<_>>();
-        let mut state = ListState::default().with_selected(Some(palette_index));
+        let rows = palette_rows(size);
+        let mut state = ListState::default()
+            .with_offset(palette_top(rows, palette_index))
+            .with_selected(Some(palette_index));
         frame.render_stateful_widget(
             List::new(items).highlight_style(colors.highlight()),
-            Rect::new(
-                area.x + 1,
-                area.y + 2,
-                area.width.saturating_sub(2),
-                area.height.saturating_sub(3),
-            ),
+            rows,
             &mut state,
         );
         if catalog.is_empty() {
@@ -1122,6 +1146,39 @@ fn render(
             area.y + 1,
         ));
     }
+}
+/// The command palette's box on a screen of `size`.
+fn palette_area(size: Rect) -> Rect {
+    let height = size.height.saturating_sub(4).min(16);
+    Rect::new(
+        1,
+        size.height.saturating_sub(height + 1),
+        size.width.saturating_sub(2),
+        height,
+    )
+}
+/// The rows listing commands in the palette.
+fn palette_rows(size: Rect) -> Rect {
+    let area = palette_area(size);
+    Rect::new(
+        area.x + 1,
+        area.y + 2,
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(3),
+    )
+}
+/// The first command drawn, keeping `selected` in view (two rows each).
+fn palette_top(rows: Rect, selected: usize) -> usize {
+    (selected + 1).saturating_sub((rows.height as usize / 2).max(1))
+}
+fn run_palette_action(app: &mut App, id: String) {
+    if id == "paste" {
+        refresh_clipboard(app);
+    }
+    app.dispatch(Command::InvokeAction {
+        id,
+        argument: String::new(),
+    });
 }
 struct Grid<'a> {
     screen: &'a Screen,

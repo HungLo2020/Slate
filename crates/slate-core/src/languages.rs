@@ -207,13 +207,10 @@ fn builtin() -> Vec<Language> {
 }
 
 /// User languages first (they override built-in ones of the same name).
-pub fn all() -> Vec<Language> {
+/// A `languages.toml` that does not parse is added to `errors`.
+pub fn all(errors: &mut Vec<String>) -> Vec<Language> {
     let path = crate::paths::config_dir().join("languages.toml");
-    let mut list: Vec<Language> = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| toml::from_str::<File>(&s).ok())
-        .map(|f| f.language)
-        .unwrap_or_default();
+    let mut list = crate::config::list(&path, |f: File| f.language, errors);
     for language in builtin() {
         if !list.iter().any(|l| l.name == language.name) {
             list.push(language);
@@ -223,13 +220,12 @@ pub fn all() -> Vec<Language> {
 }
 
 /// The language of a file: by configured extension, else by syntax name.
-pub fn for_file(path: &Path, syntax: &str) -> Option<Language> {
+pub fn find<'a>(languages: &'a [Language], path: &Path, syntax: &str) -> Option<&'a Language> {
     let extension = path.extension().map(|e| e.to_string_lossy().into_owned());
-    let all = all();
-    all.iter()
+    languages
+        .iter()
         .find(|l| extension.as_ref().is_some_and(|e| l.extensions.contains(e)))
-        .or_else(|| all.iter().find(|l| l.name == syntax))
-        .cloned()
+        .or_else(|| languages.iter().find(|l| l.name == syntax))
 }
 
 impl Language {
@@ -248,8 +244,9 @@ impl Language {
             })
             .cloned()
     }
-    /// The project root for a file: the nearest folder with a root marker
-    /// inside the workspace, else the workspace.
+    /// The project root for a file: the workspace for files inside it;
+    /// otherwise the nearest folder with a root marker, else the file's
+    /// folder.
     pub fn root_for(&self, file: &Path, workspace: &Path) -> PathBuf {
         if file.starts_with(workspace) {
             return workspace.to_path_buf();
@@ -290,14 +287,19 @@ mod tests {
             "[[language]]\nname = \"Rust\"\nserver = [\"my-ra\"]\n\n[[language]]\nname = \"Fake\"\nextensions = [\"fk\"]\nserver = [[\"a\"], [\"b\", \"-x\"]]\n",
         )
         .unwrap();
-        let rust = for_file(Path::new("/x/a.rs"), "Rust").unwrap();
+        let mut errors = Vec::new();
+        let languages = all(&mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        let for_file =
+            |path: &str, syntax: &str| find(&languages, Path::new(path), syntax).cloned();
+        let rust = for_file("/x/a.rs", "Rust").unwrap();
         assert_eq!(rust.server, vec![vec!["my-ra".to_string()]]);
         assert_eq!(rust.id(), "rust");
-        let fake = for_file(Path::new("/x/a.fk"), "Plain Text").unwrap();
+        let fake = for_file("/x/a.fk", "Plain Text").unwrap();
         assert_eq!(fake.server.len(), 2);
         assert_eq!(fake.id(), "fake");
-        assert!(for_file(Path::new("/x/a.txt"), "Plain Text").is_none());
-        let go = for_file(Path::new("/x/a.go"), "Go").unwrap();
+        assert!(for_file("/x/a.txt", "Plain Text").is_none());
+        let go = for_file("/x/a.go", "Go").unwrap();
         assert_eq!(go.formatter, Some(vec!["gofmt".to_string()]));
         assert_eq!(
             expand(
@@ -306,5 +308,14 @@ mod tests {
             ),
             ["prettier", "--stdin-filepath", "/a b.ts"]
         );
+        // A file that does not parse is reported; built-in languages remain.
+        std::fs::write(
+            dir.path().join("slate/languages.toml"),
+            "[[language]]\nname = 3\n",
+        )
+        .unwrap();
+        let mut errors = Vec::new();
+        assert!(all(&mut errors).iter().any(|l| l.name == "Rust"));
+        assert!(errors[0].contains("languages.toml"), "{errors:?}");
     }
 }
