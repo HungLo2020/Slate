@@ -9,5 +9,5 @@ fi
 
 cd "$repo_root"
 python3 scripts/dependency-policy.py
-cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 bash DevUtils/BuildScripts/build-linux-amd64.sh

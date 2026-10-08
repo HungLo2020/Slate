@@ -393,9 +393,9 @@ all published Slate versions, builds the package, reads `builds/latest-build.env
 without evaluating shell code, validates the package name/version/architecture,
 and uploads with overwrite protection. `--dry-run` builds and validates without
 uploading; `--package PATH` selects an already built package and skips rebuilding.
-Before the next release, bump `[workspace.package].version` and refresh Cargo.lock
-with Cargo. Generated packages and build metadata stay in the ignored `builds/`
-directory. Run `python3 -m unittest discover -s tests -v` for publisher tests.
+Before the next release, bump `[workspace.package].version` in Cargo.toml, the
+source of truth; the build updates Cargo.lock to match. Generated packages and
+build metadata stay in the ignored `builds/` directory. Run `python3 -m unittest discover -s tests -v` for publisher tests.
 
 Once the MattPackages APT repository is configured, install with `sudo apt install
 slate`; subsequent releases arrive through normal APT updates.

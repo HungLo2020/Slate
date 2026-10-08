@@ -23,8 +23,8 @@ staging="$(mktemp -d "$builds_dir/.slate-package.XXXXXX")"
 trap 'rm -rf "$staging"' EXIT
 
 echo "[build] Building Slate $version (TUI slate and GUI slate-gui)" >&2
-cargo build --locked --release --package slate --package slate-gui
-target_dir="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+cargo build --release --package slate --package slate-gui
+target_dir="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
 package_root="$staging/pkgroot"
 mkdir -p "$package_root/DEBIAN" "$package_root/usr/bin" "$staging/debian"
 install -m755 "$target_dir/release/slate" "$package_root/usr/bin/slate"
