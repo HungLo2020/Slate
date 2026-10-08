@@ -748,6 +748,9 @@ SLATE_GUI_TAB_CLOSE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/
 QT_QPA_PLATFORMTHEME=kde SLATE_GUI_PLATFORM=wayland SLATE_GUI_REQUIRE_KDE_DIALOGS=1 SLATE_GUI_FILE_DIALOG_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate # running Plasma desktop
 SLATE_GUI_GIT_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
 SLATE_GUI_COMMAND_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
+SLATE_GUI_AUDIT_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
+SLATE_GUI_PLATFORM=wayland python3 scripts/gui-desktop-integration.py target/debug/slate # private AT-SPI bus
+python3 scripts/gui-wayland-smoke.py target/debug/slate # Weston headless + KDE integration
 cargo build --release -p slate -p slate-gui --features slate-gui/smoke
 python3 scripts/gui-performance-smoke.py target/release/slate
 python3 scripts/idle-smoke.py target/release/slate       # Linux, release GUI/TUI idle CPU
@@ -762,19 +765,24 @@ terminal directories and unsaved-work protection. Optional Vim/htop/SSH/tmux
 integration checks run when tools are available; `SLATE_REQUIRE_TERMINAL_TOOLS=1`
 makes SSH/tmux availability and execution mandatory. CI installs those tools,
 checks the Qt 6.4 adapter API, and runs GUI workflows with distro-provided Qt
-(without KDE frameworks) in Fedora and Debian containers. Container jobs exercise their current
+(with required KDE desktop coverage on Debian) in Fedora and Debian containers. Container jobs exercise their current
 compatible packages without exact runtime version constraints.
 
 Smoke tests drive actual GUI/TUI input, saves, editing prompts, shell execution,
 clipboard interactions, named layouts, installed entry points and forced-crash
 recovery. GUI layout checks cover Basic and Fusion, plus a duplicate-caption
-regression check for KDE's desktop style when that QML style is installed.
+regression check for KDE's desktop style. Debian CI requires that style and native
+KDE dialogs, X11/Wayland accessibility, Orca discovery, and the minimum Rust 1.89
+compiler check. Automated accessibility checks exercise document ranges, cursor
+and selection; speech output still needs manual listening.
 The populated Git workflow checks normal/narrow/short panes and large fonts,
 scrollbar/action separation, bulk and section staging, and commit hook failures.
 Set `SLATE_GUI_ARTIFACT_DIR` to retain its screenshots and report.
 Release performance checks measure actual input handlers and rendered frames at
 normal, 1080p and 4K sizes, plus cursor/selection layout retention, scrolling,
-syntax highlighting, batched input and typing beside a busy terminal. Set `SLATE_GUI_PERF_REPORT` to
+syntax highlighting, batched input and typing beside a busy terminal, plus a
+50,000-line document, a 2 MiB minified file and a long wrapped line.
+Set `SLATE_GUI_PERF_REPORT` to
 save the measurements, or `SLATE_GUI_PLATFORM=wayland` to use the desktop renderer.
 For a Qt-free installation, use
 `./scripts/install.sh "$HOME/.local" --tui-only`. The GUI installation also installs
@@ -794,3 +802,46 @@ Build validation note: the standard release build passed with Rust 1.94. Rust
 1.99 produced undefined-symbol linker errors with thin LTO in the validation
 environment; its release build passed with `CARGO_PROFILE_RELEASE_LTO=false`.
 This does not change Slate's compiler or runtime dependency requirements.
+
+### Profiles and workspace editing preferences
+
+Settings → Profiles selects **default**, **minimal**, **workspace**, or a saved
+profile. Save profile stores the current layout and base preferences; Load profile
+restores them. The same commands are available in the TUI command palette:
+
+```text
+profile-save coding
+profile-load coding
+set profile minimal
+```
+
+Profiles are saved in `$XDG_CONFIG_HOME/slate/profiles/` (normally
+`~/.config/slate/profiles/`). Global preferences stay in `settings.toml`.
+Optional `~/.config/slate/editor-overrides.toml` and workspace `.slate/settings.toml`
+can specify shared and language-specific editor preferences:
+
+```toml
+[editor]
+indent_width = 4
+insert_spaces = true
+
+[language.rust]
+indent_width = 2
+format_on_save = true
+
+[language.python]
+indent_width = 4
+```
+
+Language keys use the configured language ID (for example `rust` or `python`).
+Workspace language values take precedence over global language values, which
+in turn override shared editor values. The GUI settings menu shows active values
+and override sources. Changes in that menu edit the active profile; overrides
+remain in their own files. These override files accept editor preferences only.
+
+The GUI explorer expands folders in place. Its pane menu offers New file,
+New folder, Rename and Move to Trash. The TUI offers the same commands through
+F1; Enter/Right opens directories and Left goes to the parent directory. Trash
+requires `gio` (`libglib2.0-bin` on Debian/Ubuntu) and uses desktop Trash rather
+than permanently deleting files. Save modified files before moving them to Trash.
+Modified-tab confirmations offer Save, Discard and Cancel in both frontends.

@@ -486,14 +486,7 @@ impl Document {
     }
     pub fn open_with_encoding(path: &Path, encoding: Option<&str>) -> Result<Self> {
         let path = path.canonicalize().context("Cannot resolve file")?;
-        let meta = fs::metadata(&path)?;
-        if meta.is_dir() {
-            bail!("{} is a directory", path.display());
-        }
-        if meta.len() > MAX_FILE_BYTES as u64 {
-            bail!("Documents are limited to 1 GiB");
-        }
-        let bytes = fs::read(&path)?;
+        let bytes = read_regular_bytes(&path)?;
         let decoded = text_format::decode(&bytes, encoding)?;
         let mut document = Self::scratch();
         document.stamp = FileStamp::of(&path);
@@ -798,6 +791,15 @@ impl Document {
         overwrite: bool,
         options: WriteOptions,
     ) -> Result<()> {
+        self.prepare_save(destination, overwrite)?;
+        self.write_prepared(options)
+    }
+    /// Resolve the destination and its expected contents once, before retries.
+    pub(crate) fn prepare_save(
+        &mut self,
+        destination: Option<&Path>,
+        overwrite: bool,
+    ) -> Result<()> {
         if self.label.is_some() {
             bail!("Inspection views cannot be saved");
         }
@@ -821,12 +823,21 @@ impl Document {
                     "Save As refuses to overwrite an existing file",
                 ));
             }
-            Some(Baseline::of(&fs::read(&path)?))
+            Some(Baseline::of(&read_regular_bytes(&path)?))
         } else {
             None
         };
+        self.path = Some(path);
+        self.disk = baseline;
+        Ok(())
+    }
+    pub(crate) fn write_prepared(&mut self, options: WriteOptions) -> Result<()> {
+        let path = self
+            .path
+            .clone()
+            .context("Use Save As for an untitled document")?;
         let bytes = self.encoded()?;
-        let written = fsio::write_file(&path, &bytes, baseline.as_ref(), options)?;
+        let written = fsio::write_file(&path, &bytes, self.disk.as_ref(), options)?;
         self.disk = Some(written);
         self.path = Some(path);
         self.saved = self.text.clone();
@@ -862,6 +873,34 @@ impl Document {
 }
 
 // ----- Rope helpers -----
+
+fn read_regular_bytes(path: &Path) -> Result<Vec<u8>> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A replaced path must not block on a FIFO between stat and open.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    if meta.len() > MAX_FILE_BYTES as u64 {
+        bail!("Documents are limited to 1 GiB");
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(file, (MAX_FILE_BYTES + 1) as u64),
+        &mut bytes,
+    )?;
+    if bytes.len() > MAX_FILE_BYTES {
+        bail!("Documents are limited to 1 GiB");
+    }
+    Ok(bytes)
+}
 
 /// Plain ASCII without tabs or carriage returns: one column per byte. Uses
 /// byte searches (memchr) so it stays fast even in unoptimised builds.

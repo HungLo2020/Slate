@@ -86,7 +86,7 @@ fn main() -> Result<()> {
         eprintln!("Smoke startup: core constructed");
         eprintln!("Smoke startup: workspace ready");
     }
-    let owns_socket = if single {
+    let owns_socket = if !smoke && !launch.read_only && launch.stdin.is_none() {
         let events = app.events();
         match slate_core::instance::listen(move || events.notify()) {
             Some(inbox) => {

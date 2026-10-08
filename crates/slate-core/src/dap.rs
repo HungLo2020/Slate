@@ -95,6 +95,7 @@ struct Session {
     process: crate::rpc::Process,
     seq: i64,
     pending: HashMap<i64, Request>,
+    deadlines: HashMap<i64, Instant>,
     launch: Launch,
     stopped: Option<(i64, String)>,
     /// Counts pauses and resumes.
@@ -141,12 +142,22 @@ impl App {
     }
 
     fn debug_send(&mut self, command: &str, arguments: Value, request: Request) -> Result<()> {
+        if self
+            .debug
+            .session
+            .as_ref()
+            .is_some_and(|s| s.pending.len() >= 1024)
+        {
+            self.debug_end("Debug adapter overloaded");
+            bail!("Debug adapter overloaded");
+        }
         let Some(s) = self.debug.session.as_mut() else {
             bail!("No debug session");
         };
         s.seq += 1;
         let seq = s.seq;
         s.pending.insert(seq, request);
+        s.deadlines.insert(seq, Instant::now());
         s.process.send(&json!({
             "seq": seq,
             "type": "request",
@@ -268,6 +279,7 @@ impl App {
             process,
             seq: 0,
             pending: HashMap::new(),
+            deadlines: HashMap::new(),
             launch,
             stopped: None,
             pause: 0,
@@ -333,6 +345,37 @@ impl App {
     /// Redraw the panel when output arrived and it has not been drawn
     /// recently.
     pub(crate) fn debug_flush(&mut self) {
+        let expired: Vec<_> = self
+            .debug
+            .session
+            .as_ref()
+            .map(|s| {
+                s.deadlines
+                    .iter()
+                    .filter(|(_, at)| at.elapsed() >= std::time::Duration::from_secs(30))
+                    .map(|(seq, _)| *seq)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for seq in expired {
+            if let Some(s) = self.debug.session.as_mut() {
+                s.deadlines.remove(&seq);
+                if let Some(request) = s.pending.remove(&seq) {
+                    let handshake = matches!(
+                        request,
+                        Request::Initialize | Request::Launch | Request::ConfigurationDone
+                    );
+                    if handshake {
+                        self.debug_end("Debug adapter request timed out");
+                    } else if let Err(error) =
+                        self.debug_failed(request, "Debug adapter request timed out")
+                    {
+                        self.status = format!("{error:#}");
+                    }
+                }
+            }
+        }
+
         if self
             .debug
             .session
@@ -464,6 +507,9 @@ impl App {
         match message["type"].as_str() {
             Some("response") => {
                 let seq = message["request_seq"].as_i64().unwrap_or(0);
+                if let Some(s) = self.debug.session.as_mut() {
+                    s.deadlines.remove(&seq);
+                }
                 let request = self
                     .debug
                     .session
@@ -1105,5 +1151,30 @@ impl App {
             .filter(|f| f.path.as_deref() == Some(path.as_path()) && f.line > 0)
             .map(|f| f.line - 1);
         (breakpoints, current)
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    #[test]
+    fn an_unresponsive_adapter_cannot_leave_initialization_pending_forever() {
+        let _serial = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", dir.path().join("config"));
+        std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
+        std::fs::create_dir_all(dir.path().join(".slate")).unwrap();
+        std::fs::write(dir.path().join(".slate/launch.toml"), "[[launch]]\nname = 'stuck'\nprogram = 'fixture'\nadapter = ['python3', '-c', 'import time; time.sleep(60)']\n").unwrap();
+        let mut app = crate::App::new(dir.path()).unwrap();
+        app.set_session_trust(true);
+        app.debug_start("stuck").unwrap();
+        let session = app.debug.session.as_mut().unwrap();
+        for started in session.deadlines.values_mut() {
+            *started = std::time::Instant::now() - std::time::Duration::from_secs(31);
+        }
+        app.debug_flush();
+        assert!(!app.debugging());
+        assert!(app.status.contains("timed out"));
     }
 }

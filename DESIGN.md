@@ -156,8 +156,8 @@ base paths and treating empty values as unset.
 Undo entries store a start offset, removed text, inserted text and cursor
 positions. Ordinary typing no longer copies the entire document into history.
 The regression test applies 100 three-byte edits to an 8 MiB buffer and retains
-300 bytes of text payload, plus entry metadata. Strings remain the buffer storage;
-this change does not claim rope-like insertion costs for very large files.
+300 bytes of text payload, plus entry metadata. Documents use persistent ropey
+ropes, so background snapshots share their storage and edits copy affected chunks.
 
 File open/save jobs have their own queue, independent of Git and highlighting.
 Saving captures the buffer and original disk baseline. Completion updates the
@@ -177,8 +177,8 @@ written, so conflict checks work for any encoding or mixed line endings.
 original owner, group and extended attributes, and writes in place for hard
 links, unwritable directories, or when ownership cannot be reproduced. Read-only
 and permission errors are typed so frontends can ask for confirmation or a
-privileged `tee` through sudo (terminal, with the terminal handed over) or
-pkexec (GUI, from the IO worker).
+the validated write helper through sudo (terminal, with the terminal handed over)
+or pkexec (GUI, on an independent worker).
 
 ## Workspace recovery
 
@@ -369,3 +369,77 @@ Git runs on two workers: reads (status, diff) and writes (stage, commit). The
 app keeps at most one status read in flight and coalesces requests. Every git
 process has a timeout and its own process group. Paths keep their raw bytes,
 so files with non-UTF-8 names can be staged.
+
+## Save operations and reload generations
+
+A save retains an immutable document snapshot. Preparing it resolves the actual
+Save As path and captures the expected destination baseline before any write.
+Permission/read-only failures return this prepared snapshot; confirmations are
+queued by document and retries preserve the path, contents and baseline. They
+never take their target from the currently focused tab. New edits stay dirty
+when an earlier snapshot completes. Save All retains a sequential document queue
+through untitled-path dialogs and permissions. Cancelling or failing a save stops
+that workflow. Named documents use their own format-on-save settings in Save All.
+Saving a modified tab closes it only after a successful write and
+only when no newer edits remain. Native file dialogs explicitly suspend and
+complete their core prompt, binding Save As to its original document.
+
+Reload requests carry the requested content version. Completion cannot replace a
+document edited in the meantime. Document reads reject special files and enforce
+the byte limit while reading, rather than relying only on a metadata size check.
+The opened file descriptor is checked, and Unix opens use nonblocking mode so a
+path replaced with a FIFO cannot stall the worker. Save As applies the same
+regular-file and size checks before reading an overwrite baseline.
+
+## Service budgets and large workloads
+
+Service requests and replies use bounded channels; request submission reports
+overload rather than waiting on a worker. Recovery barriers drain replies while
+waiting and have a deadline. A frontend processes at most 128 replies
+or four milliseconds of work per pass and schedules another wake for remaining
+work. RPC output is bounded by both message count and bytes; overload disconnects
+a stuck child without blocking the input thread. LSP and DAP requests expire after
+30 seconds; LSP cancellation is sent and initialization failures stop the server.
+File operations and privileged authentication do not share a blocking execution
+path. Large fuzzy pickers use a latest-query worker with cancellation. Workspace
+search queues only its newest request and materializes shared rope snapshots on
+a worker. Wrapped rows are cached by document generation, width and tab width,
+with limits on retained entries and rows. Syntax parsing skips individual lines
+larger than 64 KiB, preserving plain text editing for generated/minified files.
+Large-document minimaps and horizontal width measurements run on a coalescing
+worker and retain the previous outline until the current one arrives. Language
+detection reads only a bounded first-line hint. LSP synchronization is limited
+to 8 MiB per document; larger documents remain editable without a server. RPC
+messages and queued output are capped at 16 MiB, including pre-initialization
+queues, with at most 1024 outstanding LSP requests.
+
+## Profiles, explorer and accessibility
+
+Profiles live at `$XDG_CONFIG_HOME/slate/profiles/NAME.toml`; each contains base
+preferences, layout shape and editor-only mode. Built-ins are default, minimal and
+workspace. The selected profile is recorded in settings.toml. Overrides resolve
+as profile, global editor, workspace editor, global language, workspace language.
+Global overrides live in editor-overrides.toml and workspace overrides in
+`.slate/settings.toml`. Only typed editor preferences are accepted in overrides;
+these files cannot add commands, executables, terminal clipboard permissions or
+key bindings. GUI settings show effective values and their override sources.
+Rendering resolves document-specific options, including when split panes show
+different languages.
+
+Both frontends use the same asynchronous create, rename and Trash operations.
+The GUI flattens only expanded directories into an indented, scrollable model;
+the TUI keeps directory navigation with Enter/Right and Left. Rename refuses to
+replace an existing destination (atomically on Linux) and updates open documents.
+Trash uses the desktop's gio implementation and never falls back to permanent
+delete. Modified documents must be saved or closed first. Directory/layout GUI
+windows can receive forwarded files even though those launch options themselves
+still create a separate window.
+
+Assistive technology gets document-wide UTF-16 counts and ranges backed by rope
+indices, separately from the small IME context. Accessible cursor/selection and
+scroll operations use core commands. Character geometry and pointer offsets use
+the same visible rows and text layout as painting. AT-SPI tests use a private
+D-Bus session on a real display backend; CI also requires KDE style, X11/Wayland
+and native-dialog coverage, plus Orca discovery through the private accessibility
+bus. Screen-reader speech output still requires listening
+with an actual audio setup and is not asserted by automated tests.

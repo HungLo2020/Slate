@@ -66,6 +66,55 @@ pub fn display_chord(chord: &str) -> String {
 // IDs also retain the existing command-line spelling for scripting compatibility.
 const ACTIONS: &[(&str, &str, &str, &str, &str)] = &[
     (
+        "profile-save",
+        "Save profile…",
+        "Save this layout and preferences as a named profile",
+        "Profile name",
+        "any",
+    ),
+    (
+        "profile-load",
+        "Load profile…",
+        "Apply a saved profile",
+        "Profile name",
+        "any",
+    ),
+    (
+        "new-file",
+        "New file…",
+        "Create a file in the browsed folder",
+        "File name",
+        "files",
+    ),
+    (
+        "new-folder",
+        "New folder…",
+        "Create a folder",
+        "Folder name",
+        "files",
+    ),
+    (
+        "rename-file",
+        "Rename…",
+        "Rename the selected file or folder",
+        "New name",
+        "file-entry",
+    ),
+    (
+        "trash-file",
+        "Move to Trash…",
+        "Move the selected entry to desktop Trash",
+        "",
+        "file-entry",
+    ),
+    (
+        "toggle-folder",
+        "Expand/collapse folder",
+        "Toggle the selected explorer folder",
+        "",
+        "files",
+    ),
+    (
         "open",
         "Open file…",
         "Open a file or browse a directory",
@@ -1051,6 +1100,14 @@ impl App {
                 "terminal-ui" => self.terminal_frontend,
                 "graphical" => !self.terminal_frontend,
                 "graphical-editor" => !self.terminal_frontend && editor.is_some(),
+                "files" => kind == "files",
+                "file-entry" => {
+                    kind == "files"
+                        && self
+                            .files
+                            .get(selection.unwrap_or(self.selected))
+                            .is_some_and(|e| e.name != "..")
+                }
                 "trusted" => self.trusted(),
                 "debugging" => self.debugging(),
                 "paused" => self.debug_paused(),

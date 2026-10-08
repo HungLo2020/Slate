@@ -249,46 +249,52 @@ impl App {
             }
         }
         let d = &self.documents[&doc];
-        let total = d.line_count();
-        let tab = self.preferences.indent_width;
-        // Large documents are sampled; the minimap has a few thousand pixels at most.
-        let samples = total.min(4000);
-        let mut lines = Vec::with_capacity(samples);
-        for index in 0..samples {
-            let row = index * total / samples.max(1);
-            let (start, mut end) = d.line_range(row);
-            end = d.floor_boundary(end.min(start + 4096));
-            let line = &d.slice(start, end);
-            let trimmed = line.trim_start_matches([' ', '\t']);
-            let indent =
-                crate::document::display_width_with_tabs(&line[..line.len() - trimmed.len()], tab);
-            let width = crate::document::display_width_with_tabs(line, tab);
-            lines.push([
-                indent.min(u16::MAX as usize) as u16,
-                width.min(u16::MAX as usize) as u16,
-            ]);
+        let tab = self.preferences_for_document(doc).indent_width;
+        if d.len() <= 256 * 1024 && d.line_count() <= 4000 {
+            let overview = build_overview(doc, generation, d, tab);
+            self.overview_cache.insert(doc, overview.clone());
+            return overview;
         }
-        // The horizontal scroll range needs every line. A line is at most
-        // `tab` columns per byte wide, so only candidates are measured.
-        let mut widest = 0;
-        for row in 0..total {
-            let (start, end) = d.line_range(row);
-            if (end - start) * tab.max(1) > widest {
-                widest = widest.max(crate::document::display_width_with_tabs(
-                    &d.slice(start, end),
-                    tab,
-                ));
-            }
+        if self.overview_pending.get(&doc) != Some(&(generation, tab)) {
+            self.overview_pending.insert(doc, (generation, tab));
+            let output = self.services.reply_sender();
+            let worker = self.overview_workers.entry(doc).or_insert_with(|| {
+                crate::services::LatestWorker::new(
+                    move |(id, generation, snapshot, tab): OverviewRequest| {
+                        let _ = output.send(crate::services::Reply::Overview(
+                            build_overview(id, generation, &snapshot, tab),
+                            tab,
+                        ));
+                    },
+                )
+            });
+            worker.submit((doc, generation, d.checkpoint(), tab));
         }
-        let overview = Overview {
-            document: doc,
-            generation,
-            total,
-            lines,
-            widest,
-        };
-        self.overview_cache.insert(doc, overview.clone());
-        overview
+        self.overview_cache
+            .get(&doc)
+            .cloned()
+            .unwrap_or_else(|| Overview {
+                document: doc,
+                generation,
+                total: d.line_count(),
+                lines: Vec::new(),
+                widest: 0,
+            })
+    }
+    pub(crate) fn overview_ready(&mut self, overview: Overview, tab: usize) {
+        let id = overview.document;
+        if self
+            .documents
+            .get(&id)
+            .is_some_and(|d| d.generation == overview.generation)
+            && self.preferences_for_document(id).indent_width == tab
+        {
+            self.overview_pending.remove(&id);
+            self.overview_cache.insert(id, overview);
+            self.overview_revision += 1;
+        }
+        self.overview_workers
+            .retain(|id, _| self.documents.contains_key(id));
     }
     /// The minimap outline of the editor shown in a pane.
     pub fn pane_overview(&mut self, pane: u64) -> Option<Overview> {
@@ -299,6 +305,48 @@ impl App {
             }
             _ => None,
         }
+    }
+}
+
+pub(crate) type OverviewRequest = (u64, u64, Document, usize);
+fn build_overview(doc: u64, generation: u64, d: &Document, tab: usize) -> Overview {
+    let total = d.line_count();
+
+    // Large documents are sampled; the minimap has a few thousand pixels at most.
+    let samples = total.min(4000);
+    let mut lines = Vec::with_capacity(samples);
+    for index in 0..samples {
+        let row = index * total / samples.max(1);
+        let (start, mut end) = d.line_range(row);
+        end = d.floor_boundary(end.min(start + 4096));
+        let line = &d.slice(start, end);
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        let indent =
+            crate::document::display_width_with_tabs(&line[..line.len() - trimmed.len()], tab);
+        let width = crate::document::display_width_with_tabs(line, tab);
+        lines.push([
+            indent.min(u16::MAX as usize) as u16,
+            width.min(u16::MAX as usize) as u16,
+        ]);
+    }
+    // The horizontal scroll range needs every line. A line is at most
+    // `tab` columns per byte wide, so only candidates are measured.
+    let mut widest = 0;
+    for row in 0..total {
+        let (start, end) = d.line_range(row);
+        if (end - start) * tab.max(1) > widest {
+            widest = widest.max(crate::document::display_width_with_tabs(
+                &d.slice(start, end),
+                tab,
+            ));
+        }
+    }
+    Overview {
+        document: doc,
+        generation,
+        total,
+        lines,
+        widest,
     }
 }
 

@@ -6,7 +6,7 @@ use crate::{
     search::{Prompt, Search},
     services::{IoJob, Job, SaveFailure},
     text_format::{self, LineEnding},
-    wrap, App, Command, EditorView, Elevation, ElevationMode,
+    wrap, App, Command, EditorView, Elevation,
 };
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -101,17 +101,42 @@ impl App {
             .max(1)
     }
     /// Visual rows of a logical line: one unbroken row unless soft wrap is on.
-    pub(crate) fn line_rows(&self, doc: u64, line: usize, width: usize) -> Vec<wrap::Row> {
+    pub(crate) fn line_rows(
+        &self,
+        doc: u64,
+        line: usize,
+        width: usize,
+    ) -> std::sync::Arc<Vec<wrap::Row>> {
         let d = &self.documents[&doc];
         let (start, end) = d.line_range(line);
-        if self.preferences.soft_wrap {
-            wrap::rows(&d.slice(start, end), width, self.preferences.indent_width)
+        let options = self.preferences_for_document(doc);
+        if options.soft_wrap {
+            let key = (doc, d.generation, line, width, options.indent_width);
+            if let Some(rows) = self.wrap_cache.lock().unwrap().get(&key) {
+                return rows.clone();
+            }
+            let rows = std::sync::Arc::new(wrap::rows(
+                &d.slice(start, end),
+                width,
+                options.indent_width,
+            ));
+            let mut cache = self.wrap_cache.lock().unwrap();
+            cache.retain(|(id, generation, ..), _| *id != doc || *generation == d.generation);
+            if cache.len() >= 128
+                || cache.values().map(|rows| rows.len()).sum::<usize>() + rows.len() > 131_072
+            {
+                cache.clear();
+            }
+            if rows.len() <= 131_072 {
+                cache.insert(key, rows.clone());
+            }
+            rows
         } else {
-            vec![wrap::Row {
+            std::sync::Arc::new(vec![wrap::Row {
                 start: 0,
                 end: end - start,
                 col: 0,
-            }]
+            }])
         }
     }
     /// Visual position of a byte offset: (line, row within line, column within row).
@@ -122,7 +147,10 @@ impl App {
         let (start, _) = d.line_range(line);
         let rows = self.line_rows(v.document, line, self.text_width(id));
         let row = wrap::row_of(&rows, offset - start);
-        let (_, col) = d.line_col(offset, self.preferences.indent_width);
+        let (_, col) = d.line_col(
+            offset,
+            self.preferences_for_document(v.document).indent_width,
+        );
         (line, row, col - rows[row].col)
     }
     /// The byte offset shown at a column of a visual row.
@@ -136,7 +164,7 @@ impl App {
     ) -> usize {
         let d = &self.documents[&doc];
         let (start, _) = d.line_range(line);
-        let tab = self.preferences.indent_width;
+        let tab = self.preferences_for_document(doc).indent_width;
         let text = d.slice(start + row.start, start + row.end);
         let text = text.as_ref();
         let target = row.col + col;
@@ -260,7 +288,7 @@ impl App {
         let v = self.views[&id].clone();
         let rows = v.rows.max(1) as usize;
         let lines = self.documents[&v.document].line_count();
-        if !self.preferences.soft_wrap {
+        if !self.preferences_for_document(v.document).soft_wrap {
             let mut top = self.shown_at_or_after(id, v.top.min(lines.saturating_sub(1)));
             if !v.manual_scroll {
                 let row = cursor_line;
@@ -337,7 +365,7 @@ impl App {
         while result.len() < count && line < lines {
             let rows = self.line_rows(v.document, line, width);
             let last = rows.len() - 1;
-            for (index, row) in rows.into_iter().enumerate().skip(skip.min(last)) {
+            for (index, row) in rows.iter().copied().enumerate().skip(skip.min(last)) {
                 if result.len() == count {
                     break;
                 }
@@ -359,7 +387,7 @@ impl App {
         let rows = self.visible_rows(id, row + 1);
         match rows.get(row) {
             Some((line, index, r)) => {
-                let left = if self.preferences.soft_wrap {
+                let left = if self.preferences_for_document(v.document).soft_wrap {
                     0
                 } else {
                     v.left
@@ -376,7 +404,7 @@ impl App {
         let v = self.views[&id].clone();
         self.views.get_mut(&id).unwrap().manual_scroll = true;
         let width = self.text_width(id);
-        let wrapping = self.preferences.soft_wrap;
+        let wrapping = self.preferences_for_document(v.document).soft_wrap;
         // Steps go by shown rows: a folded region is one step, not many.
         let (mut line, mut row) = (
             self.shown_at_or_after(id, v.top),
@@ -408,124 +436,10 @@ impl App {
 
     // ----- Saving -----
 
-    pub(crate) fn start_save(
-        &mut self,
-        doc: u64,
-        destination: Option<PathBuf>,
-        overwrite: bool,
-        allow_read_only: bool,
-    ) -> Result<()> {
-        if self.pending_save.contains(&doc) {
-            bail!("A save is already in progress for this document");
-        }
-        self.pending_save.push(doc);
-        self.pending_retry = Some((doc, destination.clone(), overwrite));
-        self.services
-            .io
-            .send(IoJob::Save(
-                doc,
-                self.documents[&doc].checkpoint(),
-                destination,
-                overwrite,
-                WriteOptions {
-                    allow_read_only,
-                    backup: self.preferences.backup,
-                },
-            ))
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        self.status = "Saving…".into();
-        Ok(())
-    }
-    /// Save every modified document. With `quit`, exit once all succeed.
-    pub(crate) fn save_all(&mut self, quit: bool) -> Result<()> {
-        self.quit_after_save = quit;
-        let dirty: Vec<u64> = self
-            .documents
-            .iter()
-            .filter(|(id, d)| d.dirty() && !self.pending_save.contains(id))
-            .map(|(id, _)| *id)
-            .collect();
-        if dirty.is_empty() {
-            if self.pending_save.is_empty() && quit {
-                self.quit_after_save = false;
-                self.execute(Command::Quit { force: false })?;
-            }
-            return Ok(());
-        }
-        // Untitled buffers need a path; show one and ask before continuing.
-        if let Some(&untitled) = dirty.iter().find(|id| self.documents[id].path.is_none()) {
-            self.reveal_document(untitled);
-            self.prompt = Some(prompt("save-as", String::new()));
-            self.status = "Choose a path for the untitled document".into();
-            return Ok(());
-        }
-        for doc in dirty {
-            self.start_save(doc, None, false, false)?;
-        }
-        Ok(())
-    }
-    pub(crate) fn save_failed(&mut self, doc: u64, failure: SaveFailure) {
-        let name = self
-            .documents
-            .get(&doc)
-            .map(Document::title)
-            .unwrap_or_default();
-        match failure.kind {
-            SaveErrorKind::ReadOnly => {
-                self.reveal_document(doc);
-                self.prompt = Some(prompt("save-read-only", name));
-                self.status = failure.message;
-            }
-            SaveErrorKind::PermissionDenied if self.elevation_mode != ElevationMode::None => {
-                self.reveal_document(doc);
-                self.prompt = Some(prompt("save-elevated", name));
-                self.status = format!("{} · Save with administrator rights?", failure.message);
-            }
-            _ => {
-                self.quit_after_save = false;
-                self.pending_retry = None;
-                self.status = format!("Save failed: {}", failure.message);
-            }
-        }
-    }
     /// The user confirmed a pending prompt answer.
     pub(crate) fn confirm_pending(&mut self, kind: &str) -> Result<()> {
         match kind {
-            "save-read-only" => {
-                let (doc, destination, overwrite) =
-                    self.pending_retry.take().context("Nothing to save")?;
-                self.start_save(doc, destination, overwrite, true)
-            }
-            "save-elevated" => {
-                let (doc, _, _) = self.pending_retry.take().context("Nothing to save")?;
-                let document = &self.documents[&doc];
-                let path = document.path.clone().context("Use Save As first")?;
-                match self.elevation_mode {
-                    ElevationMode::Terminal => {
-                        self.elevation = Some(Elevation {
-                            baseline: document.disk.clone(),
-                            document: doc,
-                            path,
-                            bytes: document.encoded()?,
-                        });
-                        self.status = "Waiting for sudo…".into();
-                    }
-                    ElevationMode::Background(program) => {
-                        self.pending_save.push(doc);
-                        self.services
-                            .io
-                            .send(IoJob::SaveElevated(
-                                doc,
-                                document.checkpoint(),
-                                program.to_string(),
-                            ))
-                            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                        self.status = format!("Saving with {program}…");
-                    }
-                    ElevationMode::None => bail!("No privilege helper is available"),
-                }
-                Ok(())
-            }
+            "save-read-only" | "save-elevated" => self.retry_save(kind),
             "reload-changed" => {
                 let doc = self.pending_retry.take().context("Nothing to reload")?.0;
                 self.request_reload(doc, None)
@@ -542,27 +456,31 @@ impl App {
         self.elevation.take()
     }
     pub fn finish_elevation(&mut self, request: Elevation, result: Result<()>) {
-        self.revision += 1;
-        match result {
-            Ok(()) => {
-                if let Some(doc) = self.documents.get_mut(&request.document) {
-                    if doc.encoded().ok().as_deref() == Some(request.bytes.as_slice()) {
-                        doc.mark_saved_bytes(&request.bytes);
-                    } else {
-                        doc.mark_saved_bytes(&request.bytes);
-                        // Edits typed while sudo was running remain unsaved.
-                        doc.generation += 1;
-                    }
-                    self.status = format!("Saved {} with sudo", request.path.display());
-                }
-                if self.quit_after_save {
-                    let _ = self.save_all(true);
-                }
-            }
-            Err(e) => {
-                self.quit_after_save = false;
-                self.status = format!("Save failed: {e:#}");
-            }
+        let id = request.document;
+        let saved = self.save_operations.remove(&id);
+        let reply = match result {
+            Ok(()) => saved
+                .map(|mut doc| {
+                    doc.mark_saved_bytes(&request.bytes);
+                    Ok(doc)
+                })
+                .unwrap_or_else(|| {
+                    Err(SaveFailure {
+                        kind: SaveErrorKind::Other,
+                        message: "Save operation was cancelled".into(),
+                        snapshot: None,
+                    })
+                }),
+            Err(e) => Err(SaveFailure {
+                kind: SaveErrorKind::Other,
+                message: format!("{e:#}"),
+                snapshot: saved.map(Box::new),
+            }),
+        };
+        let success = reply.is_ok();
+        self.saved_reply(id, reply);
+        if success && self.status == "Saved" {
+            self.status = "Saved with sudo".into();
         }
     }
     pub(crate) fn request_reload(&mut self, doc: u64, encoding: Option<String>) -> Result<()> {
@@ -572,7 +490,12 @@ impl App {
             .context("This document has no file")?;
         self.services
             .io
-            .send(IoJob::Reload(doc, path, encoding))
+            .send(IoJob::Reload(
+                doc,
+                self.documents[&doc].content_version(),
+                path,
+                encoding,
+            ))
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         self.status = "Reloading…".into();
         Ok(())
@@ -999,6 +922,9 @@ impl App {
                 self.prompt = Some(prompt("insert-file", String::new()));
             }
             "insert-file" => self.insert_file(argument)?,
+            "profile-save" | "profile-load" => self.profile_action(name, argument)?,
+            "new-file" | "new-folder" | "rename-file" | "trash-file" | "toggle-folder"
+            | "expand-folder" | "collapse-folder" => self.file_action(name, argument)?,
             "save-all" => self.save_all(false)?,
             "reload" => {
                 let (_, v) = self.editor_view()?;

@@ -18,7 +18,7 @@ impl App {
         let key = (
             doc.generation,
             v.folds.clone(),
-            self.preferences.indent_width,
+            self.preferences_for_document(v.document).indent_width,
         );
         let mut cache = self.fold_cache.lock().unwrap();
         if let Some((cached_key, hidden)) = cache.get(&id) {
@@ -36,8 +36,12 @@ impl App {
                 (doc.line_offset(line) == *f).then_some(line)
             })
             .filter_map(|line| {
-                smart::fold_end(rope, line, self.preferences.indent_width)
-                    .map(|end| (line + 1, end))
+                smart::fold_end(
+                    rope,
+                    line,
+                    self.preferences_for_document(v.document).indent_width,
+                )
+                .map(|end| (line + 1, end))
             })
             .collect();
         ranges.sort();

@@ -26,6 +26,94 @@ const SHOWN: usize = 500;
 /// The workspace index is refreshed when older than this.
 const INDEX_AGE: std::time::Duration = std::time::Duration::from_secs(10);
 
+pub(crate) type SearchRequest = (PathBuf, SearchOptions, HashMap<PathBuf, ropey::Rope>, u64);
+type FilterRequest = (u64, Arc<Vec<Entry>>, String);
+/// One worker retains only the newest query; stale matching stops between files.
+pub(crate) struct FilterWorker {
+    request: Arc<(std::sync::Mutex<Option<FilterRequest>>, std::sync::Condvar)>,
+    generation: Arc<std::sync::atomic::AtomicU64>,
+}
+impl FilterWorker {
+    fn new(output: crate::services::ReplySender) -> Self {
+        let request = Arc::new((
+            std::sync::Mutex::new(None::<FilterRequest>),
+            std::sync::Condvar::new(),
+        ));
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let inbox = request.clone();
+        let latest = generation.clone();
+        std::thread::spawn(move || loop {
+            let (lock, changed) = &*inbox;
+            let mut job = lock.lock().unwrap();
+            while job.is_none() {
+                job = changed.wait(job).unwrap();
+            }
+            let (mut gen, mut entries, mut query) = job.take().unwrap();
+            drop(job);
+            if gen == u64::MAX {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            if let Some(next) = lock.lock().unwrap().take() {
+                (gen, entries, query) = next;
+            }
+            if gen == u64::MAX {
+                break;
+            }
+            let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+            let pattern = Pattern::parse(&query, CaseMatching::Smart, Normalization::Smart);
+            let mut buffer = Vec::new();
+            let mut scored = Vec::new();
+            for (i, entry) in entries.iter().enumerate() {
+                if i % 128 == 0 && latest.load(Ordering::Relaxed) != gen {
+                    break;
+                }
+                let mut positions = Vec::new();
+                if let Some(score) = pattern.indices(
+                    Utf32Str::new(&entry.label, &mut buffer),
+                    &mut matcher,
+                    &mut positions,
+                ) {
+                    positions.sort_unstable();
+                    positions.dedup();
+                    scored.push((score, i, positions));
+                }
+            }
+            if latest.load(Ordering::Relaxed) != gen {
+                continue;
+            }
+            scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            if latest.load(Ordering::Relaxed) == gen
+                && output
+                    .send(Reply::Filtered(
+                        gen,
+                        scored.into_iter().map(|(_, i, p)| (i, p)).collect(),
+                    ))
+                    .is_err()
+            {
+                break;
+            }
+        });
+        Self {
+            request,
+            generation,
+        }
+    }
+    fn submit(&self, entries: Arc<Vec<Entry>>, query: String) -> u64 {
+        let gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        *self.request.0.lock().unwrap() = Some((gen, entries, query));
+        self.request.1.notify_one();
+        gen
+    }
+}
+impl Drop for FilterWorker {
+    fn drop(&mut self) {
+        self.generation.store(u64::MAX, Ordering::Relaxed);
+        *self.request.0.lock().unwrap() = Some((u64::MAX, Arc::new(Vec::new()), String::new()));
+        self.request.1.notify_one();
+    }
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct PickerItem {
     pub label: String,
@@ -86,6 +174,8 @@ pub(crate) struct Picker {
     pub hashes: HashMap<PathBuf, u64>,
     /// The first item sent to frontends.
     pub first: usize,
+    filter_source: Option<Arc<Vec<Entry>>>,
+    filter_revision: u64,
 }
 impl Picker {
     pub fn new(kind: &str, title: &str, local: bool) -> Self {
@@ -103,6 +193,8 @@ impl Picker {
             generation: 0,
             hashes: HashMap::new(),
             first: 0,
+            filter_source: None,
+            filter_revision: 0,
         }
     }
     /// Keep the selection inside the window of items frontends receive.
@@ -116,6 +208,7 @@ impl Picker {
     }
     /// Recompute `shown` from the query.
     pub fn filter(&mut self) {
+        self.filter_source = None;
         if !self.local || self.query.trim().is_empty() {
             self.shown = (0..self.entries.len()).map(|i| (i, Vec::new())).collect();
         } else {
@@ -177,6 +270,39 @@ impl Picker {
 }
 
 impl App {
+    fn filter_current_picker(&mut self) {
+        let Some(p) = self.picker.as_mut().filter(|p| p.local) else {
+            return;
+        };
+        if p.entries.len() < 1000 || p.query.trim().is_empty() {
+            p.filter_revision = 0;
+            p.filter();
+            return;
+        }
+        let worker = self
+            .fuzzy_worker
+            .get_or_insert_with(|| FilterWorker::new(self.services.reply_sender()));
+        let source = p
+            .filter_source
+            .get_or_insert_with(|| Arc::new(p.entries.clone()))
+            .clone();
+        p.filter_revision = worker.submit(source, p.query.clone());
+        p.busy = true;
+        p.shown.clear();
+    }
+    pub(crate) fn filtered_picker(&mut self, generation: u64, shown: Vec<(usize, Vec<u32>)>) {
+        if let Some(p) = self
+            .picker
+            .as_mut()
+            .filter(|p| p.filter_revision == generation && p.local)
+        {
+            p.shown = shown;
+            p.busy = false;
+            p.selected = 0;
+            p.first = 0;
+        }
+    }
+
     pub fn picker_view(&self) -> Option<PickerView> {
         self.picker.as_ref().map(Picker::view)
     }
@@ -242,7 +368,9 @@ impl App {
             _ => bail!("Unknown picker: {kind}"),
         };
         picker.query = query.to_string();
-        picker.filter();
+        if query.is_empty() {
+            picker.filter();
+        }
         self.picker = Some(picker);
         if !query.is_empty() {
             self.picker_query(query.to_string())?;
@@ -295,8 +423,9 @@ impl App {
         if let Some(p) = self.picker.as_mut().filter(|p| p.kind == "files") {
             p.entries = entries;
             p.busy = false;
-            p.filter();
+            p.filter_source = None;
         }
+        self.filter_current_picker();
     }
 
     pub(crate) fn picker_query(&mut self, query: String) -> Result<()> {
@@ -306,7 +435,7 @@ impl App {
         p.query = query;
         p.selected = 0;
         if p.local {
-            p.filter();
+            self.filter_current_picker();
             return Ok(());
         }
         match p.kind.as_str() {
@@ -339,22 +468,38 @@ impl App {
         p.message = String::new();
         let options = p.options.clone();
         // Unsaved documents are searched as they are in the editor.
-        let buffers: HashMap<PathBuf, String> = self
+        let snapshots: HashMap<PathBuf, ropey::Rope> = self
             .documents
             .values()
             .filter(|d| d.dirty())
-            .filter_map(|d| Some((d.path.clone()?, d.text())))
+            .filter_map(|d| Some((d.path.clone()?, d.rope().clone())))
             .collect();
         let root = self.root.clone();
         let cancel = self.search_cancel.clone();
         let output = self.services.reply_sender();
-        std::thread::spawn(move || {
-            let result =
-                crate::project::search(&root, &options, &buffers, &cancel, generation, |hits| {
-                    output.send(Reply::SearchHits(generation, hits)).is_ok()
-                });
-            let _ = output.send(Reply::SearchDone(generation, result));
+        let worker = self.search_worker.get_or_insert_with(|| {
+            crate::services::LatestWorker::new(
+                move |(root, options, snapshots, generation): SearchRequest| {
+                    if cancel.load(Ordering::Relaxed) != generation {
+                        return;
+                    }
+                    let buffers = snapshots
+                        .into_iter()
+                        .map(|(path, rope)| (path, rope.to_string()))
+                        .collect();
+                    let result = crate::project::search(
+                        &root,
+                        &options,
+                        &buffers,
+                        &cancel,
+                        generation,
+                        |hits| output.send(Reply::SearchHits(generation, hits)).is_ok(),
+                    );
+                    let _ = output.send(Reply::SearchDone(generation, result));
+                },
+            )
         });
+        worker.submit((root, options, snapshots, generation));
         Ok(())
     }
 
@@ -820,5 +965,37 @@ mod tests {
         p.query = String::new();
         p.filter();
         assert_eq!(p.view().total, 4);
+    }
+    #[test]
+    fn large_fuzzy_picker_returns_only_the_latest_query() {
+        let services = crate::services::Services::new(crate::events::Events::default());
+        let entries: Arc<Vec<Entry>> = Arc::new(
+            (0..200_000)
+                .map(|i| Entry {
+                    label: format!("src/file_{i:06}.rs"),
+                    detail: String::new(),
+                    kind: "file".into(),
+                    target: Target::Document(i),
+                })
+                .collect(),
+        );
+        let worker = FilterWorker::new(services.reply_sender());
+        for query in ["f", "file", "file_199"] {
+            worker.submit(entries.clone(), query.into());
+        }
+        let generation = worker.submit(entries, "file_199999.rs".into());
+        let until = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Ok(Reply::Filtered(found, rows)) = services.rx.try_recv() {
+                assert_eq!(found, generation);
+                assert_eq!(rows.first().unwrap().0, 199999);
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "Large workspace filtering did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
     }
 }

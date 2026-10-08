@@ -213,7 +213,17 @@ fn horizontal_scrolling_and_the_minimap_outline() {
     fs::write(&path, &content).unwrap();
     let mut app = App::new(&path).unwrap();
     let pane = app.focus;
-    let overview = app.pane_overview(pane).unwrap();
+    let mut overview = app.pane_overview(pane).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while overview.lines.is_empty() {
+        app.process_events();
+        overview = app.pane_overview(pane).unwrap();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Minimap worker did not complete"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
     assert_eq!(overview.total, 10_001);
     assert!(overview.lines.len() <= 4000, "Large documents are sampled");
     assert_eq!(overview.widest, 300);

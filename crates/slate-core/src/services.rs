@@ -5,29 +5,79 @@ use crate::{
 };
 use serde::Serialize;
 use std::{
-    fs,
     path::PathBuf,
     process::Command,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::{self, Receiver},
     thread,
 };
+
+/// A single cancellable service keeps the latest queued request, never a thread per key.
+type LatestState<T> = std::sync::Arc<(std::sync::Mutex<(Option<T>, bool)>, std::sync::Condvar)>;
+pub(crate) struct LatestWorker<T> {
+    state: LatestState<T>,
+}
+impl<T: Send + 'static> LatestWorker<T> {
+    pub(crate) fn new(mut run: impl FnMut(T) + Send + 'static) -> Self {
+        let state = std::sync::Arc::new((
+            std::sync::Mutex::new((None, false)),
+            std::sync::Condvar::new(),
+        ));
+        let inbox = state.clone();
+        thread::spawn(move || loop {
+            let (lock, changed) = &*inbox;
+            let mut state = lock.lock().unwrap();
+            while state.0.is_none() && !state.1 {
+                state = changed.wait(state).unwrap();
+            }
+            if state.1 {
+                break;
+            }
+            let mut request = state.0.take().unwrap();
+            drop(state);
+            thread::sleep(std::time::Duration::from_millis(35));
+            let mut state = lock.lock().unwrap();
+            if state.1 {
+                break;
+            }
+            if let Some(latest) = state.0.take() {
+                request = latest;
+            }
+            drop(state);
+            run(request);
+        });
+        Self { state }
+    }
+    pub(crate) fn submit(&self, request: T) {
+        self.state.0.lock().unwrap().0 = Some(request);
+        self.state.1.notify_one();
+    }
+}
+impl<T> Drop for LatestWorker<T> {
+    fn drop(&mut self) {
+        self.state.0.lock().unwrap().1 = true;
+        self.state.1.notify_one();
+    }
+}
 #[derive(Clone, Serialize, PartialEq)]
 pub struct Entry {
     pub name: String,
     pub path: String,
     pub directory: bool,
+    pub depth: usize,
+    pub expanded: bool,
 }
 pub use crate::git::{GitEntry, GitState};
 pub enum Job {
-    Browse(PathBuf),
+    Browse(PathBuf, Vec<PathBuf>, bool),
     Git(crate::git::GitJob),
     /// List misspelled words with aspell, hunspell or enchant.
     Spell(String),
 }
 pub enum IoJob {
     Open(u64, PathBuf),
+    FileOperation(crate::files::FileOperation),
     /// Reread a document's file, optionally decoding with a chosen encoding.
-    Reload(u64, PathBuf, Option<String>),
+    Reload(u64, u64, PathBuf, Option<String>),
     Save(
         u64,
         Document,
@@ -54,13 +104,16 @@ pub enum IoJob {
 pub struct SaveFailure {
     pub kind: crate::fsio::SaveErrorKind,
     pub message: String,
+    pub snapshot: Option<Box<Document>>,
 }
 pub enum Reply {
     Opened(u64, Result<Document, String>),
-    Reloaded(u64, Result<Document, String>),
+    FileOperation(crate::files::FileOperation, Result<(), String>),
+    Reloaded(u64, u64, Result<Document, String>),
     OpenedDirectory(u64, PathBuf),
     Saved(u64, Result<Document, SaveFailure>),
     Highlighted(highlight::Response),
+    Overview(crate::desktop::Overview, usize),
     Files(PathBuf, Result<Vec<Entry>, String>),
     Git(Result<GitState, String>),
     GitOperation(Result<String, String>),
@@ -70,6 +123,7 @@ pub enum Reply {
     Disk(Vec<(u64, crate::document::DiskChange)>),
     /// The workspace file index for a root.
     Index(PathBuf, Vec<String>),
+    Filtered(u64, Vec<(usize, Vec<u32>)>),
     SearchHits(u64, Vec<crate::project::Hit>),
     SearchDone(u64, Result<usize, String>),
     /// Grammar-based symbols of a document.
@@ -93,7 +147,7 @@ pub enum Reply {
 }
 #[derive(Clone)]
 pub struct ReplySender {
-    sender: Sender<Reply>,
+    sender: mpsc::SyncSender<Reply>,
     events: crate::events::Events,
 }
 impl ReplySender {
@@ -103,14 +157,29 @@ impl ReplySender {
         Ok(())
     }
 }
+/// Submission never waits for a busy worker. Callers can report overload.
+pub struct QueueSender<T>(mpsc::SyncSender<T>);
+impl<T> QueueSender<T> {
+    pub fn send(&self, job: T) -> Result<(), std::io::Error> {
+        self.0.try_send(job).map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "Service queue is full; retry when work finishes",
+            ),
+            mpsc::TrySendError::Disconnected(_) => {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Service worker stopped")
+            }
+        })
+    }
+}
 pub struct JobSender {
     /// Status and diffs; a slow status never delays staging or commits.
-    git_read: Sender<Job>,
-    git_write: Sender<Job>,
-    files: Sender<Job>,
+    git_read: QueueSender<Job>,
+    git_write: QueueSender<Job>,
+    files: QueueSender<Job>,
 }
 impl JobSender {
-    pub fn send(&self, job: Job) -> Result<(), mpsc::SendError<Job>> {
+    pub fn send(&self, job: Job) -> Result<(), std::io::Error> {
         use crate::git::GitJob;
         match job {
             Job::Git(GitJob::Run(..)) => self.git_write.send(job),
@@ -123,29 +192,33 @@ pub struct Services {
     output: ReplySender,
     pub tx: JobSender,
     pub rx: Receiver<Reply>,
-    pub io: Sender<IoJob>,
+    pub io: QueueSender<IoJob>,
     pub highlight: mpsc::SyncSender<highlight::Request>,
     /// The newest requested highlight generation per document.
     pub highlight_latest: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, u64>>>,
 }
 impl Services {
     pub fn new(events: crate::events::Events) -> Self {
-        let (git_read, read_jobs) = mpsc::channel();
-        let (git_write, write_jobs) = mpsc::channel();
-        let (files, file_jobs) = mpsc::channel();
+        let (git_read, read_jobs) = mpsc::sync_channel(64);
+        let (git_write, write_jobs) = mpsc::sync_channel(64);
+        let (files, file_jobs) = mpsc::sync_channel(64);
         let tx = JobSender {
-            git_read,
-            git_write,
-            files,
+            git_read: QueueSender(git_read),
+            git_write: QueueSender(git_write),
+            files: QueueSender(files),
         };
-        let (sender, rx) = mpsc::channel();
+        let (sender, rx) = mpsc::sync_channel(256);
         let output = ReplySender { sender, events };
         let output_root = output.clone();
-        let (io, io_jobs) = mpsc::channel();
+        let (io, io_jobs) = mpsc::sync_channel(128);
         let io_output = output.clone();
         thread::spawn(move || {
             while let Ok(job) = io_jobs.recv() {
                 let reply = match job {
+                    IoJob::FileOperation(operation) => {
+                        let result = operation.run();
+                        Reply::FileOperation(operation, result)
+                    }
                     IoJob::Open(id, path) => {
                         if path.is_dir() {
                             Reply::OpenedDirectory(id, path)
@@ -153,42 +226,61 @@ impl Services {
                             Reply::Opened(id, Document::open(&path).map_err(|e| format!("{e:#}")))
                         }
                     }
-                    IoJob::Reload(id, path, encoding) => Reply::Reloaded(
+                    IoJob::Reload(id, version, path, encoding) => Reply::Reloaded(
                         id,
+                        version,
                         Document::open_with_encoding(&path, encoding.as_deref())
                             .map_err(|e| format!("{e:#}")),
                     ),
-                    IoJob::Save(id, mut doc, destination, overwrite, options) => Reply::Saved(
-                        id,
-                        doc.save_with_options(destination.as_deref(), overwrite, options)
-                            .map(|()| doc)
-                            .map_err(|e| SaveFailure {
-                                kind: crate::fsio::error_kind(&e),
-                                message: format!("{e:#}"),
-                            }),
-                    ),
-                    IoJob::SaveElevated(id, mut doc, program) => Reply::Saved(
-                        id,
-                        (|| -> anyhow::Result<Document> {
-                            let path = doc.path.clone().ok_or_else(|| {
-                                anyhow::anyhow!("Use Save As for an untitled document")
-                            })?;
-                            let bytes = doc.encoded()?;
-                            crate::fsio::write_elevated(
-                                &path,
-                                &bytes,
-                                doc.disk.as_ref(),
-                                &program,
-                                false,
-                            )?;
-                            doc.mark_saved_bytes(&bytes);
-                            Ok(doc)
-                        })()
-                        .map_err(|e| SaveFailure {
-                            kind: crate::fsio::SaveErrorKind::Other,
-                            message: format!("{e:#}"),
-                        }),
-                    ),
+                    IoJob::Save(id, mut doc, destination, overwrite, options) => {
+                        let prepared = doc.prepare_save(destination.as_deref(), overwrite);
+                        let ready = prepared.is_ok();
+                        let result = prepared.and_then(|()| doc.write_prepared(options));
+                        Reply::Saved(
+                            id,
+                            match result {
+                                Ok(()) => Ok(doc),
+                                Err(e) => Err(SaveFailure {
+                                    kind: crate::fsio::error_kind(&e),
+                                    message: format!("{e:#}"),
+                                    snapshot: ready.then(|| Box::new(doc)),
+                                }),
+                            },
+                        )
+                    }
+                    IoJob::SaveElevated(id, mut doc, program) => {
+                        let output = io_output.clone();
+                        thread::spawn(move || {
+                            let result = (|| -> anyhow::Result<()> {
+                                let path = doc
+                                    .path
+                                    .clone()
+                                    .ok_or_else(|| anyhow::anyhow!("Missing save destination"))?;
+                                let bytes = doc.encoded()?;
+                                crate::fsio::write_elevated(
+                                    &path,
+                                    &bytes,
+                                    doc.disk.as_ref(),
+                                    &program,
+                                    false,
+                                )?;
+                                doc.mark_saved_bytes(&bytes);
+                                Ok(())
+                            })();
+                            let _ = output.send(Reply::Saved(
+                                id,
+                                match result {
+                                    Ok(()) => Ok(doc),
+                                    Err(e) => Err(SaveFailure {
+                                        kind: crate::fsio::SaveErrorKind::Other,
+                                        message: format!("{e:#}"),
+                                        snapshot: Some(Box::new(doc)),
+                                    }),
+                                },
+                            ));
+                        });
+                        continue;
+                    }
                     IoJob::Checkpoint(path, w) => {
                         if let Err(e) = workspace::write_checkpoint(&path, &w) {
                             let _ = io_output
@@ -230,35 +322,11 @@ impl Services {
             thread::spawn(move || {
                 while let Ok(job) = jobs.recv() {
                     let reply = match job {
-                        Job::Browse(path) => {
-                            let entries = (|| -> std::io::Result<Vec<Entry>> {
-                                let mut list = vec![];
-                                if let Some(parent) = path.parent() {
-                                    list.push(Entry {
-                                        name: "..".into(),
-                                        path: parent.to_string_lossy().into_owned(),
-                                        directory: true,
-                                    });
-                                }
-                                let mut children = vec![];
-                                for entry in fs::read_dir(&path)?.take(100_000) {
-                                    let e = entry?;
-                                    children.push(Entry {
-                                        name: e.file_name().to_string_lossy().into_owned(),
-                                        path: e.path().to_string_lossy().into_owned(),
-                                        directory: e.path().is_dir(),
-                                    });
-                                }
-                                children.sort_by(|a, b| {
-                                    b.directory.cmp(&a.directory).then_with(|| {
-                                        a.name.to_lowercase().cmp(&b.name.to_lowercase())
-                                    })
-                                });
-                                list.extend(children);
-                                Ok(list)
-                            })();
-                            Reply::Files(path, entries.map_err(|e| e.to_string()))
-                        }
+                        Job::Browse(path, expanded, tree) => Reply::Files(
+                            path.clone(),
+                            crate::files::listing(&path, &expanded, tree)
+                                .map_err(|e| e.to_string()),
+                        ),
                         Job::Spell(text) => Reply::Spelling(spell(&text)),
                         Job::Git(job) => match crate::git::handle(job) {
                             crate::git::GitReply::Status(state) => Reply::Git(state),
@@ -276,7 +344,7 @@ impl Services {
             output: output_root,
             tx,
             rx,
-            io,
+            io: QueueSender(io),
             highlight,
             highlight_latest,
         }

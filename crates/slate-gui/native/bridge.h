@@ -167,8 +167,11 @@ class CellView : public QQuickPaintedItem {
     void paint(QPainter *painter) override;
     QVariant inputMethodQuery(Qt::InputMethodQuery query) const override;
     bool isEditor() const { return m_pane.value("kind") == "editor"; }
-    // Accessibility: the text around the cursor and positions within it.
+    // Document-wide UTF-16 ranges and positions for assistive technology.
     QVariantMap accessibleContext() const;
+    QVariantMap accessibleRequest(const QString &action, QVariantMap arguments = {}) const;
+    QRect accessibleCharacterRect(int offset) const;
+    int accessibleOffsetAt(const QPoint &point) const;
     QRectF cursorRectangle() const;
     void fontChanged();
   signals:
@@ -225,6 +228,7 @@ class CellView : public QQuickPaintedItem {
     int rowAt(qreal y) const;
     void restartBlink();
     void notifyAccessibleCursor();
+    QVariantMap m_accessibleContext;
 };
 
 // The document overview beside an editor: one bar per (sampled) line, the
@@ -256,7 +260,7 @@ class Minimap : public QQuickPaintedItem {
     int m_paneId = 0, m_visibleRows = 0, m_widest = 0, m_total = 0;
     QVariantMap m_editor;
     QColor m_background, m_foreground, m_accent;
-    QVariant m_document, m_generation;
+    QVariant m_document, m_generation, m_overviewRevision;
     QVector<QPair<int, int>> m_lines;
     void scrollTo(qreal y);
 };

@@ -53,6 +53,7 @@ struct Server {
     ready: bool,
     /// Messages held until the server has initialized.
     queue: Vec<Value>,
+    queued_bytes: usize,
 }
 
 struct OpenDoc {
@@ -155,6 +156,7 @@ pub(crate) struct Lsp {
     docs: BTreeMap<u64, OpenDoc>,
     languages: Option<Vec<Language>>,
     pending: HashMap<(u64, i64), Pending>,
+    deadlines: HashMap<(u64, i64), std::time::Instant>,
     next_id: i64,
     next_server: u64,
     /// Diagnostics by file, from language servers and task output.
@@ -439,7 +441,9 @@ impl App {
             return None;
         }
         let path = d.path.clone()?;
-        let syntax = crate::highlight::syntax_for(Some(&path), &d.line_text(0))
+        let (_, end) = d.line_range(0);
+        let hint = d.slice(0, d.floor_boundary(end.min(4096)));
+        let syntax = crate::highlight::syntax_for(Some(&path), &hint)
             .name
             .clone();
         crate::languages::find(self.languages(), &path, &syntax).cloned()
@@ -537,6 +541,9 @@ impl App {
         self.lsp
             .pending
             .insert((id, request_id), Pending::Initialize);
+        self.lsp
+            .deadlines
+            .insert((id, request_id), std::time::Instant::now());
         self.lsp.servers.insert(
             id,
             Server {
@@ -546,6 +553,7 @@ impl App {
                 capabilities: Value::Null,
                 ready: false,
                 queue: Vec::new(),
+                queued_bytes: 0,
             },
         );
         self.lsp.keys.insert(key, id);
@@ -563,7 +571,15 @@ impl App {
             if s.ready {
                 s.process.send(&message);
             } else {
-                s.queue.push(message);
+                let size = serde_json::to_vec(&message).map_or(usize::MAX, |bytes| bytes.len());
+                if s.queue.len() < 128
+                    && size <= (16 * 1024 * 1024usize).saturating_sub(s.queued_bytes)
+                {
+                    s.queued_bytes += size;
+                    s.queue.push(message);
+                } else {
+                    s.process.kill();
+                }
             }
         }
     }
@@ -576,8 +592,18 @@ impl App {
     }
 
     fn request(&mut self, server: u64, method: &str, params: Value, pending: Pending) {
+        if self.lsp.pending.len() >= 1024 {
+            if let Some(s) = self.lsp.servers.get_mut(&server) {
+                s.process.kill();
+            }
+            self.abandon(pending, "Language server overloaded");
+            return;
+        }
         let id = self.next_request();
         self.lsp.pending.insert((server, id), pending);
+        self.lsp
+            .deadlines
+            .insert((server, id), std::time::Instant::now());
         self.send_to(
             server,
             json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
@@ -604,10 +630,9 @@ impl App {
             .docs
             .iter()
             .filter(|(doc, open)| {
-                self.documents
-                    .get(doc)
-                    .is_none_or(|d| d.path.as_ref() != Some(&open.path))
-                    || !self.trusted_path(open.path.parent().unwrap_or(&open.path))
+                self.documents.get(doc).is_none_or(|d| {
+                    d.path.as_ref() != Some(&open.path) || d.len() > 8 * 1024 * 1024
+                }) || !self.trusted_path(open.path.parent().unwrap_or(&open.path))
             })
             .map(|(doc, _)| *doc)
             .collect();
@@ -621,6 +646,9 @@ impl App {
         }
         let ids: Vec<u64> = self.documents.keys().copied().collect();
         for doc in ids {
+            if self.documents[&doc].len() > 8 * 1024 * 1024 {
+                continue;
+            }
             if self.lsp.docs.contains_key(&doc) {
                 self.lsp_sync_changes(doc);
                 continue;
@@ -755,6 +783,7 @@ impl App {
 
     /// Drop a server's documents and requests, finishing what waited on it.
     fn forget_server(&mut self, server: u64, reason: &str) {
+        self.lsp.deadlines.retain(|(s, _), _| *s != server);
         self.lsp.keys.retain(|_, id| *id != server);
         self.lsp.docs.retain(|_, d| d.server != server);
         let dropped: Vec<Pending> = {
@@ -790,11 +819,47 @@ impl App {
         }
     }
 
-    /// Forget a formatting request that timed out.
+    pub(crate) fn expire_lsp_requests(&mut self) {
+        let expired: Vec<_> = self
+            .lsp
+            .deadlines
+            .iter()
+            .filter(|(_, started)| started.elapsed() >= std::time::Duration::from_secs(30))
+            .map(|(key, _)| *key)
+            .collect();
+        for (server, id) in expired {
+            self.lsp.deadlines.remove(&(server, id));
+            if let Some(pending) = self.lsp.pending.remove(&(server, id)) {
+                let initializing = matches!(pending, Pending::Initialize);
+                if let Some(s) = self.lsp.servers.get(&server) {
+                    s.process.send(&json!({"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": id}}));
+                }
+                self.abandon(pending, "Language server request timed out");
+                if initializing {
+                    if let Some(s) = self.lsp.servers.get_mut(&server) {
+                        s.process.kill();
+                    }
+                }
+            }
+        }
+    }
     pub(crate) fn lsp_cancel_formatting(&mut self, doc: u64) {
-        self.lsp
+        let keys: Vec<_> = self
+            .lsp
             .pending
-            .retain(|_, p| !matches!(p, Pending::Formatting { doc: d, .. } if *d == doc));
+            .iter()
+            .filter(|(_, p)| matches!(p, Pending::Formatting { doc: d, .. } if *d == doc))
+            .map(|(key, _)| *key)
+            .collect();
+        for (server, id) in keys {
+            self.lsp.pending.remove(&(server, id));
+            self.lsp.deadlines.remove(&(server, id));
+            if let Some(s) = self.lsp.servers.get(&server) {
+                s.process.send(
+                    &json!({"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": id}}),
+                );
+            }
+        }
     }
 
     pub(crate) fn lsp_event(&mut self, event: Event) {
@@ -827,6 +892,7 @@ impl App {
             (None, Some(method)) => self.server_notification(&method, &message["params"]),
             (Some(id), None) => {
                 let Some(id) = id.as_i64() else { return };
+                self.lsp.deadlines.remove(&(server, id));
                 let Some(pending) = self.lsp.pending.remove(&(server, id)) else {
                     return;
                 };
@@ -971,6 +1037,7 @@ impl App {
                     s.ready = true;
                     s.process
                         .send(&json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+                    s.queued_bytes = 0;
                     for message in std::mem::take(&mut s.queue) {
                         s.process.send(&message);
                     }
@@ -1610,8 +1677,8 @@ impl App {
         let uri = self.lsp.docs[&doc].uri.clone();
         let content = self.documents[&doc].content_version();
         let options = json!({
-            "tabSize": self.preferences.indent_width,
-            "insertSpaces": self.preferences.insert_spaces,
+            "tabSize": self.preferences_for_document(doc).indent_width,
+            "insertSpaces": self.preferences_for_document(doc).insert_spaces,
             "trimTrailingWhitespace": true,
         });
         self.request(
@@ -1695,6 +1762,7 @@ impl App {
             }
             return Ok(());
         }
+        self.cancel_completion_requests(view);
         self.request(
             server,
             "textDocument/completion",
@@ -1702,6 +1770,21 @@ impl App {
             Pending::Completion { view, doc, offset },
         );
         Ok(())
+    }
+
+    fn cancel_completion_requests(&mut self, view: u64) {
+        let requests: Vec<_> = self.lsp.pending.iter().filter(|(_, pending)| {
+            matches!(pending, Pending::Completion { view: pending_view, .. } if *pending_view == view)
+        }).map(|(key, _)| *key).collect();
+        for (server, id) in requests {
+            self.lsp.pending.remove(&(server, id));
+            self.lsp.deadlines.remove(&(server, id));
+            if let Some(s) = self.lsp.servers.get(&server) {
+                s.process.send(
+                    &json!({"jsonrpc":"2.0", "method":"$/cancelRequest", "params":{"id":id}}),
+                );
+            }
+        }
     }
 
     /// The identifier being typed before `offset`: its start.
@@ -1794,7 +1877,9 @@ impl App {
             })
             .collect();
         // Snippets for the language join the list.
-        let language = crate::highlight::syntax_for(d.path.as_deref(), &d.line_text(0))
+        let (_, end) = d.line_range(0);
+        let hint = d.slice(0, d.floor_boundary(end.min(4096)));
+        let language = crate::highlight::syntax_for(d.path.as_deref(), &hint)
             .name
             .clone();
         let mut snippet_errors = Vec::new();
@@ -1886,6 +1971,7 @@ impl App {
         let Some(c) = self.lsp.completion.take() else {
             return Ok(());
         };
+        self.cancel_completion_requests(c.view);
         let (Some(index), Some(view)) = (c.shown.get(c.selected), self.views.get(&c.view)) else {
             return Ok(());
         };
@@ -1943,6 +2029,11 @@ impl App {
 
     /// Keys while completions are shown. Returns true when used.
     pub(crate) fn completion_key(&mut self, k: &crate::Key) -> Result<bool> {
+        if k.key == "Escape" {
+            if let Some(view) = self.active_editor() {
+                self.cancel_completion_requests(view);
+            }
+        }
         if self.lsp.completion.is_none() {
             return Ok(false);
         }
@@ -2323,6 +2414,59 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timed_out_requests_are_removed_without_waiting_on_a_server() {
+        let _serial = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", dir.path().join("config"));
+        std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
+        let mut app = App::new(dir.path()).unwrap();
+        app.lsp.pending.insert((42, 1), Pending::Ignore);
+        app.lsp.deadlines.insert(
+            (42, 1),
+            std::time::Instant::now() - std::time::Duration::from_secs(31),
+        );
+        app.expire_lsp_requests();
+        assert!(app.lsp.pending.is_empty());
+        assert!(app.lsp.deadlines.is_empty());
+    }
+
+    #[test]
+    fn escape_cancels_a_completion_even_before_its_response_arrives() {
+        let _serial = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", dir.path().join("config"));
+        std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
+        let mut app = App::new(dir.path()).unwrap();
+        let view = app.active_editor().unwrap();
+        let doc = app.views[&view].document;
+        app.lsp.pending.insert(
+            (42, 1),
+            Pending::Completion {
+                view,
+                doc,
+                offset: 0,
+            },
+        );
+        app.lsp.deadlines.insert((42, 1), std::time::Instant::now());
+        app.completion_key(&crate::Key {
+            key: "Escape".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(app.lsp.pending.is_empty());
+        assert!(app.lsp.deadlines.is_empty());
+        app.lsp_message(
+            42,
+            json!({"jsonrpc":"2.0", "id":1, "result":[{"label":"late"}]}),
+        );
+        assert!(app.lsp.completion.is_none());
+    }
 
     #[test]
     fn workspace_edits_validate_every_file_before_changing_any() {

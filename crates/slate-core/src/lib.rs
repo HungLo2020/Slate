@@ -1,3 +1,4 @@
+mod accessibility;
 mod actions;
 pub mod cli;
 pub mod commands;
@@ -8,6 +9,7 @@ pub mod desktop;
 pub mod document;
 mod editing;
 pub mod events;
+mod files;
 mod folding;
 pub mod format;
 pub mod fsio;
@@ -26,9 +28,11 @@ pub mod picker;
 pub mod preferences;
 mod presentation;
 pub mod process;
+pub mod profiles;
 pub mod project;
 mod render;
 pub mod rpc;
+mod saves;
 pub mod search;
 mod services;
 mod smart;
@@ -118,6 +122,21 @@ pub enum Command {
         delta: i32,
     },
     OpenSettings,
+    PathDialogStart,
+    PathDialogFinish {
+        paths: Vec<PathBuf>,
+        #[serde(default)]
+        overwrite: bool,
+    },
+    AccessibleSelect {
+        pane: u64,
+        start: usize,
+        end: usize,
+    },
+    AccessibleScroll {
+        pane: u64,
+        offset: usize,
+    },
     EditorOnly,
     ShowWorkspace,
     ToggleWorkspace,
@@ -401,6 +420,7 @@ pub struct EditorPresentation {
     pub left: usize,
     pub document: u64,
     pub generation: u64,
+    pub overview_revision: u64,
 }
 #[derive(Serialize)]
 pub struct Snapshot {
@@ -428,6 +448,8 @@ pub struct Snapshot {
     pub selection: String,
     pub commands: Vec<commands::CommandInfo>,
     pub settings: Preferences,
+    pub profiles: Vec<String>,
+    pub setting_sources: BTreeMap<String, String>,
     pub editor_only: bool,
     /// Window title: the active document and the workspace folder.
     pub title: String,
@@ -479,6 +501,9 @@ pub struct App {
     pub clipboard: String,
     browser: PathBuf,
     files: Vec<Entry>,
+    expanded_folders: std::collections::BTreeSet<PathBuf>,
+    pending_file: Option<PathBuf>,
+    pending_path_dialog: Option<(String, Option<u64>)>,
     /// The Git pane: entries, branch and running jobs.
     git: git::Panel,
     selected: usize,
@@ -488,6 +513,7 @@ pub struct App {
     /// Why `layouts.toml` could not be read; saving would overwrite it.
     layouts_unreadable: Option<String>,
     pub preferences: Preferences,
+    preference_layers: profiles::Layers,
     pub prompt: Option<Prompt>,
     search: Search,
     pending_close: Option<(u64, u64)>,
@@ -514,6 +540,11 @@ pub struct App {
     recovery_key: PathBuf,
     /// Quit once pending "save all" writes succeed.
     quit_after_save: bool,
+    save_all_queue: Option<std::collections::VecDeque<u64>>,
+    save_operations: BTreeMap<u64, Document>,
+    save_questions: std::collections::VecDeque<(u64, String, String)>,
+    save_confirmation: Option<u64>,
+    close_after_save: Option<(u64, u64)>,
     /// A save waiting for confirmation: (document, destination, overwrite).
     pending_retry: Option<(u64, Option<PathBuf>, bool)>,
     /// A privileged save the frontend must perform (terminal `sudo`).
@@ -537,6 +568,9 @@ pub struct App {
     disk_conflicts: std::collections::VecDeque<(u64, Document)>,
     recent: Vec<String>,
     overview_cache: BTreeMap<u64, desktop::Overview>,
+    overview_pending: BTreeMap<u64, (u64, usize)>,
+    overview_workers: BTreeMap<u64, services::LatestWorker<desktop::OverviewRequest>>,
+    overview_revision: u64,
     /// Requests only a frontend can fulfil (new window, print), drained by it.
     frontend_requests: Vec<String>,
     inbox: Option<instance::Inbox>,
@@ -574,6 +608,12 @@ pub struct App {
     pending_trust: Option<(PathBuf, Command)>,
     /// Trust decisions for folders outside the workspace.
     trust_cache: std::sync::Mutex<std::collections::HashMap<PathBuf, bool>>,
+    /// Wrapped rows are shared across cursor movement and rendering.
+    #[allow(clippy::type_complexity)]
+    wrap_cache:
+        std::sync::Mutex<BTreeMap<(u64, u64, usize, usize, usize), std::sync::Arc<Vec<wrap::Row>>>>,
+    fuzzy_worker: Option<picker::FilterWorker>,
+    search_worker: Option<services::LatestWorker<picker::SearchRequest>>,
     /// Hidden line ranges per view, keyed by what they were computed from.
     #[allow(clippy::type_complexity)]
     fold_cache: std::sync::Mutex<BTreeMap<u64, ((u64, Vec<usize>, usize), folding::Hidden)>>,
@@ -708,6 +748,9 @@ impl App {
             quit: false,
             clipboard: String::new(),
             files: vec![],
+            expanded_folders: Default::default(),
+            pending_file: None,
+            pending_path_dialog: None,
             git: git::Panel::default(),
             selected: 0,
             services: Services::new(events.clone()),
@@ -721,6 +764,7 @@ impl App {
             presets: BTreeMap::new(),
             layouts_unreadable: None,
             preferences: Preferences::default(),
+            preference_layers: Default::default(),
             prompt: None,
             search: Search::default(),
             highlights: BTreeMap::new(),
@@ -743,6 +787,11 @@ impl App {
             file_mode,
             recovery_key,
             quit_after_save: false,
+            save_all_queue: None,
+            save_operations: Default::default(),
+            save_questions: Default::default(),
+            save_confirmation: None,
+            close_after_save: None,
             pending_retry: None,
             elevation: None,
             elevation_mode: ElevationMode::None,
@@ -757,6 +806,9 @@ impl App {
             disk_conflicts: Default::default(),
             recent: desktop::load_recent(),
             overview_cache: BTreeMap::new(),
+            overview_pending: Default::default(),
+            overview_workers: Default::default(),
+            overview_revision: 0,
             frontend_requests: vec![],
             inbox: None,
             pending_positions: BTreeMap::new(),
@@ -779,15 +831,31 @@ impl App {
             pending_trust: None,
             trust_cache: Default::default(),
             fold_cache: Default::default(),
+            wrap_cache: Default::default(),
+            fuzzy_worker: None,
+            search_worker: None,
         };
         app.read_layouts();
         app.load_preferences();
+        if let Some(layout) = app.preference_layers.layout.clone() {
+            app.restore_layout(layout)?;
+        }
         app.reload_tools();
-        app.editor_only = launch.startup.unwrap_or(if file_mode {
-            app.preferences.file_startup
-        } else {
-            app.preferences.directory_startup
-        }) == StartupMode::EditorOnly;
+        app.editor_only =
+            launch
+                .startup
+                .unwrap_or(if let Some(editor_only) = app.preference_layers.startup {
+                    if editor_only {
+                        StartupMode::EditorOnly
+                    } else {
+                        StartupMode::Workspace
+                    }
+                } else if file_mode {
+                    app.preferences.file_startup
+                } else {
+                    app.preferences.directory_startup
+                })
+                == StartupMode::EditorOnly;
         for (view, line, column) in positions {
             if line.is_some() || column.is_some() {
                 let doc = app.views[&view].document;
@@ -822,9 +890,11 @@ impl App {
         self.events.drain();
         self.poll();
         self.drain_inbox();
+        self.sync_document_preferences();
         self.reap_terminals();
         self.lsp_sync();
         self.expire_formatting();
+        self.expire_lsp_requests();
         self.expire_tasks();
         self.debug_flush();
         self.watch_files();
@@ -1041,6 +1111,7 @@ impl App {
                 return;
             }
         }
+        self.sync_document_preferences();
         self.typing =
             matches!(&cmd, Command::Key { key } if !key.ctrl && !key.alt && !key.text.is_empty());
         if !self.typing {
@@ -1056,6 +1127,7 @@ impl App {
             self.status = format!("Error: {e:#}");
         }
         self.typing = false;
+        self.sync_document_preferences();
         self.schedule_highlight();
     }
     /// Open a prompt of `kind`, filled with the selection for find and replace.
@@ -1077,6 +1149,11 @@ impl App {
             "reopen-encoding",
             "set-line-ending",
             "open-recent",
+            "new-file",
+            "new-folder",
+            "rename-file",
+            "profile-save",
+            "profile-load",
         ]
         .contains(&kind.as_str())
         {
@@ -1133,6 +1210,10 @@ impl App {
                     whole_word: false,
                 });
             }
+            "trash-file" => {
+                self.prompt = None;
+                self.confirm_trash()?;
+            }
             "confirm-replace" => {
                 self.prompt = None;
                 self.replace_in_files(&p.replacement)?;
@@ -1152,6 +1233,11 @@ impl App {
                     if let Some((pane, view)) = target {
                         self.close_tab(pane, view, true)?;
                     }
+                } else if let Some((pane, view)) = target {
+                    self.close_after_save = Some((pane, view));
+                    self.focus = pane;
+                    self.reveal_document(self.views[&view].document);
+                    self.execute(Command::Save)?;
                 }
             }
             "open" | "open-folder" | "save-as" | "commit" | "layout-save" | "layout-load"
@@ -1175,7 +1261,8 @@ impl App {
                 }
             }
             "insert-file" | "set-encoding" | "reopen-encoding" | "set-line-ending"
-            | "open-recent" | "rename-symbol" | "debug-evaluate" | "debug-program" => {
+            | "open-recent" | "new-file" | "new-folder" | "rename-file" | "profile-save"
+            | "profile-load" | "rename-symbol" | "debug-evaluate" | "debug-program" => {
                 if p.input.trim().is_empty() {
                     bail!("Enter a value");
                 }
@@ -1352,6 +1439,43 @@ impl App {
                     path: Preferences::path(),
                 })?;
             }
+            Command::PathDialogStart => {
+                let prompt = self.prompt.take().context("No path prompt")?;
+                if !["open", "open-folder", "save-as"].contains(&prompt.kind.as_str()) {
+                    bail!("Not a path prompt");
+                }
+                let doc = self.active_editor().map(|id| self.views[&id].document);
+                self.pending_path_dialog = Some((prompt.kind, doc));
+            }
+            Command::PathDialogFinish { paths, overwrite } => {
+                let (kind, doc) = self.pending_path_dialog.take().context("No path dialog")?;
+                if paths.is_empty() {
+                    if kind == "save-as" {
+                        self.cancel_save_workflow();
+                    }
+                } else if kind == "save-as" {
+                    let doc = doc.context("No document to save")?;
+                    if !self.documents.contains_key(&doc) {
+                        bail!("The document was closed");
+                    }
+                    self.reveal_document(doc);
+                    self.execute(Command::SaveAs {
+                        path: paths[0].clone(),
+                        overwrite,
+                    })?;
+                } else {
+                    if kind == "open-folder" {
+                        self.execute(Command::ShowWorkspace)?;
+                    }
+                    for path in paths {
+                        self.execute(Command::Open { path })?;
+                    }
+                }
+            }
+            Command::AccessibleSelect { pane, start, end } => {
+                self.accessible_select(pane, start, end)?
+            }
+            Command::AccessibleScroll { pane, offset } => self.accessible_scroll(pane, offset)?,
             Command::InputMethod {
                 text,
                 replace_start,
@@ -1431,6 +1555,15 @@ impl App {
             Command::DismissPrompt => {
                 let kind = self.prompt.take().map(|p| p.kind).unwrap_or_default();
                 self.pending_close = None;
+                if matches!(kind.as_str(), "rename-file" | "trash-file") {
+                    self.pending_file = None;
+                }
+                if matches!(
+                    kind.as_str(),
+                    "save-as" | "save-read-only" | "save-elevated"
+                ) {
+                    self.cancel_save_workflow();
+                }
                 match kind.as_str() {
                     "trust" => self.answer_trust(false)?,
                     "save-read-only" | "save-elevated" | "reload-changed" => {
@@ -1562,11 +1695,11 @@ impl App {
                     self.root.join(path)
                 };
                 let token = self.id();
-                self.pending_open.insert(token, self.focus);
                 self.services
                     .io
                     .send(IoJob::Open(token, path))
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                self.pending_open.insert(token, self.focus);
                 self.status = "Opening file…".into();
             }
             Command::Browse { path } => self.browse(path)?,
@@ -1869,15 +2002,34 @@ impl App {
         }
         self.browser = path.clone();
         self.selected = 0;
-        self.services.tx.send(Job::Browse(path))?;
+        self.services.tx.send(Job::Browse(
+            path,
+            self.expanded_folders.iter().cloned().collect(),
+            !self.terminal_frontend,
+        ))?;
         Ok(())
     }
     pub fn refresh(&mut self) {
-        let _ = self.services.tx.send(Job::Browse(self.browser.clone()));
+        let _ = self.services.tx.send(Job::Browse(
+            self.browser.clone(),
+            self.expanded_folders.iter().cloned().collect(),
+            !self.terminal_frontend,
+        ));
         self.refresh_git();
     }
     pub fn poll(&mut self) {
-        while let Ok(reply) = self.services.rx.try_recv() {
+        let started = Instant::now();
+        for processed in 0..128 {
+            if started.elapsed() >= Duration::from_millis(4) {
+                self.events.notify();
+                break;
+            }
+            let Ok(reply) = self.services.rx.try_recv() else {
+                break;
+            };
+            if processed == 127 {
+                self.events.notify();
+            }
             self.revision += 1;
             match reply {
                 Reply::OpenedDirectory(token, path) => {
@@ -1898,41 +2050,27 @@ impl App {
                         }
                     }
                 }
-                Reply::Saved(id, result) => {
-                    self.pending_save.retain(|d| *d != id);
-                    match result {
-                        Ok(d) => {
-                            if let Some(path) = d.path.clone() {
-                                self.remember_recent(&path);
-                            }
-                            let saved = id;
-                            if let Some(doc) = self.documents.get_mut(&id) {
-                                doc.accept_save(d);
-                                self.status = if doc.dirty() {
-                                    "Saved snapshot; newer edits remain unsaved"
-                                } else {
-                                    "Saved"
-                                }
-                                .into();
-                                self.workspace_dirty = true;
-                                self.refresh();
-                            }
-                            self.lsp_saved(saved);
-                            if self.quit_after_save {
-                                if let Err(e) = self.save_all(true) {
-                                    self.quit_after_save = false;
-                                    self.status = format!("Error: {e:#}");
-                                }
-                            }
-                        }
-                        Err(failure) => self.save_failed(id, failure),
+                Reply::Saved(id, result) => self.saved_reply(id, result),
+                Reply::Reloaded(id, version, result) => match result {
+                    Ok(d)
+                        if self
+                            .documents
+                            .get(&id)
+                            .is_some_and(|doc| doc.content_version() == version) =>
+                    {
+                        self.finish_reload(id, d)
                     }
-                }
-                Reply::Reloaded(id, result) => match result {
-                    Ok(d) => self.finish_reload(id, d),
+                    Ok(_) => {
+                        self.status =
+                            "Reload cancelled: the document was edited while loading".into()
+                    }
                     Err(e) => self.status = format!("Reload failed: {e}"),
                 },
+                Reply::Overview(overview, tab) => self.overview_ready(overview, tab),
                 Reply::Highlighted(response) => self.highlighted(response),
+                Reply::FileOperation(operation, result) => {
+                    self.file_operation_done(operation, result)
+                }
                 Reply::Files(path, Ok(entries)) if path == self.browser => {
                     if self.files != entries {
                         self.files_revision += 1;
@@ -1945,6 +2083,7 @@ impl App {
                 Reply::GitOperation(result) => self.git_operation_done(result),
                 Reply::Error(e) => self.status = e,
                 Reply::Index(root, files) => self.index_ready(root, files),
+                Reply::Filtered(generation, rows) => self.filtered_picker(generation, rows),
                 Reply::SearchHits(generation, hits) => self.search_hits(generation, hits),
                 Reply::SearchDone(generation, result) => self.search_done(generation, result),
                 Reply::Outline(doc, symbols) => self.symbols_ready(doc, symbols),
@@ -1980,6 +2119,7 @@ impl App {
                 _ => {}
             }
         }
+        self.offer_save_question();
     }
     fn new_terminal(&mut self) -> Result<u64> {
         let id = self.id();
@@ -2418,6 +2558,13 @@ impl App {
         };
         let cancel = k.key == "Escape" || letter == "c";
         match kind.as_str() {
+            "trash-file" => {
+                if letter == "y" || letter == "d" {
+                    self.execute(Command::SubmitPrompt { all: false })?;
+                } else if cancel || letter == "n" || k.key == "Enter" {
+                    self.execute(Command::DismissPrompt)?;
+                }
+            }
             "confirm-replace" => {
                 if letter == "y" || letter == "r" {
                     let replacement = self.prompt.take().unwrap().replacement;
@@ -2437,6 +2584,9 @@ impl App {
             "close-tab" => match k.key.as_str() {
                 "Escape" | "Enter" => self.execute(Command::DismissPrompt)?,
                 _ if letter == "d" => self.execute(Command::SubmitPrompt { all: true })?,
+                _ if letter == "s" || letter == "y" => {
+                    self.execute(Command::SubmitPrompt { all: false })?
+                }
                 _ => {}
             },
             "quit" => {
@@ -2467,7 +2617,7 @@ impl App {
                 } else if letter == "n" || cancel || k.key == "Enter" {
                     self.prompt = None;
                     self.pending_retry = None;
-                    self.quit_after_save = false;
+                    self.cancel_save_workflow();
                     self.status = "Save cancelled".into();
                 }
             }
@@ -2574,6 +2724,8 @@ impl App {
                 match k.key.as_str() {
                     "Up" => *selected = selected.saturating_sub(1),
                     "Down" => *selected = (*selected + 1).min(length.saturating_sub(1)),
+                    "Right" if !git => return self.file_action("expand-folder", ""),
+                    "Left" if !git => return self.file_action("collapse-folder", ""),
                     "Home" => *selected = 0,
                     "End" => *selected = length.saturating_sub(1),
                     "Enter" => {
@@ -2956,6 +3108,15 @@ impl App {
 
 /// Command-line verbs handled by `actions.rs`.
 const ACTION_VERBS: &[&str] = &[
+    "profile-save",
+    "profile-load",
+    "new-file",
+    "new-folder",
+    "rename-file",
+    "trash-file",
+    "toggle-folder",
+    "expand-folder",
+    "collapse-folder",
     "move-left",
     "move-right",
     "move-up",

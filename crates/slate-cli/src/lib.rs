@@ -145,6 +145,7 @@ fn tab_regions(tabs: &[slate_core::Tab], width: u16) -> Vec<TabRegion> {
 /// Prompts answered with a single key (no text field).
 const CHOICE_PROMPTS: &[&str] = &[
     "close-tab",
+    "trash-file",
     "quit",
     "save-read-only",
     "save-elevated",
@@ -833,8 +834,9 @@ fn clean(s: &str) -> String {
 fn prompt_view(prompt: &slate_core::search::Prompt) -> (String, &'static str, u16) {
     let input = clean(&prompt.input);
     match prompt.kind.as_str() {
+        "trash-file" => (format!("Move {input} to desktop Trash?\nY: move to Trash · N / Escape: cancel"), "Move to Trash", 5),
         "close-tab" => (
-            format!("Discard unsaved changes in {input}?\nD: discard and close · Escape / Enter: cancel\nCancel to save the document first."),
+            format!("Save changes to {input} before closing?\nS: save and close · D: discard and close\nEscape / Enter: cancel"),
             "Unsaved changes",
             6,
         ),

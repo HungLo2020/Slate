@@ -164,7 +164,10 @@ fn documents_sync_incrementally_with_utf16_positions() {
     f.synced();
     // Saving is reported.
     f.app.dispatch(Command::Save);
-    f.wait("save", |a| a.status == "Saved");
+    let file = f.file.clone();
+    f.wait("save", |a| {
+        !a.dirty() && fs::read_to_string(&file).is_ok_and(|text| text == "def fresh\n")
+    });
     let saved_log = f.dir.path().join("dump/saved");
     f.wait("didSave", |_| saved_log.exists());
 }
@@ -467,7 +470,10 @@ fn a_format_cut_short_by_a_stopped_server_leaves_the_document_saveable() {
     assert_eq!(f.app.status, "Formatting…");
     f.action("restart-language-servers", "");
     // Format-on-save still saves (unformatted), and saving works again.
-    f.wait("save", |a| a.status == "Saved");
+    let file = f.file.clone();
+    f.wait("save", |a| {
+        !a.dirty() && fs::read_to_string(&file).is_ok_and(|text| text.contains("def main   \n"))
+    });
     assert!(fs::read_to_string(&f.file)
         .unwrap()
         .contains("def main   \n"));

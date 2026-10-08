@@ -173,13 +173,13 @@ void Bridge::confirmCloseTab(QObject *windowObject) {
     const auto prompt = m_frame.value("prompt").toMap();
     if (!window || m_closeDialog || prompt.value("kind") != "close-tab") return;
     auto dialog = new QMessageBox(QMessageBox::Warning, tr("Unsaved Changes"),
-        tr("Discard unsaved changes in “%1” and close this tab?").arg(prompt.value("input").toString()),
-        QMessageBox::Discard | QMessageBox::Cancel);
+        tr("Save changes to “%1” before closing this tab?").arg(prompt.value("input").toString()),
+        QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel);
     m_closeDialog = dialog;
     dialog->setObjectName("closeTabDialog");
     dialog->setAttribute(Qt::WA_DeleteOnClose);
     dialog->setTextFormat(Qt::PlainText);
-    dialog->setInformativeText(tr("Cancel to keep editing or save the document first."));
+    dialog->setInformativeText(tr("Unsaved changes will be lost if you discard them."));
     dialog->setDefaultButton(QMessageBox::Cancel);
     dialog->setEscapeButton(QMessageBox::Cancel);
     dialog->setWindowModality(Qt::WindowModal);
@@ -190,6 +190,8 @@ void Bridge::confirmCloseTab(QObject *windowObject) {
         m_closeDialog.clear();
         if (result == QMessageBox::Discard)
             send({{"action", "submit_prompt"}, {"all", true}});
+        else if (result == QMessageBox::Save)
+            send({{"action", "submit_prompt"}, {"all", false}});
         else
             send({{"action", "dismiss_prompt"}});
         if (parent) parent->requestActivate();
@@ -236,14 +238,9 @@ void Bridge::pickPath(const QString &kind, QObject *windowObject) {
     dialog->winId();
     dialog->windowHandle()->setTransientParent(window);
     connect(window, &QObject::destroyed, dialog, &QWidget::close);
-    connect(dialog, &QFileDialog::filesSelected, this, [this, kind](const QStringList &selected) {
-        if (selected.isEmpty()) return;
-        if (kind == "open-folder") send({{"action", "show_workspace"}});
-        for (const auto &file : selected)
-            send({{"action", kind == "save-as" ? "save_as" : "open"},
-                  {"path", file}, {"overwrite", kind == "save-as"}});
-    });
-    connect(dialog, &QDialog::finished, this, [this, parent = QPointer<QWindow>(window)](int) {
+    connect(dialog, &QDialog::finished, this, [this, dialog, kind, parent = QPointer<QWindow>(window)](int result) {
+        const QStringList paths = result == QDialog::Accepted ? dialog->selectedFiles() : QStringList{};
+        send({{"action", "path_dialog_finish"}, {"paths", paths}, {"overwrite", kind == "save-as"}});
         m_pathDialog.clear();
         if (parent) parent->requestActivate();
         refresh();
@@ -251,7 +248,7 @@ void Bridge::pickPath(const QString &kind, QObject *windowObject) {
     });
     // Consume the core prompt before showing the native dialog. Cancellation
     // leaves the document untouched, and paths bypass command-line parsing.
-    send({{"action", "dismiss_prompt"}});
+    send({{"action", "path_dialog_start"}});
     emit pathDialogOpenChanged();
     refresh();
     dialog->open(); // Asynchronous: workers and Qt's event loop keep running.
@@ -323,7 +320,7 @@ void Bridge::detachView(int id, CellView *view) {
 QVariantMap Bridge::send(const QVariantMap &command) {
     const auto action = command.value("action").toString();
     if (action == "catalog") ++m_catalogRequests;
-    if (action != "catalog" && action != "input_context" && action != "file_dialog_context" &&
+    if (!action.startsWith("accessible_") && action != "catalog" && action != "input_context" && action != "file_dialog_context" &&
         action != "diagnostics" && action != "update" && action != "snapshot" && action != "overview" &&
         action != "document_text")
         m_catalogs.clear();
@@ -492,7 +489,7 @@ void Bridge::exit() {
 }
 
 // ---------------------------------------------------------------------------
-// Editor accessibility: screen readers read the document around the caret,
+// Editor accessibility: screen readers read the full document,
 // follow it, and get character positions on screen.
 class EditorAccessible : public QAccessibleObject, public QAccessibleTextInterface {
   public:
@@ -526,7 +523,7 @@ class EditorAccessible : public QAccessibleObject, public QAccessibleTextInterfa
                     return tab.toMap().value("title").toString();
             return view()->isEditor() ? QStringLiteral("Editor") : QStringLiteral("Terminal");
         }
-        if (t == QAccessible::Value) return context().value("surrounding").toString();
+        if (t == QAccessible::Value) return text(0, characterCount());
         return {};
     }
     QRect rect() const override {
@@ -539,7 +536,7 @@ class EditorAccessible : public QAccessibleObject, public QAccessibleTextInterfa
         if (type == QAccessible::TextInterface) return static_cast<QAccessibleTextInterface *>(this);
         return QAccessibleObject::interface_cast(type);
     }
-    // QAccessibleTextInterface over the text window around the caret.
+    // QAccessibleTextInterface uses document-wide UTF-16 offsets.
     QVariantMap context() const { return view()->accessibleContext(); }
     void selection(int index, int *start, int *end) const override {
         const auto c = context();
@@ -551,24 +548,20 @@ class EditorAccessible : public QAccessibleObject, public QAccessibleTextInterfa
         const auto c = context();
         return c.value("anchor").toInt() != c.value("cursor").toInt() ? 1 : 0;
     }
-    void addSelection(int, int) override {}
-    void removeSelection(int) override {}
-    void setSelection(int, int, int) override {}
+    void addSelection(int start, int end) override { setSelection(0, start, end); }
+    void removeSelection(int index) override { if (index == 0) setCursorPosition(cursorPosition()); }
+    void setSelection(int index, int start, int end) override { if (index == 0 && start >= 0 && end >= 0) view()->accessibleRequest("accessible_select", {{"start", start}, {"end", end}}); }
     int cursorPosition() const override { return context().value("cursor").toInt(); }
-    void setCursorPosition(int) override {}
+    void setCursorPosition(int offset) override { setSelection(0, offset, offset); }
     QString text(int start, int end) const override {
-        return context().value("surrounding").toString().mid(start, qMax(0, end - start));
+        if (end < 0) end = characterCount();
+        if (start < 0 || end < start) return {};
+        return view()->accessibleRequest("accessible_text", {{"start", start}, {"end", end}}).value("text").toString();
     }
-    int characterCount() const override { return context().value("surrounding").toString().size(); }
-    QRect characterRect(int offset) const override {
-        if (offset != cursorPosition()) return {};
-        auto window = view()->window();
-        if (!window) return {};
-        const auto scene = view()->mapRectToScene(view()->cursorRectangle()).toRect();
-        return QRect(window->mapToGlobal(scene.topLeft()), scene.size());
-    }
-    int offsetAtPoint(const QPoint &) const override { return -1; }
-    void scrollToSubstring(int, int) override {}
+    int characterCount() const override { return context().value("length").toInt(); }
+    QRect characterRect(int offset) const override { return view()->accessibleCharacterRect(offset); }
+    int offsetAtPoint(const QPoint &point) const override { return view()->accessibleOffsetAt(point); }
+    void scrollToSubstring(int start, int) override { if (start >= 0) view()->accessibleRequest("accessible_scroll", {{"offset", start}}); }
     QString attributes(int, int *start, int *end) const override {
         *start = *end = 0;
         return {};
@@ -662,8 +655,21 @@ void CellView::setPane(const QVariantMap &pane) {
 }
 void CellView::notifyAccessibleCursor() {
     if (!QAccessible::isActive() || !isEditor()) return;
-    QAccessibleTextCursorEvent event(this, accessibleContext().value("cursor").toInt());
-    QAccessible::updateAccessibility(&event);
+    const auto context = accessibleContext();
+    const int cursor = context.value("cursor").toInt(), anchor = context.value("anchor").toInt();
+    if (context.value("document") != m_accessibleContext.value("document") ||
+        context.value("generation") != m_accessibleContext.value("generation")) {
+        QAccessibleEvent changed(this, QAccessible::VisibleDataChanged);
+        QAccessible::updateAccessibility(&changed);
+    }
+    if (context.value("anchor") != m_accessibleContext.value("anchor") ||
+        context.value("cursor") != m_accessibleContext.value("cursor")) {
+        QAccessibleTextSelectionEvent selection(this, cursor == anchor ? -1 : qMin(cursor, anchor), cursor == anchor ? -1 : qMax(cursor, anchor));
+        QAccessible::updateAccessibility(&selection);
+        QAccessibleTextCursorEvent event(this, cursor);
+        QAccessible::updateAccessibility(&event);
+    }
+    m_accessibleContext = context;
 }
 void CellView::applySurface(const QVariantMap &patch) {
     const auto previousCursor = m_cursor;
@@ -691,13 +697,38 @@ void CellView::applySurface(const QVariantMap &patch) {
         QGuiApplication::inputMethod()->update(Qt::ImCursorRectangle);
     if (m_cursor != previousCursor) {
         restartBlink();
-        notifyAccessibleCursor();
     }
+    notifyAccessibleCursor();
     update();
 }
 QVariantMap CellView::accessibleContext() const {
     if (!bridge || !isEditor()) return {};
-    return bridge->send({{"action", "input_context"}, {"pane", m_paneId}}).value("editor").toMap();
+    return accessibleRequest("accessible_context");
+}
+QVariantMap CellView::accessibleRequest(const QString &action, QVariantMap arguments) const {
+    if (!bridge || !isEditor()) return {};
+    arguments.insert("action", action); arguments.insert("pane", m_paneId);
+    const auto result = bridge->send(arguments);
+    if (action == "accessible_select" || action == "accessible_scroll") bridge->refresh();
+    return result;
+}
+QRect CellView::accessibleCharacterRect(int offset) const {
+    if (offset < 0 || !window()) return {};
+    const auto position = accessibleRequest("accessible_position", {{"offset", offset}});
+    if (!position.contains("row")) return {};
+    const int row = position.value("row").toInt(), col = position.value("col").toInt();
+    const QRectF local(cursorX(row, col), row * bridge->cellHeight() - m_scrollPixels, bridge->cellWidth(), bridge->cellHeight());
+    const auto scene = mapRectToScene(local).toRect();
+    return QRect(window()->mapToGlobal(scene.topLeft()), scene.size());
+}
+int CellView::accessibleOffsetAt(const QPoint &point) const {
+    if (!window() || !bridge) return -1;
+    const auto local = mapFromScene(window()->mapFromGlobal(point));
+    if (!boundingRect().contains(local)) return -1;
+    const int row = int((local.y() + m_scrollPixels) / bridge->cellHeight());
+    const int col = columnAt(row, local.x());
+    const auto result = accessibleRequest("accessible_offset", {{"row", row}, {"col", col}});
+    return result.contains("offset") ? result.value("offset").toInt() : -1;
 }
 int CellView::textPosition(int row, int column) const {
     if (row < 0 || row >= int(m_columns.size()))
@@ -1210,9 +1241,10 @@ void Minimap::setEditor(const QVariantMap &editor) {
     if (editor == m_editor) return;
     m_editor = editor;
     // Fetch the outline only when the document (or its content) changes.
-    if (bridge && isVisible() && (editor.value("document") != m_document || editor.value("generation") != m_generation)) {
+    if (bridge && isVisible() && (editor.value("document") != m_document || editor.value("generation") != m_generation || editor.value("overview_revision") != m_overviewRevision)) {
         m_document = editor.value("document");
         m_generation = editor.value("generation");
+        m_overviewRevision = editor.value("overview_revision");
         const auto overview = bridge->overview(m_paneId);
         m_total = overview.value("total").toInt();
         m_lines.clear();

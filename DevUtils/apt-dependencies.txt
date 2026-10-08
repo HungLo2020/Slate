@@ -2,6 +2,7 @@
 ca-certificates
 curl
 git
+libglib2.0-bin
 build-essential
 cmake
 pkg-config

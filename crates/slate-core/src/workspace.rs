@@ -575,7 +575,22 @@ impl App {
             .io
             .send(IoJob::Flush(tx))
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        rx.recv()?;
+        let deadline = Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            // A bounded reply queue must keep draining while the I/O barrier
+            // waits, otherwise its worker can block before reaching Flush.
+            self.poll();
+            match rx.recv_timeout(std::time::Duration::from_millis(5)) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("Recovery worker stopped")
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if Instant::now() >= deadline => {
+                    anyhow::bail!("Recovery flush timed out")
+                }
+                Err(_) => {}
+            }
+        }
         self.poll();
         if let Some(store) = &self.store {
             write_checkpoint(&store.path, &self.workspace())?;
@@ -600,6 +615,29 @@ impl Drop for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flushing_drains_a_full_reply_queue_before_waiting_for_the_barrier() {
+        let _serial = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", dir.path().join("config"));
+        std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
+        let mut app = App::new(dir.path()).unwrap();
+        // Use idle workers so no startup reply can race the saturation fixture.
+        app.services = crate::services::Services::new(app.events.clone());
+        let sender = app.services.reply_sender();
+        for _ in 0..256 {
+            sender
+                .send(crate::services::Reply::Error("fixture".into()))
+                .unwrap();
+        }
+        let path = dir.path().join("barrier.txt");
+        std::fs::write(&path, "barrier").unwrap();
+        app.services.io.send(IoJob::Open(999, path)).unwrap();
+        app.flush_workspace().unwrap();
+    }
 
     #[test]
     fn releasing_the_store_unlocks_even_with_an_inherited_descriptor() {

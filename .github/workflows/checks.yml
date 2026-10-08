@@ -39,7 +39,7 @@ jobs:
             dnf install -y git gcc-c++ cmake pkgconf-pkg-config curl rust cargo qt6-qtbase-devel qt6-qtdeclarative-devel dejavu-sans-mono-fonts python3
           else
             apt-get update
-            apt-get install -y git g++ cmake pkg-config curl ca-certificates qt6-base-dev qt6-declarative-dev qml6-module-qtquick qml6-module-qtqml qml6-module-qtqml-models qml6-module-qtquick-controls qml6-module-qtquick-layouts qml6-module-qtquick-templates qml6-module-qtquick-window qml6-module-qtqml-workerscript fonts-dejavu-core python3
+            apt-get install -y git g++ cmake pkg-config curl ca-certificates qt6-base-dev qt6-declarative-dev qml6-module-qtquick qml6-module-qtqml qml6-module-qtqml-models qml6-module-qtquick-controls qml6-module-qtquick-layouts qml6-module-qtquick-templates qml6-module-qtquick-window qml6-module-qtqml-workerscript fonts-dejavu-core python3 libglib2.0-bin
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           fi
@@ -55,7 +55,27 @@ jobs:
       - run: SLATE_GUI_IDE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: SLATE_GUI_FILE_DIALOG_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: python3 scripts/single-instance-smoke.py target/debug/slate-gui
+      - name: Require KDE style and desktop integration coverage
+        if: matrix.distro == 'debian:trixie'
+        run: apt-get install -y qml6-module-org-kde-desktop plasma-integration qt6-wayland xvfb xauth dbus-x11 weston python3-gi gir1.2-atspi-2.0 at-spi2-core orca
       - run: python3 scripts/gui-layout-smoke.py target/debug/slate
+        env:
+          SLATE_REQUIRE_KDE_STYLE: ${{ matrix.distro == 'debian:trixie' && '1' || '' }}
+      - name: Test real display backends and AT-SPI
+        if: matrix.distro == 'debian:trixie'
+        env:
+          SLATE_REQUIRE_ORCA: "1"
+        run: |
+          xvfb-run -a python3 scripts/gui-desktop-integration.py target/debug/slate
+          dbus-run-session -- python3 scripts/gui-wayland-smoke.py target/debug/slate
+      - run: SLATE_GUI_AUDIT_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: python3 scripts/recovery-smoke.py target/debug/slate
       - run: cargo build --release --package slate --package slate-gui --features slate-gui/smoke
       - run: python3 scripts/gui-performance-smoke.py target/release/slate
+
+  msrv:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.89.0 --profile minimal
+      - run: cargo +1.89.0 check --locked --package slate --all-targets

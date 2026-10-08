@@ -14,11 +14,13 @@ import tempfile
 
 binary = str(Path(sys.argv[1] if len(sys.argv) > 1 else "target/release/slate").resolve())
 reports = []
-for mode, size in (("typing", "1360x820"), ("cursor", "1360x820"),
+cases = [(mode, size, "short") for mode, size in (("typing", "1360x820"), ("cursor", "1360x820"),
                    ("selection", "1360x820"), ("scroll", "1360x820"),
                    ("syntax", "1360x820"),
                    ("typing", "1920x1080"), ("typing", "3840x2160"),
-                   ("burst", "1360x820"), ("busy", "1360x820")):
+                   ("burst", "1360x820"), ("busy", "1360x820"))]
+cases += [("typing", "1360x820", "large"), ("syntax", "1360x820", "minified"), ("cursor", "1360x820", "wrapped")]
+for mode, size, fixture in cases:
     with tempfile.TemporaryDirectory(prefix="slate-gui-performance-") as temporary:
         root = Path(temporary)
         workspace = root / "workspace"
@@ -28,6 +30,12 @@ for mode, size in (("typing", "1360x820"), ("cursor", "1360x820"),
             original = "".join(f"Line {n}: tabs\t猫 and emoji 👩‍💻\n" for n in range(180))
         if mode == "syntax":
             original = '// A short Rust document.\nfn main() {\n    println!("hello");\n}\n'
+        if fixture == "large": original = "".join(f"Line {n}: content with unicode 猫\n" for n in range(50000))
+        if fixture == "minified": original = "let value = 123; " * 131072 + "\n"
+        if fixture == "wrapped": original = "long line content " * 8192 + "\n"
+        if fixture == "wrapped":
+            (root / "config/slate").mkdir(parents=True)
+            (root / "config/slate/settings.toml").write_text("soft_wrap = true\n")
         file = workspace / ("edit.rs" if mode == "syntax" else "edit.txt")
         file.write_text(original)
         (root / "runtime").mkdir(mode=0o700)
@@ -54,7 +62,7 @@ for mode, size in (("typing", "1360x820"), ("cursor", "1360x820"),
         assert file.read_text() == ("x" * report["keys"] + original if mode in ("typing", "syntax", "burst", "busy") else original)
         reports.append(report)
         actual_size = f"{report['width']}x{report['height']}"
-        print(f"PASS {mode:9} {actual_size:9}: frame {report['median_frame_ms']:.2f} ms, "
+        print(f"PASS {fixture:8} {mode:9} {actual_size:9}: frame {report['median_frame_ms']:.2f} ms, "
               f"dispatch {report['median_dispatch_ms']:.3f} ms, "
               f"payload {report['max_update_bytes']} bytes, "
               f"layouts {report['layout_builds']}, updates {report['updates']}", flush=True)

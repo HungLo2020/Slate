@@ -61,7 +61,7 @@ Priority: optional
 Architecture: amd64
 Maintainer: Slate Maintainers
 Installed-Size: $installed_size
-Depends: $shlib_depends
+Depends: $shlib_depends, libglib2.0-bin
 Recommends: $gui_depends, $qml_depends, git, plasma-integration, qml6-module-org-kde-desktop, breeze-icon-theme, fonts-dejavu-core
 Suggests: aspell | hunspell, wl-clipboard | xclip, breeze-icon-theme | adwaita-icon-theme, gdb, clangd, python3-pylsp
 Homepage: https://github.com/HungLo2020/Slate

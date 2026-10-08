@@ -2142,7 +2142,102 @@ static void startIdeSmoke(Bridge *state, QQuickWindow *window) {
     timer->start(100);
 }
 
+static void startAuditSmoke(Bridge *state, QQuickWindow *window) {
+    const QString dir = qEnvironmentVariable("SLATE_GUI_SMOKE_DIR"), workspace = dir + "/workspace";
+    auto timer = new QTimer(state); auto step = std::make_shared<int>(0); auto ticks = std::make_shared<int>(0);
+    auto finish = [=](bool pass, const QString &detail) {
+        timer->stop(); QFile report(dir + "/report.json"); report.open(QIODevice::WriteOnly);
+        report.write(QJsonDocument(QJsonObject{{"pass", pass}, {"detail", detail}}).toJson());
+        window->grabWindow().save(dir + "/gui.png"); QGuiApplication::exit(pass ? 0 : 2);
+    };
+    auto invoke = [=](const QString &id, const QString &argument = QString()) { state->send({{"action", "invoke_action"}, {"id", id}, {"argument", argument}}); state->refresh(); };
+    auto select = [=](const QString &path) {
+        state->refresh();
+        int pane = -1;
+        for (const auto &value : state->frame().value("panes").toList()) {
+            auto item = value.toMap();
+            if (item.value("kind") == "files") { pane = item.value("id").toInt(); break; }
+        }
+        if (pane < 0) return false;
+        state->send({{"action", "focus"}, {"pane", pane}});
+        state->refresh();
+        const auto entries = state->frame().value("files").toList();
+        for (int i = 0; i < entries.size(); ++i) if (entries[i].toMap().value("path").toString() == path) {
+            state->send({{"action", "click"}, {"pane", pane}, {"row", i}, {"col", 0}}); state->refresh(); return true;
+        }
+        return false;
+    };
+    auto pathDialog = []() -> QFileDialog * { for (auto w : QApplication::topLevelWidgets()) if (auto d = qobject_cast<QFileDialog *>(w); d && d->objectName() == "pathDialog") return d; return nullptr; };
+    QObject::connect(timer, &QTimer::timeout, state, [=]() {
+        if (++*ticks > 300) { finish(false, QString("Audit timeout at %1: %2").arg(*step).arg(state->frame().value("status").toString())); return; }
+        switch (*step) {
+        case 0: if (*ticks < 5) return; state->send({{"action", "focus"}, {"pane", 1}}); invoke("new-folder", "nested"); break;
+        case 1: if (!QFileInfo::exists(workspace + "/nested")) return; if (!select(workspace + "/nested")) return; invoke("toggle-folder"); invoke("new-file", "nested/inside.txt"); break;
+        case 2: {
+            if (!QFileInfo::exists(workspace + "/nested/inside.txt")) return;
+            bool child = false; for (const auto &row : state->frame().value("files").toList()) if (row.toMap().value("depth").toInt() == 1) child = true;
+            if (!child || !select(workspace + "/nested/inside.txt")) return;
+            auto menu = findItem(window->contentItem(), "paneActions_1");
+            if (!menu) { finish(false, "Explorer context menu missing"); return; }
+            invoke("rename-file", "renamed.txt"); break;
+        }
+        case 3:
+            if (!QFileInfo::exists(workspace + "/nested/renamed.txt")) return;
+            if (QFileInfo::exists(workspace + "/nested/inside.txt")) { finish(false, "Rename left the old file behind"); return; }
+            state->send({{"action", "focus"}, {"pane", 2}});
+            state->send({{"action", "paste"}, {"text", QString(6000, 'q') + QString::fromUtf8("猫👩‍💻")}}); state->refresh(); break;
+        case 4: {
+            auto grid = qobject_cast<CellView *>(findItem(window->contentItem(), "cells_2"));
+            auto accessible = grid ? QAccessible::queryAccessibleInterface(grid) : nullptr; auto text = accessible ? accessible->textInterface() : nullptr;
+            if (!text || text->characterCount() != 6006 || text->text(0, 12) != QString(12, 'q')) { finish(false, "Accessibility lacks full document ranges/UTF-16 offsets"); return; }
+            text->setCursorPosition(0); if (text->cursorPosition() != 0) { finish(false, "Accessible cursor movement failed"); return; }
+            text->setSelection(0, 6000, 6006); int start = -1, end = -1; text->selection(0, &start, &end);
+            if (start != 6000 || end != 6006 || text->text(start, end) != QString::fromUtf8("猫👩‍💻")) { finish(false, "Accessible Unicode selection failed"); return; }
+            text->setCursorPosition(0); auto rect = text->characterRect(0);
+            if (!rect.isValid() || text->offsetAtPoint(rect.center()) != 0) { finish(false, "Accessible character geometry/hit testing failed"); return; }
+            text->scrollToSubstring(6000, 6006); if (text->cursorPosition() != 0) { finish(false, "Accessible scrolling moved the cursor"); return; }
+            invoke("new"); state->send({{"action", "paste"}, {"text", "first untitled"}}); invoke("new"); state->send({{"action", "paste"}, {"text", "second untitled"}}); invoke("save-all"); break;
+        }
+        case 5: { auto dialog = pathDialog(); if (!dialog) return; selectDialogPath(workspace + "/first-saved.txt"); break; }
+        case 6: if (!QFileInfo::exists(workspace + "/first-saved.txt")) return; break;
+        case 7: { auto dialog = pathDialog(); if (!dialog) return; selectDialogPath(workspace + "/second-saved.txt"); break; }
+        case 8:
+            if (!QFileInfo::exists(workspace + "/second-saved.txt") || state->frame().value("dirty").toBool()) return;
+            state->send({{"action", "paste"}, {"text", "changed "}}); invoke("close"); break;
+        case 9: {
+            QMessageBox *dialog = nullptr; for (auto w : QApplication::topLevelWidgets()) if (w->objectName() == "closeTabDialog") dialog = qobject_cast<QMessageBox *>(w);
+            if (!dialog) return;
+            if (!dialog->button(QMessageBox::Save)) { finish(false, "Modified tab has no Save button"); return; }
+            QTest::mouseClick(dialog->button(QMessageBox::Save), Qt::LeftButton); break;
+        }
+        case 10:
+            if (state->closeDialogOpen() || state->frame().value("dirty").toBool()) return;
+            invoke("profile-save", "audit-profile"); invoke("profile-load", "minimal"); break;
+        case 11:
+            if (!state->frame().value("editor_only").toBool()) { finish(false, "Minimal profile did not collapse panes"); return; }
+            invoke("profile-load", "audit-profile"); break;
+        case 12:
+            if (state->frame().value("editor_only").toBool()) { finish(false, "Saved profile did not restore panes"); return; }
+            if (!select(workspace + "/first-saved.txt")) return;
+            invoke("trash-file");
+            if (state->frame().value("prompt").toMap().value("kind") != "trash-file") {
+                finish(false, QString("Trash unavailable: %1").arg(state->frame().value("status").toString())); return;
+            }
+            break;
+        case 13: {
+            auto prompt = state->frame().value("prompt").toMap(); if (prompt.value("kind") != "trash-file") return;
+            state->send({{"action", "submit_prompt"}, {"all", false}}); state->refresh(); break;
+        }
+        case 14:
+            if (QFileInfo::exists(workspace + "/first-saved.txt")) return;
+            finish(true, "Explorer expansion/create/rename/desktop Trash, full Unicode accessibility, native Save All dialogs, Save-and-close and profile restoration"); return;
+        }
+        ++*step;
+    });
+    timer->start(100);
+}
 void startSmoke(Bridge *state, QQuickWindow *window) {
+    if (!qEnvironmentVariableIsEmpty("SLATE_GUI_AUDIT_SMOKE")) { startAuditSmoke(state, window); return; }
     if (QGuiApplication::desktopFileName() != "slate" ||
         QGuiApplication::windowIcon().pixmap(64, 64).isNull()) {
         qWarning("Application desktop identity or embedded SVG icon is missing");

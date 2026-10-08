@@ -116,6 +116,7 @@ pub fn run(app: App) -> i32 {
 }
 pub fn run_with(mut app: App, qt_arguments: &[String]) -> i32 {
     app.terminal_frontend = false;
+    app.refresh();
     // A desktop session authorizes privileged saves through polkit.
     if slate_core::fsio::which("pkexec").is_some() {
         app.elevation_mode = slate_core::ElevationMode::Background("pkexec");
@@ -321,6 +322,10 @@ fn respond(state: &mut GuiContext, request: serde_json::Value) -> String {
             };
             serde_json::json!({"root": app.root, "path": path}).to_string()
         }
+        "accessible_context" => app.accessible_context(request["pane"].as_u64().unwrap_or_default()).to_string(),
+        "accessible_text" => serde_json::json!({"text": app.accessible_text(request["pane"].as_u64().unwrap_or_default(), request["start"].as_u64().unwrap_or_default() as usize, request["end"].as_u64().unwrap_or_default() as usize)}).to_string(),
+        "accessible_position" => app.accessible_position(request["pane"].as_u64().unwrap_or_default(), request["offset"].as_u64().unwrap_or_default() as usize).to_string(),
+        "accessible_offset" => serde_json::json!({"offset": app.accessible_offset(request["pane"].as_u64().unwrap_or_default(), request["row"].as_u64().unwrap_or_default() as usize, request["col"].as_u64().unwrap_or_default() as usize)}).to_string(),
         "input_context" => serde_json::json!({
             "editor": request["pane"].as_u64().and_then(|id| app.editor_input_context(id))
         })

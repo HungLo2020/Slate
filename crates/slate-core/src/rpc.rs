@@ -6,20 +6,25 @@ use std::{
     io::{self, BufRead, BufReader, Read, Write},
     path::Path,
     process::{Child, Command, Stdio},
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread,
 };
 
 /// Messages larger than this end the connection.
-const MESSAGE_LIMIT: usize = 64 * 1024 * 1024;
+const MESSAGE_LIMIT: usize = 16 * 1024 * 1024;
 /// Longest header line accepted.
 const HEADER_LIMIT: u64 = 8 * 1024;
 /// Standard error kept for error reports.
 const STDERR_TAIL: usize = 4096;
+const QUEUE_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct Process {
     child: Child,
-    input: mpsc::Sender<Vec<u8>>,
+    input: mpsc::SyncSender<Vec<u8>>,
+    queued_bytes: Arc<AtomicUsize>,
 }
 
 pub fn frame(message: &Value) -> Vec<u8> {
@@ -103,10 +108,14 @@ impl Process {
             .stderr
             .take()
             .ok_or_else(|| io::Error::other("no stderr"))?;
-        let (input, queued) = mpsc::channel::<Vec<u8>>();
+        let (input, queued) = mpsc::sync_channel::<Vec<u8>>(128);
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let budget = queued_bytes.clone();
         thread::spawn(move || {
             for bytes in queued {
-                if stdin.write_all(&bytes).and_then(|_| stdin.flush()).is_err() {
+                let result = stdin.write_all(&bytes).and_then(|_| stdin.flush());
+                budget.fetch_sub(bytes.len(), Ordering::Relaxed);
+                if result.is_err() {
                     break;
                 }
             }
@@ -151,11 +160,39 @@ impl Process {
                 format!("{reason}: {last}")
             });
         });
-        Ok(Self { child, input })
+        Ok(Self {
+            child,
+            input,
+            queued_bytes,
+        })
     }
 
     pub fn send(&self, message: &Value) -> bool {
-        self.input.send(frame(message)).is_ok()
+        let bytes = frame(message);
+        let size = bytes.len();
+        if self
+            .queued_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                n.checked_add(size).filter(|n| *n <= QUEUE_BYTES)
+            })
+            .is_err()
+        {
+            self.terminate_overloaded();
+            return false;
+        }
+        if self.input.try_send(bytes).is_err() {
+            self.queued_bytes.fetch_sub(size, Ordering::Relaxed);
+            self.terminate_overloaded();
+            return false;
+        }
+        true
+    }
+
+    fn terminate_overloaded(&self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+        }
     }
 
     /// Stop the process group: give it `grace` to exit, then force it.
@@ -214,5 +251,27 @@ mod tests {
         );
         drop(process);
         assert!(done.recv_timeout(std::time::Duration::from_secs(5)).is_ok());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_stops_reading_cannot_grow_the_outgoing_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let process = Process::spawn(
+            &[
+                "python3".into(),
+                "-c".into(),
+                "import time; time.sleep(60)".into(),
+            ],
+            dir.path(),
+            |_| true,
+            |_| {},
+        )
+        .unwrap();
+        let message = serde_json::json!({"text": "q".repeat(8 * 1024 * 1024)});
+        assert!(process.send(&message));
+        assert!(
+            !process.send(&message),
+            "A blocked child accepted more than the byte budget"
+        );
     }
 }

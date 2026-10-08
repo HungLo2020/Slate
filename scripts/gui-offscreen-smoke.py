@@ -9,7 +9,10 @@ import sys
 import tempfile
 
 binary = str(pathlib.Path(sys.argv[1] if len(sys.argv)>1 else 'target/debug/slate').resolve())
-with tempfile.TemporaryDirectory(prefix='slate-gui-offscreen-') as temporary:
+# Desktop Trash deliberately refuses some internal/temporary mounts. Keep its
+# isolated fixture on the home filesystem, with its own XDG data directory.
+fixture_parent = pathlib.Path.home() if os.environ.get('SLATE_GUI_AUDIT_SMOKE') else None
+with tempfile.TemporaryDirectory(prefix='slate-gui-offscreen-', dir=fixture_parent) as temporary:
     root = pathlib.Path(temporary)
     workspace = root/'workspace'
     workspace.mkdir()
@@ -64,7 +67,7 @@ with tempfile.TemporaryDirectory(prefix='slate-gui-offscreen-') as temporary:
     platform = os.environ.get('SLATE_GUI_PLATFORM', 'offscreen')
     environment = {**os.environ, 'SLATE_GUI_SMOKE_DIR':temporary,
                    'QT_QPA_PLATFORM':platform, 'QT_QUICK_BACKEND':'software', 'SHELL':'/bin/sh',
-                   'XDG_CONFIG_HOME':str(root/'config'), 'XDG_STATE_HOME':str(root/'state'),
+                   'XDG_CONFIG_HOME':str(root/'config'), 'XDG_STATE_HOME':str(root/'state'), 'XDG_DATA_HOME':str(root/'data'),
                    'XDG_RUNTIME_DIR':str(root/'runtime')}
     if platform.startswith('wayland'):
         display = pathlib.Path(os.environ.get('WAYLAND_DISPLAY', 'wayland-0'))

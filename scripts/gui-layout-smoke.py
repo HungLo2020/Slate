@@ -27,6 +27,7 @@ if any((path/'org/kde/desktop/qmldir').is_file() for path in qml_paths):
                    env={**os.environ, 'SLATE_GUI_CAPTION_SMOKE': '1',
                         'QT_QUICK_CONTROLS_STYLE': 'org.kde.desktop'}, check=True)
 else:
+    assert not os.environ.get("SLATE_REQUIRE_KDE_STYLE"), "KDE desktop style is required in this test job"
     print('SKIP KDE desktop style: QML module not found')
 for style in styles:
     for scale in ('1', '1.5', '2'):

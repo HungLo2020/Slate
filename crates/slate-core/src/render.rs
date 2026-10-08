@@ -233,6 +233,8 @@ impl App {
                 self.command_catalog("")
             },
             settings: self.preferences.clone(),
+            profiles: self.preference_layers.names.clone(),
+            setting_sources: self.preference_sources(),
             editor_only: self.editor_only,
             title: self.window_title(),
             recent: self.recent.clone(),
@@ -285,6 +287,7 @@ impl App {
             left: v.left,
             document: v.document,
             generation: doc.generation,
+            overview_revision: self.overview_revision,
         }
     }
     pub(crate) fn editor_signature(&self, id: u64) -> String {
@@ -301,8 +304,8 @@ impl App {
             &self.selection_foreground,
             &self.search,
             self.preferences.line_numbers,
-            self.preferences.indent_width,
-            self.preferences.soft_wrap,
+            self.preferences_for_document(v.document).indent_width,
+            self.preferences_for_document(v.document).soft_wrap,
             self.preferences.show_whitespace,
         ))
         .unwrap()
@@ -359,8 +362,9 @@ impl App {
         cols: u16,
         graphical: bool,
     ) -> (Screen, Vec<Vec<text_presentation::TextSpan>>) {
-        let tab = self.preferences.indent_width;
-        let wrapping = self.preferences.soft_wrap;
+        let options = self.preferences_for_document(self.views[&id].document);
+        let tab = options.indent_width;
+        let wrapping = options.soft_wrap;
         {
             let v = self.views.get_mut(&id).unwrap();
             v.rows = rows;

@@ -23,6 +23,7 @@ impl std::str::FromStr for StartupMode {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {
+    pub profile: String,
     pub indent_width: usize,
     pub insert_spaces: bool,
     pub auto_indent: bool,
@@ -269,6 +270,7 @@ impl Default for Preferences {
     fn default() -> Self {
         let (global_keys, editor_keys, terminal_keys) = keymap("default").unwrap();
         Self {
+            profile: "default".into(),
             indent_width: 4,
             insert_spaces: true,
             auto_indent: true,
@@ -317,6 +319,11 @@ pub struct Setting {
     pub kind: SettingKind,
 }
 pub const SETTINGS: &[Setting] = &[
+    Setting {
+        name: "profile",
+        label: "Profile",
+        kind: SettingKind::Choice(&["default", "minimal", "workspace"]),
+    },
     Setting {
         name: "file-startup",
         label: "Opening a file",
@@ -441,6 +448,7 @@ impl Preferences {
             StartupMode::Workspace => "workspace",
         };
         match name {
+            "profile" => self.profile.clone(),
             "file-startup" => mode(self.file_startup).into(),
             "directory-startup" => mode(self.directory_startup).into(),
             "indent-width" => self.indent_width.to_string(),
@@ -513,6 +521,7 @@ impl Preferences {
         crate::paths::config_dir().join("settings.toml")
     }
     pub fn validate(&self) -> Result<()> {
+        crate::profiles::validate_name(&self.profile)?;
         if !(1..=16).contains(&self.indent_width) {
             bail!("indent_width must be 1–16");
         }
@@ -612,6 +621,21 @@ impl App {
             "Up" => prompt.field = (prompt.field + count - 1) % count,
             "Down" | "Tab" => prompt.field = (prompt.field + 1) % count,
             "Left" | "Right" | "Enter" | "Space" | " " => {
+                if SETTINGS[prompt.field].name == "profile" {
+                    let names = &self.preference_layers.names;
+                    let index = names
+                        .iter()
+                        .position(|n| n == &self.preferences.profile)
+                        .unwrap_or(0);
+                    let next = if key.key == "Left" {
+                        (index + names.len() - 1) % names.len()
+                    } else {
+                        (index + 1) % names.len()
+                    };
+                    let name = names[next].clone();
+                    self.select_profile(&name)?;
+                    return Ok(());
+                }
                 if let Some((name, value)) =
                     self.preferences.stepped(prompt.field, key.key == "Left")
                 {
@@ -623,10 +647,17 @@ impl App {
         Ok(())
     }
     pub(super) fn load_preferences(&mut self) {
-        match Preferences::load() {
-            Ok(p) => self.preferences = p,
+        match crate::profiles::Layers::load(&self.root) {
+            Ok(layers) => self.install_preferences(layers),
             Err(e) => self.status = format!("Settings error: {e:#}"),
         }
+    }
+    pub(crate) fn install_preferences(&mut self, layers: crate::profiles::Layers) {
+        self.preference_layers = layers;
+        self.sync_document_preferences();
+        self.overview_cache.clear();
+        self.overview_pending.clear();
+        self.overview_revision += 1;
         self.apply_pane_colors();
         self.highlights.clear();
         self.highlight_pending.clear();
@@ -638,7 +669,10 @@ impl App {
                 bail!("Not saving over settings.toml until it is fixed: {e:#}");
             }
         }
-        let mut settings = self.preferences.clone();
+        if name == "profile" {
+            return self.select_profile(value);
+        }
+        let mut settings = self.preference_layers.base.clone();
         let flag = |value: &str| -> Result<bool> {
             value
                 .parse()
@@ -689,7 +723,7 @@ impl App {
                     .join(", ")
             ),
         }
-        settings.save()?;
+        self.persist_profile_preferences(&settings)?;
         self.load_preferences();
         self.status = format!("Set {name} to {value}");
         Ok(())

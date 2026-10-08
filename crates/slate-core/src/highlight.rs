@@ -187,6 +187,13 @@ fn highlight_request(
         {
             return None;
         }
+        // Minified/generated lines must not monopolize the syntax worker.
+        if request.rope.line(line).len_bytes() > 64 * 1024 {
+            if line >= first {
+                lines.push(Arc::new(Vec::new()));
+            }
+            continue;
+        }
         let text = line_text(&request.rope, line);
         let Ok(ops) = parse.parse_line(&text, ss) else {
             // A grammar failure leaves the rest of the document plain.

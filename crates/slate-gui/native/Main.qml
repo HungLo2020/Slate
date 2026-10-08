@@ -1052,6 +1052,7 @@ ApplicationWindow {
                         height: root.fileRowHeight
                         width: browser.width
                         padding: 4
+                        leftPadding: 4 + (modelData.depth || 0) * 16
                         contentItem: Label {
                             textFormat: Text.PlainText
                             text: fileDelegate.text
@@ -1072,7 +1073,7 @@ ApplicationWindow {
                                 rowHint.visible = false;
                             }
                         }
-                        text: (modelData.directory ? "▸  " : "   ") + modelData.name
+                        text: (modelData.directory ? (modelData.expanded ? "▾  " : "▸  ") : "   ") + modelData.name
                         highlighted: index === browser.currentIndex
                         onClicked: {
                             root.send({
@@ -1081,9 +1082,12 @@ ApplicationWindow {
                                 "row": index,
                                 "col": 0
                             });
+                            if (modelData.directory && modelData.name !== "..")
+                                root.invokeAction("toggle-folder", modelData.path, panel.paneId);
                             browser.forceActiveFocus();
                         }
                         onDoubleClicked: {
+                            if (modelData.directory && modelData.name !== "..") return;
                             root.send({
                                 "action": "focus",
                                 "pane": panel.paneId
@@ -1117,6 +1121,10 @@ ApplicationWindow {
                 }
                 CommandMenu {
                     id: paneMenu
+                    CommandMenuItem { actionId: "new-file"; commandPane: panel.paneId; visible: panel.paneData.kind === "files" }
+                    CommandMenuItem { actionId: "new-folder"; commandPane: panel.paneId; visible: panel.paneData.kind === "files" }
+                    CommandMenuItem { actionId: "rename-file"; commandPane: panel.paneId; visible: panel.paneData.kind === "files" }
+                    CommandMenuItem { actionId: "trash-file"; commandPane: panel.paneId; visible: panel.paneData.kind === "files" }
                     objectName: "paneMenu_" + panel.paneId
                     x: Math.max(0, panel.width - width - 2)
                     y: root.paneHeaderHeight + 2
@@ -1425,7 +1433,12 @@ ApplicationWindow {
                 "rename-symbol": "Rename symbol",
                 "project-replace": "Replace in files",
                 "debug-evaluate": "Evaluate expression",
-                "debug-program": "Start debugging"
+                "debug-program": "Start debugging",
+                "new-file": "Create file",
+                "new-folder": "Create folder",
+                "rename-file": "Rename file or folder",
+                "profile-save": "Save profile",
+                "profile-load": "Load profile"
             })[prompt.kind] || "Input"
         // Find and replace sit at the bottom without dimming the text, so
         // the matches stay visible; other prompts are centred.
@@ -1567,10 +1580,11 @@ ApplicationWindow {
         objectName: "choiceDialog"
         enter: Transition {}
         exit: Transition {}
-        readonly property var kinds: ["save-read-only", "save-elevated", "reload-changed", "file-changed", "quit", "trust", "confirm-replace"]
+        readonly property var kinds: ["save-read-only", "save-elevated", "reload-changed", "file-changed", "quit", "trust", "confirm-replace", "trash-file"]
         readonly property var prompt: root.frame.prompt || ({ "kind": "", "input": "" })
         readonly property var copy: ({
                 "save-read-only": ["Read-only file", "%1 is read-only. Overwrite it anyway?", "Overwrite", ""],
+                "trash-file": ["Move to Trash", "Move %1 to desktop Trash?", "Move to Trash", ""],
                 "save-elevated": ["Permission denied", "You do not have permission to write %1. Save it with administrator rights?", "Save as Administrator", ""],
                 "reload-changed": ["Reload from disk", "Reload %1 from disk and discard your unsaved changes?", "Reload", ""],
                 "file-changed": ["File changed on disk", "%1 changed on disk while you have unsaved changes.", "Reload from Disk", "Keep My Version"],
@@ -1906,9 +1920,38 @@ ApplicationWindow {
             ColumnLayout {
                 width: settingsScroll.availableWidth
                 Label {
-                    text: "Startup"
+                    text: "Profiles"
                     font.bold: true
                 }
+                RowLayout {
+                    Layout.fillWidth: true
+                    Label { text: "Active profile"; Layout.fillWidth: true }
+                    ComboBox {
+                        objectName: "settingsProfile"
+                        model: root.frame.profiles || ["default", "minimal", "workspace"]
+                        currentIndex: Math.max(0, model.indexOf(root.settings.profile || "default"))
+                        onActivated: settingsDialog.configure("profile", currentText)
+                    }
+                }
+                RowLayout {
+                    Button { text: "Save profile…"; onClicked: { settingsDialog.close(); root.invokeAction("profile-save"); } }
+                    Button { text: "Load profile…"; onClicked: { settingsDialog.close(); root.invokeAction("profile-load"); } }
+                }
+                Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    text: "Editor values below include workspace and language overrides. Changes here edit the active profile."
+                }
+                Repeater {
+                    model: Object.keys(root.frame.setting_sources || {})
+                    delegate: Label {
+                        required property string modelData
+                        Layout.fillWidth: true
+                        wrapMode: Text.Wrap
+                        text: modelData.replace(/_/g, " ") + ": " + root.frame.setting_sources[modelData]
+                    }
+                }
+                Label { text: "Startup"; font.bold: true }
                 Repeater {
                     model: [
                         {"label": "Opening a file", "setting": "file-startup", "field": "file_startup"},

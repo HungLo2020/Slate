@@ -82,7 +82,10 @@ def tui(root, workspace, args, environment, expected, exercise_settings):
                 assert time.monotonic() < deadline, output.decode(errors="replace")[-4000:]
                 pump(.05)
             command("settings")
-            assert b"Opening a file" in output and b"automatically" in output, output.decode(errors="replace")[-7000:]
+            visible = re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', output)
+            visible = re.sub(rb'\s+', b'', visible)
+            assert b"Openingafile" in visible and b"automatically" in visible, output.decode(errors="replace")[-7000:]
+            send(b"\x1b[B")  # Skip the profile selector.
             send(b"\r")  # File: workspace.
             send(b"\x1b[B")
             send(b"\r")  # Directory: editor-only.
