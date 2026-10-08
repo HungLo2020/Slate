@@ -221,6 +221,9 @@ impl App {
             location: self.location(),
             hints: self.hints(),
             foreground: self.colors.0.clone(),
+            terminal_background: self.terminal_colors.background.clone(),
+            terminal_foreground: self.terminal_colors.foreground.clone(),
+            terminal_selection: self.terminal_colors.selection.clone(),
             background: self.colors.1.clone(),
             accent: self.colors.3.clone(),
             selection: self.colors.2.clone(),
@@ -336,14 +339,14 @@ impl App {
         id: u64,
         revision: u64,
     ) -> std::sync::Arc<Screen> {
-        let key = format!("terminal:{revision}:{}:{}", self.colors.0, self.colors.1);
+        let key = format!("terminal:{revision}:{:?}", self.terminal_colors);
         if let Some((prior, _, screen)) = self.render_cache.get(&id) {
             if *prior == key {
                 return screen.clone();
             }
         }
         let screen =
-            std::sync::Arc::new(self.terminals[&id].screen_with(&self.colors.0, &self.colors.1));
+            std::sync::Arc::new(self.terminals[&id].screen_with_palette(&self.terminal_colors));
         self.screen_builds += 1;
         self.render_cache
             .insert(id, (key, self.screen_builds, screen.clone()));

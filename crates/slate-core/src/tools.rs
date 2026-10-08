@@ -216,6 +216,17 @@ impl App {
             };
             target = Some((v.document, d.content_version(), range));
         }
+        if tool.project && !self.trusted_path(&cwd) {
+            self.ask_trust_for(
+                &cwd,
+                "Project tools run commands from this folder",
+                crate::Command::Action {
+                    name: "run-tool".into(),
+                    argument: which.into(),
+                },
+            );
+            return Ok(());
+        }
         let command = vec!["sh".to_string(), "-c".into(), tool.command.clone()];
         let name = tool.name.clone();
         let output = tool.output;

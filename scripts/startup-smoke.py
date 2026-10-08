@@ -9,6 +9,7 @@ import json
 import os
 import pathlib
 import pty
+import re
 import select
 import shutil
 import struct
@@ -62,9 +63,11 @@ def tui(root, workspace, args, environment, expected, exercise_settings):
     try:
         pump(.8)
         assert process.poll() is None, output.decode(errors="replace")
-        assert b"editor #2" in output, output.decode(errors="replace")
-        assert (b"files #1" not in output) == expected, output.decode(errors="replace")
-        assert (b"terminal #3" not in output) == expected
+        text = re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', output)
+        labels = re.sub(rb'\s+', b'', text)
+        assert b"editor#2" in labels, output.decode(errors="replace")
+        assert (b"files#1" not in labels) == expected, output.decode(errors="replace")
+        assert (b"terminal#3" not in labels) == expected
         assert (not (root / "shell-starts").exists()) == expected
         send(b"\x1b[21~")  # F10
         send(b"\x1b[21~")
@@ -73,7 +76,11 @@ def tui(root, workspace, args, environment, expected, exercise_settings):
             send(b"\x01")
             send(b"startup modes preserve edits")
             send(b"\x13")
-            assert (workspace / "edit.txt").read_text() == "startup modes preserve edits"
+            deadline = time.monotonic() + 5
+            while (workspace / "edit.txt").read_text() != "startup modes preserve edits":
+                assert process.poll() is None, output.decode(errors="replace")[-4000:]
+                assert time.monotonic() < deadline, output.decode(errors="replace")[-4000:]
+                pump(.05)
             command("settings")
             assert b"Opening a file" in output and b"automatically" in output, output.decode(errors="replace")[-7000:]
             send(b"\r")  # File: workspace.
@@ -102,7 +109,7 @@ def gui(root, workspace, args, environment, expected):
     report = json.loads((root / "report.json").read_text()) if (root / "report.json").exists() else {}
     logs = result.stdout + result.stderr
     assert result.returncode == 0 and report.get("pass"), f"{report}\n{logs}"
-    assert not any(error in logs for error in ("ReferenceError:", "TypeError:", "Binding loop detected", "Unable to assign")), logs
+    assert not any(error in logs for error in ("ReferenceError:", "TypeError:", "Cannot anchor to an item", "Binding loop detected", "Unable to assign")), logs
     artifacts = os.environ.get("SLATE_STARTUP_ARTIFACT_DIR")
     if artifacts:
         destination = pathlib.Path(artifacts) / ("editor-only" if expected else "workspace")

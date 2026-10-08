@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
 };
 
 /// The bytes a document was loaded from or last written to.
@@ -174,8 +174,12 @@ pub fn write_file(
     check_baseline(path, baseline)?;
     if options.backup && existing.is_some() {
         let backup = backup_path(path);
-        fs::copy(path, &backup)
+        let temp = tempfile::NamedTempFile::new_in(parent)?;
+        fs::copy(path, temp.path())
             .with_context(|| format!("Could not write backup {}", backup.display()))?;
+        temp.as_file().sync_all()?;
+        temp.persist(&backup).map_err(|e| e.error)?;
+        sync_directory(parent);
     }
     let Some(meta) = existing else {
         return write_new(path, parent, bytes, baseline);
@@ -316,13 +320,65 @@ fn write_in_place(
     };
     let result = (|| -> Result<()> {
         let mut file = fs::OpenOptions::new()
+            .read(true)
             .write(true)
             .open(path)
             .map_err(|e| map_io(e, path))?;
         check_baseline(path, baseline)?;
-        file.set_len(0)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let current = fs::metadata(path)?;
+            let opened = file.metadata()?;
+            anyhow::ensure!(
+                current.dev() == opened.dev() && current.ino() == opened.ino(),
+                "File replaced while saving; nothing was changed"
+            );
+        }
+        // In-place writes preserve hard links and metadata, but cannot be
+        // atomic. Persist a private original before modifying the inode.
+        let recovery_dir = crate::paths::state_dir().join("slate/save-recovery");
+        fs::create_dir_all(&recovery_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&recovery_dir, fs::Permissions::from_mode(0o700))?;
+        }
+        let prefix = format!(
+            "{}-",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        );
+        let mut original = tempfile::Builder::new()
+            .prefix(&prefix)
+            .tempfile_in(&recovery_dir)?;
+        std::io::copy(&mut file, &mut original)?;
+        original.as_file().sync_all()?;
+        check_baseline(path, baseline)?;
+        let (mut original, recovery_path) = original.keep().map_err(|e| e.error)?;
+        sync_directory(&recovery_dir);
+        let write = (|| -> Result<()> {
+            file.seek(SeekFrom::Start(0))?;
+            file.set_len(0)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = write {
+            let restored = (|| -> Result<()> {
+                original.seek(SeekFrom::Start(0))?;
+                file.seek(SeekFrom::Start(0))?;
+                file.set_len(0)?;
+                std::io::copy(&mut original, &mut file)?;
+                file.sync_all()?;
+                Ok(())
+            })();
+            if let Err(rollback) = restored {
+                anyhow::bail!("Save failed: {error:#}; restore failed: {rollback:#}. Original bytes preserved in {}", recovery_path.display());
+            }
+            let _ = fs::remove_file(&recovery_path);
+            return Err(error.context("Save failed; original contents restored"));
+        }
+        let _ = fs::remove_file(recovery_path);
         Ok(())
     })();
     if let Some(permissions) = restore {
@@ -398,8 +454,6 @@ fn copy_xattrs(_source: &Path, _target: &fs::File) -> bool {
     true
 }
 
-/// Write through a privileged helper (`sudo` in a terminal, `pkexec` in a
-/// desktop session) using `tee`, which keeps the file's inode and owner.
 /// Replace an application file (settings, layouts, trust, recovery)
 /// atomically: a private temporary file in the same folder, synced, then
 /// renamed over the old one. The folder is created when missing.
@@ -414,42 +468,85 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub fn write_elevated(path: &Path, bytes: &[u8], program: &str, interactive: bool) -> Result<()> {
-    let tee = which("tee").unwrap_or_else(|| PathBuf::from("/usr/bin/tee"));
+/// The privileged subprocess uses the same conflict checks, atomic writes,
+/// metadata preservation and rollback as an ordinary save. Never truncate via tee.
+pub fn write_elevated(
+    path: &Path,
+    bytes: &[u8],
+    baseline: Option<&Baseline>,
+    program: &str,
+    interactive: bool,
+) -> Result<()> {
+    let executable = std::env::current_exe()?;
     let mut command = Command::new(program);
     if program.ends_with("sudo") {
         command.arg("--");
     }
     command
-        .arg(&tee)
-        .arg("--")
-        .arg(path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null());
-    if !interactive {
-        command.stderr(Stdio::piped());
+        .arg(executable)
+        .arg("--internal-elevated-save")
+        .arg(path);
+    let mut input = serde_json::to_vec(&baseline)?;
+    input.push(b'\n');
+    input.extend_from_slice(bytes);
+    let timeout = std::time::Duration::from_secs(120);
+    let result = if interactive {
+        crate::process::run_interactive(&mut command, input, timeout, program)
+    } else {
+        crate::process::run(&mut command, Some(input), timeout, program)
     }
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("Cannot run {program}"))?;
-    {
-        let mut stdin = child.stdin.take().context("No helper input")?;
-        stdin.write_all(bytes)?;
-    }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        anyhow::bail!(
-            "{program} could not write {}{}",
-            path.display(),
-            if detail.is_empty() {
-                String::new()
-            } else {
-                format!(": {detail}")
-            }
-        );
-    }
+    .map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        result.status.success(),
+        "{program} could not save {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&result.stderr).trim()
+    );
     Ok(())
+}
+
+/// Recognized before parsing ordinary frontend arguments or loading config.
+/// Its destination is visible in sudo/polkit's command; input carries the
+/// expected disk baseline followed by the proposed file bytes.
+pub fn elevated_save_entry(args: &[std::ffi::OsString]) -> Option<Result<()>> {
+    if args
+        .first()
+        .is_none_or(|arg| arg != "--internal-elevated-save")
+    {
+        return None;
+    }
+    Some((|| {
+        use std::io::BufRead;
+        anyhow::ensure!(args.len() == 2, "Expected one elevated-save destination");
+        let path = Path::new(&args[1]);
+        anyhow::ensure!(
+            path.is_absolute(),
+            "Elevated-save destination must be absolute"
+        );
+        let mut input = std::io::BufReader::new(std::io::stdin().lock());
+        let mut header = String::new();
+        input.by_ref().take(4096).read_line(&mut header)?;
+        anyhow::ensure!(header.ends_with('\n'), "Invalid elevated-save header");
+        let baseline: Option<Baseline> = serde_json::from_str(&header)?;
+        let mut bytes = Vec::new();
+        input
+            .take(crate::document::MAX_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() <= crate::document::MAX_FILE_BYTES,
+            "Document is too large"
+        );
+        write_file(
+            path,
+            &bytes,
+            baseline.as_ref(),
+            WriteOptions {
+                allow_read_only: true,
+                backup: false,
+            },
+        )?;
+        Ok(())
+    })())
 }
 
 pub fn which(program: &str) -> Option<PathBuf> {
@@ -462,6 +559,50 @@ pub fn which(program: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_inplace_saves_restore_data() {
+        if let Some(directory) = std::env::var_os("SLATE_TEST_SAVE_LIMIT") {
+            let directory = PathBuf::from(directory);
+            let path = directory.join("original.txt");
+            let original = fs::read(&path).unwrap();
+            unsafe {
+                libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                let limit = libc::rlimit {
+                    rlim_cur: 64,
+                    rlim_max: 64,
+                };
+                assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+            }
+            let result = write_file(
+                &path,
+                &[b'X'; 200],
+                Some(&Baseline::of(&original)),
+                WriteOptions::default(),
+            );
+            assert!(result.is_err());
+            assert_eq!(fs::read(&path).unwrap(), original);
+            assert_eq!(fs::read(directory.join("link.txt")).unwrap(), original);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("original.txt");
+        fs::write(&path, b"Original bytes\n").unwrap();
+        fs::hard_link(&path, dir.path().join("link.txt")).unwrap();
+        let result = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "fsio::tests::failed_inplace_saves_restore_data"])
+            .env("SLATE_TEST_SAVE_LIMIT", dir.path())
+            .env("XDG_STATE_HOME", dir.path().join("state"))
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
 
     #[test]
     fn new_files_conflicts_and_backups() {
@@ -492,9 +633,49 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn backup_replaces_links_without_overwriting_their_targets() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("document.txt");
+        let other = dir.path().join("other.txt");
+        fs::write(&other, b"keep").unwrap();
+        for hard_link in [false, true] {
+            fs::write(&path, b"original").unwrap();
+            let backup = backup_path(&path);
+            let _ = fs::remove_file(&backup);
+            if hard_link {
+                fs::hard_link(&other, &backup).unwrap();
+            } else {
+                symlink(&other, &backup).unwrap();
+            }
+            write_file(
+                &path,
+                b"updated",
+                Some(&Baseline::of(b"original")),
+                WriteOptions {
+                    backup: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(fs::read(&other).unwrap(), b"keep");
+            assert_eq!(fs::read(&backup).unwrap(), b"original");
+            assert!(!fs::symlink_metadata(&backup)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn hard_links_permissions_and_read_only_files_are_respected() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let _env = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
         let path = dir.path().join("linked.txt");
         let link = dir.path().join("other-name.txt");
         fs::write(&path, b"old").unwrap();

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Drive the actual TUI under a PTY; check file saves and shell execution."""
-import fcntl, os, pathlib, pty, select, signal, struct, subprocess, sys, tempfile, termios, time
+import fcntl, os, pathlib, pty, re, select, signal, struct, subprocess, sys, tempfile, termios, time
 binary = str(pathlib.Path(sys.argv[1] if len(sys.argv)>1 else 'target/debug/slate').resolve())
 with tempfile.TemporaryDirectory(prefix='slate-tui-') as tmp:
     root=pathlib.Path(tmp); file=root/'edit.txt'; file.write_text('original\n')
@@ -30,7 +30,10 @@ with tempfile.TemporaryDirectory(prefix='slate-tui-') as tmp:
     try:
         pump(1)
         assert process.poll() is None,output.decode(errors='replace')
-        assert b'files #1' in output and b'editor #2' in output and b'terminal #3' in output,'Default panes missing'
+        # Ratatui may render blank cells with cursor-forward sequences.
+        text = re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', output)
+        labels = re.sub(rb'\s+', b'', text)
+        assert all(label in labels for label in (b'files#1', b'editor#2', b'terminal#3')), 'Default panes missing'
         send(b'\x01');send(b'TUI edited\rsecond line');send(b'\x13')
         assert file.read_text()=='TUI edited\nsecond line',file.read_text()
         command('set indent-width 2')

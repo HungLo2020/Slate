@@ -4,6 +4,7 @@
 use std::{
     io::{Read, Write},
     process::{Child, Command, Output, Stdio},
+    sync::mpsc,
     time::{Duration, Instant},
 };
 
@@ -53,6 +54,27 @@ pub fn run(
     timeout: Duration,
     label: &str,
 ) -> Result<Output, String> {
+    run_inner(command, input, timeout, label, false)
+}
+
+/// Keep password prompts visible while still bounding the helper's lifetime.
+pub fn run_interactive(
+    command: &mut Command,
+    input: Vec<u8>,
+    timeout: Duration,
+    label: &str,
+) -> Result<Output, String> {
+    run_inner(command, Some(input), timeout, label, true)
+}
+
+fn run_inner(
+    command: &mut Command,
+    input: Option<Vec<u8>>,
+    timeout: Duration,
+    label: &str,
+    interactive: bool,
+) -> Result<Output, String> {
+    const OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
     isolate(command)
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -60,52 +82,118 @@ pub fn run(
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(if interactive {
+            Stdio::inherit()
+        } else {
+            Stdio::piped()
+        });
     let mut child = command.spawn().map_err(|e| format!("{label}: {e}"))?;
+    let (done, completed) = mpsc::channel();
+    let mut input_done = input.is_none();
     if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        let done = done.clone();
         std::thread::spawn(move || {
             let _ = stdin.write_all(&input);
+            drop(stdin);
+            let _ = done.send((2, Ok(Vec::new())));
         });
     }
-    fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+    fn drain(
+        pipe: Option<impl Read + Send + 'static>,
+        which: usize,
+        done: mpsc::Sender<(usize, Result<Vec<u8>, String>)>,
+    ) {
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
             if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut bytes);
+                let result = pipe
+                    .by_ref()
+                    .take((OUTPUT_LIMIT + 1) as u64)
+                    .read_to_end(&mut bytes);
+                if let Err(error) = result {
+                    let _ = done.send((which, Err(error.to_string())));
+                    return;
+                }
+                if bytes.len() > OUTPUT_LIMIT {
+                    let _ = done.send((which, Err("output exceeded 16 MiB".into())));
+                    return;
+                }
             }
-            bytes
-        })
+            let _ = done.send((which, Ok(bytes)));
+        });
     }
-    let stdout = drain(child.stdout.take());
-    let stderr = drain(child.stderr.take());
+    drain(child.stdout.take(), 0, done.clone());
+    drain(child.stderr.take(), 1, done);
+    let mut output = [None, None];
     let started = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < timeout => std::thread::sleep(Duration::from_millis(5)),
-            Ok(None) => {
-                #[cfg(unix)]
-                kill_group(child.id(), libc::SIGKILL);
-                let _ = child.kill();
-                let _ = child.wait();
+    let mut status = None;
+    loop {
+        let result = (|| {
+            while let Ok((which, bytes)) = completed.try_recv() {
+                let bytes = bytes.map_err(|e| format!("{label}: {e}"))?;
+                if which == 2 {
+                    input_done = true;
+                } else {
+                    output[which] = Some(bytes);
+                }
+            }
+            if status.is_none() {
+                status = child.try_wait().map_err(|e| format!("{label}: {e}"))?;
+            }
+            if status.is_some() && input_done && output.iter().all(Option::is_some) {
+                return Ok(true);
+            }
+            if started.elapsed() >= timeout {
                 return Err(format!(
                     "{label} timed out after {} s",
                     timeout.as_secs().max(1)
                 ));
             }
-            Err(e) => return Err(format!("{label}: {e}")),
+            Ok(false)
+        })();
+        match result {
+            Ok(true) => break,
+            Ok(false) => std::thread::sleep(Duration::from_millis(5)),
+            Err(error) => {
+                stop_group(&mut child, Duration::ZERO);
+                return Err(error);
+            }
         }
-    };
+    }
     Ok(Output {
-        status,
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
+        status: status.unwrap(),
+        stdout: output[0].take().unwrap(),
+        stderr: output[1].take().unwrap(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deadline_covers_pipes_inherited_by_descendants() {
+        let started = Instant::now();
+        let result = run(
+            Command::new("sh").args(["-c", "sleep 5 & exit 0"]),
+            None,
+            Duration::from_millis(100),
+            "orphan",
+        );
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn excessive_output_is_bounded() {
+        let result = run(
+            Command::new("head").args(["-c", "20000000", "/dev/zero"]),
+            None,
+            Duration::from_secs(5),
+            "noisy",
+        );
+        assert!(result.unwrap_err().contains("output exceeded"));
+    }
 
     #[test]
     fn timeouts_stop_the_whole_process_group() {

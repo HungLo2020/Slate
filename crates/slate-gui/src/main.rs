@@ -54,7 +54,11 @@ fn split_arguments(args: Vec<OsString>) -> (Vec<OsString>, Vec<String>) {
 
 fn main() -> Result<()> {
     slate_gui::handle_termination_signals();
-    let (args, qt_arguments) = split_arguments(std::env::args_os().skip(1).collect());
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if let Some(result) = slate_core::fsio::elevated_save_entry(&arguments) {
+        return result;
+    }
+    let (args, qt_arguments) = split_arguments(arguments);
     let launch = cli::parse(args)?;
     if launch.help {
         println!("{}", cli::USAGE);
@@ -70,8 +74,7 @@ fn main() -> Result<()> {
     let smoke = std::env::var_os("SLATE_GUI_SMOKE_DIR").is_some();
     // Files go to a running window, like other desktop editors. Directories,
     // standard input and --new-instance always open a new window.
-    let single =
-        !launch.new_instance && launch.directory.is_none() && launch.stdin.is_none() && !smoke;
+    let single = slate_core::instance::can_share_window(&launch) && !smoke;
     if single && !launch.files.is_empty() && slate_core::instance::forward(&launch.files) {
         return Ok(());
     }

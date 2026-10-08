@@ -98,7 +98,10 @@ impl App {
             if then_save {
                 return Ok(false);
             }
-            let root = self.document_root(doc).unwrap_or(folder);
+            let root = self
+                .document_root(doc)
+                .filter(|root| !self.trusted_path(root))
+                .unwrap_or(folder);
             self.ask_trust_for(
                 &root,
                 "Formatters read and can run the project's configuration",

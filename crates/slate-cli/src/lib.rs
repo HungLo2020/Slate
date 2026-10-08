@@ -379,8 +379,13 @@ pub fn run(mut app: App) -> Result<()> {
                     "Slate: saving {} with sudo (Ctrl+C cancels)",
                     request.path.display()
                 );
-                result =
-                    slate_core::fsio::write_elevated(&request.path, &request.bytes, "sudo", true);
+                result = slate_core::fsio::write_elevated(
+                    &request.path,
+                    &request.bytes,
+                    request.baseline.as_ref(),
+                    "sudo",
+                    true,
+                );
             })?;
             app.finish_elevation(request, result);
             redraw = true;
@@ -957,7 +962,11 @@ fn render(
                 Grid {
                     screen,
                     colors,
-                    selection: &s.selection,
+                    selection: if p.kind == "terminal" {
+                        &s.terminal_selection
+                    } else {
+                        &s.selection
+                    },
                 },
                 content,
             );

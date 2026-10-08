@@ -601,6 +601,15 @@ impl Document {
         cursor: usize,
     ) -> Result<Vec<(usize, usize)>> {
         self.locked()?;
+        for (start, end, _) in edits {
+            anyhow::ensure!(
+                *start <= *end
+                    && *end <= self.len()
+                    && self.is_char_boundary(*start)
+                    && self.is_char_boundary(*end),
+                "Invalid text range"
+            );
+        }
         let mut order: Vec<usize> = (0..edits.len()).collect();
         order.sort_by_key(|i| (edits[*i].0, edits[*i].1));
         for pair in order.windows(2) {

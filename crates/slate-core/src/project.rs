@@ -156,14 +156,12 @@ pub fn search(
                 let Ok(bytes) = std::fs::read(&path) else {
                     continue;
                 };
-                // Binary files are skipped, as grep does.
-                if bytes[..bytes.len().min(8192)].contains(&0) {
+                // Use the same BOM, legacy encoding and newline handling as
+                // opened documents. UTF-16 NUL bytes are not binary data.
+                let Ok(decoded) = crate::text_format::decode(&bytes, None) else {
                     continue;
-                }
-                (
-                    String::from_utf8_lossy(&bytes).into_owned(),
-                    content_hash(&bytes),
-                )
+                };
+                (decoded.text, content_hash(&bytes))
             }
         };
         let mut line = 0;
@@ -216,6 +214,38 @@ pub fn search(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn search_decodes_text_like_the_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut utf16 = vec![0xff, 0xfe];
+        for unit in "café\r\nhello\r\n".encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        fs::write(dir.path().join("utf16.txt"), utf16).unwrap();
+        fs::write(dir.path().join("legacy.txt"), b"caf\xe9\rhello\r").unwrap();
+        fs::write(dir.path().join("binary.bin"), b"hello\0world").unwrap();
+        for (query, line) in [("café", 0), ("hello", 1)] {
+            let mut hits = Vec::new();
+            search(
+                dir.path(),
+                &SearchOptions {
+                    query: query.into(),
+                    ..Default::default()
+                },
+                &HashMap::new(),
+                &Arc::new(AtomicU64::new(0)),
+                0,
+                |batch| {
+                    hits.extend(batch);
+                    true
+                },
+            )
+            .unwrap();
+            assert_eq!(hits.len(), 2);
+            assert!(hits.iter().all(|hit| hit.line == line && hit.column == 0));
+        }
+    }
 
     #[test]
     fn index_and_search_respect_ignore_rules_and_unsaved_buffers() {

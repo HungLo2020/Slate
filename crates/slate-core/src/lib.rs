@@ -37,6 +37,7 @@ pub mod tasks;
 pub mod terminal;
 pub mod text_format;
 pub mod text_presentation;
+pub mod theme;
 pub mod tools;
 pub mod trust;
 pub mod workspace;
@@ -420,6 +421,9 @@ pub struct Snapshot {
     pub background: String,
     pub foreground: String,
     pub accent: String,
+    pub terminal_background: String,
+    pub terminal_foreground: String,
+    pub terminal_selection: String,
     /// Selection background, so monochrome terminals can show reverse video.
     pub selection: String,
     pub commands: Vec<commands::CommandInfo>,
@@ -495,6 +499,7 @@ pub struct App {
     workspace_dirty: bool,
     checkpoint_at: Instant,
     colors: (String, String, String, String),
+    terminal_colors: theme::Palette,
     system_colors: Option<(String, String, String, String, String)>,
     selection_foreground: String,
     events: events::Events,
@@ -576,6 +581,7 @@ pub struct App {
 /// A privileged write the terminal frontend performs with `sudo`, after
 /// handing it the terminal for a password prompt.
 pub struct Elevation {
+    pub baseline: Option<fsio::Baseline>,
     pub document: u64,
     pub path: PathBuf,
     pub bytes: Vec<u8>,
@@ -733,6 +739,7 @@ impl App {
                 "#88c0d0".into(),
             ),
             system_colors: None,
+            terminal_colors: theme::Palette::dark(true),
             file_mode,
             recovery_key,
             quit_after_save: false,
@@ -1470,10 +1477,7 @@ impl App {
                     accent.clone(),
                     selection_foreground.clone(),
                 ));
-                if self.preferences.theme == "auto" {
-                    self.colors = (foreground, background, selection, accent);
-                    self.selection_foreground = selection_foreground;
-                }
+                self.apply_pane_colors();
             }
             Command::ReloadSettings => {
                 self.load_preferences();

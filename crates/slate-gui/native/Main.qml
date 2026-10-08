@@ -819,6 +819,9 @@ ApplicationWindow {
                 }
                 Minimap {
                     id: minimap
+                    background: root.frame.background || "#1b1e26"
+                    foreground: root.frame.foreground || "#d8dee9"
+                    accent: root.frame.accent || "#88c0d0"
                     objectName: "minimap_" + panel.paneId
                     visible: panel.showMinimap
                     x: grid.x + grid.width
@@ -953,12 +956,11 @@ ApplicationWindow {
                         contentHeight: hoverText.implicitHeight
                         clip: true
                         boundsBehavior: Flickable.StopAtBounds
-                        ScrollBar.vertical: ScrollBar {
+                        ScrollBar.vertical: Basic.ScrollBar {
                             parent: hoverBox
-                            anchors.top: hoverBox.top
-                            anchors.bottom: hoverBox.bottom
-                            anchors.right: hoverBox.right
-                            anchors.margins: 2
+                            x: hoverBox.width - width - 2
+                            y: 2
+                            height: Math.max(0, hoverBox.height - 4)
                             policy: hoverBox.overflowing ? ScrollBar.AlwaysOn : ScrollBar.AlwaysOff
                         }
                         Label {
@@ -2029,13 +2031,26 @@ ApplicationWindow {
                 RowLayout {
                     Label {
                         textFormat: Text.PlainText
-                        text: "Theme"
+                        text: "Editor theme"
                         Layout.fillWidth: true
                     }
                     ComboBox {
                         model: ["auto", "dark", "light"]
-                        currentIndex: model.indexOf(root.settings.theme || "auto")
-                        onActivated: settingsDialog.configure("theme", currentText)
+                        currentIndex: model.indexOf(root.settings.editor_theme || "dark")
+                        onActivated: settingsDialog.configure("editor-theme", currentText)
+                    }
+                }
+                RowLayout {
+                    Label {
+                        textFormat: Text.PlainText
+                        text: "Terminal theme"
+                        Layout.fillWidth: true
+                    }
+                    ComboBox {
+                        objectName: "terminalThemeSetting"
+                        model: ["auto", "dark", "light", "editor"]
+                        currentIndex: model.indexOf(root.settings.terminal_theme || "dark")
+                        onActivated: settingsDialog.configure("terminal-theme", currentText)
                     }
                 }
                 RowLayout {

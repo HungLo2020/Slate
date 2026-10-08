@@ -89,15 +89,25 @@ impl App {
     /// or inside another trusted folder.
     pub(crate) fn trusted_path(&self, path: &Path) -> bool {
         let path = canonical(path);
-        if self.trusted && path.starts_with(canonical(&self.root)) {
-            return true;
-        }
         // Checked on every event-loop pass for open documents; the decision
         // only changes when trust does.
         let mut cache = self.trust_cache.lock().unwrap();
-        *cache
-            .entry(path.clone())
-            .or_insert_with(|| is_trusted(&path))
+        *cache.entry(path.clone()).or_insert_with(|| {
+            let root = canonical(&self.root);
+            let list = entries();
+            if path.starts_with(&root) {
+                // Session trust overrides the root entry, but never a more
+                // specific persisted decision about a child folder.
+                list.iter()
+                    .filter(|(folder, _)| {
+                        folder != &root && folder.starts_with(&root) && path.starts_with(folder)
+                    })
+                    .max_by_key(|(folder, _)| folder.components().count())
+                    .map_or(self.trusted, |(_, trusted)| *trusted)
+            } else {
+                decide(&path, &list)
+            }
+        })
     }
     /// Trust (or restrict) this session only, without remembering it.
     pub fn set_session_trust(&mut self, trusted: bool) {
@@ -195,6 +205,19 @@ mod tests {
         assert!(!super::is_trusted(&inner));
         assert!(!super::is_trusted(&inner.join("src")));
         assert!(super::is_trusted(&project));
+        std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
+        let mut app = crate::App::new(&project).unwrap();
+        assert!(app.trusted());
+        assert!(app.trusted_path(&project));
+        assert!(!app.trusted_path(&inner.join("src")));
+        app.set_session_trust(true);
+        assert!(
+            !app.trusted_path(&inner.join("src")),
+            "Session trust must respect child restrictions"
+        );
+        app.debug_start("vendor/program").unwrap();
+        assert_eq!(app.pending_trust.as_ref().unwrap().0, inner);
+        assert!(!app.debugging());
         super::set_trusted(&inner, true).unwrap();
         assert!(super::is_trusted(&inner));
         super::set_trusted(&project, false).unwrap();

@@ -48,6 +48,29 @@ with tempfile.TemporaryDirectory(prefix='slate-instance-') as temporary:
                 break
             assert time.monotonic() < deadline, f'Running window did not open the file: {documents}'
             time.sleep(0.1)
+        # Editing/layout/recovery options keep their semantics in a new window.
+        for flag in ('--view', '--fresh', '--editor-only', '--workspace'):
+            special_file = root / (flag[2:] + '.txt')
+            special_file.write_text('special launch\n')
+            special = subprocess.Popen([binary, flag, str(special_file)], env=environment,
+                                       stdout=log, stderr=log)
+            try:
+                deadline = time.monotonic() + 8
+                while True:
+                    assert special.poll() is None, f'{flag} was forwarded instead of opening a window'
+                    documents = []
+                    for session in (root / 'state').glob('slate/workspaces/*/session.json'):
+                        documents += list(json.loads(session.read_text())['documents'].values())
+                    document = next((d for d in documents if d.get('path') == str(special_file)), None)
+                    if document is not None:
+                        assert document.get('read_only', False) == (flag == '--view'), document
+                        break
+                    assert time.monotonic() < deadline, f'{flag} did not checkpoint its document'
+                    time.sleep(0.1)
+            finally:
+                if special.poll() is None:
+                    special.terminate()
+                special.wait(timeout=10)
         # --new-instance starts its own window instead.
         separate = subprocess.Popen([binary, '--new-instance', str(second)], env=environment,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -61,4 +84,4 @@ with tempfile.TemporaryDirectory(prefix='slate-instance-') as temporary:
             primary.wait(timeout=10)
         log.close()
     assert not socket.exists(), 'The socket outlived the window'
-print('PASS single instance: files go to the running window, --new-instance opens another, socket cleaned up')
+print('PASS single instance: files go to the running window, launch options open separate windows, --new-instance opens another, socket cleaned up')

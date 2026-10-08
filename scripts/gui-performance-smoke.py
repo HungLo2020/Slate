@@ -50,7 +50,7 @@ for mode, size in (("typing", "1360x820"), ("cursor", "1360x820"),
         report = json.loads((root / "report.json").read_text()) if (root / "report.json").exists() else {}
         logs = (root / "log").read_text()
         assert result.returncode == 0 and report.get("pass"), f"{mode} {size}: {report}\n{logs}"
-        assert not any(error in logs for error in ("ReferenceError:", "TypeError:", "Unable to assign", "Binding loop")), logs
+        assert not any(error in logs for error in ("ReferenceError:", "TypeError:", "Cannot anchor to an item", "Unable to assign", "Binding loop")), logs
         assert file.read_text() == ("x" * report["keys"] + original if mode in ("typing", "syntax", "burst", "busy") else original)
         reports.append(report)
         actual_size = f"{report['width']}x{report['height']}"

@@ -5,6 +5,19 @@ mod support;
 use std::fs;
 use support::{wait_file, Env};
 
+#[test]
+fn full_workspace_panes_are_present_in_the_rendered_terminal() {
+    let env = Env::new();
+    let file = env.path("file.txt");
+    fs::write(&file, "hello\n").unwrap();
+    let mut tui = env.slate(&["--workspace", file.to_str().unwrap()]);
+    // These assertions use the VT parser's reconstructed screen, so cursor
+    // movement optimizations cannot make a pane appear to be missing.
+    for header in ["files #1", "editor #2", "terminal #3"] {
+        tui.wait_for(header);
+    }
+}
+
 fn project(env: &Env) -> std::path::PathBuf {
     let root = env.path("project");
     fs::create_dir_all(root.join("src")).unwrap();

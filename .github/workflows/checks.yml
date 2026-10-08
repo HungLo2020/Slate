@@ -39,7 +39,7 @@ jobs:
             dnf install -y git gcc-c++ cmake pkgconf-pkg-config curl rust cargo qt6-qtbase-devel qt6-qtdeclarative-devel dejavu-sans-mono-fonts python3
           else
             apt-get update
-            apt-get install -y git g++ cmake pkg-config curl ca-certificates qt6-base-dev qt6-declarative-dev qml6-module-qtquick-controls qml6-module-qtquick-layouts qml6-module-qtquick-templates qml6-module-qtquick-window qml6-module-qtqml-workerscript fonts-dejavu-core python3
+            apt-get install -y git g++ cmake pkg-config curl ca-certificates qt6-base-dev qt6-declarative-dev qml6-module-qtquick qml6-module-qtqml qml6-module-qtqml-models qml6-module-qtquick-controls qml6-module-qtquick-layouts qml6-module-qtquick-templates qml6-module-qtquick-window qml6-module-qtqml-workerscript fonts-dejavu-core python3
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           fi

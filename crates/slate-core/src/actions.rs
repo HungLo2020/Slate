@@ -503,6 +503,7 @@ impl App {
                 match self.elevation_mode {
                     ElevationMode::Terminal => {
                         self.elevation = Some(Elevation {
+                            baseline: document.disk.clone(),
                             document: doc,
                             path,
                             bytes: document.encoded()?,
@@ -581,6 +582,9 @@ impl App {
             return;
         };
         fresh.read_only = old.read_only;
+        // Replacing a document must advance its render/highlight generation,
+        // even when neither the old nor the new file has been edited.
+        fresh.generation = old.generation.wrapping_add(1);
         let notice = fresh.notice.take();
         self.status = format!(
             "Reloaded {}{}",

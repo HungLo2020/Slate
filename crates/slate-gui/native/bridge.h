@@ -1,5 +1,6 @@
 #pragma once
 #include <QAbstractListModel>
+#include <QColor>
 #include <QElapsedTimer>
 #include <QFont>
 #include <QHash>
@@ -230,6 +231,9 @@ class CellView : public QQuickPaintedItem {
 // visible region highlighted. Click or drag to scroll.
 class Minimap : public QQuickPaintedItem {
     Q_OBJECT
+    Q_PROPERTY(QColor background MEMBER m_background NOTIFY changed)
+    Q_PROPERTY(QColor foreground MEMBER m_foreground NOTIFY changed)
+    Q_PROPERTY(QColor accent MEMBER m_accent NOTIFY changed)
     Q_PROPERTY(int paneId MEMBER m_paneId NOTIFY changed)
     Q_PROPERTY(QVariantMap editor READ editor WRITE setEditor NOTIFY changed)
     Q_PROPERTY(int visibleRows MEMBER m_visibleRows NOTIFY changed)
@@ -251,6 +255,7 @@ class Minimap : public QQuickPaintedItem {
   private:
     int m_paneId = 0, m_visibleRows = 0, m_widest = 0, m_total = 0;
     QVariantMap m_editor;
+    QColor m_background, m_foreground, m_accent;
     QVariant m_document, m_generation;
     QVector<QPair<int, int>> m_lines;
     void scrollTo(qreal y);

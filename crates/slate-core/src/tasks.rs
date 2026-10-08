@@ -329,6 +329,17 @@ impl App {
             .as_ref()
             .map(|c| self.root.join(c))
             .unwrap_or_else(|| self.root.clone());
+        if !self.trusted_path(&cwd) {
+            self.ask_trust_for(
+                &cwd,
+                "Tasks run commands from this folder",
+                crate::Command::Action {
+                    name: "run-task".into(),
+                    argument: task.name.clone(),
+                },
+            );
+            return Ok(());
+        }
         let mut command = Command::new("sh");
         command
             .args(["-c", &task.command])

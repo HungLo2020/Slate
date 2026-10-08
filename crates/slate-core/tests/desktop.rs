@@ -50,8 +50,24 @@ fn clean_documents_follow_their_file_and_modified_ones_ask() {
     let path = dir.path().join("watched.txt");
     fs::write(&path, "one\n").unwrap();
     let mut app = App::new(&path).unwrap();
+    let doc = app.views[&editor(&app)].document;
+    let generation = app.documents[&doc].generation;
+    app.snapshot(100, 30, 0, 1, 1, 0);
     rewrite(&path, "two\n");
     wait(&mut app, "automatic reload", |a| text(a) == "two\n");
+    assert!(app.documents[&doc].generation > generation);
+    let snapshot = app.snapshot(100, 30, 0, 1, 1, 0);
+    let visible: String = snapshot
+        .panes
+        .iter()
+        .filter_map(|pane| pane.screen.as_ref())
+        .flat_map(|screen| screen.cells.iter().flatten())
+        .map(|cell| cell.text.as_str())
+        .collect();
+    assert!(
+        visible.contains("two"),
+        "Reloaded text was not rendered: {visible}"
+    );
     assert!(app.status.contains("reloaded"), "{}", app.status);
     assert!(!app.dirty());
 
@@ -257,7 +273,7 @@ fn graphical_only_actions_become_frontend_requests() {
 }
 
 #[test]
-fn terminals_follow_the_editor_theme() {
+fn terminals_have_independent_themes_and_can_follow_the_editor() {
     let (dir, _serial) = isolated();
     let mut app = App::new_with_startup(
         dir.path(),
@@ -276,11 +292,25 @@ fn terminals_follow_the_editor_theme() {
         .unwrap();
     let screen = terminal.screen.as_ref().unwrap();
     let corner = screen.cells.last().unwrap().last().unwrap();
-    assert_eq!(
+    assert_ne!(
         corner.bg, snapshot.background,
-        "Default terminal cells use the theme"
+        "Changing the editor theme leaves the terminal theme alone"
     );
-    assert_eq!(snapshot.background, "#ffffff");
+    app.dispatch(Command::Configure {
+        name: "terminal-theme".into(),
+        value: "editor".into(),
+    });
+    let snapshot = app.snapshot(120, 40, 1, 1, 1, 3);
+    let terminal = snapshot
+        .panes
+        .iter()
+        .find(|p| p.kind == "terminal")
+        .unwrap();
+    assert_eq!(
+        terminal.screen.as_ref().unwrap().cells[0][0].bg,
+        snapshot.background
+    );
+    assert_eq!(snapshot.background, "#fafafa");
 }
 
 #[test]

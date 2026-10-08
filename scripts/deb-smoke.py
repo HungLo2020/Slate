@@ -58,7 +58,7 @@ with tempfile.TemporaryDirectory(prefix="slate-deb-smoke-") as temporary:
                 time.sleep(2)
                 log.seek(0); output = log.read()
                 assert process.poll() is None, output
-                assert not any(error in output for error in ("failed to load", "is not installed", "ReferenceError:", "TypeError:")), output
+                assert not any(error in output for error in ("failed to load", "is not installed", "ReferenceError:", "TypeError:", "Cannot anchor to an item")), output
             finally:
                 if process.poll() is None:
                     process.terminate()

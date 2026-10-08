@@ -28,6 +28,9 @@ pub struct Preferences {
     pub auto_indent: bool,
     pub line_numbers: bool,
     pub theme: String,
+    /// Content themes are independent of desktop menus and dialogs.
+    pub editor_theme: String,
+    pub terminal_theme: String,
     pub file_startup: StartupMode,
     pub directory_startup: StartupMode,
     /// `default` or `nano`. Choosing a keymap replaces the key tables below.
@@ -271,6 +274,8 @@ impl Default for Preferences {
             auto_indent: true,
             line_numbers: true,
             theme: "auto".into(),
+            editor_theme: "dark".into(),
+            terminal_theme: "dark".into(),
             file_startup: StartupMode::EditorOnly,
             directory_startup: StartupMode::Workspace,
             keymap: "default".into(),
@@ -343,9 +348,14 @@ pub const SETTINGS: &[Setting] = &[
         kind: SettingKind::Bool,
     },
     Setting {
-        name: "theme",
-        label: "Theme",
+        name: "editor-theme",
+        label: "Editor theme",
         kind: SettingKind::Choice(&["auto", "dark", "light"]),
+    },
+    Setting {
+        name: "terminal-theme",
+        label: "Terminal theme",
+        kind: SettingKind::Choice(&["auto", "dark", "light", "editor"]),
     },
     Setting {
         name: "keymap",
@@ -437,7 +447,8 @@ impl Preferences {
             "insert-spaces" => self.insert_spaces.to_string(),
             "auto-indent" => self.auto_indent.to_string(),
             "line-numbers" => self.line_numbers.to_string(),
-            "theme" => self.theme.clone(),
+            "theme" | "editor-theme" => self.editor_theme.clone(),
+            "terminal-theme" => self.terminal_theme.clone(),
             "keymap" => self.keymap.clone(),
             "soft-wrap" => self.soft_wrap.to_string(),
             "wrap-column" => self.wrap_column.to_string(),
@@ -508,6 +519,12 @@ impl Preferences {
         if !["auto", "dark", "light"].contains(&self.theme.as_str()) {
             bail!("theme must be auto, dark or light");
         }
+        if !["auto", "dark", "light"].contains(&self.editor_theme.as_str()) {
+            bail!("editor_theme must be auto, dark or light");
+        }
+        if !["auto", "dark", "light", "editor"].contains(&self.terminal_theme.as_str()) {
+            bail!("terminal_theme must be auto, dark, light or editor");
+        }
         if !["default", "nano"].contains(&self.keymap.as_str()) {
             bail!("keymap must be default or nano");
         }
@@ -541,6 +558,11 @@ impl Preferences {
         let source = fs::read_to_string(path)?;
         let table: toml::Table = toml::from_str(&source).context("Invalid settings.toml")?;
         let mut settings: Self = toml::from_str(&source).context("Invalid settings.toml")?;
+        // Preserve an older explicit light/dark choice. Older automatic
+        // settings gain the darker content defaults without changing Qt chrome.
+        if !table.contains_key("editor_theme") && settings.theme != "auto" {
+            settings.editor_theme = settings.theme.clone();
+        }
         // Key tables the file omits come from its chosen keymap.
         let (global, editor, terminal) = keymap(&settings.keymap)?;
         for (name, preset, field) in [
@@ -605,33 +627,7 @@ impl App {
             Ok(p) => self.preferences = p,
             Err(e) => self.status = format!("Settings error: {e:#}"),
         }
-        if let ("auto", Some(palette)) =
-            (self.preferences.theme.as_str(), self.system_colors.as_ref())
-        {
-            self.colors = (
-                palette.0.clone(),
-                palette.1.clone(),
-                palette.2.clone(),
-                palette.3.clone(),
-            );
-            self.selection_foreground = palette.4.clone();
-        } else if self.preferences.theme == "light" {
-            self.selection_foreground = "#20242c".into();
-            self.colors = (
-                "#20242c".into(),
-                "#ffffff".into(),
-                "#bdd9f5".into(),
-                "#1769aa".into(),
-            );
-        } else {
-            self.selection_foreground = "#ffffff".into();
-            self.colors = (
-                "#d8dee9".into(),
-                "#20242c".into(),
-                "#425b78".into(),
-                "#88c0d0".into(),
-            );
-        }
+        self.apply_pane_colors();
         self.highlights.clear();
         self.highlight_pending.clear();
     }
@@ -653,7 +649,11 @@ impl App {
             "insert-spaces" => settings.insert_spaces = flag(value)?,
             "auto-indent" => settings.auto_indent = flag(value)?,
             "line-numbers" => settings.line_numbers = flag(value)?,
-            "theme" => settings.theme = value.into(),
+            "theme" | "editor-theme" => {
+                settings.theme = value.into();
+                settings.editor_theme = value.into();
+            }
+            "terminal-theme" => settings.terminal_theme = value.into(),
             "file-startup" => settings.file_startup = value.parse()?,
             "directory-startup" => settings.directory_startup = value.parse()?,
             "keymap" => {
@@ -694,15 +694,87 @@ impl App {
         self.status = format!("Set {name} to {value}");
         Ok(())
     }
+    pub(super) fn apply_pane_colors(&mut self) {
+        let automatic = || match self.system_colors.as_ref() {
+            Some((fg, bg, selection, accent, selection_fg)) => {
+                crate::theme::Palette::new(fg, bg, selection, selection_fg, accent)
+            }
+            None => crate::theme::Palette::dark(false),
+        };
+        let editor = match self.preferences.editor_theme.as_str() {
+            "auto" => automatic(),
+            "light" => crate::theme::Palette::light(),
+            _ => crate::theme::Palette::dark(false),
+        };
+        self.terminal_colors = match self.preferences.terminal_theme.as_str() {
+            "auto" => automatic(),
+            "light" => crate::theme::Palette::light(),
+            "editor" => editor.clone(),
+            _ => crate::theme::Palette::dark(true),
+        };
+        self.colors = (
+            editor.foreground,
+            editor.background,
+            editor.selection,
+            editor.accent,
+        );
+        self.selection_foreground = editor.selection_foreground;
+    }
     pub(super) fn light_theme(&self) -> bool {
-        let color = u32::from_str_radix(&self.colors.1[1..], 16).unwrap_or(0);
-        ((color >> 16) & 255) * 299 + ((color >> 8) & 255) * 587 + (color & 255) * 114 > 128_000
+        crate::theme::is_light(&self.colors.1)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_themes_are_independent_and_survive_reload() {
+        let _env = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", dir.path().join("config"));
+        std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, "hello").unwrap();
+        let mut app = crate::App::new(&file).unwrap();
+        let default = app.snapshot(100, 30, 0, 1, 1, 0);
+        assert_eq!(default.background, "#1b1e26");
+        assert_eq!(default.terminal_background, "#14171c");
+        app.dispatch(crate::Command::Theme {
+            foreground: "#101010".into(),
+            background: "#ffffff".into(),
+            selection: "#abcdef".into(),
+            accent: "#123456".into(),
+            selection_foreground: "#010101".into(),
+        });
+        assert_eq!(
+            app.colors.1, "#1b1e26",
+            "Native desktop changes must not replace explicit pane themes"
+        );
+        app.configure("terminal-theme", "auto").unwrap();
+        assert_eq!(app.terminal_colors.background, "#ffffff");
+        assert_eq!(app.colors.1, "#1b1e26");
+        app.configure("editor-theme", "light").unwrap();
+        assert_eq!(app.preferences.value("theme"), "light");
+        app.configure("terminal-theme", "dark").unwrap();
+        app.load_preferences();
+        assert!(app.light_theme());
+        assert!(!app.terminal_colors.is_light());
+        app.configure("terminal-theme", "editor").unwrap();
+        assert_eq!(app.terminal_colors.background, app.colors.1);
+        assert_eq!(app.terminal_colors.selection, app.colors.2);
+        app.configure("editor-theme", "auto").unwrap();
+        assert_eq!(app.colors.1, "#ffffff");
+        assert_eq!(app.terminal_colors.selection, "#abcdef");
+        assert_eq!(Preferences::load().unwrap().terminal_theme, "editor");
+        std::fs::write(Preferences::path(), "theme = \"light\"\n").unwrap();
+        let migrated = Preferences::load().unwrap();
+        assert_eq!(migrated.editor_theme, "light");
+        assert_eq!(migrated.terminal_theme, "dark");
+    }
 
     #[test]
     fn older_settings_gain_new_default_keys_without_losing_their_own() {

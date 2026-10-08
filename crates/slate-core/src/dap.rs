@@ -211,6 +211,26 @@ impl App {
             );
             return Ok(());
         }
+        let program = self.root.join(&launch.program);
+        let cwd = launch
+            .cwd
+            .as_ref()
+            .map(|cwd| self.root.join(cwd))
+            .unwrap_or_else(|| self.root.clone());
+        let program_folder = program.parent().unwrap_or(&self.root).to_path_buf();
+        for folder in [program_folder, cwd] {
+            if !self.trusted_path(&folder) {
+                self.ask_trust_for(
+                    &folder,
+                    "Debugging runs programs from this folder",
+                    crate::Command::Action {
+                        name: "debug-start".into(),
+                        argument: launch.name.clone(),
+                    },
+                );
+                return Ok(());
+            }
+        }
         let adapter = if launch.adapter.is_empty() {
             vec!["gdb".to_string(), "-i".into(), "dap".into()]
         } else {

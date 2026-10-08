@@ -456,11 +456,16 @@ impl TerminalSession {
         len
     }
     pub fn screen(&self) -> Screen {
-        self.screen_with("#d8dee9", "#20242c")
+        self.screen_with_palette(&crate::theme::Palette::dark(true))
     }
     /// The screen with the default foreground/background drawn in the
     /// editor theme's colours, so terminals follow light and dark themes.
     pub fn screen_with(&self, default_fg: &str, default_bg: &str) -> Screen {
+        self.screen_with_palette(&crate::theme::Palette::new(
+            default_fg, default_bg, "#35465e", "#ffffff", "#88c0d0",
+        ))
+    }
+    pub fn screen_with_palette(&self, palette: &crate::theme::Palette) -> Screen {
         let p = self.parser.lock().unwrap();
         let s = self.selection_screen.as_ref().unwrap_or_else(|| p.screen());
         let (rows, cols) = s.size();
@@ -470,12 +475,12 @@ impl TerminalSession {
             for col in 0..cols {
                 let c = s.cell(row, col).unwrap();
                 let mut fg = match c.fgcolor() {
-                    vt100::Color::Default => default_fg.to_string(),
-                    other => color(other, false),
+                    vt100::Color::Default => palette.foreground.clone(),
+                    other => color(other, false, palette),
                 };
                 let mut bg = match c.bgcolor() {
-                    vt100::Color::Default => default_bg.to_string(),
-                    other => color(other, true),
+                    vt100::Color::Default => palette.background.clone(),
+                    other => color(other, true, palette),
                 };
                 if c.inverse() {
                     std::mem::swap(&mut fg, &mut bg);
@@ -483,7 +488,8 @@ impl TerminalSession {
                 if let Some((a, b)) = self.selection {
                     let (start, end) = if a <= b { (a, b) } else { (b, a) };
                     if (row, col) >= start && (row, col) < end {
-                        bg = "#425b78".into();
+                        bg = palette.selection.clone();
+                        fg = palette.selection_foreground.clone();
                     }
                 }
                 line.push(Cell {
@@ -523,18 +529,18 @@ impl Drop for TerminalSession {
         let _ = self.child.wait();
     }
 }
-fn color(c: vt100::Color, background: bool) -> String {
+fn color(c: vt100::Color, background: bool, palette: &crate::theme::Palette) -> String {
     match c {
-        vt100::Color::Default => if background { "#20242c" } else { "#d8dee9" }.into(),
+        vt100::Color::Default => if background {
+            &palette.background
+        } else {
+            &palette.foreground
+        }
+        .clone(),
         vt100::Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
         vt100::Color::Idx(i) => {
-            const ANSI: [&str; 16] = [
-                "#20242c", "#bf616a", "#a3be8c", "#ebcb8b", "#81a1c1", "#b48ead", "#88c0d0",
-                "#e5e9f0", "#4c566a", "#d08770", "#b8d7a3", "#f0dcab", "#a3c5e5", "#c9acd7",
-                "#a3d8e0", "#ffffff",
-            ];
             if i < 16 {
-                return ANSI[i as usize].into();
+                return palette.ansi[i as usize].clone();
             }
             if i >= 232 {
                 let v = 8 + (i - 232) * 10;
@@ -628,6 +634,26 @@ fn decode_base64(data: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_palettes_change_ansi_but_preserve_application_rgb() {
+        let dark = crate::theme::Palette::dark(true);
+        let light = crate::theme::Palette::light();
+        assert_ne!(
+            color(vt100::Color::Idx(1), false, &dark),
+            color(vt100::Color::Idx(1), false, &light)
+        );
+        for palette in [&dark, &light] {
+            assert_eq!(
+                color(vt100::Color::Rgb(18, 52, 86), false, palette),
+                "#123456"
+            );
+            assert_eq!(
+                color(vt100::Color::Rgb(18, 52, 86), true, palette),
+                "#123456"
+            );
+        }
+    }
 
     #[test]
     fn pasted_control_sequences_are_removed() {

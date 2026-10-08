@@ -174,7 +174,13 @@ impl Services {
                                 anyhow::anyhow!("Use Save As for an untitled document")
                             })?;
                             let bytes = doc.encoded()?;
-                            crate::fsio::write_elevated(&path, &bytes, &program, false)?;
+                            crate::fsio::write_elevated(
+                                &path,
+                                &bytes,
+                                doc.disk.as_ref(),
+                                &program,
+                                false,
+                            )?;
                             doc.mark_saved_bytes(&bytes);
                             Ok(doc)
                         })()

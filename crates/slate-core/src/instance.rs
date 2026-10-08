@@ -16,6 +16,17 @@ struct Request {
 /// Files handed over by other `slate-gui` invocations, waiting to be opened.
 pub type Inbox = Arc<Mutex<Vec<LaunchFile>>>;
 
+/// Launch options that affect editing or layout belong to their own window.
+/// Forwarding them could change existing documents or discard recovery state.
+pub fn can_share_window(launch: &crate::cli::Launch) -> bool {
+    !launch.new_instance
+        && !launch.read_only
+        && launch.recover
+        && launch.startup.is_none()
+        && launch.directory.is_none()
+        && launch.stdin.is_none()
+}
+
 #[cfg(unix)]
 fn socket_path() -> PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
@@ -34,6 +45,7 @@ pub fn forward(files: &[LaunchFile]) -> bool {
         return false;
     };
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(3)));
     let request = Request {
         files: files
             .iter()
@@ -77,9 +89,12 @@ pub fn listen(notify: impl Fn() + Send + 'static) -> Option<Inbox> {
     let queue = inbox.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+            let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(500)));
             let mut line = String::new();
-            let mut reader = BufReader::new(&stream);
-            if reader.read_line(&mut line).is_err() {
+            use std::io::Read;
+            let mut reader = BufReader::new(&stream).take(1024 * 1024);
+            if reader.read_line(&mut line).is_err() || !line.ends_with('\n') {
                 continue;
             }
             let Ok(request) = serde_json::from_str::<Request>(&line) else {
@@ -150,6 +165,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn launch_options_are_never_lost_to_forwarding() {
+        let launch =
+            |args: &[&str]| crate::cli::parse(args.iter().map(std::ffi::OsString::from)).unwrap();
+        assert!(can_share_window(&launch(&["file.txt"])));
+        for flag in [
+            "--view",
+            "--fresh",
+            "--workspace",
+            "--editor-only",
+            "--new-instance",
+        ] {
+            assert!(!can_share_window(&launch(&[flag, "file.txt"])));
+        }
+    }
+
+    #[test]
     fn a_second_invocation_hands_files_to_the_first() {
         // Other tests change the environment too.
         let _serial = crate::paths::TEST_ENV
@@ -160,12 +191,15 @@ mod tests {
         let woke = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = woke.clone();
         let inbox = listen(move || flag.store(true, std::sync::atomic::Ordering::SeqCst)).unwrap();
+        // A client that never sends a newline must not block later launches.
+        let stalled = std::os::unix::net::UnixStream::connect(socket_path()).unwrap();
         let file = LaunchFile {
             path: runtime.path().join("a.txt"),
             line: Some(3),
             column: None,
         };
         assert!(forward(std::slice::from_ref(&file)));
+        drop(stalled);
         let received = inbox.lock().unwrap().clone();
         assert_eq!(received.len(), 1);
         assert_eq!(received[0].line, Some(3));

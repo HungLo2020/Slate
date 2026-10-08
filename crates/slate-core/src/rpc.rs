@@ -165,12 +165,7 @@ impl Process {
 
     /// Stop the process (and its process group) now.
     pub fn kill(&mut self) {
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(-(self.child.id() as i32), libc::SIGTERM);
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        crate::process::stop_group(&mut self.child, std::time::Duration::from_millis(50));
     }
 }
 

@@ -335,6 +335,33 @@ fn text_edits(d: &crate::document::Document, edits: &Value) -> Replacements {
     out
 }
 
+fn checked_text_edits(d: &crate::document::Document, edits: &Value) -> Result<Replacements> {
+    let list = edits
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Invalid text edits; nothing was changed"))?;
+    for edit in list {
+        anyhow::ensure!(
+            edit["newText"].is_string(),
+            "Invalid replacement text; nothing was changed"
+        );
+        for end in ["start", "end"] {
+            for field in ["line", "character"] {
+                anyhow::ensure!(
+                    edit["range"][end][field]
+                        .as_u64()
+                        .is_some_and(|value| value <= u32::MAX as u64),
+                    "Invalid edit position; nothing was changed"
+                );
+            }
+        }
+        anyhow::ensure!(
+            position(&edit["range"]["start"]) <= position(&edit["range"]["end"]),
+            "Reversed edit range; nothing was changed"
+        );
+    }
+    Ok(text_edits(d, edits))
+}
+
 /// Hover contents as plain text.
 fn hover_text(contents: &Value) -> String {
     match contents {
@@ -580,6 +607,7 @@ impl App {
                 self.documents
                     .get(doc)
                     .is_none_or(|d| d.path.as_ref() != Some(&open.path))
+                    || !self.trusted_path(open.path.parent().unwrap_or(&open.path))
             })
             .map(|(doc, _)| *doc)
             .collect();
@@ -603,7 +631,7 @@ impl App {
             let path = self.documents[&doc].path.clone().unwrap();
             let root = language.root_for(&path, &self.root);
             // A server runs the project's code (build scripts, plugins).
-            if !self.trusted_path(&root) {
+            if !self.trusted_path(&root) || !self.trusted_path(path.parent().unwrap_or(&path)) {
                 continue;
             }
             let Some(server) = self.start_server(&language, root) else {
@@ -1269,8 +1297,13 @@ impl App {
             Closed(Box<crate::document::Document>),
         }
         let mut plan: Vec<(Target, Replacements)> = Vec::new();
+        let mut targets = std::collections::BTreeSet::new();
         for (path, version, edits) in per_file {
             let real = path.canonicalize().unwrap_or_else(|_| path.clone());
+            anyhow::ensure!(
+                targets.insert(real.clone()),
+                "The edit names the same file more than once; nothing was changed"
+            );
             if !real.starts_with(&root) {
                 bail!(
                     "The edit changes {} outside the workspace; nothing was changed",
@@ -1296,12 +1329,18 @@ impl App {
                             self.documents[&doc].title()
                         );
                     }
-                    let replacements = self.text_edits(doc, &edits);
+                    let replacements = checked_text_edits(&self.documents[&doc], &edits)?;
+                    // Exercise every document's full edit validation before
+                    // committing any: ranges, overlaps, read-only and size.
+                    self.documents[&doc]
+                        .checkpoint()
+                        .replace_many(&replacements, 0)?;
                     plan.push((Target::Open(doc), replacements));
                 }
                 None => {
                     let d = crate::document::Document::open(&path)?;
-                    let replacements = text_edits(&d, &edits);
+                    let replacements = checked_text_edits(&d, &edits)?;
+                    d.checkpoint().replace_many(&replacements, 0)?;
                     plan.push((Target::Closed(Box::new(d)), replacements));
                 }
             }
@@ -1368,7 +1407,18 @@ impl App {
     /// A request position at `offset` in view `id`.
     fn position_in(&mut self, id: u64, offset: usize, action: &str) -> Result<Option<RequestAt>> {
         let doc = self.views[&id].document;
-        if let Some(root) = self.document_root(doc).filter(|r| !self.trusted_path(r)) {
+        let restricted = self
+            .document_root(doc)
+            .filter(|r| !self.trusted_path(r))
+            .or_else(|| {
+                self.documents[&doc]
+                    .path
+                    .as_ref()
+                    .and_then(|path| path.parent())
+                    .filter(|folder| !self.trusted_path(folder))
+                    .map(Path::to_path_buf)
+            });
+        if let Some(root) = restricted {
             if !action.is_empty() {
                 self.ask_trust_for(
                     &root,
@@ -2273,6 +2323,48 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_edits_validate_every_file_before_changing_any() {
+        let _serial = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", dir.path().join("config"));
+        std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, "abc\n").unwrap();
+        std::fs::write(&b, "abc\n").unwrap();
+        let mut app = App::new(&a).unwrap();
+        let id = *app.documents.keys().next().unwrap();
+        let replacement = |start, end, text| json!({"range":{"start":{"line":0,"character":start},"end":{"line":0,"character":end}},"newText":text});
+        let edits = |second| {
+            json!({"documentChanges":[
+                {"textDocument":{"uri":uri(&a),"version":null},"edits":[replacement(0,1,"X")]},
+                {"textDocument":{"uri":uri(&b),"version":null},"edits":second}
+            ]})
+        };
+        for invalid in [
+            json!([replacement(0, 2, "Y"), replacement(1, 3, "Z")]),
+            json!([replacement(2, 1, "Y")]),
+            json!([replacement(0, u64::MAX, "Y")]),
+            json!([{"newText":"Y"}]),
+        ] {
+            assert!(app.apply_workspace_edit(&edits(invalid), None).is_err());
+            assert_eq!(app.documents[&id].text(), "abc\n");
+            assert!(!app.dirty());
+            assert_eq!(app.documents.len(), 1);
+        }
+        assert_eq!(
+            app.apply_workspace_edit(&edits(json!([replacement(0, 1, "Y")])), None)
+                .unwrap(),
+            2
+        );
+        assert_eq!(app.documents[&id].text(), "Xbc\n");
+        assert!(app.documents.values().any(|d| d.text() == "Ybc\n"));
+        assert_eq!(std::fs::read_to_string(b).unwrap(), "abc\n");
+    }
 
     #[test]
     fn uris_round_trip_with_spaces_and_unicode() {

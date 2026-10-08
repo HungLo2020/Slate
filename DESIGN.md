@@ -91,11 +91,15 @@ context are exposed to Qt input methods. The terminal retains its fixed-cell
 renderer. This provides basic accessible names/roles; complete platform screen
 reader integration is not claimed by the input-method tests.
 
-The GUI editor's base/text/selection colors follow Qt's desktop palette by
-default. Syntax colors choose a light or dark palette from its luminance.
-The latest desktop palette is retained when settings reload or change, including
-when switching back from an explicit light/dark theme to automatic colors.
-Terminal ANSI colors remain consistent with the emulator. GUI tabs fit their header; when space is limited, the active tab and a menu of
+Editor and terminal content use independent shared-core palettes. Dark defaults
+are #1b1e26 for editors and #14171c for terminals; native GUI chrome follows Qt.
+`editor_theme` chooses auto/dark/light, and `terminal_theme` additionally accepts
+editor to inherit its palette. Automatic palettes retain Qt's latest view/text/
+selection colors. The editor's background luminance chooses the syntax palette.
+Terminal ANSI and selection colors come from its own palette; explicit RGB
+colors supplied by applications pass through unchanged. The minimap darkens its
+editor background. Palette changes invalidate the appropriate render cache.
+GUI tabs fit their header; when space is limited, the active tab and a menu of
 all tabs replace the full tab row. The tab model changes only when titles or
 active tabs change, so editing does not recreate controls. Git views receive
 repository/selection metadata without editor or PTY screen payloads. File/Git
@@ -323,7 +327,8 @@ and retry the action once trusted. Git status and bulk staging are scoped to
 the workspace's subtree of a parent repository.
 
 Child processes that Slate waits for (Git, formatters, tools) run in their own
-process group with a deadline (`process::run`); on timeout the whole group is
+process group with a deadline (`process::run`); output is limited to 16 MiB per stream, and the deadline includes input and
+output pipes inherited by descendants. On timeout the whole group is
 killed, so a hung `git` or a formatter's grandchildren do not linger. Tasks,
 language servers and debug adapters are stopped the same way when they end or
 Slate quits.

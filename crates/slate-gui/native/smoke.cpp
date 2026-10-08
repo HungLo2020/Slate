@@ -708,9 +708,14 @@ static void startGitSmoke(Bridge *state, QQuickWindow *window) {
             window->resize(480, 320);
             break;
         case 16:
+            if (!view->property("compactHeight").toBool() && ++*settling < 8)
+                return;
+            *settling = 0;
             if (view->property("draft").toString() != "GUI bulk commit" ||
                 !view->property("compactHeight").toBool()) {
-                finish(false, "Failed commit draft lost when compacting pane");
+                finish(false, "Failed commit did not settle into compact layout; draft=" +
+                              view->property("draft").toString() +
+                              "; height=" + QString::number(view->height()));
                 return;
             }
             if (!click("gitCommit_1"))
@@ -1891,15 +1896,23 @@ static void startDesktopSmoke(Bridge *state, QQuickWindow *window) {
         }
         case 20: {
             if (!context().value("surrounding").toString().endsWith(QStringLiteral("猫"))) return;
-            // Terminals use the editor theme's default background.
+            // Terminal content has its own theme, independent of the editor.
+            state->send({{"action", "configure"}, {"name", "editor-theme"}, {"value", "light"}});
+            state->send({{"action", "configure"}, {"name", "terminal-theme"}, {"value", "dark"}});
+            state->refresh();
+            const auto themed = state->frame();
+            if (themed.value("background") != "#fafafa" || themed.value("terminal_background") != "#14171c") {
+                finish(false, "Editor and terminal theme settings were not independent");
+                return;
+            }
             QVariantMap terminal;
             for (const auto &value : frame.value("panes").toList())
                 if (value.toMap().value("kind") == "terminal") terminal = value.toMap();
             const auto cells = state->surface(terminal.value("id").toInt()).value("screen").toMap().value("cells").toList();
             if (cells.isEmpty() || cells.last().toList().isEmpty()) return;
             const auto bg = cells.last().toList().last().toMap().value("bg").toString();
-            if (bg != frame.value("background").toString()) {
-                finish(false, "Terminal background " + bg + " ignores the theme " + frame.value("background").toString());
+            if (bg != themed.value("terminal_background").toString()) {
+                finish(false, "Terminal background " + bg + " ignores its theme " + themed.value("terminal_background").toString());
                 return;
             }
             qputenv("SLATE_GUI_NEW_WINDOW_LOG", (dir + "/new-window.log").toUtf8());
@@ -1914,6 +1927,20 @@ static void startDesktopSmoke(Bridge *state, QQuickWindow *window) {
         case 22: {
             auto label = findItem(window->contentItem(), "statusLabel");
             if (!label || !label->property("text").toString().startsWith("Error") || !label->property("font").value<QFont>().bold()) return;
+            auto minimap = findItem(window->contentItem(), "minimap_2");
+            if (!minimap || minimap->property("background").value<QColor>() != QColor("#fafafa")) {
+                finish(false, "Minimap did not follow the editor theme");
+                return;
+            }
+            const auto image = window->grabWindow();
+            const auto sample = minimap->mapToScene(QPointF(minimap->width() / 2, minimap->height() - 5));
+            const auto actualColor = image.pixelColor((sample * image.devicePixelRatio()).toPoint());
+            const auto expectedColor = QColor("#fafafa").darker(110);
+            if (actualColor.rgba() != expectedColor.rgba()) {
+                finish(false, "Minimap retained stale colors after a theme change: " +
+                              actualColor.name() + "; expected " + expectedColor.name());
+                return;
+            }
             if (state->send({{"action", "flush"}}).value("status").toString().isEmpty()) {
                 finish(false, "Session flush did not report");
                 return;

@@ -785,7 +785,7 @@ void CellView::paint(QPainter *p) {
     if (!bridge)
         return;
     const bool editor = m_pane.value("kind") == "editor";
-    const QColor background(bridge->frame().value("background").toString());
+    const QColor background(bridge->frame().value(editor ? "background" : "terminal_background").toString());
     p->fillRect(boundingRect(), background);
     const auto screen = m_screen;
     const int cw = bridge->cellWidth(), ch = bridge->cellHeight();
@@ -1230,15 +1230,13 @@ void Minimap::setEditor(const QVariantMap &editor) {
 }
 void Minimap::paint(QPainter *p) {
     if (!bridge) return;
-    const QColor background(bridge->frame().value("background").toString());
-    const QColor foreground(bridge->frame().value("foreground").toString());
-    p->fillRect(boundingRect(), background.darker(background.lightness() > 128 ? 104 : 80));
+    p->fillRect(boundingRect(), m_background.darker(110));
     if (m_lines.isEmpty() || m_total <= 0) return;
     // At most 3 px per line; long documents are compressed to the height.
     const qreal lineHeight = qMin<qreal>(3.0, height() / qMax(1, m_total));
     const qreal sampleHeight = lineHeight * m_total / m_lines.size();
     const qreal scale = (width() - 6) / 120.0;
-    QColor bar = foreground;
+    QColor bar = m_foreground;
     bar.setAlphaF(0.45);
     for (int i = 0; i < m_lines.size(); ++i) {
         const auto [indent, length] = m_lines[i];
@@ -1248,7 +1246,7 @@ void Minimap::paint(QPainter *p) {
         p->fillRect(QRectF(x, i * sampleHeight, w, qMax<qreal>(1, sampleHeight * 0.7)), bar);
     }
     const int top = m_editor.value("top").toInt();
-    QColor region = QColor(bridge->frame().value("accent").toString());
+    QColor region = m_accent;
     region.setAlphaF(0.22);
     p->fillRect(QRectF(0, top * lineHeight, width(), qMax<qreal>(4, m_visibleRows * lineHeight)), region);
 }

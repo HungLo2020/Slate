@@ -440,10 +440,16 @@ fn permission_denied_offers_a_sudo_save() {
     tui.send("y");
     tui.wait_for("with sudo");
     let data = fs::read_to_string(env.path("sudo-record.data")).unwrap();
+    let (header, data) = data.split_once('\n').unwrap();
+    let baseline: slate_core::fsio::Baseline = serde_json::from_str(header).unwrap();
+    assert_eq!(
+        baseline,
+        slate_core::fsio::Baseline::of(&fs::read(target).unwrap())
+    );
     assert!(data.starts_with("edited-"), "{data}");
     let args = fs::read_to_string(env.path("sudo-record.args")).unwrap();
     assert!(
-        args.contains("tee") && args.contains("/etc/hostname"),
+        args.contains("--internal-elevated-save") && args.contains("/etc/hostname"),
         "{args}"
     );
     tui.wait_gone(" *");

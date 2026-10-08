@@ -18,7 +18,7 @@ portable-pty = "0.9"
 vt100 = "0.16"
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 rust-version = "1.89"
 
@@ -37,6 +37,7 @@ anyhow.workspace = true
 lto = "thin"
 
 [dev-dependencies]
+serde_json.workspace = true
 portable-pty.workspace = true
 vt100.workspace = true
 tempfile.workspace = true

@@ -359,6 +359,8 @@ Settings are saved automatically to `$XDG_CONFIG_HOME/slate/settings.toml`
 ```toml
 file_startup = "editor-only"
 directory_startup = "workspace"
+editor_theme = "dark"     # auto, dark, light
+terminal_theme = "dark"   # auto, dark, light, editor
 keymap = "default"        # or "nano"
 soft_wrap = false
 wrap_column = 80          # justify and hard wrap
@@ -370,6 +372,23 @@ terminal_clipboard = false          # let terminal programs set the clipboard (O
 complete_while_typing = true
 accept_completion_on_enter = true
 ```
+
+Editor and terminal themes are independent. Their dark defaults use charcoal
+backgrounds (`#1b1e26` and `#14171c`) while GUI menus and dialogs keep the desktop
+palette. `auto` follows the desktop palette in the GUI and uses a dark fallback
+in the TUI. Terminal `editor` follows the editor's colors, including selection.
+Terminal ANSI colors adapt to light/dark backgrounds; explicit application RGB
+colors are preserved. `set theme` remains an alias for the editor theme.
+Older explicit light/dark settings keep their editor choice.
+
+In-place saves (hard links or unwritable parent directories) first persist a
+private original under `$XDG_STATE_HOME/slate/save-recovery`. A failed write
+restores it; if restoration fails, the error names the retained recovery file.
+After abnormal termination, originals left there can be recovered manually.
+Administrator saves use the same checked save path instead of `tee`.
+
+GUI invocations with `--view`, `--fresh`, `--editor-only`, or `--workspace` open
+a separate window, so their options cannot be lost when another window exists.
 
 Keymaps gain new default bindings when Slate adds them, without changing keys
 you set. A configuration file that does not parse (`settings.toml`,
@@ -591,7 +610,8 @@ indent
 outdent
 set indent-width 2
 set insert-spaces true
-set theme auto
+set editor-theme dark
+set terminal-theme dark
 set file-startup editor-only
 set directory-startup workspace
 settings
@@ -634,8 +654,9 @@ commands discard unsaved work. GUI window closure asks before discarding.
 
 `set` writes `$XDG_CONFIG_HOME/slate/settings.toml` (normally
 `~/.config/slate/settings.toml`). Supported options: `indent-width` (1–16),
-`insert-spaces`, `auto-indent`, `line-numbers` (booleans), `theme`
-(`auto`, `dark`, `light`), `keymap` (`default`, `nano`; choosing one replaces the
+`insert-spaces`, `auto-indent`, `line-numbers` (booleans), `editor-theme`
+(`auto`, `dark`, `light`), `terminal-theme` (`auto`, `dark`, `light`, `editor`),
+`theme` (an alias for `editor-theme`), `keymap` (`default`, `nano`; choosing one replaces the
 key tables), `soft-wrap`, `wrap-column` (10–500), `hard-wrap`, `backup`,
 `file-recovery`, `tui-mouse`, `terminal-clipboard`, `complete-while-typing`
 and `accept-completion-on-enter`; `set` with an unknown name lists them all. Running as root through `sudo` without `-H`,

@@ -282,7 +282,7 @@ fn dispatch_gui(state: &mut GuiContext, request: serde_json::Value) -> String {
             }
         }
         let apply_theme = matches!(command, Command::ReloadSettings)
-            || matches!(&command, Command::Configure { name, value } if name == "theme" && value == "auto");
+            || matches!(&command, Command::Configure { name, value } if ["theme", "editor-theme", "terminal-theme"].contains(&name.as_str()) && value == "auto");
         app.dispatch(command);
         let mut response = serde_json::json!({"status":app.status,"quit":app.quit});
         if apply_theme {

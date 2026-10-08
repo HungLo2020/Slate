@@ -16,6 +16,8 @@ pub fn isolate() {
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("XDG_CONFIG_HOME", dir.path().join("config"));
         std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
+        #[cfg(unix)]
+        std::env::set_var("SHELL", "/bin/sh");
         dir
     });
 }
@@ -29,6 +31,8 @@ pub fn isolated() -> (tempfile::TempDir, MutexGuard<'static, ()>) {
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("XDG_CONFIG_HOME", dir.path().join("config"));
     std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
+    #[cfg(unix)]
+    std::env::set_var("SHELL", "/bin/sh");
     (dir, guard)
 }
 

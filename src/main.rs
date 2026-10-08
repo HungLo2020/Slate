@@ -43,6 +43,9 @@ fn main() -> Result<()> {
     let mut args = std::env::args_os();
     let invocation = PathBuf::from(args.next().unwrap_or_default());
     let args: Vec<OsString> = args.collect();
+    if let Some(result) = slate_core::fsio::elevated_save_entry(&args) {
+        return result;
+    }
     let launch = cli::parse(args.clone())?;
     let invoked_as_gui = invocation.file_name().is_some_and(|n| n == "slate-gui");
     if launch.frontend == Some(Frontend::Gui)
