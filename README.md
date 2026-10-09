@@ -418,8 +418,9 @@ with `bash DevUtils/InstallDependencies.sh`, then:
 
 ```bash
 bash DevUtils/Build.sh
-python3 scripts/deb-smoke.py builds/slate_0.1.1_amd64.deb
-sudo apt install ./builds/slate_0.1.1_amd64.deb
+python3 scripts/deb-smoke.py             # selects the current Cargo.toml version
+package=$(sed -n 's/^BUILD_ARTIFACT_PATH=//p' builds/latest-build.env)
+sudo apt install "$package"
 ```
 
 The package includes `/usr/bin/slate`, `/usr/bin/slate-gui`, the desktop entry,
@@ -463,7 +464,8 @@ slate`; subsequent releases arrive through normal APT updates.
 ## Working prototype features
 
 - File-aware editor-only / workspace startup in both frontends; configurable defaults.
-- Lazy directory browsing (including parent navigation); open UTF-8 files,
+- Lazy directory browsing rooted at the opened workspace; parent navigation
+  stops at that root in both frontends. Open UTF-8 files,
   create untitled buffers, save, and save as a new file.
 - Grapheme-aware cursor movement, selection, mouse selection, copy/cut/paste,
   configurable line numbers, incremental undo/redo, and multiple documents.
@@ -569,7 +571,9 @@ the comparison for that group. Staged diffs compare the index to HEAD (including
 an initial commit); unstaged diffs compare the working file to the index.
 Untracked previews compare the file to an empty file. Git errors remain visible,
 and Refresh reloads changes made outside Slate. **Stage all** and **Unstage all**
-operate on the entire repository; section +/− controls operate on that group.
+operate on the workspace subtree when its repository is larger; section +/−
+controls operate on that group. Commits include all staged repository changes,
+including changes staged outside the workspace.
 Unstaging preserves working files. The GUI shows section counts, file names and
 parent folders, and reserves a gutter for the scrollbar beside the row actions.
 
@@ -645,7 +649,8 @@ quit
 ```
 
 `stage`, `unstage`, and `diff` use the selected Git entry.
-`stage-all` and `unstage-all` operate on the entire repository. A diff opens as a
+`stage-all` and `unstage-all` operate on the workspace subtree of a larger
+repository. Commits include all staged changes in the repository. A diff opens as a
 named read-only inspection view. Inspecting a diff does not mark the workspace dirty. `close` closes the focused file or terminal tab, whereas `close-pane`
 removes its presentation. Explicit `discard-document` and `discard-quit`
 commands discard unsaved work. GUI window closure asks before discarding.
@@ -689,9 +694,20 @@ Restoring clean files reads current disk content; restoring dirty files preserve
 unsaved text and its original disk baseline, so external changes are still
 rejected on save. Missing clean files are retained as recoverable dirty buffers.
 Explicit discard-and-quit discards buffer changes in the checkpoint too. Undo
-history is not restored. Checkpoints are limited to 128 MiB; failures are reported
-without replacing the previous checkpoint. Startup restoration runs before the
-UI opens; interactive file operations run on the worker.
+history is not restored. Checkpoint metadata is limited to 128 MiB. Large buffers
+and their saved text live in separate checksum-verified files, each limited to
+1 GiB, so a large unsaved document does not consume the metadata budget. Small
+buffers remain inline. A checkpoint is marked complete only after its worker
+confirms persistence. Failures retain the previous checkpoint, remain visible
+in the status bar, and retry without requiring another edit. Save your documents
+if recovery is unavailable. Old inline checkpoints remain readable; checkpoints
+with external buffers require a build that supports checkpoint schema 2. Startup restoration
+runs before the UI opens; interactive file operations run on the worker.
+
+Terminal input is nonblocking and limited to 4 MiB across queued and in-flight
+writes, with at most 1024 queued messages. A paste is accepted in full or rejected
+in full, including its bracketed-paste framing. If input is full, the status bar
+asks you to wait and retry a smaller paste; rejected input is not replayed later.
 
 Terminals restart fresh shells, rather than replaying commands or restoring
 running processes. On Linux, the shell's directory is read through `/proc` when
@@ -708,6 +724,10 @@ with `printf '\033]7;file://localhost%s\007' "$PWD"` in its prompt hook.
   index/search, pickers and external tools. They run their processes and reader
   threads and report to the main loop as typed `ide::Event`s, so editor state is
   changed in one place.
+  Startup construction lives in `session`; bounded worker-reply dispatch in
+  `service_events`; save workflow state in `saves`; recovery scheduling and health
+  in `workspace`; checkpoint payload persistence in `recovery_io`; and bounded
+  PTY input in `terminal_input`.
 - `slate-cli`: Ratatui/Crossterm presentation and terminal input.
 - `slate-gui`: Qt Quick QML and a thin Qt C++ presentation adapter (editor and
   terminal surfaces, minimap, accessibility, printing). A small JSON/C ABI
@@ -731,6 +751,10 @@ cargo test -p slate --test tui_nano      # nano workflows in a real PTY
 cargo test -p slate --test tui_ide       # pickers, carets, folds, language server in a PTY
 cargo test -p slate-core --test lsp      # LSP client against tests/fixtures/fake_lsp.py
 cargo test -p slate-core --test debug    # gdb -i dap on a compiled C program
+cargo test -p slate-core --lib recovery_io  # large buffers, integrity, atomic failure and GC
+cargo test -p slate-core --lib terminal_input # stalled writes, byte/message budgets, cleanup
+cargo test -p slate-core --lib workspace # checkpoint failures, pending saves and shutdown
+cargo test -p slate-core --test terminals # real stalled PTY and editor responsiveness
 python3 scripts/tui-smoke.py target/debug/slate
 python3 scripts/tab-close-smoke.py target/debug/slate
 python3 scripts/recovery-smoke.py target/debug/slate
@@ -789,7 +813,7 @@ For a Qt-free installation, use
 a desktop launcher and scalable icon; put the selected prefix's `bin` in PATH.
 
 Documents are ropes (up to 1 GiB). Undo stores inserted and removed spans,
-with a 32 MiB payload budget and up to 10,000 edits, never whole-buffer
+with a 64 MiB payload budget and up to 10,000 edits, never whole-buffer
 copies. Several edits from one action (carets, rename, formatting) undo as one
 step. Syntax highlighting is incremental: it is checkpointed every 32 lines,
 resumes from the line an edit touched, and does the visible rows first.

@@ -51,7 +51,7 @@ impl App {
         let entries: Vec<_> = self
             .documents
             .iter()
-            .filter(|(id, _)| !self.pending_save.contains(id))
+            .filter(|(id, _)| !self.saves.pending_save.contains(id))
             .filter_map(|(id, d)| {
                 d.watch_entry()
                     .map(|(path, baseline, stamp, encoding)| (*id, path, baseline, stamp, encoding))
@@ -68,7 +68,7 @@ impl App {
         self.disk_check_pending = false;
         for (id, change) in changes {
             // A save that started after the check owns the baseline now.
-            if self.pending_save.contains(&id) {
+            if self.saves.pending_save.contains(&id) {
                 continue;
             }
             let Some(document) = self.documents.get_mut(&id) else {

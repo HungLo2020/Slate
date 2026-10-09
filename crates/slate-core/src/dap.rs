@@ -974,7 +974,7 @@ impl App {
         if self.debug.session.is_some() {
             self.send_breakpoints(&path)?;
         }
-        self.workspace_dirty = true;
+        self.recovery.dirty = true;
         self.revision += 1;
         Ok(())
     }
@@ -990,7 +990,7 @@ impl App {
             }
         }
         self.status = "Removed all breakpoints".into();
-        self.workspace_dirty = true;
+        self.recovery.dirty = true;
         self.revision += 1;
         Ok(())
     }

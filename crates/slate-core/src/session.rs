@@ -1,0 +1,232 @@
+//! Construct a session and resolve startup presentation before recovery.
+use crate::*;
+
+impl App {
+    pub fn new(path: &Path) -> Result<Self> {
+        Self::new_with_startup(path, None)
+    }
+    /// Open one file (created on first save if missing) or directory.
+    pub fn new_with_startup(path: &Path, mode: Option<StartupMode>) -> Result<Self> {
+        let mut launch = cli::Launch {
+            recover: true,
+            startup: mode,
+            ..Default::default()
+        };
+        if path.is_dir() {
+            launch.directory = Some(path.to_path_buf());
+        } else {
+            launch.files.push(cli::LaunchFile {
+                path: path.to_path_buf(),
+                ..Default::default()
+            });
+        }
+        Self::launch(&launch, None)
+    }
+    /// Build the initial session from parsed command-line arguments.
+    /// `stdin` holds the bytes read for a `-` argument.
+    pub fn launch(launch: &cli::Launch, stdin: Option<Vec<u8>>) -> Result<Self> {
+        let directory = launch
+            .directory
+            .as_ref()
+            .map(|d| {
+                d.canonicalize()
+                    .with_context(|| format!("Cannot open {}", d.display()))
+            })
+            .transpose()?;
+        let mut opened: Vec<(Document, Option<usize>, Option<usize>)> = vec![];
+        if let (Some(spec), Some(bytes)) = (&launch.stdin, stdin) {
+            let mut document = Document::from_bytes(&bytes, "standard input")?;
+            document.label = None;
+            opened.push((document, spec.line, spec.column));
+        }
+        for file in &launch.files {
+            let document = if file.path.exists() {
+                Document::open(&file.path)
+                    .with_context(|| format!("Cannot open {}", file.path.display()))?
+            } else {
+                Document::new_file(&file.path)?
+            };
+            opened.push((document, file.line, file.column));
+        }
+        let file_mode = directory.is_none() && (!launch.files.is_empty() || launch.stdin.is_some());
+        let root = match &directory {
+            Some(directory) => directory.clone(),
+            None => opened
+                .iter()
+                .find_map(|(d, _, _)| d.path.as_ref()?.parent().map(Path::to_path_buf))
+                .filter(|p| p.is_dir())
+                .map_or_else(std::env::current_dir, Ok)?,
+        };
+        let recovery_key = match (&directory, opened.first()) {
+            (None, Some((d, _, _))) => d.path.clone().unwrap_or_else(|| root.clone()),
+            _ => root.clone(),
+        };
+        let mut notices = vec![];
+        let mut documents = BTreeMap::new();
+        let mut views = BTreeMap::new();
+        let mut positions = vec![];
+        let mut ids = 20;
+        if opened.is_empty() {
+            opened.push((Document::scratch(), None, None));
+        }
+        let mut tabs = vec![];
+        for (index, (mut document, line, column)) in opened.into_iter().enumerate() {
+            let (doc, view) = if index == 0 {
+                (10, 11)
+            } else {
+                ids += 2;
+                (ids - 1, ids)
+            };
+            if launch.read_only {
+                document.read_only = true;
+            }
+            if let Some(notice) = document.notice.take() {
+                notices.push(notice);
+            }
+            documents.insert(doc, document);
+            views.insert(
+                view,
+                EditorView {
+                    document: doc,
+                    ..Default::default()
+                },
+            );
+            tabs.push(View::Editor(view));
+            positions.push((view, line, column));
+        }
+        let mut layout = Node::default_layout(11, 12);
+        if let Some((pane_tabs, _)) = layout.pane_mut(2) {
+            *pane_tabs = tabs;
+        }
+        let events = events::Events::default();
+        let mut app = Self {
+            browser: root.clone(),
+            root: root.clone(),
+            documents,
+            views,
+            terminals: BTreeMap::new(),
+            deferred_terminals: BTreeMap::from([(12, root.clone())]),
+            editor_only: false,
+            layout,
+            focus: 2,
+            status: String::new(),
+            quit: false,
+            clipboard: String::new(),
+            files: vec![],
+            expanded_folders: Default::default(),
+            pending_file: None,
+            pending_path_dialog: None,
+            git: git::Panel::default(),
+            selected: 0,
+            services: Services::new(events.clone()),
+            events,
+            revision: 1,
+            files_revision: 1,
+            render_cache: BTreeMap::new(),
+            screen_builds: 0,
+            typing: false,
+            ids,
+            presets: BTreeMap::new(),
+            layouts_unreadable: None,
+            preferences: Preferences::default(),
+            preference_layers: Default::default(),
+            prompt: None,
+            search: Search::default(),
+            highlights: BTreeMap::new(),
+            highlight_pending: BTreeMap::new(),
+            pending_open: BTreeMap::new(),
+            saves: Default::default(),
+            recovery: workspace::RecoveryState::new(recovery_key),
+            pending_close: None,
+            selection_foreground: "#ffffff".into(),
+            colors: (
+                "#d8dee9".into(),
+                "#20242c".into(),
+                "#425b78".into(),
+                "#88c0d0".into(),
+            ),
+            system_colors: None,
+            terminal_colors: theme::Palette::dark(true),
+            file_mode,
+            elevation_mode: ElevationMode::None,
+            last_cut: None,
+            misspellings: vec![],
+            suspend_requested: false,
+            terminal_frontend: true,
+            match_cache: None,
+            disk_check_at: Instant::now(),
+            disk_check_pending: false,
+            disk_conflicts: Default::default(),
+            recent: desktop::load_recent(),
+            overview_cache: BTreeMap::new(),
+            overview_pending: Default::default(),
+            overview_workers: Default::default(),
+            overview_revision: 0,
+            frontend_requests: vec![],
+            inbox: None,
+            pending_positions: BTreeMap::new(),
+            back: Vec::new(),
+            forward: Vec::new(),
+            picker: None,
+            index: Default::default(),
+            index_at: None,
+            index_pending: false,
+            search_cancel: Default::default(),
+            last_search: None,
+            last_search_files: Vec::new(),
+            replace_backups: Vec::new(),
+            lsp: Default::default(),
+            formatting: Default::default(),
+            tasks: BTreeMap::new(),
+            debug: Default::default(),
+            tools: Vec::new(),
+            trusted: trust::is_trusted(&root),
+            pending_trust: None,
+            trust_cache: Default::default(),
+            fold_cache: Default::default(),
+            wrap_cache: Default::default(),
+            fuzzy_worker: None,
+            search_worker: None,
+        };
+        app.read_layouts();
+        app.load_preferences();
+        if let Some(layout) = app.preference_layers.layout.clone() {
+            app.restore_layout(layout)?;
+        }
+        app.reload_tools();
+        app.editor_only =
+            launch
+                .startup
+                .unwrap_or(if let Some(editor_only) = app.preference_layers.startup {
+                    if editor_only {
+                        StartupMode::EditorOnly
+                    } else {
+                        StartupMode::Workspace
+                    }
+                } else if file_mode {
+                    app.preferences.file_startup
+                } else {
+                    app.preferences.directory_startup
+                })
+                == StartupMode::EditorOnly;
+        for (view, line, column) in positions {
+            if line.is_some() || column.is_some() {
+                let doc = app.views[&view].document;
+                let cursor = app.documents[&doc].at_line_col(
+                    line.unwrap_or(1).saturating_sub(1),
+                    column.unwrap_or(1).saturating_sub(1),
+                    app.preferences.indent_width,
+                );
+                app.views.get_mut(&view).unwrap().cursor = cursor;
+            }
+        }
+        if !app.editor_only {
+            app.ensure_terminals()?;
+        }
+        if !notices.is_empty() {
+            app.status = notices.join(" · ");
+        }
+        app.refresh();
+        Ok(app)
+    }
+}

@@ -20,7 +20,9 @@ jobs:
       - run: cargo build --release
       - run: python3 scripts/install-smoke.py target/release/slate
       - run: python3 scripts/startup-smoke.py target/release/slate --tui-only
+      - run: python3 scripts/tab-close-smoke.py target/release/slate
       - run: python3 scripts/recovery-smoke.py target/release/slate
+      - run: python3 scripts/recovery-smoke.py target/release/slate-gui
       - name: Verify optional TUI-only installation
         run: cargo build --release --package slate && python3 scripts/install-smoke.py target/release/slate --tui-only
       # Qt 6.4 builds the public adapter API here. Ubuntu 24.04 has no Kirigami 6 runtime.

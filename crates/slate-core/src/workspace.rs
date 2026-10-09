@@ -10,7 +10,6 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::Write,
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -32,7 +31,7 @@ pub struct Workspace {
 }
 impl Workspace {
     pub fn validate(&self, root: &Path) -> Result<()> {
-        if self.version != 1
+        if !matches!(self.version, 1 | 2)
             || self.root != root
             || !self.layout.validate()
             || self.documents.is_empty()
@@ -114,9 +113,24 @@ impl Workspace {
     /// their text, and the layout (or a plain one when the saved layout is
     /// unusable). Returns `None` when nothing worth keeping is left.
     pub fn salvage(bytes: &[u8], root: &Path) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+        if value
+            .get("buffers")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|b| !b.is_empty())
+        {
+            return None;
+        }
+        Self::salvage_with(bytes, root, |_, _| Ok(()))
+    }
+    pub(crate) fn salvage_with(
+        bytes: &[u8],
+        root: &Path,
+        mut hydrate: impl FnMut(u64, &mut Document) -> Result<()>,
+    ) -> Option<Self> {
         use serde_json::Value;
         let value: Value = serde_json::from_slice(bytes).ok()?;
-        if value.get("version")?.as_u64()? != 1
+        if !matches!(value.get("version")?.as_u64()?, 1 | 2)
             || value
                 .get("root")
                 .and_then(|r| serde_json::from_value::<PathBuf>(r.clone()).ok())?
@@ -140,8 +154,8 @@ impl Workspace {
             if documents.len() == 128 {
                 break;
             }
-            if let Ok(d) = serde_json::from_value::<Document>(v) {
-                if d.valid_recovery() {
+            if let Ok(mut d) = serde_json::from_value::<Document>(v) {
+                if hydrate(id, &mut d).is_ok() && d.valid_recovery() {
                     documents.insert(id, d);
                 }
             }
@@ -307,18 +321,15 @@ impl WorkspaceStore {
         if !self.path.exists() {
             return Ok(None);
         }
-        if fs::metadata(&self.path)?.len() > 128 * 1024 * 1024 {
-            bail!("Recovery checkpoint is too large");
-        }
-        let bytes = fs::read(&self.path)?;
-        let error = match serde_json::from_slice::<Workspace>(&bytes) {
+        let bytes = crate::recovery_io::read_metadata(&self.path)?;
+        let error = match crate::recovery_io::decode(&self.path, &bytes) {
             Ok(w) => match w.validate(root) {
                 Ok(()) => return Ok(Some((w, None))),
                 Err(e) => e,
             },
-            Err(e) => e.into(),
+            Err(e) => e,
         };
-        let Some(w) = Workspace::salvage(&bytes, root) else {
+        let Some(w) = crate::recovery_io::salvage(&self.path, &bytes, root) else {
             return Err(error);
         };
         let stamp = std::time::SystemTime::now()
@@ -333,45 +344,38 @@ impl WorkspaceStore {
     }
 }
 pub fn write_checkpoint(path: &Path, workspace: &Workspace) -> Result<()> {
-    let mut file =
-        tempfile::NamedTempFile::new_in(path.parent().context("Recovery directory missing")?)?;
-    struct LimitedWriter<'a> {
-        writer: &'a mut File,
-        remaining: usize,
-    }
-    impl Write for LimitedWriter<'_> {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if bytes.len() > self.remaining {
-                return Err(std::io::Error::other("Recovery checkpoint exceeds 128 MiB"));
-            }
-            let n = self.writer.write(bytes)?;
-            self.remaining -= n;
-            Ok(n)
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            self.writer.flush()
-        }
-    }
-    serde_json::to_writer(
-        LimitedWriter {
-            writer: file.as_file_mut(),
-            remaining: 128 * 1024 * 1024,
-        },
-        workspace,
-    )?;
-    file.flush()?;
-    file.as_file().sync_all()?;
-    file.persist(path).map_err(|e| e.error)?;
-    #[cfg(unix)]
-    File::open(path.parent().unwrap())?.sync_all()?;
-    Ok(())
+    crate::recovery_io::write(path, workspace)
 }
 
 use crate::{services::IoJob, App, Command};
 
+/// Recovery submission and completion state, separate from editor/view state.
+pub(crate) struct RecoveryState {
+    pub key: PathBuf,
+    pub store: Option<WorkspaceStore>,
+    pub dirty: bool,
+    pub at: Instant,
+    pub persisted: u64,
+    pub pending: Option<u64>,
+    pub warning: Option<String>,
+}
+impl RecoveryState {
+    pub fn new(key: PathBuf) -> Self {
+        Self {
+            key,
+            store: None,
+            dirty: false,
+            at: Instant::now(),
+            persisted: 0,
+            pending: None,
+            warning: None,
+        }
+    }
+}
+
 impl App {
     pub fn enable_workspace(&mut self, recover: bool) -> Result<()> {
-        let store = WorkspaceStore::acquire(&self.recovery_key)?;
+        let store = WorkspaceStore::acquire(&self.recovery.key)?;
         self.attach_workspace(store, recover)
     }
     pub fn attach_workspace(&mut self, store: WorkspaceStore, recover: bool) -> Result<()> {
@@ -432,11 +436,8 @@ impl App {
                 self.focus = w.focus;
                 self.ids = w.ids;
                 self.restore_breakpoints(w.breakpoints);
-                self.browser = if w.browser.is_dir() {
-                    w.browser
-                } else {
-                    self.root.clone()
-                };
+                self.browser = crate::files::workspace_directory(&w.browser, &self.root)
+                    .unwrap_or_else(|_| self.root.clone());
                 let docs = self.documents.keys().copied().collect::<Vec<_>>();
                 for doc in docs {
                     self.clamp_views(doc);
@@ -462,8 +463,8 @@ impl App {
         for terminal in self.terminals.values_mut() {
             terminal.set_events(self.events.clone());
         }
-        self.store = Some(store);
-        self.workspace_dirty = true;
+        self.recovery.store = Some(store);
+        self.recovery.dirty = true;
         self.refresh();
         Ok(())
     }
@@ -549,33 +550,84 @@ impl App {
         hasher.finish()
     }
     pub(super) fn checkpoint(&mut self) {
-        let fingerprint = self.checkpoint_fingerprint();
-        if fingerprint == self.checkpoint_key {
-            self.workspace_dirty = false;
-            self.checkpoint_at = Instant::now();
+        if self.recovery.pending.is_some() {
             return;
         }
-        if let Some(store) = &self.store {
-            let result = self
-                .services
-                .io
-                .send(IoJob::Checkpoint(store.path.clone(), self.workspace()));
-            if result.is_ok() {
-                self.workspace_dirty = false;
-                self.checkpoint_key = fingerprint;
-            } else {
-                self.status = "Recovery worker is unavailable".into();
+        let fingerprint = self.checkpoint_fingerprint();
+        if fingerprint == self.recovery.persisted {
+            self.recovery.dirty = false;
+            self.recovery.at = Instant::now();
+            return;
+        }
+        if let Some(store) = &self.recovery.store {
+            match self.services.io.send(IoJob::Checkpoint(
+                store.path.clone(),
+                self.workspace(),
+                fingerprint,
+            )) {
+                Ok(()) => self.recovery.pending = Some(fingerprint),
+                Err(error) => {
+                    self.revision += 1;
+                    self.recovery.warning = Some(format!(
+                        "Recovery unavailable: {error}; save your documents"
+                    ))
+                }
             }
         }
-        self.checkpoint_at = Instant::now();
+        self.recovery.at = Instant::now();
+    }
+    pub(crate) fn checkpoint_finished(
+        &mut self,
+        fingerprint: u64,
+        result: std::result::Result<(), String>,
+    ) {
+        if self.recovery.pending != Some(fingerprint) {
+            return;
+        }
+        self.recovery.pending = None;
+        match result {
+            Ok(()) => {
+                self.recovery.persisted = fingerprint;
+                self.recovery.warning = None;
+                self.recovery.dirty = self.checkpoint_fingerprint() != fingerprint;
+            }
+            Err(error) => {
+                self.recovery.dirty = true;
+                self.recovery.warning = Some(format!(
+                    "Recovery unavailable: {error}; save your documents"
+                ));
+            }
+        }
+    }
+    /// A persistent warning until the next checkpoint succeeds.
+    pub fn recovery_warning(&self) -> Option<&str> {
+        self.recovery.warning.as_deref()
+    }
+    pub(crate) fn visible_status(&self) -> String {
+        match self.recovery_warning() {
+            Some(warning) => format!("Error: {warning} · {}", self.status),
+            None => self.status.clone(),
+        }
     }
     pub fn flush_workspace(&mut self) -> Result<()> {
         let (tx, rx) = std::sync::mpsc::sync_channel(0);
-        self.services
-            .io
-            .send(IoJob::Flush(tx))
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let deadline = Instant::now() + std::time::Duration::from_secs(15);
+        // Submission is nonblocking too: a saturated request queue must be
+        // drained during shutdown rather than abandon pending saves/recovery.
+        loop {
+            match self.services.io.send(IoJob::Flush(tx.clone())) {
+                Ok(()) => break,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    self.poll();
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        drop(tx);
         loop {
             // A bounded reply queue must keep draining while the I/O barrier
             // waits, otherwise its worker can block before reaching Flush.
@@ -592,10 +644,19 @@ impl App {
             }
         }
         self.poll();
-        if let Some(store) = &self.store {
-            write_checkpoint(&store.path, &self.workspace())?;
+        if let Some(store) = &self.recovery.store {
+            if let Err(error) = write_checkpoint(&store.path, &self.workspace()) {
+                self.recovery.warning = Some(format!(
+                    "Recovery unavailable: {error:#}; save your documents"
+                ));
+                self.recovery.dirty = true;
+                return Err(error);
+            }
+            self.recovery.persisted = self.checkpoint_fingerprint();
+            self.recovery.pending = None;
+            self.recovery.warning = None;
         }
-        self.workspace_dirty = false;
+        self.recovery.dirty = false;
         Ok(())
     }
 }
@@ -604,7 +665,7 @@ impl Drop for App {
     fn drop(&mut self) {
         // Tasks run in their own process groups, so nothing else stops them.
         self.kill_tasks();
-        if self.store.is_some() {
+        if self.recovery.store.is_some() {
             if let Err(e) = self.flush_workspace() {
                 eprintln!("Could not persist Slate workspace: {e:#}");
             }
@@ -630,7 +691,10 @@ mod tests {
         let sender = app.services.reply_sender();
         for _ in 0..256 {
             sender
-                .send(crate::services::Reply::Error("fixture".into()))
+                .send(crate::services::Reply::Files(
+                    dir.path().into(),
+                    Err("fixture".into()),
+                ))
                 .unwrap();
         }
         let path = dir.path().join("barrier.txt");
@@ -651,5 +715,174 @@ mod tests {
         drop(inherited);
         assert!(WorkspaceStore::acquire_in(root.path(), state.path()).is_err());
         drop(reopened);
+    }
+    fn isolated_app(root: &Path) -> App {
+        std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
+        std::env::set_var("XDG_STATE_HOME", root.join("state"));
+        let mut app =
+            App::new_with_startup(root, Some(crate::preferences::StartupMode::EditorOnly)).unwrap();
+        app.enable_workspace(false).unwrap();
+        app
+    }
+    fn settle(app: &mut App, check: impl Fn(&App) -> bool) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !check(app) {
+            app.poll();
+            assert!(Instant::now() < deadline, "{}", app.visible_status());
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    #[test]
+    fn checkpoint_failure_stays_visible_and_retries_without_another_edit() {
+        let _serial = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = isolated_app(dir.path());
+        let parent = app
+            .recovery
+            .store
+            .as_ref()
+            .unwrap()
+            .path
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let displaced = parent.with_extension("unavailable");
+        fs::rename(&parent, &displaced).unwrap();
+        app.checkpoint();
+        assert_eq!(app.recovery.persisted, 0, "submission is not persistence");
+        settle(&mut app, |a| a.recovery_warning().is_some());
+        app.status = "Unrelated action succeeded".into();
+        assert!(app
+            .snapshot(100, 30, 1, 1, 1, 3)
+            .status
+            .contains("Recovery unavailable"));
+        assert!(app.recovery.dirty);
+        assert!(app
+            .gui_snapshot(
+                crate::layout::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 30
+                },
+                1,
+                (1, 1),
+                1,
+                (1, 3),
+                None
+            )
+            .status
+            .contains("Recovery unavailable"));
+        fs::rename(displaced, parent).unwrap();
+        app.checkpoint();
+        settle(&mut app, |a| a.recovery.pending.is_none());
+        assert!(app.recovery_warning().is_none());
+        assert!(!app.recovery.dirty);
+    }
+    #[test]
+    fn an_edit_during_checkpoint_is_persisted_by_the_next_checkpoint() {
+        let _serial = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = isolated_app(dir.path());
+        app.checkpoint();
+        let submitted = app.recovery.pending.unwrap();
+        app.dispatch(Command::Paste {
+            text: "edited during checkpoint".into(),
+        });
+        settle(&mut app, |a| a.recovery.pending.is_none());
+        assert_eq!(app.recovery.persisted, submitted);
+        assert!(app.recovery.dirty);
+        app.checkpoint();
+        settle(&mut app, |a| a.recovery.pending.is_none());
+        let w = app
+            .recovery
+            .store
+            .as_ref()
+            .unwrap()
+            .load(&app.root)
+            .unwrap()
+            .unwrap();
+        assert_eq!(w.documents[&10].text(), "edited during checkpoint");
+        assert!(!app.recovery.dirty);
+    }
+    #[test]
+    fn shutdown_completes_pending_save_and_recovers_newer_edits() {
+        let _serial = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.txt");
+        fs::write(&source, "original").unwrap();
+        let mut app = isolated_app(dir.path());
+        let path = app.recovery.store.as_ref().unwrap().path.clone();
+        app.documents.insert(10, Document::open(&source).unwrap());
+        app.dispatch(Command::Paste {
+            text: "saved ".into(),
+        });
+        app.start_save(10, None, false, false).unwrap();
+        app.dispatch(Command::Paste {
+            text: "newer ".into(),
+        });
+        drop(app);
+        assert_eq!(fs::read_to_string(&source).unwrap(), "saved original");
+        let w = crate::recovery_io::decode(&path, &fs::read(&path).unwrap()).unwrap();
+        assert_eq!(w.documents[&10].text(), "saved newer original");
+        assert!(w.documents[&10].dirty());
+        assert!(w.documents[&10].baseline_matches(b"saved original"));
+    }
+    #[test]
+    fn shutdown_drains_saturated_request_and_reply_queues() {
+        let _serial = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = isolated_app(dir.path());
+        app.services = crate::services::Services::new(app.events.clone());
+        let (release, barrier) = std::sync::mpsc::sync_channel(0);
+        app.services.io.send(IoJob::Flush(release)).unwrap();
+        let source = dir.path().join("queued.txt");
+        fs::write(&source, "queued").unwrap();
+        let mut submitted = 0;
+        loop {
+            match app.services.io.send(IoJob::Open(999, source.clone())) {
+                Ok(()) => submitted += 1,
+                Err(error) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+                    break;
+                }
+            }
+        }
+        assert!(submitted >= 127);
+        for _ in 0..256 {
+            app.services
+                .reply_sender()
+                .send(crate::services::Reply::Files(
+                    dir.path().into(),
+                    Err("fixture".into()),
+                ))
+                .unwrap();
+        }
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            barrier.recv().unwrap();
+        });
+        app.dispatch(Command::Paste {
+            text: "protected during shutdown".into(),
+        });
+        app.flush_workspace().unwrap();
+        release.join().unwrap();
+        let w = app
+            .recovery
+            .store
+            .as_ref()
+            .unwrap()
+            .load(&app.root)
+            .unwrap()
+            .unwrap();
+        assert_eq!(w.documents[&10].text(), "protected during shutdown");
     }
 }

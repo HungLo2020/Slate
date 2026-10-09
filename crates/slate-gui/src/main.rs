@@ -53,7 +53,6 @@ fn split_arguments(args: Vec<OsString>) -> (Vec<OsString>, Vec<String>) {
 }
 
 fn main() -> Result<()> {
-    slate_gui::handle_termination_signals();
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     if let Some(result) = slate_core::fsio::elevated_save_entry(&arguments) {
         return result;
@@ -71,6 +70,9 @@ fn main() -> Result<()> {
     if launch.frontend == Some(Frontend::Tui) {
         return slate_cli::run(cli::start(&launch)?);
     }
+    // Only the GUI blocks signals for sigwait. The TUI must retain its
+    // own handlers, including when launched through slate-gui --tui.
+    slate_gui::handle_termination_signals();
     let smoke = std::env::var_os("SLATE_GUI_SMOKE_DIR").is_some();
     // Files go to a running window, like other desktop editors. Directories,
     // standard input and --new-instance always open a new window.

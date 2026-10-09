@@ -208,7 +208,7 @@ impl App {
                 self.git.entries.clone()
             },
             browser: self.browser.to_string_lossy().into_owned(),
-            status: self.status.clone(),
+            status: self.visible_status(),
             dirty: self.dirty(),
             quit: self.quit,
             clipboard: if graphical {

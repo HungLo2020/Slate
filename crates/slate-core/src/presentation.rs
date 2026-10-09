@@ -44,6 +44,10 @@ impl App {
     pub(super) fn reap_terminals(&mut self) {
         let mut exited = Vec::new();
         for (id, terminal) in &mut self.terminals {
+            if let Some(error) = terminal.take_input_error() {
+                self.status = error;
+                self.revision += 1;
+            }
             if let Some(text) = terminal.take_clipboard() {
                 // A program (perhaps over ssh) may only replace the clipboard
                 // when the user allows it.
@@ -61,7 +65,7 @@ impl App {
         for (id, code) in exited {
             self.terminals.remove(&id);
             self.remove_terminal_views(id);
-            self.workspace_dirty = true;
+            self.recovery.dirty = true;
             self.revision += 1;
             self.status = if code == 0 {
                 format!("Terminal {id} exited")

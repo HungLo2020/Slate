@@ -111,3 +111,61 @@ fn a_shell_closes_even_when_a_background_job_keeps_the_terminal_open() {
         !a.terminals.contains_key(&id)
     });
 }
+
+#[test]
+fn stalled_pty_rejects_pastes_without_blocking_editor_or_shutdown() {
+    use slate_core::terminal::TerminalSession;
+    use std::time::Instant;
+    let (dir, _serial) = isolated();
+    let mut app = App::new_with_startup(dir.path(), Some(StartupMode::Workspace)).unwrap();
+    app.dispatch(Command::NewTerminal);
+    let id = focused_terminal(&app);
+    let terminal = TerminalSession::spawn(
+        dir.path(),
+        Some("stty -echo -icanon; printf '\\033[?2004hREADY'; exec sleep 30"),
+        24,
+        80,
+    )
+    .unwrap();
+    app.terminals.insert(id, terminal);
+    wait(&mut app, "a stalled terminal", |a| {
+        a.terminals[&id]
+            .screen()
+            .cells
+            .iter()
+            .flatten()
+            .map(|c| c.text.as_str())
+            .collect::<String>()
+            .contains("READY")
+    });
+    let paste = "x".repeat(4 * 1024 * 1024 - 12);
+    app.dispatch(Command::Paste {
+        text: paste.clone(),
+    });
+    let started = Instant::now();
+    app.dispatch(Command::Paste { text: paste });
+    assert!(app.status.contains("input is full"), "{}", app.status);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let (pane, index) = app
+        .layout
+        .panes()
+        .into_iter()
+        .find_map(|pane| {
+            let (tabs, _) = app.layout.pane_mut(pane)?;
+            tabs.iter()
+                .position(|tab| matches!(tab, View::Editor(_)))
+                .map(|index| (pane, index))
+        })
+        .unwrap();
+    app.dispatch(Command::SwitchTab { pane, index });
+    app.dispatch(Command::Paste {
+        text: "editor still works".into(),
+    });
+    assert!(app
+        .documents
+        .values()
+        .any(|d| d.text() == "editor still works"));
+    let started = Instant::now();
+    drop(app);
+    assert!(started.elapsed() < Duration::from_secs(5));
+}

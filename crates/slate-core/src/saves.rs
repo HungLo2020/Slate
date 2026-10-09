@@ -8,6 +8,20 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 
+/// State that survives tab focus changes, native dialogs and save retries.
+#[derive(Default)]
+pub(crate) struct SaveWorkflow {
+    pub pending_save: Vec<u64>,
+    pub quit_after_save: bool,
+    pub save_all_queue: Option<std::collections::VecDeque<u64>>,
+    pub save_operations: std::collections::BTreeMap<u64, Document>,
+    pub save_questions: std::collections::VecDeque<(u64, String, String)>,
+    pub save_confirmation: Option<u64>,
+    pub close_after_save: Option<(u64, u64)>,
+    pub pending_retry: Option<(u64, Option<PathBuf>, bool)>,
+    pub elevation: Option<Elevation>,
+}
+
 impl App {
     pub(crate) fn start_save(
         &mut self,
@@ -16,7 +30,7 @@ impl App {
         overwrite: bool,
         allow_read_only: bool,
     ) -> Result<()> {
-        if self.pending_save.contains(&id) || self.save_operations.contains_key(&id) {
+        if self.saves.pending_save.contains(&id) || self.saves.save_operations.contains_key(&id) {
             bail!("A save is already in progress for this document");
         }
         let snapshot = self.documents[&id].checkpoint();
@@ -30,15 +44,15 @@ impl App {
                 backup: self.preferences.backup,
             },
         ))?;
-        self.save_operations.insert(id, snapshot);
-        self.pending_save.push(id);
+        self.saves.save_operations.insert(id, snapshot);
+        self.saves.pending_save.push(id);
         self.status = "Saving…".into();
         Ok(())
     }
 
     pub(crate) fn save_all(&mut self, quit: bool) -> Result<()> {
-        if self.save_all_queue.is_none() {
-            self.save_all_queue = Some(
+        if self.saves.save_all_queue.is_none() {
+            self.saves.save_all_queue = Some(
                 self.documents
                     .iter()
                     .filter(|(_, d)| d.dirty())
@@ -46,7 +60,7 @@ impl App {
                     .collect(),
             );
         }
-        self.quit_after_save |= quit;
+        self.saves.quit_after_save |= quit;
         self.continue_save_all()
     }
 
@@ -55,18 +69,18 @@ impl App {
             return Ok(());
         }
         loop {
-            let Some(queue) = self.save_all_queue.as_mut() else {
+            let Some(queue) = self.saves.save_all_queue.as_mut() else {
                 return Ok(());
             };
             let Some(&id) = queue.front() else {
-                self.save_all_queue = None;
-                if self.quit_after_save && self.pending_save.is_empty() {
-                    self.quit_after_save = false;
+                self.saves.save_all_queue = None;
+                if self.saves.quit_after_save && self.saves.pending_save.is_empty() {
+                    self.saves.quit_after_save = false;
                     self.execute(Command::Quit { force: false })?;
                 }
                 return Ok(());
             };
-            if self.save_operations.contains_key(&id) || self.formatting.contains_key(&id) {
+            if self.saves.save_operations.contains_key(&id) || self.formatting.contains_key(&id) {
                 return Ok(());
             }
             let Some(doc) = self.documents.get(&id).filter(|d| d.dirty()) else {
@@ -93,9 +107,9 @@ impl App {
 
     pub(crate) fn save_failed(&mut self, id: u64, failure: SaveFailure) {
         if let Some(snapshot) = failure.snapshot {
-            self.save_operations.insert(id, *snapshot);
+            self.saves.save_operations.insert(id, *snapshot);
         } else {
-            self.save_operations.remove(&id);
+            self.saves.save_operations.remove(&id);
             self.cancel_save_workflow();
             self.status = format!("Save failed: {}", failure.message);
             return;
@@ -106,13 +120,14 @@ impl App {
                 "save-elevated"
             }
             _ => {
-                self.save_operations.remove(&id);
+                self.saves.save_operations.remove(&id);
                 self.cancel_save_workflow();
                 self.status = format!("Save failed: {}", failure.message);
                 return;
             }
         };
-        self.save_questions
+        self.saves
+            .save_questions
             .push_back((id, kind.into(), failure.message));
         self.offer_save_question();
     }
@@ -120,17 +135,17 @@ impl App {
     pub(crate) fn offer_save_question(&mut self) {
         if self.prompt.is_some()
             || self.pending_path_dialog.is_some()
-            || self.save_confirmation.is_some()
+            || self.saves.save_confirmation.is_some()
         {
             return;
         }
-        if let Some((id, kind, message)) = self.save_questions.pop_front() {
+        if let Some((id, kind, message)) = self.saves.save_questions.pop_front() {
             if !self.documents.contains_key(&id) {
-                self.save_operations.remove(&id);
+                self.saves.save_operations.remove(&id);
                 return;
             }
             self.reveal_document(id);
-            self.save_confirmation = Some(id);
+            self.saves.save_confirmation = Some(id);
             self.prompt = Some(crate::search::Prompt {
                 kind,
                 input: self.documents[&id].title(),
@@ -144,8 +159,13 @@ impl App {
     }
 
     pub(crate) fn retry_save(&mut self, kind: &str) -> Result<()> {
-        let id = self.save_confirmation.take().context("Nothing to save")?;
+        let id = self
+            .saves
+            .save_confirmation
+            .take()
+            .context("Nothing to save")?;
         let snapshot = self
+            .saves
             .save_operations
             .get(&id)
             .context("Missing save operation")?
@@ -166,7 +186,7 @@ impl App {
                 let path = snapshot.path.clone().context("Missing save destination")?;
                 match self.elevation_mode {
                     ElevationMode::Terminal => {
-                        self.elevation = Some(Elevation {
+                        self.saves.elevation = Some(Elevation {
                             baseline: snapshot.disk.clone(),
                             document: id,
                             path,
@@ -183,30 +203,30 @@ impl App {
             Ok(())
         })();
         if let Err(error) = submitted {
-            self.save_operations.remove(&id);
+            self.saves.save_operations.remove(&id);
             self.cancel_save_workflow();
             return Err(error);
         }
-        self.pending_save.push(id);
+        self.saves.pending_save.push(id);
         self.status = "Saving…".into();
         Ok(())
     }
 
     pub(crate) fn cancel_save_workflow(&mut self) {
-        self.save_all_queue = None;
-        self.quit_after_save = false;
-        self.close_after_save = None;
-        if let Some(id) = self.save_confirmation.take() {
-            self.save_operations.remove(&id);
+        self.saves.save_all_queue = None;
+        self.saves.quit_after_save = false;
+        self.saves.close_after_save = None;
+        if let Some(id) = self.saves.save_confirmation.take() {
+            self.saves.save_operations.remove(&id);
         }
     }
 
     pub(crate) fn saved_reply(&mut self, id: u64, result: Result<Document, SaveFailure>) {
         self.revision += 1;
-        self.pending_save.retain(|doc| *doc != id);
+        self.saves.pending_save.retain(|doc| *doc != id);
         match result {
             Ok(saved) => {
-                self.save_operations.remove(&id);
+                self.saves.save_operations.remove(&id);
                 if let Some(path) = saved.path.clone() {
                     self.remember_recent(&path);
                 }
@@ -218,19 +238,19 @@ impl App {
                         "Saved"
                     }
                     .into();
-                    self.workspace_dirty = true;
+                    self.recovery.dirty = true;
                 }
                 self.lsp_saved(id);
                 self.refresh();
-                if let Some((pane, view)) = self.close_after_save {
+                if let Some((pane, view)) = self.saves.close_after_save {
                     if self.views.get(&view).is_some_and(|v| v.document == id) {
-                        self.close_after_save = None;
+                        self.saves.close_after_save = None;
                         if self.documents.get(&id).is_some_and(|d| !d.dirty()) {
                             let _ = self.close_tab(pane, view, false);
                         }
                     }
                 }
-                if let Some(queue) = &mut self.save_all_queue {
+                if let Some(queue) = &mut self.saves.save_all_queue {
                     if queue.front() == Some(&id) {
                         queue.pop_front();
                     }
@@ -332,12 +352,12 @@ mod tests {
                 }),
             );
         }
-        assert_eq!(a.save_confirmation, Some(first));
+        assert_eq!(a.saves.save_confirmation, Some(first));
         a.dispatch(Command::DismissPrompt);
         a.offer_save_question();
-        assert_eq!(a.save_confirmation, Some(second));
+        assert_eq!(a.saves.save_confirmation, Some(second));
         assert_eq!(
-            a.save_operations[&second].path,
+            a.saves.save_operations[&second].path,
             Some(dir.path().join(format!("{second}.txt")))
         );
     }

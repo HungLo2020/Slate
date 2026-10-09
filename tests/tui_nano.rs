@@ -251,6 +251,7 @@ fn soft_wrap_shows_and_navigates_long_lines() {
     tui.send(b"\x1b[B");
     tui.send("|");
     tui.send(b"\x13");
+    tui.wait_for("Saved"); // Saving is asynchronous; wait for completion before inspecting disk.
     let saved = fs::read_to_string(&path).unwrap();
     let first_line = saved.lines().next().unwrap();
     assert!(

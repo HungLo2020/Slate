@@ -30,15 +30,19 @@ mod presentation;
 pub mod process;
 pub mod profiles;
 pub mod project;
+mod recovery_io;
 mod render;
 pub mod rpc;
 mod saves;
 pub mod search;
+mod service_events;
 mod services;
+mod session;
 mod smart;
 mod snippets;
 pub mod tasks;
 pub mod terminal;
+mod terminal_input;
 pub mod text_format;
 pub mod text_presentation;
 pub mod theme;
@@ -61,8 +65,6 @@ use std::{
 };
 use terminal::{Cell, Screen, TerminalSession};
 use unicode_segmentation::UnicodeSegmentation;
-
-use workspace::WorkspaceStore;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct EditorView {
@@ -520,10 +522,8 @@ pub struct App {
     highlights: BTreeMap<u64, highlight::LineCache>,
     highlight_pending: BTreeMap<u64, (u64, bool)>,
     pending_open: BTreeMap<u64, u64>,
-    pending_save: Vec<u64>,
-    store: Option<WorkspaceStore>,
-    workspace_dirty: bool,
-    checkpoint_at: Instant,
+    saves: saves::SaveWorkflow,
+    recovery: workspace::RecoveryState,
     colors: (String, String, String, String),
     terminal_colors: theme::Palette,
     system_colors: Option<(String, String, String, String, String)>,
@@ -536,19 +536,6 @@ pub struct App {
     typing: bool,
     /// Launched with files (or standard input) rather than a directory.
     pub file_mode: bool,
-    /// The path whose recovery checkpoint this session uses.
-    recovery_key: PathBuf,
-    /// Quit once pending "save all" writes succeed.
-    quit_after_save: bool,
-    save_all_queue: Option<std::collections::VecDeque<u64>>,
-    save_operations: BTreeMap<u64, Document>,
-    save_questions: std::collections::VecDeque<(u64, String, String)>,
-    save_confirmation: Option<u64>,
-    close_after_save: Option<(u64, u64)>,
-    /// A save waiting for confirmation: (document, destination, overwrite).
-    pending_retry: Option<(u64, Option<PathBuf>, bool)>,
-    /// A privileged save the frontend must perform (terminal `sudo`).
-    elevation: Option<Elevation>,
     /// How this frontend performs privileged saves.
     pub elevation_mode: ElevationMode,
     /// Consecutive line cuts append to the cut buffer, as in nano:
@@ -557,7 +544,6 @@ pub struct App {
     misspellings: Vec<String>,
     /// The terminal frontend should suspend itself (SIGTSTP).
     pub suspend_requested: bool,
-    checkpoint_key: u64,
     /// The terminal interface hosts this session (enables suspend, mouse toggle).
     pub terminal_frontend: bool,
     /// Search matches by (document, generation, query).
@@ -637,245 +623,6 @@ pub enum ElevationMode {
     Background(&'static str),
 }
 impl App {
-    pub fn new(path: &Path) -> Result<Self> {
-        Self::new_with_startup(path, None)
-    }
-    /// Open one file (created on first save if missing) or directory.
-    pub fn new_with_startup(path: &Path, mode: Option<StartupMode>) -> Result<Self> {
-        let mut launch = cli::Launch {
-            recover: true,
-            startup: mode,
-            ..Default::default()
-        };
-        if path.is_dir() {
-            launch.directory = Some(path.to_path_buf());
-        } else {
-            launch.files.push(cli::LaunchFile {
-                path: path.to_path_buf(),
-                ..Default::default()
-            });
-        }
-        Self::launch(&launch, None)
-    }
-    /// Build the initial session from parsed command-line arguments.
-    /// `stdin` holds the bytes read for a `-` argument.
-    pub fn launch(launch: &cli::Launch, stdin: Option<Vec<u8>>) -> Result<Self> {
-        let directory = launch
-            .directory
-            .as_ref()
-            .map(|d| {
-                d.canonicalize()
-                    .with_context(|| format!("Cannot open {}", d.display()))
-            })
-            .transpose()?;
-        let mut opened: Vec<(Document, Option<usize>, Option<usize>)> = vec![];
-        if let (Some(spec), Some(bytes)) = (&launch.stdin, stdin) {
-            let mut document = Document::from_bytes(&bytes, "standard input")?;
-            document.label = None;
-            opened.push((document, spec.line, spec.column));
-        }
-        for file in &launch.files {
-            let document = if file.path.exists() {
-                Document::open(&file.path)
-                    .with_context(|| format!("Cannot open {}", file.path.display()))?
-            } else {
-                Document::new_file(&file.path)?
-            };
-            opened.push((document, file.line, file.column));
-        }
-        let file_mode = directory.is_none() && (!launch.files.is_empty() || launch.stdin.is_some());
-        let root = match &directory {
-            Some(directory) => directory.clone(),
-            None => opened
-                .iter()
-                .find_map(|(d, _, _)| d.path.as_ref()?.parent().map(Path::to_path_buf))
-                .filter(|p| p.is_dir())
-                .map_or_else(std::env::current_dir, Ok)?,
-        };
-        let recovery_key = match (&directory, opened.first()) {
-            (None, Some((d, _, _))) => d.path.clone().unwrap_or_else(|| root.clone()),
-            _ => root.clone(),
-        };
-        let mut notices = vec![];
-        let mut documents = BTreeMap::new();
-        let mut views = BTreeMap::new();
-        let mut positions = vec![];
-        let mut ids = 20;
-        if opened.is_empty() {
-            opened.push((Document::scratch(), None, None));
-        }
-        let mut tabs = vec![];
-        for (index, (mut document, line, column)) in opened.into_iter().enumerate() {
-            let (doc, view) = if index == 0 {
-                (10, 11)
-            } else {
-                ids += 2;
-                (ids - 1, ids)
-            };
-            if launch.read_only {
-                document.read_only = true;
-            }
-            if let Some(notice) = document.notice.take() {
-                notices.push(notice);
-            }
-            documents.insert(doc, document);
-            views.insert(
-                view,
-                EditorView {
-                    document: doc,
-                    ..Default::default()
-                },
-            );
-            tabs.push(View::Editor(view));
-            positions.push((view, line, column));
-        }
-        let mut layout = Node::default_layout(11, 12);
-        if let Some((pane_tabs, _)) = layout.pane_mut(2) {
-            *pane_tabs = tabs;
-        }
-        let events = events::Events::default();
-        let mut app = Self {
-            browser: root.clone(),
-            root: root.clone(),
-            documents,
-            views,
-            terminals: BTreeMap::new(),
-            deferred_terminals: BTreeMap::from([(12, root.clone())]),
-            editor_only: false,
-            layout,
-            focus: 2,
-            status: String::new(),
-            quit: false,
-            clipboard: String::new(),
-            files: vec![],
-            expanded_folders: Default::default(),
-            pending_file: None,
-            pending_path_dialog: None,
-            git: git::Panel::default(),
-            selected: 0,
-            services: Services::new(events.clone()),
-            events,
-            revision: 1,
-            files_revision: 1,
-            render_cache: BTreeMap::new(),
-            screen_builds: 0,
-            typing: false,
-            ids,
-            presets: BTreeMap::new(),
-            layouts_unreadable: None,
-            preferences: Preferences::default(),
-            preference_layers: Default::default(),
-            prompt: None,
-            search: Search::default(),
-            highlights: BTreeMap::new(),
-            highlight_pending: BTreeMap::new(),
-            pending_open: BTreeMap::new(),
-            pending_save: vec![],
-            store: None,
-            workspace_dirty: false,
-            pending_close: None,
-            checkpoint_at: Instant::now(),
-            selection_foreground: "#ffffff".into(),
-            colors: (
-                "#d8dee9".into(),
-                "#20242c".into(),
-                "#425b78".into(),
-                "#88c0d0".into(),
-            ),
-            system_colors: None,
-            terminal_colors: theme::Palette::dark(true),
-            file_mode,
-            recovery_key,
-            quit_after_save: false,
-            save_all_queue: None,
-            save_operations: Default::default(),
-            save_questions: Default::default(),
-            save_confirmation: None,
-            close_after_save: None,
-            pending_retry: None,
-            elevation: None,
-            elevation_mode: ElevationMode::None,
-            last_cut: None,
-            misspellings: vec![],
-            suspend_requested: false,
-            checkpoint_key: 0,
-            terminal_frontend: true,
-            match_cache: None,
-            disk_check_at: Instant::now(),
-            disk_check_pending: false,
-            disk_conflicts: Default::default(),
-            recent: desktop::load_recent(),
-            overview_cache: BTreeMap::new(),
-            overview_pending: Default::default(),
-            overview_workers: Default::default(),
-            overview_revision: 0,
-            frontend_requests: vec![],
-            inbox: None,
-            pending_positions: BTreeMap::new(),
-            back: Vec::new(),
-            forward: Vec::new(),
-            picker: None,
-            index: Default::default(),
-            index_at: None,
-            index_pending: false,
-            search_cancel: Default::default(),
-            last_search: None,
-            last_search_files: Vec::new(),
-            replace_backups: Vec::new(),
-            lsp: Default::default(),
-            formatting: Default::default(),
-            tasks: BTreeMap::new(),
-            debug: Default::default(),
-            tools: Vec::new(),
-            trusted: trust::is_trusted(&root),
-            pending_trust: None,
-            trust_cache: Default::default(),
-            fold_cache: Default::default(),
-            wrap_cache: Default::default(),
-            fuzzy_worker: None,
-            search_worker: None,
-        };
-        app.read_layouts();
-        app.load_preferences();
-        if let Some(layout) = app.preference_layers.layout.clone() {
-            app.restore_layout(layout)?;
-        }
-        app.reload_tools();
-        app.editor_only =
-            launch
-                .startup
-                .unwrap_or(if let Some(editor_only) = app.preference_layers.startup {
-                    if editor_only {
-                        StartupMode::EditorOnly
-                    } else {
-                        StartupMode::Workspace
-                    }
-                } else if file_mode {
-                    app.preferences.file_startup
-                } else {
-                    app.preferences.directory_startup
-                })
-                == StartupMode::EditorOnly;
-        for (view, line, column) in positions {
-            if line.is_some() || column.is_some() {
-                let doc = app.views[&view].document;
-                let cursor = app.documents[&doc].at_line_col(
-                    line.unwrap_or(1).saturating_sub(1),
-                    column.unwrap_or(1).saturating_sub(1),
-                    app.preferences.indent_width,
-                );
-                app.views.get_mut(&view).unwrap().cursor = cursor;
-            }
-        }
-        if !app.editor_only {
-            app.ensure_terminals()?;
-        }
-        if !notices.is_empty() {
-            app.status = notices.join(" · ");
-        }
-        app.refresh();
-        Ok(app)
-    }
     /// Whether this session keeps workspace recovery checkpoints.
     pub fn wants_recovery(&self) -> bool {
         !self.file_mode || self.preferences.file_recovery
@@ -899,7 +646,7 @@ impl App {
         self.debug_flush();
         self.watch_files();
         self.schedule_highlight();
-        if self.workspace_dirty && self.checkpoint_at.elapsed() >= Duration::from_secs(1) {
+        if self.recovery.dirty && self.recovery.at.elapsed() >= Duration::from_secs(1) {
             self.checkpoint();
         }
     }
@@ -967,7 +714,7 @@ impl App {
             .get(&view)
             .context("Missing editor view")?
             .document;
-        if self.pending_save.contains(&doc) {
+        if self.saves.pending_save.contains(&doc) {
             bail!("Wait for the pending save before closing this tab");
         }
         // Closed panes can leave cached views behind. Only tabs still present
@@ -1121,7 +868,7 @@ impl App {
         }
         self.revision += 1;
         if !matches!(cmd, Command::Theme { .. }) {
-            self.workspace_dirty = true;
+            self.recovery.dirty = true;
         }
         if let Err(e) = self.execute(cmd) {
             self.status = format!("Error: {e:#}");
@@ -1234,7 +981,7 @@ impl App {
                         self.close_tab(pane, view, true)?;
                     }
                 } else if let Some((pane, view)) = target {
-                    self.close_after_save = Some((pane, view));
+                    self.saves.close_after_save = Some((pane, view));
                     self.focus = pane;
                     self.reveal_document(self.views[&view].document);
                     self.execute(Command::Save)?;
@@ -1567,8 +1314,8 @@ impl App {
                 match kind.as_str() {
                     "trust" => self.answer_trust(false)?,
                     "save-read-only" | "save-elevated" | "reload-changed" => {
-                        self.pending_retry = None;
-                        self.quit_after_save = false;
+                        self.saves.pending_retry = None;
+                        self.saves.quit_after_save = false;
                         self.status = "Save cancelled".into();
                     }
                     "quit" => self.status = "Quit cancelled".into(),
@@ -1971,7 +1718,7 @@ impl App {
                     });
                     return Ok(());
                 }
-                if !self.pending_save.is_empty() {
+                if !self.saves.pending_save.is_empty() {
                     bail!("Wait for pending file saves before quitting");
                 }
                 if force {
@@ -1996,14 +1743,12 @@ impl App {
         } else {
             self.browser.join(path)
         };
-        let path = path.canonicalize()?;
-        if !path.is_dir() {
-            bail!("Not a directory");
-        }
+        let path = files::workspace_directory(&path, &self.root)?;
         self.browser = path.clone();
         self.selected = 0;
         self.services.tx.send(Job::Browse(
             path,
+            self.root.clone(),
             self.expanded_folders.iter().cloned().collect(),
             !self.terminal_frontend,
         ))?;
@@ -2012,114 +1757,11 @@ impl App {
     pub fn refresh(&mut self) {
         let _ = self.services.tx.send(Job::Browse(
             self.browser.clone(),
+            self.root.clone(),
             self.expanded_folders.iter().cloned().collect(),
             !self.terminal_frontend,
         ));
         self.refresh_git();
-    }
-    pub fn poll(&mut self) {
-        let started = Instant::now();
-        for processed in 0..128 {
-            if started.elapsed() >= Duration::from_millis(4) {
-                self.events.notify();
-                break;
-            }
-            let Ok(reply) = self.services.rx.try_recv() else {
-                break;
-            };
-            if processed == 127 {
-                self.events.notify();
-            }
-            self.revision += 1;
-            match reply {
-                Reply::OpenedDirectory(token, path) => {
-                    if let Some(pane) = self.pending_open.remove(&token) {
-                        if self.layout.view(pane).is_some() {
-                            self.focus = pane;
-                        }
-                        if let Err(e) = self.browse(path) {
-                            self.status = format!("Browse failed: {e:#}");
-                        }
-                    }
-                }
-                Reply::Opened(token, result) => {
-                    if let Some(pane) = self.pending_open.remove(&token) {
-                        match result {
-                            Ok(d) => self.finish_open(pane, d),
-                            Err(e) => self.status = format!("Open failed: {e}"),
-                        }
-                    }
-                }
-                Reply::Saved(id, result) => self.saved_reply(id, result),
-                Reply::Reloaded(id, version, result) => match result {
-                    Ok(d)
-                        if self
-                            .documents
-                            .get(&id)
-                            .is_some_and(|doc| doc.content_version() == version) =>
-                    {
-                        self.finish_reload(id, d)
-                    }
-                    Ok(_) => {
-                        self.status =
-                            "Reload cancelled: the document was edited while loading".into()
-                    }
-                    Err(e) => self.status = format!("Reload failed: {e}"),
-                },
-                Reply::Overview(overview, tab) => self.overview_ready(overview, tab),
-                Reply::Highlighted(response) => self.highlighted(response),
-                Reply::FileOperation(operation, result) => {
-                    self.file_operation_done(operation, result)
-                }
-                Reply::Files(path, Ok(entries)) if path == self.browser => {
-                    if self.files != entries {
-                        self.files_revision += 1;
-                    }
-                    self.files = entries;
-                    self.selected = self.selected.min(self.files.len().saturating_sub(1));
-                }
-                Reply::Files(_, Err(e)) => self.status = e,
-                Reply::Git(state) => self.git_status(state),
-                Reply::GitOperation(result) => self.git_operation_done(result),
-                Reply::Error(e) => self.status = e,
-                Reply::Index(root, files) => self.index_ready(root, files),
-                Reply::Filtered(generation, rows) => self.filtered_picker(generation, rows),
-                Reply::SearchHits(generation, hits) => self.search_hits(generation, hits),
-                Reply::SearchDone(generation, result) => self.search_done(generation, result),
-                Reply::Outline(doc, symbols) => self.symbols_ready(doc, symbols),
-                Reply::Replaced(report) => self.replaced(report),
-                Reply::Ide(event) => self.ide_event(event),
-                Reply::Previews(generation, previews) => self.previews_ready(generation, previews),
-                Reply::ToolDone(name, output, target, result) => {
-                    self.tool_done(name, output, target, result)
-                }
-                Reply::Formatted(doc, content, result) => self.formatted(doc, content, result),
-                Reply::Spelling(result) => self.spelling_result(result),
-                Reply::Disk(changes) => self.disk_changes(changes),
-                Reply::Output(_, _) if self.quit => {
-                    self.git.jobs = self.git.jobs.saturating_sub(1);
-                }
-                Reply::Output(title, text) => {
-                    self.git.jobs = self.git.jobs.saturating_sub(1);
-                    let doc = self.id();
-                    let d = Document::inspection(format!("{title} · read-only"), text);
-                    self.documents.insert(doc, d);
-                    let _ = self.editor_target();
-                    let view = self.id();
-                    self.views.insert(
-                        view,
-                        EditorView {
-                            document: doc,
-                            ..Default::default()
-                        },
-                    );
-                    self.add_tab(View::Editor(view));
-                    self.status = "Git diff · read-only".into();
-                }
-                _ => {}
-            }
-        }
-        self.offer_save_question();
     }
     fn new_terminal(&mut self) -> Result<u64> {
         let id = self.id();
@@ -2616,7 +2258,7 @@ impl App {
                     self.confirm_pending(&kind)?;
                 } else if letter == "n" || cancel || k.key == "Enter" {
                     self.prompt = None;
-                    self.pending_retry = None;
+                    self.saves.pending_retry = None;
                     self.cancel_save_workflow();
                     self.status = "Save cancelled".into();
                 }
@@ -3294,7 +2936,7 @@ impl App {
             path.display(),
             notice.map(|n| format!(" · {n}")).unwrap_or_default()
         );
-        self.workspace_dirty = true;
+        self.recovery.dirty = true;
     }
     fn location(&self) -> String {
         if let Some(id) = self.active_editor() {

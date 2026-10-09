@@ -4,6 +4,7 @@ import fcntl
 import os
 import pathlib
 import pty
+import re
 import select
 import signal
 import struct
@@ -87,7 +88,10 @@ with tempfile.TemporaryDirectory(prefix="slate-tab-close-") as temporary:
         click(15)  # The remaining clean second.txt tab.
         send(b"KEEP")
         click(15)  # Untitled *: closing must ask before discarding.
-        assert b"Unsaved changes" in output, "Dirty tab close did not ask for confirmation"
+        # Ratatui can position the second word with a cursor escape instead
+        # of emitting a literal space; assert the rendered words across CSI.
+        assert re.search(rb"Unsaved(?:\x1b\[[0-?]*[ -/]*[@-~]|\s)*changes", output), \
+            "Dirty tab close did not ask for confirmation"
         send(b"\x1b")
         scratch = root / "scratch.txt"
         command("save-as " + str(scratch))

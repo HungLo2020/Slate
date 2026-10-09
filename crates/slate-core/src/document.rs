@@ -117,6 +117,9 @@ pub struct Document {
     /// A recovery entry that stores only a reference to a clean file.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) reference: bool,
+    /// Placeholder whose payload must be hydrated before recovery validation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) recovery_external: bool,
     /// The file exists but the current user cannot write it.
     #[serde(skip)]
     pub file_read_only: bool,
@@ -426,6 +429,7 @@ impl Document {
             saved_format: TextFormat::default(),
             disk: None,
             reference: false,
+            recovery_external: false,
             file_read_only: false,
             stamp: None,
             notice: None,
@@ -707,6 +711,8 @@ impl Document {
         copy.version = self.version;
         copy.saved_version = self.saved_version;
         copy.unavailable = self.unavailable;
+        copy.reference = self.reference;
+        copy.recovery_external = self.recovery_external;
         copy.format = self.format.clone();
         copy.saved_format = self.saved_format.clone();
         copy.disk = self.disk.clone();
@@ -727,6 +733,13 @@ impl Document {
         copy.reference = true;
         copy
     }
+    pub(crate) fn recovery_ropes(&self) -> (&Rope, &Rope) {
+        (&self.text, &self.saved)
+    }
+    pub(crate) fn set_recovery_ropes(&mut self, text: Rope, saved: Rope) {
+        self.text = text;
+        self.saved = saved;
+    }
     pub fn accept_save(&mut self, saved: Self) {
         self.unavailable = false;
         self.typing_at = None;
@@ -743,7 +756,9 @@ impl Document {
         self.unavailable = true;
     }
     pub fn valid_recovery(&self) -> bool {
-        self.text.len_bytes() <= MAX_FILE_BYTES && self.saved.len_bytes() <= MAX_FILE_BYTES
+        !self.recovery_external
+            && self.text.len_bytes() <= MAX_FILE_BYTES
+            && self.saved.len_bytes() <= MAX_FILE_BYTES
     }
     pub fn discard_changes(&mut self) {
         self.unavailable = false;

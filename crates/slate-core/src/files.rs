@@ -85,18 +85,33 @@ fn rename_no_replace(from: &Path, to: &Path) -> Result<()> {
     }
 }
 
+/// Resolve directory navigation against the workspace, including symlinks.
+pub(crate) fn workspace_directory(path: &Path, workspace: &Path) -> Result<PathBuf> {
+    let path = path.canonicalize()?;
+    if !path.starts_with(workspace) {
+        bail!("Folder is outside the workspace");
+    }
+    if !path.is_dir() {
+        bail!("Not a directory");
+    }
+    Ok(path)
+}
+
 pub(crate) fn listing(
     root: &Path,
+    workspace: &Path,
     expanded: &[PathBuf],
     tree: bool,
 ) -> std::io::Result<Vec<Entry>> {
     fn children(
         path: &Path,
+        workspace: &Path,
         depth: usize,
         expanded: &[PathBuf],
         tree: bool,
         out: &mut Vec<Entry>,
     ) -> std::io::Result<()> {
+        workspace_directory(path, workspace).map_err(std::io::Error::other)?;
         if depth > 16 || out.len() >= 100_000 {
             return Ok(());
         }
@@ -110,7 +125,10 @@ pub(crate) fn listing(
                     path: e.path().to_string_lossy().into_owned(),
                     directory,
                     depth,
-                    expanded: tree && directory && expanded.contains(&e.path()),
+                    expanded: tree
+                        && directory
+                        && expanded.contains(&e.path())
+                        && workspace_directory(&e.path(), workspace).is_ok(),
                 }
             })
             .collect();
@@ -127,13 +145,14 @@ pub(crate) fn listing(
             let path = PathBuf::from(&row.path);
             out.push(row);
             if descend {
-                let _ = children(&path, depth + 1, expanded, tree, out);
+                let _ = children(&path, workspace, depth + 1, expanded, tree, out);
             }
         }
         Ok(())
     }
     let mut rows = Vec::new();
-    if let Some(parent) = root.parent() {
+    let canonical = workspace_directory(root, workspace).map_err(std::io::Error::other)?;
+    if let Some(parent) = canonical.parent().filter(|p| p.starts_with(workspace)) {
         rows.push(Entry {
             name: "..".into(),
             path: parent.to_string_lossy().into_owned(),
@@ -142,7 +161,7 @@ pub(crate) fn listing(
             expanded: false,
         });
     }
-    children(root, 0, expanded, tree, &mut rows)?;
+    children(root, workspace, 0, expanded, tree, &mut rows)?;
     Ok(rows)
 }
 
@@ -204,9 +223,12 @@ impl App {
             "toggle-folder" | "expand-folder" | "collapse-folder" => {
                 if self.terminal_frontend {
                     let path = if name == "collapse-folder" {
+                        if self.browser == self.root {
+                            return Ok(());
+                        }
                         self.browser
                             .parent()
-                            .context("Already at the filesystem root")?
+                            .context("Already at the workspace root")?
                             .to_path_buf()
                     } else {
                         selected()?
@@ -218,9 +240,12 @@ impl App {
                     } else {
                         PathBuf::from(argument)
                     };
-                    if !path.is_dir() {
-                        bail!("Select a folder");
-                    }
+                    let path = if path.is_absolute() {
+                        path
+                    } else {
+                        self.browser.join(path)
+                    };
+                    workspace_directory(&path, &self.root)?;
                     if name == "collapse-folder"
                         || (name == "toggle-folder" && self.expanded_folders.contains(&path))
                     {
@@ -251,7 +276,7 @@ impl App {
         Ok(())
     }
     fn ensure_entry_idle(&self, source: &Path) -> Result<()> {
-        if self.save_operations.values().any(|doc| {
+        if self.saves.save_operations.values().any(|doc| {
             doc.path
                 .as_ref()
                 .is_some_and(|path| path.starts_with(source))
@@ -306,7 +331,7 @@ impl App {
         self.index_at = None;
         self.refresh_index();
         self.refresh();
-        self.workspace_dirty = true;
+        self.recovery.dirty = true;
         self.status = "File operation completed".into();
     }
 }
@@ -314,6 +339,33 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_listing_does_not_follow_symlinks_outside_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        let inside = root.join("inside");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&inside).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(inside.join("visible.txt"), "inside").unwrap();
+        fs::write(outside.join("hidden.txt"), "outside").unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&inside, &link).unwrap();
+        let rows = listing(&root, &root, std::slice::from_ref(&link), true).unwrap();
+        assert!(rows.iter().any(|e| e.depth == 1 && e.name == "visible.txt"));
+        assert!(!rows.iter().any(|e| e.name == ".."));
+
+        // The link may have changed after expansion was queued.
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let rows = listing(&root, &root, std::slice::from_ref(&link), true).unwrap();
+        assert!(rows.iter().any(|e| e.name == "link" && !e.expanded));
+        assert!(!rows.iter().any(|e| e.name == "hidden.txt"));
+        assert!(listing(&link, &root, &[], false).is_err());
+        assert!(listing(&outside, &root, &[], true).is_err());
+    }
     #[test]
     fn rename_never_replaces_an_existing_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -356,7 +408,8 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("modified"));
-        app.save_operations
+        app.saves
+            .save_operations
             .insert(id, app.documents[&id].checkpoint());
         assert!(app
             .file_action("rename-file", "renamed.txt")

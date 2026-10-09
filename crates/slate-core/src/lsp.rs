@@ -1448,7 +1448,7 @@ impl App {
             files += 1;
         }
         self.revision += 1;
-        self.workspace_dirty = true;
+        self.recovery.dirty = true;
         Ok(files)
     }
 

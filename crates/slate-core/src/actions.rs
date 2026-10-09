@@ -441,7 +441,12 @@ impl App {
         match kind {
             "save-read-only" | "save-elevated" => self.retry_save(kind),
             "reload-changed" => {
-                let doc = self.pending_retry.take().context("Nothing to reload")?.0;
+                let doc = self
+                    .saves
+                    .pending_retry
+                    .take()
+                    .context("Nothing to reload")?
+                    .0;
                 self.request_reload(doc, None)
             }
             _ => Ok(()),
@@ -453,11 +458,11 @@ impl App {
     }
     /// A privileged save the terminal frontend should perform now.
     pub fn take_elevation(&mut self) -> Option<Elevation> {
-        self.elevation.take()
+        self.saves.elevation.take()
     }
     pub fn finish_elevation(&mut self, request: Elevation, result: Result<()>) {
         let id = request.document;
-        let saved = self.save_operations.remove(&id);
+        let saved = self.saves.save_operations.remove(&id);
         let reply = match result {
             Ok(()) => saved
                 .map(|mut doc| {
@@ -929,7 +934,7 @@ impl App {
             "reload" => {
                 let (_, v) = self.editor_view()?;
                 if self.documents[&v.document].dirty() && argument != "force" {
-                    self.pending_retry = Some((v.document, None, false));
+                    self.saves.pending_retry = Some((v.document, None, false));
                     self.prompt = Some(prompt(
                         "reload-changed",
                         self.documents[&v.document].title(),

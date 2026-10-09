@@ -7,7 +7,10 @@ recovery and process control.
 
 ## Updates and frontend boundary
 
-Rust remains authoritative for documents, history, view state and services. The
+Rust remains authoritative for documents, history, view state and services.
+`session.rs` owns startup composition, `service_events.rs` applies worker replies,
+and `SaveWorkflow` and `RecoveryState` group their lifecycle state outside the
+main `App` field list. `recovery_io.rs` owns the checkpoint storage format. The
 Qt Quick frontend owns graphical controls, text shaping and pixel hit testing;
 Ratatui owns terminal presentation. Neither frontend has a second mutable editor
 buffer or independent undo stack.
@@ -15,7 +18,7 @@ buffer or independent undo stack.
 Worker replies and PTY output notify a coalesced event signal. On Unix a
 nonblocking socket pair wakes Qt through QSocketNotifier; a condition variable
 wakes the TUI alongside input from its reader thread. Workers never mutate Qt or
-App state. Qt coalesces output bursts over 16 ms. A separate one-second maintenance
+App state. Qt coalesces output bursts over 8 ms. A separate one-second maintenance
 wake services checkpoints and provides the non-Unix fallback. Rendering is not
 responsible for keeping background work alive.
 
@@ -50,9 +53,10 @@ Git status is parsed using NUL-delimited records, retaining rename source paths.
 Index and worktree changes are separate selectable entries, with groups for
 staged, unstaged, untracked and conflicts. Staging a working rename and
 unstaging an index rename include both names; restaging edits to an index rename
-uses only its destination, whose source is already removed. Bulk actions operate at the resolved repository root, including
-when the workspace opens a subdirectory. Section staging collects only that
-group's paths into a single job. Unstaging an unborn index removes cached entries
+uses only its destination, whose source is already removed. Bulk actions execute
+at the resolved repository root with a pathspec scoped to the workspace subtree.
+Commits include all staged repository changes. Section staging collects only
+that group's paths into a single job. Unstaging an unborn index removes cached entries
 recursively, preserving all working files. Operations remain asynchronous and
 expose busy/error state. The GUI keeps the commit draft above pane delegates,
 which can be recreated by compact layouts; completion clears it only on success. Diff
@@ -189,8 +193,24 @@ layout/tab/focus state, browser directory and terminal working directories.
 Single-file sessions keep no checkpoint unless `file_recovery` is enabled; then
 the checkpoint is keyed by the file. A fingerprint of documents' generations,
 views and layout skips writes when nothing recorded has changed.
-It is written through a private temporary file, synced and atomically replaced.
-The maintenance wake queues changed state at most once a second; shutdown flushes pending I/O
+Small buffers stay inline; larger buffers and their saved text are streamed into
+private, content-addressed files under `buffers/`, each bounded by the 1 GiB
+editor limit. SHA-256 and byte counts are checked before restoring each rope.
+The 128 MiB JSON cap applies to metadata, not the aggregate buffer contents.
+External references use schema 2; schema 1 inline checkpoints remain supported.
+Payloads and their directory are synced before the metadata is atomically
+replaced. Failed writes retain the previous checkpoint. Corrupt/missing payloads
+are excluded during salvage while intact documents retain their text and views;
+the original metadata is kept beside the salvaged session. Payload cleanup runs
+only after commit and preserves references from retained previous/damaged JSON
+checkpoints; unreadable retained metadata disables cleanup.
+`RecoveryState` tracks submitted and persisted fingerprints separately, with
+at most one checkpoint in flight. A typed completion acknowledges the write;
+failures retain a visible warning and dirty state for retry even without another
+edit. The warning is combined with ordinary status messages in both frontends
+until persistence succeeds. Edits made while writing trigger another checkpoint.
+The maintenance wake queues changed state at most once a second; shutdown drains replies while submitting and waiting for its I/O barrier,
+then flushes pending I/O
 and the final checkpoint before releasing the lock. Recovery does not save user
 files or replay shell commands.
 
@@ -304,8 +324,8 @@ move with local edits until the server publishes again, and task problem
 matchers add their own (`source = "task"`). Completion results are filtered
 locally with `nucleo-matcher` while typing; incomplete lists ask again.
 WorkspaceEdits change open documents through `Document::replace_many`, which
-groups its revisions so one undo reverts the whole edit, and rewrite closed
-files on disk.
+groups its revisions so one undo reverts the whole edit. Closed files open as
+unsaved background documents, so changes can be reviewed, undone and saved.
 
 The debugger client speaks DAP to `gdb -i dap` by default. It sends
 breakpoints and `configurationDone` after `initialized`. On `stopped` it
@@ -361,8 +381,13 @@ beside it.
 ## Terminals and Git workers
 
 vt100 callbacks answer cursor and device queries in order, take window titles
-and OSC 52 copies, and follow OSC 7 directories. Terminal input is written by
-its own thread, so a stalled program never blocks typing elsewhere. Exited
+and OSC 52 copies, and follow OSC 7 directories. Terminal input is written by its own thread through `InputQueue`. Byte
+reservations include the current write until it completes; a 4 MiB budget and
+1024-message channel reject overload without blocking. Bracketed paste is one
+message, so rejection cannot leave the child in paste mode. Write failures and
+refused protocol replies are surfaced through the main loop. Closing a session
+closes its input queue before stopping the child, and queued reservations are
+released as messages are dropped. Exited
 shells are reaped and their tabs closed.
 
 Git runs on two workers: reads (status, diff) and writes (stage, commit). The
@@ -428,8 +453,11 @@ different languages.
 
 Both frontends use the same asynchronous create, rename and Trash operations.
 The GUI flattens only expanded directories into an indented, scrollable model;
-the TUI keeps directory navigation with Enter/Right and Left. Rename refuses to
-replace an existing destination (atomically on Linux) and updates open documents.
+the TUI keeps directory navigation with Enter/Right and Left. Both file panes
+stay within the workspace root: parent navigation stops there, directory symlinks
+cannot browse outside it, and recovery resets an out-of-workspace browser location
+to the root. Explicit file opening remains available for files elsewhere. Rename
+refuses to replace an existing destination (atomically on Linux) and updates open documents.
 Trash uses the desktop's gio implementation and never falls back to permanent
 delete. Modified documents must be saved or closed first. Directory/layout GUI
 windows can receive forwarded files even though those launch options themselves

@@ -2,11 +2,11 @@ use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
 use std::{
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc, Mutex,
+        Arc, Mutex,
     },
     thread,
 };
@@ -126,7 +126,7 @@ pub struct TerminalSession {
     master: Box<dyn MasterPty + Send>,
     /// Bytes for the shell, written by a dedicated thread so a slow or
     /// stalled program never blocks the interface.
-    input: mpsc::Sender<Vec<u8>>,
+    input: crate::terminal_input::InputQueue,
     child: Box<dyn Child + Send + Sync>,
     parser: Arc<Mutex<Parser>>,
     revision: Arc<AtomicU64>,
@@ -171,19 +171,7 @@ impl TerminalSession {
             .context("Cannot spawn terminal shell")?;
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader()?;
-        let mut writer = pair.master.take_writer()?;
-        let (input, queued) = mpsc::channel::<Vec<u8>>();
-        thread::spawn(move || {
-            for bytes in queued {
-                if writer
-                    .write_all(&bytes)
-                    .and_then(|_| writer.flush())
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
+        let input = crate::terminal_input::InputQueue::start(pair.master.take_writer()?);
         let parser = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
             rows,
             cols,
@@ -211,7 +199,9 @@ impl TerminalSession {
                 };
                 output_revision.fetch_add(1, Ordering::Release);
                 if !replies.is_empty() {
-                    let _ = responses.send(replies);
+                    if let Err(error) = responses.send(&replies) {
+                        responses.report(format!("Terminal reply was not sent: {error}"));
+                    }
                 }
                 if let Some(events) = output_events.lock().unwrap().as_ref() {
                     events.notify();
@@ -300,26 +290,35 @@ impl TerminalSession {
         Ok(())
     }
     pub fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        self.input.send(bytes)?;
         self.selection = None;
         self.selection_screen = None;
         self.parser.lock().unwrap().screen_mut().set_scrollback(0);
         self.changed();
-        self.input
-            .send(bytes.to_vec())
-            .map_err(|_| anyhow::anyhow!("The terminal has exited"))
+        Ok(())
     }
     pub fn paste(&mut self, text: &str) -> Result<()> {
+        // Bound allocation before normalizing. A paste is one queue message:
+        // rejection cannot leave the child in bracketed-paste mode.
         let bracketed = self.parser.lock().unwrap().screen().bracketed_paste();
+        let framing = if bracketed { 12 } else { 0 };
+        anyhow::ensure!(
+            text.len() <= crate::terminal_input::INPUT_BYTES - framing,
+            "Terminal paste exceeds the 4 MiB input limit; nothing was sent. Retry a smaller paste"
+        );
+        let text = paste_text(text);
+        let mut bytes = Vec::with_capacity(text.len() + if bracketed { 12 } else { 0 });
         if bracketed {
-            self.write(b"\x1b[200~")?;
+            bytes.extend_from_slice(b"\x1b[200~");
         }
-        // Control characters in pasted text could end bracketed paste early
-        // (ESC [201~) and run what follows; keep text, tabs and line breaks.
-        self.write(paste_text(text).as_bytes())?;
+        bytes.extend_from_slice(text.as_bytes());
         if bracketed {
-            self.write(b"\x1b[201~")?;
+            bytes.extend_from_slice(b"\x1b[201~");
         }
-        Ok(())
+        self.write(&bytes)
+    }
+    pub(crate) fn take_input_error(&self) -> Option<String> {
+        self.input.take_error()
     }
     pub fn application_cursor(&self) -> bool {
         self.parser.lock().unwrap().screen().application_cursor()
@@ -519,6 +518,7 @@ impl TerminalSession {
 }
 impl Drop for TerminalSession {
     fn drop(&mut self) {
+        self.input.close();
         #[cfg(unix)]
         if let Some(pid) = self.child.process_id() {
             unsafe {
@@ -685,5 +685,37 @@ mod tests {
         );
         assert_eq!(hooks.title.as_deref(), Some("build"));
         assert_eq!(hooks.clipboard, ["hi"]);
+    }
+    #[test]
+    fn rejected_paste_does_not_queue_an_opening_bracket_or_clear_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut terminal = TerminalSession::spawn(
+            dir.path(),
+            Some("stty -echo -icanon; printf '\\033[?2004hREADY'; exec sleep 30"),
+            24,
+            80,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !terminal
+            .parser
+            .lock()
+            .unwrap()
+            .screen()
+            .contents()
+            .contains("READY")
+        {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(terminal.parser.lock().unwrap().screen().bracketed_paste());
+        // Only six bytes remain, enough for the opening delimiter alone.
+        let pending = crate::terminal_input::INPUT_BYTES - 6;
+        terminal.write(&vec![b'x'; pending]).unwrap();
+        terminal.select(0, 0, false);
+        let selected = terminal.selection;
+        assert!(terminal.paste("payload").is_err());
+        assert_eq!(terminal.input.queued_bytes(), pending);
+        assert_eq!(terminal.selection, selected);
     }
 }

@@ -554,6 +554,20 @@ unsafe extern "C" fn slate_response_free(response: *mut c_char) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_app(
+        path: &std::path::Path,
+        mode: Option<slate_core::preferences::StartupMode>,
+    ) -> anyhow::Result<App> {
+        static TEST_HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        TEST_HOME.get_or_init(|| {
+            let dir = tempfile::tempdir().unwrap();
+            std::env::set_var("XDG_CONFIG_HOME", dir.path().join("config"));
+            std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
+            std::env::set_var("SHELL", "/bin/sh");
+            dir
+        });
+        App::new_with_startup(path, mode)
+    }
     fn request(state: &mut GuiContext, value: serde_json::Value) -> serde_json::Value {
         let input = CString::new(value.to_string()).unwrap();
         unsafe {
@@ -564,13 +578,71 @@ mod tests {
         }
     }
     #[test]
+    fn file_pane_requests_keep_the_gui_inside_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("nested.txt"), "nested").unwrap();
+        let mut app =
+            test_app(&root, Some(slate_core::preferences::StartupMode::Workspace)).unwrap();
+        app.terminal_frontend = false;
+        app.refresh();
+        let pane = app
+            .layout
+            .panes()
+            .into_iter()
+            .find(|p| matches!(app.layout.view(*p), Some(slate_core::layout::View::Files)))
+            .unwrap();
+        app.dispatch(Command::Focus { pane });
+        let mut state = GuiContext::new(app);
+        let snapshot = serde_json::json!({"action":"snapshot"});
+        let update = serde_json::json!({"action":"update"});
+        settle(&mut state, &update);
+        let initial = request(&mut state, snapshot.clone());
+        assert!(!initial["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == ".."));
+        request(
+            &mut state,
+            serde_json::json!({
+                "action":"action", "name":"expand-folder", "argument":child,
+            }),
+        );
+        settle(&mut state, &update);
+        let expanded = request(&mut state, snapshot.clone());
+        assert!(expanded["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == "nested.txt"));
+        for action in [
+            serde_json::json!({"action":"browse", "path":".."}),
+            serde_json::json!({"action":"invoke_action", "id":"toggle-folder", "argument":dir.path()}),
+        ] {
+            let response = request(&mut state, action);
+            assert!(response["status"]
+                .as_str()
+                .unwrap()
+                .contains("outside the workspace"));
+            let frame = request(&mut state, snapshot.clone());
+            assert_eq!(frame["browser"], root.to_string_lossy().as_ref());
+            assert!(!frame["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["name"] == ".."));
+        }
+    }
+    #[test]
     fn idle_and_component_updates_do_not_transport_unchanged_grids() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("edit.txt");
         std::fs::write(&file, "hello\n").unwrap();
         let mut state = GuiContext::new(
-            App::new_with_startup(&file, Some(slate_core::preferences::StartupMode::Workspace))
-                .unwrap(),
+            test_app(&file, Some(slate_core::preferences::StartupMode::Workspace)).unwrap(),
         );
         let update = serde_json::json!({"action":"update", "width":1280, "height":720});
         let initial = request(&mut state, update.clone());
@@ -579,9 +651,8 @@ mod tests {
             .unwrap()
             .iter()
             .any(|p| p["kind"] == "editor" && p.get("lines").is_some()));
-        // Finish initial background work; the frontend isn't required to continuously render.
-        std::thread::sleep(std::time::Duration::from_millis(350));
-        request(&mut state, update.clone());
+        // Wait for background startup to settle before asserting idle behavior.
+        settle(&mut state, &update);
         let idle = request(&mut state, update.clone());
         assert_eq!(idle, serde_json::json!({"unchanged":true}));
         state.app.dispatch(Command::Key {
@@ -619,15 +690,26 @@ mod tests {
     }
     fn editor_state(file: &std::path::Path) -> GuiContext {
         let mut app =
-            App::new_with_startup(file, Some(slate_core::preferences::StartupMode::EditorOnly))
-                .unwrap();
+            test_app(file, Some(slate_core::preferences::StartupMode::EditorOnly)).unwrap();
         app.preferences = Default::default();
         GuiContext::new(app)
     }
     fn settle(state: &mut GuiContext, update: &serde_json::Value) {
-        request(state, update.clone());
-        std::thread::sleep(std::time::Duration::from_millis(350));
-        request(state, update.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut quiet = 0;
+        while quiet < 3 {
+            let frame = request(state, update.clone());
+            quiet = if frame["unchanged"] == true {
+                quiet + 1
+            } else {
+                0
+            };
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Background work did not settle"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
     #[test]
     fn large_viewport_is_compact_and_edits_only_patch_the_changed_line() {
@@ -720,7 +802,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("doc.txt");
         std::fs::write(&file, "one\n    two\n").unwrap();
-        let mut app = App::new(&file).unwrap();
+        let mut app = test_app(&file, None).unwrap();
         app.terminal_frontend = false;
         let mut state = GuiContext::new(app);
         request(
@@ -771,7 +853,7 @@ mod tests {
     fn terminal_output_finishes_in_the_cached_view_without_another_user_event() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = GuiContext::new(
-            App::new_with_startup(
+            test_app(
                 dir.path(),
                 Some(slate_core::preferences::StartupMode::Workspace),
             )
@@ -818,7 +900,7 @@ mod tests {
     fn terminal_selection_only_transports_its_changed_row_and_cursor() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = GuiContext::new(
-            App::new_with_startup(
+            test_app(
                 dir.path(),
                 Some(slate_core::preferences::StartupMode::Workspace),
             )

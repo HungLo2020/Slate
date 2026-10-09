@@ -68,7 +68,8 @@ pub struct Entry {
 }
 pub use crate::git::{GitEntry, GitState};
 pub enum Job {
-    Browse(PathBuf, Vec<PathBuf>, bool),
+    /// Browser directory, workspace boundary, expanded rows, tree mode.
+    Browse(PathBuf, PathBuf, Vec<PathBuf>, bool),
     Git(crate::git::GitJob),
     /// List misspelled words with aspell, hunspell or enchant.
     Spell(String),
@@ -98,7 +99,7 @@ pub enum IoJob {
             String,
         )>,
     ),
-    Checkpoint(PathBuf, Workspace),
+    Checkpoint(PathBuf, Workspace, u64),
     Flush(mpsc::SyncSender<()>),
 }
 pub struct SaveFailure {
@@ -107,6 +108,7 @@ pub struct SaveFailure {
     pub snapshot: Option<Box<Document>>,
 }
 pub enum Reply {
+    Checkpoint(u64, Result<(), String>),
     Opened(u64, Result<Document, String>),
     FileOperation(crate::files::FileOperation, Result<(), String>),
     Reloaded(u64, u64, Result<Document, String>),
@@ -118,7 +120,6 @@ pub enum Reply {
     Git(Result<GitState, String>),
     GitOperation(Result<String, String>),
     Output(String, String),
-    Error(String),
     Spelling(Result<Vec<String>, String>),
     Disk(Vec<(u64, crate::document::DiskChange)>),
     /// The workspace file index for a root.
@@ -281,13 +282,10 @@ impl Services {
                         });
                         continue;
                     }
-                    IoJob::Checkpoint(path, w) => {
-                        if let Err(e) = workspace::write_checkpoint(&path, &w) {
-                            let _ = io_output
-                                .send(Reply::Error(format!("Recovery checkpoint failed: {e:#}")));
-                        }
-                        continue;
-                    }
+                    IoJob::Checkpoint(path, w, fingerprint) => Reply::Checkpoint(
+                        fingerprint,
+                        workspace::write_checkpoint(&path, &w).map_err(|e| format!("{e:#}")),
+                    ),
                     IoJob::CheckDisk(entries) => {
                         let changes: Vec<_> = entries
                             .into_iter()
@@ -322,9 +320,9 @@ impl Services {
             thread::spawn(move || {
                 while let Ok(job) = jobs.recv() {
                     let reply = match job {
-                        Job::Browse(path, expanded, tree) => Reply::Files(
+                        Job::Browse(path, workspace, expanded, tree) => Reply::Files(
                             path.clone(),
-                            crate::files::listing(&path, &expanded, tree)
+                            crate::files::listing(&path, &workspace, &expanded, tree)
                                 .map_err(|e| e.to_string()),
                         ),
                         Job::Spell(text) => Reply::Spelling(spell(&text)),

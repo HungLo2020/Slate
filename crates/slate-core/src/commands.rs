@@ -1127,7 +1127,7 @@ impl App {
                 }
             }
             if matches!(id, "quit" | "discard-quit" | "save" | "save-as") {
-                enabled &= self.pending_save.is_empty();
+                enabled &= self.saves.pending_save.is_empty();
             }
             if id == "refresh" && kind == "git" {
                 enabled &= self.git.jobs == 0;
@@ -1164,7 +1164,7 @@ impl App {
             let reason = if enabled {
                 ""
             } else if matches!(id, "quit" | "discard-quit" | "save" | "save-as")
-                && !self.pending_save.is_empty()
+                && !self.saves.pending_save.is_empty()
             {
                 "Wait for pending file saves"
             } else if id == "refresh" && kind == "git" && self.git.jobs != 0 {
