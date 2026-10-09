@@ -19,10 +19,13 @@ jobs:
       - name: Install build dependencies
         run: bash DevUtils/InstallDependencies.sh
       - name: Install release Rust toolchain
-        run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.98.0 --component rustfmt --component clippy
-      - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        run: |
+          useradd --create-home --shell /bin/bash slate-build
+          chown -R slate-build:slate-build "$GITHUB_WORKSPACE"
+          runuser -u slate-build -- sh -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.98.0 --component rustfmt --component clippy'
       - run: python3 -m unittest discover -s tests -v
-      - run: bash DevUtils/Build.sh
+      - name: Test and build as an unprivileged user
+        run: runuser -u slate-build -- env PATH="/home/slate-build/.cargo/bin:$PATH" bash DevUtils/Build.sh
       - run: python3 scripts/deb-smoke.py
       - uses: actions/upload-artifact@v4
         with:

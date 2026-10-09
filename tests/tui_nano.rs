@@ -163,6 +163,8 @@ fn read_only_files_ask_before_saving_and_keep_links_and_mode() {
     tui.wait_for("overwrite it anyway");
     tui.send("y");
     wait_file(&path, b"new data\n");
+    // A confirmed read-only save restores permissions before its completion reply.
+    tui.wait_for("Saved");
     let meta = fs::metadata(&path).unwrap();
     assert_eq!(meta.mode() & 0o777, 0o444);
     assert_eq!(meta.ino(), inode, "The hard link was broken");
