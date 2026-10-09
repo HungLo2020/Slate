@@ -1,7 +1,9 @@
 //! Workspace-wide file index and text search. Both walk the folder the way
 //! Git sees it (`.gitignore`, `.ignore` and hidden files are skipped) on a
 //! worker thread, with limits so huge trees stay responsive.
+use anyhow::Context;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -17,6 +19,67 @@ pub const INDEX_LIMIT: usize = 200_000;
 pub const MATCH_LIMIT: usize = 20_000;
 /// Files larger than this are not searched.
 const SEARCH_FILE_LIMIT: u64 = 16 * 1024 * 1024;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchPolicy {
+    pub include: String,
+    pub exclude: String,
+    pub hidden: bool,
+    pub ignored: bool,
+    pub max_bytes: u64,
+}
+impl Default for SearchPolicy {
+    fn default() -> Self {
+        Self {
+            include: String::new(),
+            exclude: String::new(),
+            hidden: false,
+            ignored: false,
+            max_bytes: SEARCH_FILE_LIMIT,
+        }
+    }
+}
+impl SearchPolicy {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_bytes == 0 || self.max_bytes > crate::document::MAX_FILE_BYTES as u64 {
+            return Err("Search size limit must be between 1 byte and 1 GiB".into());
+        }
+        self.overrides(std::path::Path::new("."))?;
+        Ok(())
+    }
+    fn overrides(&self, root: &Path) -> Result<ignore::overrides::Override, String> {
+        let mut builder = ignore::overrides::OverrideBuilder::new(root);
+        for glob in self.include.split(';').filter(|s| !s.trim().is_empty()) {
+            builder.add(glob.trim()).map_err(|e| e.to_string())?;
+        }
+        for glob in self.exclude.split(';').filter(|s| !s.trim().is_empty()) {
+            builder
+                .add(&format!("!{}", glob.trim()))
+                .map_err(|e| e.to_string())?;
+        }
+        builder.build().map_err(|e| e.to_string())
+    }
+}
+#[derive(Default)]
+pub struct SearchReport {
+    pub matches: usize,
+    pub large: usize,
+    pub unreadable: usize,
+    pub binary: usize,
+}
+
+fn search_walker(root: &Path, policy: &SearchPolicy) -> Result<ignore::WalkBuilder, String> {
+    let mut builder = walker(root);
+    builder
+        .hidden(!policy.hidden)
+        .git_ignore(!policy.ignored)
+        .git_global(!policy.ignored)
+        .git_exclude(!policy.ignored)
+        .ignore(!policy.ignored)
+        .overrides(policy.overrides(root)?);
+    Ok(builder)
+}
 
 fn walker(root: &Path) -> ignore::WalkBuilder {
     let mut builder = ignore::WalkBuilder::new(root);
@@ -110,15 +173,28 @@ fn preview(line: &str, column: usize, length: usize) -> (String, usize) {
     while !line.is_char_boundary(start) {
         start -= 1;
     }
-    let mut end = (column + length + CONTEXT * 2).min(line.len());
+    let mut end = column
+        .saturating_add(length.min(240))
+        .saturating_add(CONTEXT * 2)
+        .min(line.len())
+        .min(start + 480);
     while !line.is_char_boundary(end) {
-        end += 1;
+        end -= 1;
     }
-    let leading = line[start..].len() - line[start..].trim_start().len();
+    let leading = line[start..end].len() - line[start..end].trim_start().len();
+    let leading = if leading <= column - start {
+        leading
+    } else {
+        0
+    };
     let start = if start == 0 { start + leading } else { start };
     let text = line[start..end].replace('\t', " ");
     (
-        format!("{}{text}", if start > 0 && leading == 0 { "…" } else { "" }),
+        format!(
+            "{}{text}{}",
+            if start > 0 && leading == 0 { "…" } else { "" },
+            if end < line.len() { "…" } else { "" }
+        ),
         start,
     )
 }
@@ -133,32 +209,141 @@ pub fn search(
     buffers: &HashMap<PathBuf, String>,
     cancel: &Arc<AtomicU64>,
     generation: u64,
-    mut emit: impl FnMut(Vec<Hit>) -> bool,
+    emit: impl FnMut(Vec<Hit>) -> bool,
 ) -> Result<usize, String> {
+    search_with_policy(
+        root,
+        options,
+        &SearchPolicy::default(),
+        buffers,
+        cancel,
+        generation,
+        emit,
+    )
+    .map(|r| r.matches)
+}
+#[allow(clippy::too_many_arguments)]
+pub fn search_with_policy(
+    root: &Path,
+    options: &SearchOptions,
+    policy: &SearchPolicy,
+    buffers: &HashMap<PathBuf, String>,
+    cancel: &Arc<AtomicU64>,
+    generation: u64,
+    emit: impl FnMut(Vec<Hit>) -> bool,
+) -> Result<SearchReport, String> {
+    search_source(
+        root,
+        options,
+        policy,
+        cancel,
+        generation,
+        |path| {
+            buffers.get(path).map(|text| {
+                if text.len() as u64 > policy.max_bytes {
+                    Err(())
+                } else {
+                    Ok(text.clone())
+                }
+            })
+        },
+        emit,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn search_ropes(
+    root: &Path,
+    options: &SearchOptions,
+    policy: &SearchPolicy,
+    buffers: &HashMap<PathBuf, ropey::Rope>,
+    cancel: &Arc<AtomicU64>,
+    generation: u64,
+    emit: impl FnMut(Vec<Hit>) -> bool,
+) -> Result<SearchReport, String> {
+    search_source(
+        root,
+        options,
+        policy,
+        cancel,
+        generation,
+        |path| {
+            buffers.get(path).map(|rope| {
+                if rope.len_bytes() as u64 > policy.max_bytes {
+                    Err(())
+                } else {
+                    Ok(rope.to_string())
+                }
+            })
+        },
+        emit,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn search_source(
+    root: &Path,
+    options: &SearchOptions,
+    policy: &SearchPolicy,
+    cancel: &Arc<AtomicU64>,
+    generation: u64,
+    mut buffer: impl FnMut(&Path) -> Option<Result<String, ()>>,
+    mut emit: impl FnMut(Vec<Hit>) -> bool,
+) -> Result<SearchReport, String> {
+    policy.validate()?;
+    let mut report = SearchReport::default();
     let regex = options.compile()?;
     let mut total = 0;
     let mut batch = Vec::new();
     let mut last_emit = std::time::Instant::now();
-    for entry in walker(root).build().flatten() {
+    for entry in search_walker(root, policy)?.build() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                report.unreadable += 1;
+                continue;
+            }
+        };
         if cancel.load(Ordering::Relaxed) != generation {
-            return Ok(total);
+            report.matches = total;
+            return Ok(report);
         }
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
         let path = entry.path().to_path_buf();
-        let (text, hash) = match buffers.get(&path) {
-            Some(text) => (text.clone(), content_hash(text.as_bytes())),
+        let (text, hash) = match buffer(&path) {
+            Some(Ok(text)) => {
+                let hash = content_hash(text.as_bytes());
+                (text, hash)
+            }
+            Some(Err(())) => {
+                report.large += 1;
+                continue;
+            }
             None => {
-                if entry.metadata().map(|m| m.len()).unwrap_or(0) > SEARCH_FILE_LIMIT {
+                if entry.metadata().map(|m| m.len()).unwrap_or(0) > policy.max_bytes {
+                    report.large += 1;
                     continue;
                 }
-                let Ok(bytes) = std::fs::read(&path) else {
+                use std::io::Read;
+                let bytes = (|| -> std::io::Result<Vec<u8>> {
+                    let mut bytes = Vec::new();
+                    std::fs::File::open(&path)?
+                        .take(policy.max_bytes + 1)
+                        .read_to_end(&mut bytes)?;
+                    Ok(bytes)
+                })();
+                let Ok(bytes) = bytes else {
+                    report.unreadable += 1;
                     continue;
                 };
+                if bytes.len() as u64 > policy.max_bytes {
+                    report.large += 1;
+                    continue;
+                }
                 // Use the same BOM, legacy encoding and newline handling as
                 // opened documents. UTF-16 NUL bytes are not binary data.
                 let Ok(decoded) = crate::text_format::decode(&bytes, None) else {
+                    report.binary += 1;
                     continue;
                 };
                 (decoded.text, content_hash(&bytes))
@@ -194,12 +379,14 @@ pub fn search(
             total += 1;
             if total >= MATCH_LIMIT {
                 emit(std::mem::take(&mut batch));
-                return Ok(total);
+                report.matches = total;
+                return Ok(report);
             }
         }
         if !batch.is_empty() && (batch.len() >= 500 || last_emit.elapsed().as_millis() > 50) {
             if !emit(std::mem::take(&mut batch)) {
-                return Ok(total);
+                report.matches = total;
+                return Ok(report);
             }
             last_emit = std::time::Instant::now();
         }
@@ -207,7 +394,26 @@ pub fn search(
     if !batch.is_empty() {
         emit(batch);
     }
-    Ok(total)
+    report.matches = total;
+    Ok(report)
+}
+
+impl crate::App {
+    pub(crate) fn search_settings(&mut self, argument: &str) -> anyhow::Result<()> {
+        if argument.is_empty() {
+            self.prompt = Some(crate::search::Prompt {
+                kind: "search-settings".into(),
+                input: serde_json::to_string(&self.project_search_policy)?,
+                ..Default::default()
+            });
+            return Ok(());
+        }
+        self.execute(crate::Command::ConfigureProjectSearch {
+            policy: serde_json::from_str(argument).context(
+                "Search settings require JSON with include, exclude, hidden, ignored and max_bytes",
+            )?,
+        })
+    }
 }
 
 #[cfg(test)]

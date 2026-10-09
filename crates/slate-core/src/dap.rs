@@ -484,10 +484,10 @@ impl App {
                     }
                 }
             }
-            Event::DapExited { session, reason } => {
-                if self.debug.session.as_ref().is_some_and(|s| s.id == session) {
-                    self.debug_end(&format!("Debugger stopped ({reason})"));
-                }
+            Event::DapExited { session, reason }
+                if self.debug.session.as_ref().is_some_and(|s| s.id == session) =>
+            {
+                self.debug_end(&format!("Debugger stopped ({reason})"));
             }
             _ => {}
         }

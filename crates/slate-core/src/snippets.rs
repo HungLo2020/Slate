@@ -343,7 +343,7 @@ impl App {
             expansion
                 .stops
                 .get(&0)
-                .map(&place)
+                .map(place)
                 .unwrap_or_else(|| vec![(end, end)]),
         );
         let v = self.views.get_mut(&id).unwrap();

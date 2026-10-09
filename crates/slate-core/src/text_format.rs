@@ -90,6 +90,9 @@ pub fn encoding_name(label: &str) -> Result<String> {
     if matches!(normalized.as_str(), "utf-16be" | "utf16be") {
         return Ok("UTF-16BE".into());
     }
+    if matches!(normalized.as_str(), "latin1" | "latin-1" | "iso-8859-1") {
+        return Ok("ISO-8859-1".into());
+    }
     let encoding = encoding_rs::Encoding::for_label(normalized.as_bytes())
         .with_context(|| format!("Unknown encoding: {label}"))?;
     if encoding == encoding_rs::REPLACEMENT || encoding == encoding_rs::X_USER_DEFINED {
@@ -157,6 +160,7 @@ fn strip_bom<'a>(bytes: &'a [u8], encoding: &str) -> (bool, &'a [u8]) {
 
 fn decode_body(body: &[u8], encoding: &str) -> Result<String> {
     match encoding {
+        "ISO-8859-1" => Ok(body.iter().map(|b| char::from(*b)).collect()),
         "UTF-8" => Ok(std::str::from_utf8(body)
             .context("The file is not valid UTF-8")?
             .to_owned()),
@@ -164,7 +168,7 @@ fn decode_body(body: &[u8], encoding: &str) -> Result<String> {
             if !body.len().is_multiple_of(2) {
                 bail!("The file has an odd number of bytes for {encoding}");
             }
-            let units = body.chunks_exact(2).map(|pair| {
+            let units = body.as_chunks::<2>().0.iter().map(|pair| {
                 if encoding == "UTF-16LE" {
                     u16::from_le_bytes([pair[0], pair[1]])
                 } else {
@@ -233,19 +237,85 @@ pub fn normalize_input(text: &str) -> Cow<'_, str> {
     }
 }
 
-/// Encode a document rope. UTF-8 with LF line endings copies chunks directly.
+/// Validate representability without flattening or allocating the encoded document.
+pub fn validate_rope(text: &ropey::Rope, format: &TextFormat) -> Result<()> {
+    encode_chunks(text, format, |_| Ok(()))
+}
+/// Encode chunks with one streaming encoder, bounding output to the document limit.
 pub fn encode_rope(text: &ropey::Rope, format: &TextFormat) -> Result<Vec<u8>> {
-    if format.encoding == "UTF-8" && format.line_ending == LineEnding::Lf {
-        let mut bytes = Vec::with_capacity(text.len_bytes() + 3);
+    let mut bytes = Vec::with_capacity(text.len_bytes().min(16 * 1024 * 1024));
+    encode_chunks(text, format, |chunk| {
+        bytes.extend_from_slice(chunk);
+        Ok(())
+    })?;
+    Ok(bytes)
+}
+fn encode_chunks(
+    text: &ropey::Rope,
+    format: &TextFormat,
+    mut emit: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    let mut total = 0usize;
+    let mut output = |bytes: &[u8]| -> Result<()> {
+        total = total
+            .checked_add(bytes.len())
+            .context("Encoded size overflow")?;
+        anyhow::ensure!(
+            total <= crate::document::MAX_FILE_BYTES,
+            "Encoded document exceeds 1 GiB"
+        );
+        emit(bytes)
+    };
+    let unicode = matches!(
+        format.encoding.as_str(),
+        "UTF-8" | "UTF-16LE" | "UTF-16BE" | "ISO-8859-1"
+    );
+    if unicode {
         if format.bom {
-            bytes.extend_from_slice(b"\xEF\xBB\xBF");
+            match format.encoding.as_str() {
+                "UTF-8" => output(b"\xef\xbb\xbf")?,
+                "UTF-16LE" => output(b"\xff\xfe")?,
+                "UTF-16BE" => output(b"\xfe\xff")?,
+                _ => {}
+            }
         }
+        let mut chunk_format = format.clone();
+        chunk_format.bom = false;
         for chunk in text.chunks() {
-            bytes.extend_from_slice(chunk.as_bytes());
+            output(&encode(chunk, &chunk_format)?)?;
         }
-        return Ok(bytes);
+        return Ok(());
     }
-    encode(&text.to_string(), format)
+    let encoding =
+        encoding_rs::Encoding::for_label(format.encoding.as_bytes()).context("Unknown encoding")?;
+    let mut encoder = encoding.new_encoder();
+    let mut buffer = [0u8; 8192];
+    let mut write = |input: &str, last: bool| -> Result<()> {
+        let mut rest = input;
+        loop {
+            let (result, read, written) =
+                encoder.encode_from_utf8_without_replacement(rest, &mut buffer, last);
+            output(&buffer[..written])?;
+            rest = &rest[read..];
+            match result {
+                encoding_rs::EncoderResult::InputEmpty => return Ok(()),
+                encoding_rs::EncoderResult::OutputFull => {}
+                encoding_rs::EncoderResult::Unmappable(c) => bail!(
+                    "{} cannot store '{c}' (U+{:04X})",
+                    format.encoding,
+                    c as u32
+                ),
+            }
+        }
+    };
+    for chunk in text.chunks() {
+        if format.line_ending == LineEnding::Lf {
+            write(chunk, false)?;
+        } else {
+            write(&chunk.replace('\n', format.line_ending.as_str()), false)?;
+        }
+    }
+    write("", true)
 }
 
 pub fn encode(text: &str, format: &TextFormat) -> Result<Vec<u8>> {
@@ -256,6 +326,14 @@ pub fn encode(text: &str, format: &TextFormat) -> Result<Vec<u8>> {
     };
     let mut bytes = Vec::with_capacity(text.len() + 3);
     match format.encoding.as_str() {
+        "ISO-8859-1" => {
+            for c in text.chars() {
+                bytes.push(
+                    u8::try_from(c as u32)
+                        .with_context(|| format!("ISO-8859-1 cannot store '{c}'"))?,
+                );
+            }
+        }
         "UTF-8" => {
             if format.bom {
                 bytes.extend_from_slice(b"\xEF\xBB\xBF");
@@ -358,7 +436,7 @@ mod tests {
         assert!(decode(b"ELF\0\x01\x02", None).is_err());
         assert_eq!(normalize_input("a\rb\r\nc"), "a\nb\nc");
         assert!(matches!(normalize_input("plain"), Cow::Borrowed(_)));
-        assert_eq!(encoding_name("latin1").unwrap(), "windows-1252");
+        assert_eq!(encoding_name("latin1").unwrap(), "ISO-8859-1");
         assert_eq!(encoding_name("utf16").unwrap(), "UTF-16LE");
         assert!(encoding_name("klingon").is_err());
     }

@@ -22,6 +22,37 @@ pub(crate) struct SaveWorkflow {
     pub elevation: Option<Elevation>,
 }
 
+pub(crate) struct Preparation {
+    pub id: u64,
+    pub snapshot: Document,
+    pub destination: Option<PathBuf>,
+    pub overwrite: bool,
+    pub options: WriteOptions,
+    pub settings: crate::editorconfig::Settings,
+}
+pub(crate) struct Prepared {
+    snapshot: Document,
+    edits: Vec<(usize, usize, String)>,
+    format: crate::text_format::TextFormat,
+}
+impl Preparation {
+    pub(crate) fn prepare(&self) -> Result<Prepared> {
+        let edits = self.settings.edits(self.snapshot.rope())?;
+        let format = self.settings.format(self.snapshot.format.clone())?;
+        let mut checked = self.snapshot.checkpoint();
+        if !edits.is_empty() {
+            checked.replace_many(&edits, 0)?;
+        }
+        if checked.format != format {
+            checked.set_format(format.clone())?;
+        }
+        Ok(Prepared {
+            snapshot: checked,
+            edits,
+            format,
+        })
+    }
+}
 impl App {
     pub(crate) fn start_save(
         &mut self,
@@ -34,20 +65,71 @@ impl App {
             bail!("A save is already in progress for this document");
         }
         let snapshot = self.documents[&id].checkpoint();
-        self.services.io.send(IoJob::Save(
+        let settings = self.editorconfig_settings(id, destination.as_deref())?;
+        self.services.io.send(IoJob::PrepareSave(Preparation {
             id,
-            snapshot.checkpoint(),
+            snapshot: snapshot.checkpoint(),
             destination,
             overwrite,
-            WriteOptions {
+            options: WriteOptions {
                 allow_read_only,
                 backup: self.preferences.backup,
             },
-        ))?;
+            settings,
+        }))?;
         self.saves.save_operations.insert(id, snapshot);
         self.saves.pending_save.push(id);
-        self.status = "Saving…".into();
+        self.status = "Preparing save…".into();
         Ok(())
+    }
+
+    pub(crate) fn prepared_save(&mut self, request: Preparation, result: Result<Prepared, String>) {
+        let id = request.id;
+        self.saves.pending_save.retain(|doc| *doc != id);
+        self.saves.save_operations.remove(&id);
+        let result = (|| -> Result<()> {
+            let prepared = result.map_err(anyhow::Error::msg)?;
+            let doc = self
+                .documents
+                .get(&id)
+                .context("Document closed while preparing save")?;
+            let same = doc.content_version() == request.snapshot.content_version()
+                && doc.format == request.snapshot.format
+                && !doc.read_only;
+            if same {
+                if !prepared.edits.is_empty() {
+                    self.replace_in_document(id, &prepared.edits)?;
+                }
+                // Validated on the worker against this exact text.
+                let d = self.documents.get_mut(&id).unwrap();
+                if d.format != prepared.format {
+                    d.format = prepared.format;
+                    d.generation += 1;
+                }
+            }
+            // Save the requested snapshot even if the user continued typing.
+            // Accepting it updates the baseline; newer edits remain unsaved.
+            let snapshot = if same {
+                self.documents[&id].checkpoint()
+            } else {
+                prepared.snapshot
+            };
+            self.services.io.send(IoJob::Save(
+                id,
+                snapshot.checkpoint(),
+                request.destination,
+                request.overwrite,
+                request.options,
+            ))?;
+            self.saves.save_operations.insert(id, snapshot);
+            self.saves.pending_save.push(id);
+            self.status = "Saving…".into();
+            Ok(())
+        })();
+        if let Err(e) = result {
+            self.cancel_save_workflow();
+            self.status = format!("Save failed: {e:#}");
+        }
     }
 
     pub(crate) fn save_all(&mut self, quit: bool) -> Result<()> {
@@ -213,6 +295,7 @@ impl App {
     }
 
     pub(crate) fn cancel_save_workflow(&mut self) {
+        self.pending_workspace = None;
         self.saves.save_all_queue = None;
         self.saves.quit_after_save = false;
         self.saves.close_after_save = None;

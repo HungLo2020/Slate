@@ -5,8 +5,9 @@ use crate::{
     document::{DiskChange, Document},
     search::Prompt,
     services::IoJob,
-    App,
+    App, Command,
 };
+use anyhow::Result;
 use serde::Serialize;
 use std::{
     path::{Path, PathBuf},
@@ -249,7 +250,7 @@ impl App {
             }
         }
         let d = &self.documents[&doc];
-        let tab = self.preferences_for_document(doc).indent_width;
+        let tab = self.preferences_for_document(doc).tab_width;
         if d.len() <= 256 * 1024 && d.line_count() <= 4000 {
             let overview = build_overview(doc, generation, d, tab);
             self.overview_cache.insert(doc, overview.clone());
@@ -287,7 +288,7 @@ impl App {
             .documents
             .get(&id)
             .is_some_and(|d| d.generation == overview.generation)
-            && self.preferences_for_document(id).indent_width == tab
+            && self.preferences_for_document(id).tab_width == tab
         {
             self.overview_pending.remove(&id);
             self.overview_cache.insert(id, overview);
@@ -366,6 +367,41 @@ pub(crate) fn blend(a: &str, b: &str, amount: f32) -> String {
         (x + (y - x) * amount).round() as u32
     };
     format!("#{:02x}{:02x}{:02x}", channel(16), channel(8), channel(0))
+}
+
+pub(crate) fn load_projects() -> Vec<String> {
+    let mut list: Vec<String> = crate::user_state::read("projects.json");
+    list.truncate(20);
+    list
+}
+
+impl App {
+    pub(crate) fn remember_project(&mut self) {
+        let path = self.root.to_string_lossy().into_owned();
+        self.recent_projects.retain(|p| *p != path);
+        self.recent_projects.insert(0, path);
+        self.recent_projects.truncate(20);
+        if let Ok(json) = serde_json::to_vec(&self.recent_projects) {
+            let _ = crate::fsio::write_private(&crate::user_state::path("projects.json"), &json);
+        }
+    }
+    pub(crate) fn open_recent_project(&mut self, argument: &str) -> Result<()> {
+        if argument.is_empty() {
+            self.prompt = Some(Prompt {
+                kind: "open-recent-project".into(),
+                input: self.recent_projects.first().cloned().unwrap_or_default(),
+                ..Default::default()
+            });
+            return Ok(());
+        }
+        let path = argument
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| self.recent_projects.get(n.checked_sub(1)?))
+            .cloned()
+            .unwrap_or_else(|| argument.into());
+        self.execute(Command::OpenWorkspace { path: path.into() })
+    }
 }
 
 #[cfg(test)]

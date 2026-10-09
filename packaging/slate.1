@@ -1,0 +1,77 @@
+.TH SLATE 1 "October 2026" "Slate" "User Commands"
+.SH NAME
+slate, slate-gui \- shared terminal and graphical text editor
+.SH SYNOPSIS
+.B slate
+[OPTIONS] [+LINE[,COLUMN]] [FILE...]
+.br
+.B slate-gui
+[OPTIONS] [FILE...|DIRECTORY]
+.SH DESCRIPTION
+Slate uses one Rust editing core for its terminal and Qt Quick interfaces.
+A directory opens a rooted workspace. Standard input is accepted as a file
+argument of a single dash. Missing files are created when saved.
+.SH OPTIONS
+.TP
+.B --tui, --gui
+Choose the interface.
+.TP
+.B -v, --view
+Open files read-only.
+.TP
+.B --fresh
+Skip restoring the prior recovery checkpoint.
+.TP
+.B --editor-only, --workspace
+Choose the initial layout.
+.TP
+.B --new-instance
+Open a separate graphical window.
+.TP
+.B -B, --backup
+Keep the previous saved file as NAME~.
+.TP
+.B -S, --softwrap
+Wrap long lines on screen.
+.TP
+.B -l, --linenumbers
+Display line numbers.
+.TP
+.B -E, --tabstospaces
+Insert spaces for typed tabs.
+.TP
+.B -T N, --tabsize=N
+Set tab display width to 1\(en32 columns.
+.TP
+.B -H, --historylog
+Persist search and replacement history (up to 100 entries each).
+.TP
+.B -G, --locking
+Warn about files open in another Slate instance or with another editor's swap file.
+Editing remains allowed; locks are advisory.
+.TP
+.B -I, --ignorercfiles
+Use default Slate preferences for this session. EditorConfig still applies.
+.TP
+.B -i, --autoindent
+Automatically indent new lines.
+.TP
+.B -m, --mouse
+Enable terminal mouse support.
+.TP
+.B -h, --help
+Show command help.
+.TP
+.B -V, --version
+Show the version.
+.SH KEYS
+F1 or Ctrl-Shift-P opens the command palette. Ctrl-S saves, Ctrl-F finds,
+Ctrl-H replaces, Ctrl-Q quits. Choose keymap = "nano" in settings for nano
+bindings. Find/replace accepts Alt-R for regex, Alt-S for selection scope,
+and Up/Down for history. Alt-Shift-drag selects a rectangle.
+.SH FILES
+Configuration is under $XDG_CONFIG_HOME/slate (normally ~/.config/slate).
+Recovery, history and diagnostics are under $XDG_STATE_HOME/slate
+(normally ~/.local/state/slate). Preferences and profiles use TOML.
+.SH SEE ALSO
+The repository README, docs/SUPPORT.md, and the shared command palette.

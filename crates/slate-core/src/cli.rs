@@ -1,6 +1,6 @@
 //! Command-line parsing shared by the `slate` and `slate-gui` executables.
 use crate::preferences::StartupMode;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::{ffi::OsString, path::PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,6 +25,8 @@ pub struct Launch {
     /// `-` reads the initial buffer from standard input.
     pub stdin: Option<LaunchFile>,
     pub read_only: bool,
+    pub options: std::collections::BTreeMap<String, String>,
+    pub ignore_rc: bool,
     pub recover: bool,
     pub startup: Option<StartupMode>,
     /// GUI: open a separate window instead of handing files to a running one.
@@ -45,6 +47,16 @@ Usage:
 Options:
   --tui / --gui      choose the terminal or graphical interface
   -v, --view         open files read-only
+  -B, --backup       keep the previous file as NAME~
+  -S, --softwrap     wrap long lines on screen
+  -l, --linenumbers  display line numbers
+  -E, --tabstospaces insert spaces when typing Tab
+  -T, --tabsize N    display tabs at N columns (1–32)
+  -H, --historylog   persist search and replacement history
+  -G, --locking      warn about files in use by another editor
+  -I, --ignorercfiles use default preferences for this session
+  -i, --autoindent   indent new lines automatically
+  -m, --mouse        enable TUI mouse support
   --fresh            start without restoring the previous workspace
   --editor-only      show only the editor, regardless of startup settings
   --workspace        show the full workspace, regardless of startup settings
@@ -88,7 +100,8 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Launch> {
     };
     let mut pending: Option<(usize, Option<usize>)> = None;
     let mut options = true;
-    for arg in args {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
         let text = arg.to_str();
         if options {
             match text {
@@ -118,6 +131,45 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Launch> {
                 }
                 Some("-v" | "--view") => {
                     launch.read_only = true;
+                    continue;
+                }
+                Some(
+                    "-B" | "--backup" | "-S" | "--softwrap" | "-l" | "--linenumbers" | "-E"
+                    | "--tabstospaces" | "-H" | "--historylog" | "-G" | "--locking" | "-i"
+                    | "--autoindent" | "-m" | "--mouse",
+                ) => {
+                    let key = match text.unwrap() {
+                        "-B" | "--backup" => "backup",
+                        "-S" | "--softwrap" => "soft_wrap",
+                        "-l" | "--linenumbers" => "line_numbers",
+                        "-E" | "--tabstospaces" => "insert_spaces",
+                        "-H" | "--historylog" => "history_log",
+                        "-G" | "--locking" => "locking",
+                        "-i" | "--autoindent" => "auto_indent",
+                        _ => "tui_mouse",
+                    };
+                    launch.options.insert(key.into(), "true".into());
+                    continue;
+                }
+                Some("-I" | "--ignorercfiles") => {
+                    launch.ignore_rc = true;
+                    continue;
+                }
+                Some("-T" | "--tabsize") => {
+                    let n = args
+                        .next()
+                        .context("--tabsize requires a number")?
+                        .to_string_lossy()
+                        .parse::<usize>()
+                        .context("Invalid tab size")?;
+                    anyhow::ensure!((1..=32).contains(&n), "Tab size must be 1–32");
+                    launch.options.insert("tab_width".into(), n.to_string());
+                    continue;
+                }
+                Some(s) if s.starts_with("--tabsize=") => {
+                    let n = s[10..].parse::<usize>().context("Invalid tab size")?;
+                    anyhow::ensure!((1..=32).contains(&n), "Tab size must be 1–32");
+                    launch.options.insert("tab_width".into(), n.to_string());
                     continue;
                 }
                 Some("--new-instance") => {
@@ -183,7 +235,13 @@ pub fn start(launch: &Launch) -> Result<crate::App> {
     let stdin = if launch.stdin.is_some() {
         use std::io::Read;
         let mut bytes = vec![];
-        std::io::stdin().read_to_end(&mut bytes)?;
+        std::io::stdin()
+            .take(crate::document::MAX_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() <= crate::document::MAX_FILE_BYTES,
+            "Standard input exceeds the 1 GiB document limit"
+        );
         Some(bytes)
     } else {
         None
@@ -195,6 +253,26 @@ pub fn start(launch: &Launch) -> Result<crate::App> {
         }
     }
     Ok(app)
+}
+
+pub(crate) fn apply_launch_options(
+    p: &mut crate::preferences::Preferences,
+    options: &std::collections::BTreeMap<String, String>,
+) {
+    for (key, value) in options {
+        match key.as_str() {
+            "backup" => p.backup = true,
+            "soft_wrap" => p.soft_wrap = true,
+            "line_numbers" => p.line_numbers = true,
+            "insert_spaces" => p.insert_spaces = true,
+            "history_log" => p.history_log = true,
+            "locking" => p.locking = true,
+            "auto_indent" => p.auto_indent = true,
+            "tui_mouse" => p.tui_mouse = true,
+            "tab_width" => p.tab_width = value.parse().unwrap_or(4),
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]

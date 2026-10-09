@@ -30,6 +30,10 @@ pub struct Language {
     pub formatter: Option<Vec<String>>,
     #[serde(default)]
     pub roots: Vec<String>,
+    #[serde(default)]
+    pub settings: serde_json::Value,
+    #[serde(default)]
+    pub initialization_options: serde_json::Value,
 }
 
 /// `server = ["a", "--x"]` or `server = [["a"], ["b"]]`.
@@ -67,6 +71,8 @@ fn builtin() -> Vec<Language> {
                 server: servers.iter().map(|s| strings(s)).collect(),
                 formatter: formatter.map(strings),
                 roots: strings(roots),
+                settings: serde_json::Value::Null,
+                initialization_options: serde_json::Value::Null,
             }
         };
     vec![

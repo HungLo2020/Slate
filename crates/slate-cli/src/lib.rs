@@ -145,6 +145,7 @@ fn tab_regions(tabs: &[slate_core::Tab], width: u16) -> Vec<TabRegion> {
 /// Prompts answered with a single key (no text field).
 const CHOICE_PROMPTS: &[&str] = &[
     "close-tab",
+    "switch-workspace",
     "trash-file",
     "quit",
     "save-read-only",
@@ -831,7 +832,10 @@ fn clean(s: &str) -> String {
         .collect()
 }
 /// Text, title and height of each prompt kind.
-fn prompt_view(prompt: &slate_core::search::Prompt) -> (String, &'static str, u16) {
+fn prompt_view(
+    prompt: &slate_core::search::Prompt,
+    search: &slate_core::search::Search,
+) -> (String, &'static str, u16) {
     let input = clean(&prompt.input);
     match prompt.kind.as_str() {
         "trash-file" => (format!("Move {input} to desktop Trash?\nY: move to Trash · N / Escape: cancel"), "Move to Trash", 5),
@@ -870,15 +874,19 @@ fn prompt_view(prompt: &slate_core::search::Prompt) -> (String, &'static str, u1
             "Workspace trust",
             5,
         ),
+        "switch-workspace" => (format!("Open {input}?\nY / S: save all first · N / D: discard changes · Escape: cancel"), "Open folder", 5),
         "reload-changed" => (
             format!("Reload {input} from disk and discard your unsaved changes?\nY: reload · N / Escape: keep editing"),
             "Reload",
             5,
         ),
-        "replace" => (
-            format!("Find: {input}\nWith: {}\nTab switches fields · Enter replaces next · Ctrl-Enter replaces all\nEscape closes", clean(&prompt.replacement)),
-            "replace",
-            8,
+        "find" | "replace" => (
+            format!("Find: {input}{}\nAlt+C case: {} · Alt+W word: {}\nAlt+R regex: {} · Alt+S selection: {}\n↑ ↓ history · {} · Escape closes",
+                if prompt.kind == "replace" {format!("\nWith: {}",clean(&prompt.replacement))} else {String::new()},
+                if prompt.case_sensitive {"on"} else {"off"},if prompt.whole_word {"on"} else {"off"},
+                if search.regex_mode {"on"} else {"off"},if search.selection_only {"on"} else {"off"},
+                if prompt.kind == "replace" {"Tab fields · Enter replaces next · Ctrl-Enter all"} else {"Enter finds"}),
+            if prompt.kind == "replace" {"replace"} else {"Find"}, 9,
         ),
         kind => (
             format!("> {input}\nEnter confirms · Escape closes"),
@@ -894,6 +902,8 @@ fn prompt_view(prompt: &slate_core::search::Prompt) -> (String, &'static str, u1
                 "reopen-encoding" => "Reopen with encoding (utf-8, latin1, shift_jis…)",
                 "set-line-ending" => "Line endings: lf, crlf or cr",
                 "open-recent" => "Open recent file (path or number)",
+                "open-recent-project" => "Open recent project (path or number)",
+                "search-settings" => "Search settings JSON (include / exclude accept semicolon-separated globs)",
                 "rename-symbol" => "Rename symbol to",
                 "project-replace" => "Replace search results with",
                 "debug-evaluate" => "Evaluate expression",
@@ -1029,7 +1039,7 @@ fn render(
     }
     if let Some(prompt) = &s.prompt {
         let settings = prompt.kind == "settings";
-        let (text, title, height) = prompt_view(prompt);
+        let (text, title, height) = prompt_view(prompt, &s.search);
         let height = if settings {
             (s.settings.menu_items().len() as u16 + 4).min(size.height.saturating_sub(2))
         } else {

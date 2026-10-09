@@ -1,20 +1,27 @@
 mod accessibility;
 mod actions;
+mod budget;
 pub mod cli;
 pub mod commands;
+mod comparison;
 pub mod config;
 mod cursors;
 pub mod dap;
 pub mod desktop;
+mod diagnostics;
 pub mod document;
+mod document_search;
 mod editing;
+mod editorconfig;
 pub mod events;
+mod file_locks;
 mod files;
 mod folding;
 pub mod format;
 pub mod fsio;
 pub mod git;
 mod highlight;
+mod history;
 pub mod ide;
 pub mod instance;
 pub mod languages;
@@ -28,6 +35,8 @@ pub mod picker;
 pub mod preferences;
 mod presentation;
 pub mod process;
+#[cfg(test)]
+mod production_tests;
 pub mod profiles;
 pub mod project;
 mod recovery_io;
@@ -48,7 +57,9 @@ pub mod text_presentation;
 pub mod theme;
 pub mod tools;
 pub mod trust;
+mod user_state;
 pub mod workspace;
+mod workspace_edit;
 mod wrap;
 
 use anyhow::{bail, Context, Result};
@@ -88,6 +99,8 @@ pub struct EditorView {
     /// Carets beyond the primary one.
     #[serde(default, skip)]
     pub extra: Vec<cursors::Selection>,
+    #[serde(default, skip)]
+    pub rectangle_origin: Option<usize>,
     /// Folded regions, by the byte offset of their header line's start.
     #[serde(default)]
     pub folds: Vec<usize>,
@@ -124,6 +137,9 @@ pub enum Command {
         delta: i32,
     },
     OpenSettings,
+    OpenWorkspace {
+        path: PathBuf,
+    },
     PathDialogStart,
     PathDialogFinish {
         paths: Vec<PathBuf>,
@@ -157,6 +173,28 @@ pub enum Command {
     SetClipboard {
         text: String,
     },
+    ReportError {
+        message: String,
+    },
+    SearchHistory {
+        backward: bool,
+        #[serde(default)]
+        field: Option<usize>,
+    },
+    SetShortcut {
+        scope: String,
+        chord: String,
+        command: String,
+    },
+    SelectRectangle,
+    ConfigureSearch {
+        regex: bool,
+        selection_only: bool,
+    },
+    CancelSearch,
+    ConfigureProjectSearch {
+        policy: project::SearchPolicy,
+    },
     Search {
         query: String,
         #[serde(default)]
@@ -185,6 +223,14 @@ pub enum Command {
     },
     Prompt {
         kind: String,
+    },
+    UpdateSearchPrompt {
+        input: String,
+        replacement: String,
+        case_sensitive: bool,
+        whole_word: bool,
+        regex: bool,
+        selection_only: bool,
     },
     UpdatePrompt {
         input: String,
@@ -432,6 +478,7 @@ pub struct Snapshot {
     pub files: Vec<Entry>,
     pub git: Vec<GitEntry>,
     pub browser: String,
+    pub search: Search,
     pub status: String,
     pub dirty: bool,
     pub quit: bool,
@@ -456,6 +503,8 @@ pub struct Snapshot {
     /// Window title: the active document and the workspace folder.
     pub title: String,
     pub recent: Vec<String>,
+    pub recent_projects: Vec<String>,
+    pub project_search_policy: project::SearchPolicy,
     pub git_branch: String,
     pub git_repository: bool,
     pub git_busy: bool,
@@ -502,6 +551,7 @@ pub struct App {
     pub quit: bool,
     pub clipboard: String,
     browser: PathBuf,
+    pending_workspace: Option<PathBuf>,
     files: Vec<Entry>,
     expanded_folders: std::collections::BTreeSet<PathBuf>,
     pending_file: Option<PathBuf>,
@@ -548,11 +598,18 @@ pub struct App {
     pub terminal_frontend: bool,
     /// Search matches by (document, generation, query).
     #[allow(clippy::type_complexity)]
-    match_cache: Option<(u64, u64, String, std::sync::Arc<Vec<(usize, usize)>>)>,
+    document_search_state: document_search::State,
     disk_check_at: Instant,
     disk_check_pending: bool,
     disk_conflicts: std::collections::VecDeque<(u64, Document)>,
     recent: Vec<String>,
+    recent_projects: Vec<String>,
+    diff_inspections: BTreeMap<u64, comparison::Inspection>,
+    history: history::History,
+    diagnostics: diagnostics::Diagnostics,
+    file_locks: file_locks::FileLocks,
+    launch_options: BTreeMap<String, String>,
+    ignore_rc: bool,
     overview_cache: BTreeMap<u64, desktop::Overview>,
     overview_pending: BTreeMap<u64, (u64, usize)>,
     overview_workers: BTreeMap<u64, services::LatestWorker<desktop::OverviewRequest>>,
@@ -575,6 +632,7 @@ pub struct App {
     search_cancel: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The search that replace-in-files repeats, and the files it matched.
     last_search: Option<project::SearchOptions>,
+    project_search_policy: project::SearchPolicy,
     last_search_files: Vec<(PathBuf, Option<u64>)>,
     /// Files the last replace-in-files rewrote: (file, before, after).
     replace_backups: Vec<(PathBuf, Vec<u8>, Vec<u8>)>,
@@ -645,6 +703,18 @@ impl App {
         self.expire_tasks();
         self.debug_flush();
         self.watch_files();
+        self.update_file_locks();
+        self.record_diagnostic_status();
+        if self.pending_workspace.is_some()
+            && !self.dirty()
+            && self.saves.pending_save.is_empty()
+            && self.prompt.is_none()
+        {
+            let path = self.pending_workspace.take().unwrap();
+            if let Err(e) = self.switch_workspace(&path) {
+                self.status = format!("Workspace switch failed: {e:#}");
+            }
+        }
         self.schedule_highlight();
         if self.recovery.dirty && self.recovery.at.elapsed() >= Duration::from_secs(1) {
             self.checkpoint();
@@ -768,6 +838,7 @@ impl App {
         if !shared {
             self.views.retain(|_, v| v.document != doc);
             self.documents.remove(&doc);
+            self.diff_inspections.remove(&doc);
             self.highlights.remove(&doc);
             self.highlight_pending.remove(&doc);
         }
@@ -812,6 +883,7 @@ impl App {
             }
             self.views.remove(&view);
             self.documents.remove(&doc);
+            self.diff_inspections.remove(&doc);
             self.highlights.remove(&doc);
         }
     }
@@ -873,12 +945,16 @@ impl App {
         if let Err(e) = self.execute(cmd) {
             self.status = format!("Error: {e:#}");
         }
+        self.record_diagnostic_status();
         self.typing = false;
         self.sync_document_preferences();
         self.schedule_highlight();
     }
     /// Open a prompt of `kind`, filled with the selection for find and replace.
     fn open_prompt(&mut self, kind: String) -> Result<()> {
+        if matches!(kind.as_str(), "find" | "replace") {
+            self.history.begin();
+        }
         if ![
             "find",
             "replace",
@@ -937,12 +1013,21 @@ impl App {
     /// Act on the open prompt (`all`: the "all" choice, e.g. Replace All).
     fn submit_prompt(&mut self, all: bool) -> Result<()> {
         let p = self.prompt.clone().context("No active prompt")?;
+        self.remember_prompt_history(&p);
         match p.kind.as_str() {
             // Graphical frontends answer confirmations through
             // dialogs: `all` selects the alternative button.
             "save-read-only" | "save-elevated" | "reload-changed" => {
                 self.prompt = None;
                 self.confirm_pending(&p.kind)?;
+            }
+            "open-recent-project" => {
+                self.prompt = None;
+                self.open_recent_project(&p.input)?;
+            }
+            "search-settings" => {
+                self.search_settings(&p.input)?;
+                self.prompt = None;
             }
             "file-changed" => self.resolve_disk_conflict(!all),
             "trust" => self.answer_trust(true)?,
@@ -964,6 +1049,18 @@ impl App {
             "confirm-replace" => {
                 self.prompt = None;
                 self.replace_in_files(&p.replacement)?;
+            }
+            "switch-workspace" => {
+                self.prompt = None;
+                if all {
+                    let path = self
+                        .pending_workspace
+                        .take()
+                        .context("No workspace selected")?;
+                    self.switch_workspace(&path)?;
+                } else {
+                    self.save_all(false)?;
+                }
             }
             "quit" => {
                 self.prompt = None;
@@ -1070,6 +1167,22 @@ impl App {
                     ctrl,
                     alt,
                 })?;
+        } else if alt && shift && matches!(kind.as_str(), "press" | "drag") {
+            if let Some(View::Editor(id)) = self.layout.view(pane).cloned() {
+                let offset = self.click_offset(id, row, col);
+                if kind == "press" {
+                    let v = self.views.get_mut(&id).unwrap();
+                    v.anchor = Some(offset);
+                    v.cursor = offset;
+                    v.extra.clear();
+                    v.rectangle_origin = Some(offset);
+                } else {
+                    let from = self.views[&id]
+                        .rectangle_origin
+                        .unwrap_or(self.views[&id].cursor);
+                    self.select_rectangle(id, from, offset)?;
+                }
+            }
         } else if let (true, "press", Some(View::Editor(id))) =
             (alt, kind.as_str(), self.layout.view(pane).cloned())
         {
@@ -1178,6 +1291,7 @@ impl App {
                     self.scroll_columns(id, delta);
                 }
             }
+            Command::OpenWorkspace { path } => self.open_workspace(path)?,
             Command::OpenSettings => {
                 if !Preferences::path().exists() {
                     self.preferences.save()?;
@@ -1211,11 +1325,12 @@ impl App {
                         overwrite,
                     })?;
                 } else {
-                    if kind == "open-folder" {
-                        self.execute(Command::ShowWorkspace)?;
-                    }
                     for path in paths {
-                        self.execute(Command::Open { path })?;
+                        if kind == "open-folder" {
+                            self.open_workspace(path)?;
+                        } else {
+                            self.execute(Command::Open { path })?;
+                        }
                     }
                 }
             }
@@ -1253,13 +1368,80 @@ impl App {
             }
             Command::InvokeAction { id, argument } => self.invoke_action(&id, &argument)?,
             Command::SetClipboard { text } => self.clipboard = text,
+            Command::ReportError { message } => self.status = format!("Error: {message}"),
+            Command::SearchHistory { backward, field } => {
+                if let (Some(p), Some(field)) = (&mut self.prompt, field) {
+                    p.field = field.min(1);
+                }
+                self.search_history(backward)?;
+            }
+            Command::SetShortcut {
+                scope,
+                chord,
+                command,
+            } => self.set_shortcut(&scope, &chord, &command)?,
+            Command::SelectRectangle => {
+                let id = self.active_editor().context("Focus an editor first")?;
+                let v = &self.views[&id];
+                self.select_rectangle(
+                    id,
+                    v.anchor.context("Select the rectangle corners first")?,
+                    v.cursor,
+                )?;
+            }
+            Command::ConfigureSearch {
+                regex,
+                selection_only,
+            } => {
+                let scope = if selection_only
+                    && self.search.selection_only
+                    && self.search.scope.is_some()
+                {
+                    self.search.scope
+                } else if selection_only {
+                    let id = self.active_editor().context("Focus an editor first")?;
+                    let v = &self.views[&id];
+                    let a = v
+                        .anchor
+                        .context("Select text before searching within a selection")?;
+                    if a == v.cursor {
+                        bail!("Select text before searching within a selection");
+                    }
+                    Some((v.document, a.min(v.cursor), a.max(v.cursor)))
+                } else {
+                    None
+                };
+                let mut search = Search::new(
+                    self.search.query.clone(),
+                    self.search.case_sensitive,
+                    self.search.whole_word,
+                );
+                search.regex_mode = regex;
+                search.selection_only = selection_only;
+                search.scope = scope;
+                self.search = search;
+            }
+            Command::ConfigureProjectSearch { policy } => {
+                policy.validate().map_err(anyhow::Error::msg)?;
+                self.project_search_policy = policy;
+                if let Some(p) = &self.picker {
+                    if p.kind == "search" {
+                        self.picker_query(p.query.clone())?;
+                    }
+                }
+            }
+            Command::CancelSearch => {
+                self.document_search_state.cancel();
+                self.status = "Search cancelled".into();
+            }
+
             Command::Search {
                 query,
                 case_sensitive,
                 whole_word,
                 backward,
             } => {
-                self.search = Search::new(query, case_sensitive, whole_word);
+                self.set_search(query, case_sensitive, whole_word);
                 self.find(backward)?;
             }
             Command::Replace {
@@ -1269,7 +1451,7 @@ impl App {
                 case_sensitive,
                 whole_word,
             } => {
-                self.search = Search::new(query, case_sensitive, whole_word);
+                self.set_search(query, case_sensitive, whole_word);
                 self.replace_matches(&replacement, all)?;
             }
             Command::GoToLine { line } => {
@@ -1285,6 +1467,25 @@ impl App {
             }
             Command::Indent { outdent } => self.indent(outdent)?,
             Command::Prompt { kind } => self.open_prompt(kind)?,
+            Command::UpdateSearchPrompt {
+                input,
+                replacement,
+                case_sensitive,
+                whole_word,
+                regex,
+                selection_only,
+            } => {
+                self.execute(Command::UpdatePrompt {
+                    input,
+                    replacement,
+                    case_sensitive,
+                    whole_word,
+                })?;
+                self.execute(Command::ConfigureSearch {
+                    regex,
+                    selection_only,
+                })?;
+            }
             Command::UpdatePrompt {
                 input,
                 replacement,
@@ -1302,6 +1503,9 @@ impl App {
             Command::DismissPrompt => {
                 let kind = self.prompt.take().map(|p| p.kind).unwrap_or_default();
                 self.pending_close = None;
+                if kind == "switch-workspace" {
+                    self.pending_workspace = None;
+                }
                 if matches!(kind.as_str(), "rename-file" | "trash-file") {
                     self.pending_file = None;
                 }
@@ -2072,6 +2276,12 @@ impl App {
                 start + length
             }
         };
+        if let Some((scope_doc, a, b)) = &mut self.search.scope {
+            if *scope_doc == doc {
+                *a = position(*a);
+                *b = position(*b);
+            }
+        }
         let insertion = start == end;
         // Text inserted at a line start that contains a line break pushes
         // that line down: marks on it (folds, breakpoints) follow the line.
@@ -2231,6 +2441,17 @@ impl App {
                 }
                 _ => {}
             },
+            "switch-workspace" => {
+                if letter == "y" || letter == "s" {
+                    self.execute(Command::SubmitPrompt { all: false })?;
+                } else if letter == "n" || letter == "d" {
+                    self.execute(Command::SubmitPrompt { all: true })?;
+                } else if cancel || k.key == "Enter" {
+                    self.pending_workspace = None;
+                    self.prompt = None;
+                    self.status = "Workspace switch cancelled".into();
+                }
+            }
             "quit" => {
                 if letter == "y" || letter == "s" {
                     self.prompt = None;
@@ -2268,6 +2489,33 @@ impl App {
         Ok(true)
     }
     fn key(&mut self, k: Key) -> Result<()> {
+        if k.key == "Escape" && self.document_search_state.busy {
+            self.document_search_state.cancel();
+            self.status = "Search cancelled".into();
+            return Ok(());
+        }
+        if k.alt
+            && self
+                .prompt
+                .as_ref()
+                .is_some_and(|p| p.kind == "find" || p.kind == "replace")
+            && ["r", "s"].contains(&k.key.to_ascii_lowercase().as_str())
+        {
+            let regex = if k.key.eq_ignore_ascii_case("r") {
+                !self.search.regex_mode
+            } else {
+                self.search.regex_mode
+            };
+            let selection_only = if k.key.eq_ignore_ascii_case("s") {
+                !self.search.selection_only
+            } else {
+                self.search.selection_only
+            };
+            return self.execute(Command::ConfigureSearch {
+                regex,
+                selection_only,
+            });
+        }
         if self.choice_key(&k)? {
             return Ok(());
         }
@@ -2283,6 +2531,14 @@ impl App {
         }
         if self.prompt.as_ref().is_some_and(|p| p.kind == "settings") {
             return self.settings_key(&k);
+        }
+        if matches!(k.key.as_str(), "Up" | "Down")
+            && self
+                .prompt
+                .as_ref()
+                .is_some_and(|p| matches!(p.kind.as_str(), "find" | "replace"))
+        {
+            return self.search_history(k.key == "Up");
         }
         if let Some(p) = &mut self.prompt {
             match k.key.as_str() {
@@ -2667,7 +2923,9 @@ impl App {
             "open" | "open-folder" | "save-as" if args.is_empty() => {
                 Some(Command::Prompt { kind: verb.into() })
             }
-            "open" | "open-folder" => Some(Command::Open { path: args.into() }),
+            "open" => Some(Command::Open { path: args.into() }),
+            "select-rectangle" => Some(Command::SelectRectangle),
+            "open-folder" => Some(Command::OpenWorkspace { path: args.into() }),
             "save" => Some(Command::Save),
             "save-as" => Some(Command::SaveAs {
                 path: args.into(),
@@ -2750,6 +3008,16 @@ impl App {
 
 /// Command-line verbs handled by `actions.rs`.
 const ACTION_VERBS: &[&str] = &[
+    "signature-help",
+    "open-recent-project",
+    "support-report",
+    "search-settings",
+    "diff-side-by-side",
+    "stage-hunk",
+    "unstage-hunk",
+    "accept-ours",
+    "accept-theirs",
+    "accept-both",
     "profile-save",
     "profile-load",
     "new-file",

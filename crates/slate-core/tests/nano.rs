@@ -156,8 +156,8 @@ fn encodings_and_line_endings_can_be_changed() {
     action(&mut app, "reopen-encoding", "latin1");
     wait(&mut app, |a| text(a) != "Ã©");
     assert!(app.status.starts_with("Reloaded"), "{}", app.status);
-    // Each UTF-8 byte becomes one windows-1252 character.
-    assert_eq!(text(&app), "Ã\u{192}Â©");
+    // Each UTF-8 byte becomes one exact ISO-8859-1 character.
+    assert_eq!(text(&app), "Ã\u{83}Â©");
     // Opening a legacy file from inside Slate reports its encoding.
     let legacy = dir.path().join("legacy.txt");
     fs::write(&legacy, b"caf\xe9").unwrap();

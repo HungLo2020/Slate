@@ -26,7 +26,13 @@ const SHOWN: usize = 500;
 /// The workspace index is refreshed when older than this.
 const INDEX_AGE: std::time::Duration = std::time::Duration::from_secs(10);
 
-pub(crate) type SearchRequest = (PathBuf, SearchOptions, HashMap<PathBuf, ropey::Rope>, u64);
+pub(crate) type SearchRequest = (
+    PathBuf,
+    SearchOptions,
+    crate::project::SearchPolicy,
+    HashMap<PathBuf, ropey::Rope>,
+    u64,
+);
 type FilterRequest = (u64, Arc<Vec<Entry>>, String);
 /// One worker retains only the newest query; stale matching stops between files.
 pub(crate) struct FilterWorker {
@@ -304,7 +310,14 @@ impl App {
     }
 
     pub fn picker_view(&self) -> Option<PickerView> {
-        self.picker.as_ref().map(Picker::view)
+        self.picker.as_ref().map(|p| {
+            let mut view = p.view();
+            if p.kind == "search" {
+                let policy = &self.project_search_policy;
+                view.message.push_str(&format!(" · hidden {} · ignored {} · max {} MiB · include: {} · exclude: {} · Alt+H/I toggle · search-settings",if policy.hidden {"on"} else {"off"},if policy.ignored {"on"} else {"off"},policy.max_bytes/(1024*1024),if policy.include.is_empty() {"all"} else {&policy.include},if policy.exclude.is_empty() {"none"} else {&policy.exclude}));
+            }
+            view
+        })
     }
 
     /// Open a picker: files, symbols, documents, search or diagnostics.
@@ -479,18 +492,15 @@ impl App {
         let output = self.services.reply_sender();
         let worker = self.search_worker.get_or_insert_with(|| {
             crate::services::LatestWorker::new(
-                move |(root, options, snapshots, generation): SearchRequest| {
+                move |(root, options, policy, snapshots, generation): SearchRequest| {
                     if cancel.load(Ordering::Relaxed) != generation {
                         return;
                     }
-                    let buffers = snapshots
-                        .into_iter()
-                        .map(|(path, rope)| (path, rope.to_string()))
-                        .collect();
-                    let result = crate::project::search(
+                    let result = crate::project::search_ropes(
                         &root,
                         &options,
-                        &buffers,
+                        &policy,
+                        &snapshots,
                         &cancel,
                         generation,
                         |hits| output.send(Reply::SearchHits(generation, hits)).is_ok(),
@@ -499,7 +509,13 @@ impl App {
                 },
             )
         });
-        worker.submit((root, options, snapshots, generation));
+        worker.submit((
+            root,
+            options,
+            self.project_search_policy.clone(),
+            snapshots,
+            generation,
+        ));
         Ok(())
     }
 
@@ -534,7 +550,11 @@ impl App {
         }
     }
 
-    pub(crate) fn search_done(&mut self, generation: u64, result: Result<usize, String>) {
+    pub(crate) fn search_done(
+        &mut self,
+        generation: u64,
+        result: Result<crate::project::SearchReport, String>,
+    ) {
         let Some(p) = self
             .picker
             .as_mut()
@@ -552,7 +572,8 @@ impl App {
             })
             .collect::<std::collections::BTreeSet<_>>()
             .len();
-        p.message = match result {
+        let exclusions = result.as_ref().map(|r| format!(" · skipped {} oversized, {} unreadable, {} binary/invalid · hidden {}, ignored {}", r.large, r.unreadable, r.binary, if self.project_search_policy.hidden { "included" } else { "excluded" }, if self.project_search_policy.ignored { "included" } else { "excluded" })).unwrap_or_default();
+        p.message = match result.map(|r| r.matches) {
             Ok(0) => "No results".into(),
             Ok(n) if n >= crate::project::MATCH_LIMIT => {
                 format!(
@@ -567,6 +588,7 @@ impl App {
             ),
             Err(e) => e,
         };
+        p.message.push_str(&exclusions);
     }
 
     pub(crate) fn picker_move(&mut self, delta: i32) {
@@ -599,6 +621,8 @@ impl App {
             "case" => p.options.case_sensitive = !p.options.case_sensitive,
             "word" => p.options.whole_word = !p.options.whole_word,
             "regex" => p.options.regex = !p.options.regex,
+            "hidden" => self.project_search_policy.hidden = !self.project_search_policy.hidden,
+            "ignored" => self.project_search_policy.ignored = !self.project_search_policy.ignored,
             _ => bail!("Unknown search option: {name}"),
         }
         self.start_search()
@@ -659,10 +683,14 @@ impl App {
                 self.picker_query(query)?;
             }
             ("h", true, false) | ("H", true, false) => self.begin_replace_in_files()?,
-            (key, false, true) if ["c", "w", "r"].contains(&key.to_lowercase().as_str()) => {
+            (key, false, true)
+                if ["c", "w", "r", "i", "h"].contains(&key.to_lowercase().as_str()) =>
+            {
                 let name = match key.to_lowercase().as_str() {
                     "c" => "case",
                     "w" => "word",
+                    "i" => "ignored",
+                    "h" => "hidden",
                     _ => "regex",
                 };
                 self.picker_option(name)?;

@@ -610,40 +610,51 @@ impl App {
         }
     }
     pub fn flush_workspace(&mut self) -> Result<()> {
-        let (tx, rx) = std::sync::mpsc::sync_channel(0);
+        self.flush_diagnostics();
         let deadline = Instant::now() + std::time::Duration::from_secs(15);
-        // Submission is nonblocking too: a saturated request queue must be
-        // drained during shutdown rather than abandon pending saves/recovery.
         loop {
-            match self.services.io.send(IoJob::Flush(tx.clone())) {
-                Ok(()) => break,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        && Instant::now() < deadline =>
-                {
-                    self.poll();
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+            let (tx, rx) = std::sync::mpsc::sync_channel(0);
+            // Submission is nonblocking too: a saturated request queue must be
+            // drained during shutdown rather than abandon pending saves/recovery.
+            loop {
+                match self.services.io.send(IoJob::Flush(tx.clone())) {
+                    Ok(()) => break,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        self.poll();
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) => return Err(error.into()),
             }
-        }
-        drop(tx);
-        loop {
-            // A bounded reply queue must keep draining while the I/O barrier
-            // waits, otherwise its worker can block before reaching Flush.
+            drop(tx);
+            loop {
+                // A bounded reply queue must keep draining while the I/O barrier
+                // waits, otherwise its worker can block before reaching Flush.
+                self.poll();
+                match rx.recv_timeout(std::time::Duration::from_millis(5)) {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        anyhow::bail!("Recovery worker stopped")
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        if Instant::now() >= deadline =>
+                    {
+                        anyhow::bail!("Recovery flush timed out")
+                    }
+                    Err(_) => {}
+                }
+            }
             self.poll();
-            match rx.recv_timeout(std::time::Duration::from_millis(5)) {
-                Ok(()) => break,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    anyhow::bail!("Recovery worker stopped")
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if Instant::now() >= deadline => {
-                    anyhow::bail!("Recovery flush timed out")
-                }
-                Err(_) => {}
+            if self.saves.pending_save.is_empty() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("Save flush timed out");
             }
         }
-        self.poll();
         if let Some(store) = &self.recovery.store {
             if let Err(error) = write_checkpoint(&store.path, &self.workspace()) {
                 self.recovery.warning = Some(format!(
@@ -665,6 +676,7 @@ impl Drop for App {
     fn drop(&mut self) {
         // Tasks run in their own process groups, so nothing else stops them.
         self.kill_tasks();
+        self.flush_diagnostics();
         if self.recovery.store.is_some() {
             if let Err(e) = self.flush_workspace() {
                 eprintln!("Could not persist Slate workspace: {e:#}");

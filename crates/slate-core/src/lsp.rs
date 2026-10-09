@@ -50,6 +50,7 @@ struct Server {
     root: PathBuf,
     process: crate::rpc::Process,
     capabilities: Value,
+    settings: Value,
     ready: bool,
     /// Messages held until the server has initialized.
     queue: Vec<Value>,
@@ -67,6 +68,11 @@ struct OpenDoc {
 #[derive(Debug)]
 enum Pending {
     Initialize,
+    Signature {
+        doc: u64,
+        offset: usize,
+        version: u64,
+    },
     Hover {
         doc: u64,
         offset: usize,
@@ -337,10 +343,25 @@ fn text_edits(d: &crate::document::Document, edits: &Value) -> Replacements {
     out
 }
 
-fn checked_text_edits(d: &crate::document::Document, edits: &Value) -> Result<Replacements> {
+pub(crate) fn checked_text_edits(
+    d: &crate::document::Document,
+    edits: &Value,
+) -> Result<Replacements> {
     let list = edits
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("Invalid text edits; nothing was changed"))?;
+    anyhow::ensure!(
+        list.len() <= 10_000,
+        "Text edit exceeds 10,000 replacements or is not an array"
+    );
+    let inserted = list
+        .iter()
+        .map(|edit| edit["newText"].as_str().map_or(0, str::len))
+        .sum::<usize>();
+    anyhow::ensure!(
+        inserted <= 16 * 1024 * 1024,
+        "Text edit exceeds 16 MiB of inserted text"
+    );
     for edit in list {
         anyhow::ensure!(
             edit["newText"].is_string(),
@@ -506,6 +527,7 @@ impl App {
             "method": "initialize",
             "params": {
                 "processId": std::process::id(),
+                "initializationOptions": language.initialization_options,
                 "clientInfo": {"name": "Slate", "version": env!("CARGO_PKG_VERSION")},
                 "rootUri": root_uri,
                 "rootPath": root.to_string_lossy(),
@@ -515,7 +537,7 @@ impl App {
                     "window": {"workDoneProgress": true, "showMessage": {}},
                     "workspace": {
                         "applyEdit": true,
-                        "workspaceEdit": {"documentChanges": true},
+                        "workspaceEdit": {"documentChanges": true, "resourceOperations": ["create", "rename", "delete"], "failureHandling": "transactional"},
                         "configuration": true,
                         "workspaceFolders": true,
                         "symbol": {}
@@ -523,6 +545,7 @@ impl App {
                     "textDocument": {
                         "synchronization": {"didSave": true, "dynamicRegistration": false},
                         "hover": {"contentFormat": ["plaintext", "markdown"]},
+                        "signatureHelp": {"signatureInformation": {"documentationFormat": ["plaintext", "markdown"], "parameterInformation": {"labelOffsetSupport": true}}, "contextSupport": true},
                         "completion": {
                             "completionItem": {"snippetSupport": true, "documentationFormat": ["plaintext"]},
                             "contextSupport": true
@@ -551,6 +574,7 @@ impl App {
                 root,
                 process,
                 capabilities: Value::Null,
+                settings: language.settings.clone(),
                 ready: false,
                 queue: Vec::new(),
                 queued_bytes: 0,
@@ -883,7 +907,7 @@ impl App {
         match (id, method) {
             // A request from the server.
             (Some(id), Some(method)) => {
-                let result = self.server_request(&method, &message["params"]);
+                let result = self.server_request(server, &method, &message["params"]);
                 if let Some(s) = self.lsp.servers.get(&server) {
                     s.process
                         .send(&json!({"jsonrpc": "2.0", "id": id, "result": result}));
@@ -916,12 +940,33 @@ impl App {
         }
     }
 
-    fn server_request(&mut self, method: &str, params: &Value) -> Value {
+    fn server_request(&mut self, server: u64, method: &str, params: &Value) -> Value {
         match method {
             "workspace/configuration" => Value::Array(
                 params["items"]
                     .as_array()
-                    .map(|items| items.iter().map(|_| Value::Null).collect())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .map(|item| {
+                                let mut value = self
+                                    .lsp
+                                    .servers
+                                    .get(&server)
+                                    .map(|s| &s.settings)
+                                    .unwrap_or(&Value::Null);
+                                for part in item["section"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .split('.')
+                                    .filter(|s| !s.is_empty())
+                                {
+                                    value = &value[part];
+                                }
+                                value.clone()
+                            })
+                            .collect()
+                    })
                     .unwrap_or_default(),
             ),
             "workspace/applyEdit" => {
@@ -1037,6 +1082,7 @@ impl App {
                     s.ready = true;
                     s.process
                         .send(&json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+                    s.process.send(&json!({"jsonrpc": "2.0", "method": "workspace/didChangeConfiguration", "params": {"settings": s.settings}}));
                     s.queued_bytes = 0;
                     for message in std::mem::take(&mut s.queue) {
                         s.process.send(&message);
@@ -1046,6 +1092,33 @@ impl App {
                         .unwrap_or(&s.language)
                         .to_string();
                     self.status = format!("{name} ready");
+                }
+            }
+            Pending::Signature {
+                doc,
+                offset,
+                version,
+            } => {
+                if self
+                    .documents
+                    .get(&doc)
+                    .is_some_and(|d| d.content_version() == version)
+                {
+                    let signatures = result["signatures"].as_array();
+                    let index = result["activeSignature"].as_u64().unwrap_or(0) as usize;
+                    if let Some(signature) =
+                        signatures.and_then(|s| s.get(index).or_else(|| s.first()))
+                    {
+                        let label = signature["label"].as_str().unwrap_or("");
+                        let documentation = hover_text(&signature["documentation"]);
+                        self.lsp.hover = Some(Hover {
+                            doc,
+                            offset,
+                            text: format!("{label}\n{documentation}"),
+                        });
+                    } else {
+                        self.status = "No signature here".into();
+                    }
                 }
             }
             Pending::Hover { doc, offset, quiet } => {
@@ -1326,6 +1399,9 @@ impl App {
     /// versions). Open documents change in the editor; closed files open as
     /// unsaved documents, so the whole edit can be reviewed, undone or
     /// saved. Returns the number of files changed.
+    pub(crate) fn lsp_version(&self, id: u64) -> Option<i64> {
+        self.lsp.docs.get(&id).map(|d| d.version)
+    }
     pub(crate) fn apply_workspace_edit(
         &mut self,
         edit: &Value,
@@ -1336,7 +1412,7 @@ impl App {
         if let Some(changes) = edit["documentChanges"].as_array() {
             for change in changes {
                 if change["kind"].is_string() {
-                    bail!("Edits that create, rename or delete files are not supported");
+                    return self.apply_resource_edit(edit, expected);
                 }
                 let path = change["textDocument"]["uri"]
                     .as_str()
@@ -1355,6 +1431,7 @@ impl App {
                 per_file.push((path, None, edits.clone()));
             }
         }
+        anyhow::ensure!(per_file.len() <= 128, "Workspace edit exceeds 128 files");
         let root = self
             .root
             .canonicalize()
@@ -1405,6 +1482,10 @@ impl App {
                     plan.push((Target::Open(doc), replacements));
                 }
                 None => {
+                    anyhow::ensure!(
+                        std::fs::metadata(&path)?.len() <= 16 * 1024 * 1024,
+                        "Closed-file edit exceeds 16 MiB"
+                    );
                     let d = crate::document::Document::open(&path)?;
                     let replacements = checked_text_edits(&d, &edits)?;
                     d.checkpoint().replace_many(&replacements, 0)?;
@@ -1508,6 +1589,25 @@ impl App {
             "position": json_position(self.documents[&doc].position(offset)),
         });
         Ok(Some((id, doc, server, offset, params)))
+    }
+
+    pub(crate) fn lsp_signature(&mut self) -> Result<()> {
+        let Some((_, doc, server, offset, mut params)) = self.editor_position("signature-help")?
+        else {
+            return Ok(());
+        };
+        params["context"] = json!({"triggerKind": 1, "isRetrigger": false});
+        self.request(
+            server,
+            "textDocument/signatureHelp",
+            params,
+            Pending::Signature {
+                doc,
+                offset,
+                version: self.documents[&doc].content_version(),
+            },
+        );
+        Ok(())
     }
 
     pub(crate) fn lsp_hover(&mut self) -> Result<()> {
@@ -2085,6 +2185,15 @@ impl App {
         let Some(server) = self.lsp.docs.get(&doc).map(|d| d.server) else {
             return;
         };
+        let signature_trigger = self
+            .lsp
+            .servers
+            .get(&server)
+            .and_then(|s| s.capabilities["signatureHelpProvider"]["triggerCharacters"].as_array())
+            .is_some_and(|triggers| triggers.iter().any(|t| t.as_str() == Some(typed)));
+        if signature_trigger {
+            let _ = self.lsp_signature();
+        }
         let triggers: Vec<String> = self
             .lsp
             .servers

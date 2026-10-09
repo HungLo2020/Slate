@@ -111,12 +111,20 @@ pub enum GitJob {
         untracked: bool,
     },
     Run(Context, Vec<OsString>),
+    Comparison {
+        context: Context,
+        path: OsString,
+        display: String,
+        staged: bool,
+        untracked: bool,
+    },
+    Hunk(std::sync::Arc<crate::comparison::Preview>, usize),
 }
 
 pub enum GitReply {
     Status(Result<GitState, String>),
     Operation(Result<String, String>),
-    Output(String, String),
+    Preview(Result<crate::comparison::Preview, String>),
 }
 
 #[cfg(unix)]
@@ -162,7 +170,17 @@ pub fn handle(job: GitJob) -> GitReply {
             display,
             staged,
             untracked,
-        } => diff(&context, path, &display, staged, untracked),
+        } => preview(context, path, display, staged, untracked, false),
+        GitJob::Comparison {
+            context,
+            path,
+            display,
+            staged,
+            untracked,
+        } => preview(context, path, display, staged, untracked, true),
+        GitJob::Hunk(preview, index) => {
+            GitReply::Operation(crate::comparison::apply_hunk(&preview, index))
+        }
         GitJob::Run(context, args) => GitReply::Operation(operation(&context, args)),
     }
 }
@@ -194,54 +212,56 @@ fn operation(context: &Context, mut list: Vec<OsString>) -> Result<String, Strin
     }
 }
 
-fn diff(
-    context: &Context,
+fn preview(
+    context: Context,
     path: OsString,
-    display: &str,
+    display: String,
     staged: bool,
     untracked: bool,
+    side_by_side: bool,
 ) -> GitReply {
-    let mut list = args(&["diff", "--no-ext-diff", "--no-textconv"]);
+    let result =
+        load_patch(&context, &path, staged, untracked).map(|patch| crate::comparison::Preview {
+            context,
+            path,
+            display,
+            staged,
+            untracked,
+            patch,
+            side_by_side,
+        });
+    GitReply::Preview(result)
+}
+pub(crate) fn load_patch(
+    context: &Context,
+    path: &std::ffi::OsStr,
+    staged: bool,
+    untracked: bool,
+) -> Result<String, String> {
+    let mut list = args(&["diff", "--no-ext-diff", "--no-textconv", "--no-color"]);
     if untracked {
         list.extend(args(&["--no-index", "--", "/dev/null"]));
-        list.push(path);
     } else {
         if staged {
             list.push("--cached".into());
         }
         list.push("--".into());
-        list.push(path);
     }
-    match run(context, &list, READ_TIMEOUT) {
-        Ok(result) if result.status.success() || (untracked && result.status.code() == Some(1)) => {
-            let mut text = String::from_utf8_lossy(&result.stdout).into_owned();
-            if text.is_empty() {
-                text =
-                    "No changes in this comparison. Refresh Git if the file changed externally.\n"
-                        .into();
-            }
-            if text.len() > 2 * 1024 * 1024 {
-                let mut end = 2 * 1024 * 1024;
-                while !text.is_char_boundary(end) {
-                    end -= 1;
-                }
-                text.truncate(end);
-                text.push_str("\n[Diff preview truncated at 2 MiB]\n");
-            }
-            let kind = if untracked {
-                "Untracked"
-            } else if staged {
-                "Staged diff"
-            } else {
-                "Working diff"
-            };
-            GitReply::Output(format!("{kind} · {display}"), text)
-        }
-        Ok(result) => {
-            GitReply::Operation(Err(String::from_utf8_lossy(&result.stderr).trim().into()))
-        }
-        Err(e) => GitReply::Operation(Err(e)),
+    list.push(path.to_owned());
+    let result = run(context, &list, READ_TIMEOUT)?;
+    if !result.status.success() && !(untracked && result.status.code() == Some(1)) {
+        return Err(String::from_utf8_lossy(&result.stderr).trim().into());
     }
+    let mut text = String::from_utf8(result.stdout).map_err(|_| "Diff is not UTF-8".to_string())?;
+    if text.len() > 2 * 1024 * 1024 {
+        let mut end = 2 * 1024 * 1024;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("\n[Diff preview truncated at 2 MiB]\n");
+    }
+    Ok(text)
 }
 
 fn status(context: &Context) -> Result<GitState, String> {

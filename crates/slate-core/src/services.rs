@@ -12,24 +12,33 @@ use std::{
 };
 
 /// A single cancellable service keeps the latest queued request, never a thread per key.
-type LatestState<T> = std::sync::Arc<(std::sync::Mutex<(Option<T>, bool)>, std::sync::Condvar)>;
+type LatestState<T> = std::sync::Arc<(
+    std::sync::Mutex<(Option<T>, bool, bool)>,
+    std::sync::Condvar,
+)>;
 pub(crate) struct LatestWorker<T> {
     state: LatestState<T>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 impl<T: Send + 'static> LatestWorker<T> {
     pub(crate) fn new(mut run: impl FnMut(T) + Send + 'static) -> Self {
         let state = std::sync::Arc::new((
-            std::sync::Mutex::new((None, false)),
+            std::sync::Mutex::new((None, false, false)),
             std::sync::Condvar::new(),
         ));
         let inbox = state.clone();
-        thread::spawn(move || loop {
+        let thread = thread::spawn(move || loop {
             let (lock, changed) = &*inbox;
             let mut state = lock.lock().unwrap();
             while state.0.is_none() && !state.1 {
                 state = changed.wait(state).unwrap();
             }
             if state.1 {
+                let last = if state.2 { state.0.take() } else { None };
+                drop(state);
+                if let Some(last) = last {
+                    run(last);
+                }
                 break;
             }
             let mut request = state.0.take().unwrap();
@@ -37,6 +46,11 @@ impl<T: Send + 'static> LatestWorker<T> {
             thread::sleep(std::time::Duration::from_millis(35));
             let mut state = lock.lock().unwrap();
             if state.1 {
+                if state.2 {
+                    request = state.0.take().unwrap_or(request);
+                    drop(state);
+                    run(request);
+                }
                 break;
             }
             if let Some(latest) = state.0.take() {
@@ -45,7 +59,22 @@ impl<T: Send + 'static> LatestWorker<T> {
             drop(state);
             run(request);
         });
-        Self { state }
+        Self {
+            state,
+            thread: Some(thread),
+        }
+    }
+    /// Drain the most recent request and wait for its write before shutdown.
+    pub(crate) fn finish(mut self) {
+        {
+            let mut state = self.state.0.lock().unwrap();
+            state.1 = true;
+            state.2 = true;
+        }
+        self.state.1.notify_one();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
     pub(crate) fn submit(&self, request: T) {
         self.state.0.lock().unwrap().0 = Some(request);
@@ -76,6 +105,7 @@ pub enum Job {
 }
 pub enum IoJob {
     Open(u64, PathBuf),
+    PrepareSave(crate::saves::Preparation),
     FileOperation(crate::files::FileOperation),
     /// Reread a document's file, optionally decoding with a chosen encoding.
     Reload(u64, u64, PathBuf, Option<String>),
@@ -108,6 +138,14 @@ pub struct SaveFailure {
     pub snapshot: Option<Box<Document>>,
 }
 pub enum Reply {
+    PreparedSave(
+        Box<crate::saves::Preparation>,
+        Result<Box<crate::saves::Prepared>, String>,
+    ),
+    DocumentSearch(
+        crate::document_search::Request,
+        Result<crate::document_search::Outcome, String>,
+    ),
     Checkpoint(u64, Result<(), String>),
     Opened(u64, Result<Document, String>),
     FileOperation(crate::files::FileOperation, Result<(), String>),
@@ -119,14 +157,14 @@ pub enum Reply {
     Files(PathBuf, Result<Vec<Entry>, String>),
     Git(Result<GitState, String>),
     GitOperation(Result<String, String>),
-    Output(String, String),
+    GitPreview(Result<crate::comparison::Preview, String>),
     Spelling(Result<Vec<String>, String>),
     Disk(Vec<(u64, crate::document::DiskChange)>),
     /// The workspace file index for a root.
     Index(PathBuf, Vec<String>),
     Filtered(u64, Vec<(usize, Vec<u32>)>),
     SearchHits(u64, Vec<crate::project::Hit>),
-    SearchDone(u64, Result<usize, String>),
+    SearchDone(u64, Result<crate::project::SearchReport, String>),
     /// Grammar-based symbols of a document.
     Outline(u64, Vec<crate::outline::Symbol>),
     /// Files rewritten by replace-in-files.
@@ -183,7 +221,7 @@ impl JobSender {
     pub fn send(&self, job: Job) -> Result<(), std::io::Error> {
         use crate::git::GitJob;
         match job {
-            Job::Git(GitJob::Run(..)) => self.git_write.send(job),
+            Job::Git(GitJob::Run(..) | GitJob::Hunk(..)) => self.git_write.send(job),
             Job::Git(_) => self.git_read.send(job),
             _ => self.files.send(job),
         }
@@ -216,6 +254,13 @@ impl Services {
         thread::spawn(move || {
             while let Ok(job) = io_jobs.recv() {
                 let reply = match job {
+                    IoJob::PrepareSave(request) => {
+                        let result = request
+                            .prepare()
+                            .map(Box::new)
+                            .map_err(|e| format!("{e:#}"));
+                        Reply::PreparedSave(Box::new(request), result)
+                    }
                     IoJob::FileOperation(operation) => {
                         let result = operation.run();
                         Reply::FileOperation(operation, result)
@@ -329,7 +374,7 @@ impl Services {
                         Job::Git(job) => match crate::git::handle(job) {
                             crate::git::GitReply::Status(state) => Reply::Git(state),
                             crate::git::GitReply::Operation(result) => Reply::GitOperation(result),
-                            crate::git::GitReply::Output(title, text) => Reply::Output(title, text),
+                            crate::git::GitReply::Preview(result) => Reply::GitPreview(result),
                         },
                     };
                     if output.send(reply).is_err() {

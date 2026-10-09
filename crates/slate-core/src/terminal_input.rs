@@ -64,14 +64,9 @@ impl InputQueue {
         if bytes.is_empty() {
             return Ok(());
         }
-        self.state
-            .bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
-                queued
-                    .checked_add(bytes.len())
-                    .filter(|n| *n <= INPUT_BYTES)
-            })
-            .map_err(|_| Self::full())?;
+        if !crate::budget::reserve(&self.state.bytes, bytes.len(), INPUT_BYTES) {
+            return Err(Self::full());
+        }
         let message = Message {
             bytes: bytes.to_vec(),
             state: self.state.clone(),

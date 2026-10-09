@@ -2,6 +2,57 @@
 use crate::*;
 
 impl App {
+    pub(crate) fn open_workspace(&mut self, path: PathBuf) -> Result<()> {
+        let path = if path.is_absolute() {
+            path
+        } else {
+            self.root.join(path)
+        }
+        .canonicalize()?;
+        if !path.is_dir() {
+            bail!("Select a workspace folder");
+        }
+        if !self.terminal_frontend {
+            self.frontend_requests
+                .push(format!("open-workspace:{}", path.display()));
+        } else if path == self.root {
+            self.expand_workspace()?;
+            self.browse(path)?;
+        } else if !self.saves.pending_save.is_empty() {
+            bail!("Wait for saves to finish before switching workspaces");
+        } else if self.dirty() {
+            self.pending_workspace = Some(path.clone());
+            self.prompt = Some(search::Prompt {
+                kind: "switch-workspace".into(),
+                input: path.display().to_string(),
+                replacement: String::new(),
+                field: 0,
+                case_sensitive: false,
+                whole_word: false,
+            });
+        } else {
+            self.switch_workspace(&path)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn switch_workspace(&mut self, path: &Path) -> Result<()> {
+        let launch = cli::Launch {
+            directory: Some(path.to_path_buf()),
+            recover: true,
+            startup: Some(StartupMode::Workspace),
+            ..Default::default()
+        };
+        let mut next = Self::launch_with_events(&launch, None, self.events.clone())?;
+        next.terminal_frontend = self.terminal_frontend;
+        next.elevation_mode = self.elevation_mode;
+        next.inbox = self.inbox.clone();
+        next.enable_workspace(true)?;
+        self.flush_workspace()?;
+        *self = next;
+        self.revision += 1;
+        self.events.notify();
+        Ok(())
+    }
     pub fn new(path: &Path) -> Result<Self> {
         Self::new_with_startup(path, None)
     }
@@ -25,6 +76,13 @@ impl App {
     /// Build the initial session from parsed command-line arguments.
     /// `stdin` holds the bytes read for a `-` argument.
     pub fn launch(launch: &cli::Launch, stdin: Option<Vec<u8>>) -> Result<Self> {
+        Self::launch_with_events(launch, stdin, events::Events::default())
+    }
+    pub(crate) fn launch_with_events(
+        launch: &cli::Launch,
+        stdin: Option<Vec<u8>>,
+        events: events::Events,
+    ) -> Result<Self> {
         let directory = launch
             .directory
             .as_ref()
@@ -98,9 +156,9 @@ impl App {
         if let Some((pane_tabs, _)) = layout.pane_mut(2) {
             *pane_tabs = tabs;
         }
-        let events = events::Events::default();
         let mut app = Self {
             browser: root.clone(),
+            pending_workspace: None,
             root: root.clone(),
             documents,
             views,
@@ -153,11 +211,18 @@ impl App {
             misspellings: vec![],
             suspend_requested: false,
             terminal_frontend: true,
-            match_cache: None,
+            document_search_state: Default::default(),
             disk_check_at: Instant::now(),
             disk_check_pending: false,
             disk_conflicts: Default::default(),
             recent: desktop::load_recent(),
+            recent_projects: crate::desktop::load_projects(),
+            diff_inspections: Default::default(),
+            history: Default::default(),
+            diagnostics: Default::default(),
+            file_locks: Default::default(),
+            launch_options: launch.options.clone(),
+            ignore_rc: launch.ignore_rc,
             overview_cache: BTreeMap::new(),
             overview_pending: Default::default(),
             overview_workers: Default::default(),
@@ -173,6 +238,7 @@ impl App {
             index_pending: false,
             search_cancel: Default::default(),
             last_search: None,
+            project_search_policy: Default::default(),
             last_search_files: Vec::new(),
             replace_backups: Vec::new(),
             lsp: Default::default(),
@@ -226,6 +292,10 @@ impl App {
         if !notices.is_empty() {
             app.status = notices.join(" · ");
         }
+        if launch.directory.is_some() {
+            app.remember_project();
+        }
+        app.update_file_locks();
         app.refresh();
         Ok(app)
     }

@@ -208,6 +208,7 @@ impl App {
                 self.git.entries.clone()
             },
             browser: self.browser.to_string_lossy().into_owned(),
+            search: self.search.clone(),
             status: self.visible_status(),
             dirty: self.dirty(),
             quit: self.quit,
@@ -238,6 +239,8 @@ impl App {
             editor_only: self.editor_only,
             title: self.window_title(),
             recent: self.recent.clone(),
+            recent_projects: self.recent_projects.clone(),
+            project_search_policy: self.project_search_policy.clone(),
             git_branch: self.git.branch.clone(),
             git_repository: self.git.repository,
             git_busy: self.git.jobs > 0,
@@ -304,7 +307,7 @@ impl App {
             &self.selection_foreground,
             &self.search,
             self.preferences.line_numbers,
-            self.preferences_for_document(v.document).indent_width,
+            self.preferences_for_document(v.document).tab_width,
             self.preferences_for_document(v.document).soft_wrap,
             self.preferences.show_whitespace,
         ))
@@ -363,7 +366,7 @@ impl App {
         graphical: bool,
     ) -> (Screen, Vec<Vec<text_presentation::TextSpan>>) {
         let options = self.preferences_for_document(self.views[&id].document);
-        let tab = options.indent_width;
+        let tab = options.tab_width;
         let wrapping = options.soft_wrap;
         {
             let v = self.views.get_mut(&id).unwrap();
@@ -597,6 +600,15 @@ impl App {
                             c.fg = format!("#{:06x}", span.fg);
                             c.bold = span.bold;
                             c.italic = span.italic;
+                        }
+                        if self.diff_inspections.contains_key(&doc_id) {
+                            let prefix = line_slice.chars().next();
+                            if prefix == Some('+') {
+                                c.fg = "#268b47".into();
+                            }
+                            if prefix == Some('-') {
+                                c.fg = "#d14b4b".into();
+                            }
                         }
                         while match_index < ranges.len() && ranges[match_index].1 <= i {
                             match_index += 1;

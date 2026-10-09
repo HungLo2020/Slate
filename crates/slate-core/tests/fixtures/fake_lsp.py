@@ -115,7 +115,13 @@ def handle(message):
     method = message.get("method")
     params = message.get("params", {})
     mid = message.get("id")
-    if method == "initialize":
+    if method is None and mid == 1001 and DUMP:
+        with open(os.path.join(DUMP, "configuration.json"), "w") as f:
+            json.dump(message.get("result"), f)
+    elif method == "initialize":
+        if DUMP:
+            with open(os.path.join(DUMP, "initialize.json"), "w") as f:
+                json.dump(params, f)
         # Exercise server-to-client requests during start-up.
         send({"id": next_id, "method": "window/workDoneProgress/create", "params": {"token": "load"}})
         next_id += 1
@@ -126,6 +132,7 @@ def handle(message):
             "capabilities": {
                 "textDocumentSync": {"openClose": True, "change": 2, "save": True},
                 "hoverProvider": True,
+                "signatureHelpProvider": {"triggerCharacters": ["("]},
                 "definitionProvider": True,
                 "referencesProvider": True,
                 "renameProvider": True,
@@ -138,6 +145,12 @@ def handle(message):
     elif method == "initialized":
         send({"method": "$/progress", "params": {"token": "load", "value": {"kind": "begin", "title": "Indexing"}}})
         send({"method": "$/progress", "params": {"token": "load", "value": {"kind": "end"}}})
+    elif method == "workspace/didChangeConfiguration":
+        if DUMP:
+            with open(os.path.join(DUMP, "settings.json"), "w") as f:
+                json.dump(params["settings"], f)
+    elif method == "textDocument/signatureHelp":
+        send({"id": mid, "result": {"signatures": [{"label": "call(arg: int)", "documentation": "Argument documentation"}], "activeSignature": 0, "activeParameter": 0}})
     elif method == "textDocument/didOpen":
         doc = params["textDocument"]
         docs[doc["uri"]] = doc["text"]

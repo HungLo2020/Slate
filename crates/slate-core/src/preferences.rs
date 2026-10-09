@@ -25,6 +25,10 @@ impl std::str::FromStr for StartupMode {
 pub struct Preferences {
     pub profile: String,
     pub indent_width: usize,
+    /// Zero follows indent_width.
+    pub tab_width: usize,
+    pub history_log: bool,
+    pub locking: bool,
     pub insert_spaces: bool,
     pub auto_indent: bool,
     pub line_numbers: bool,
@@ -272,6 +276,9 @@ impl Default for Preferences {
         Self {
             profile: "default".into(),
             indent_width: 4,
+            tab_width: 0,
+            history_log: false,
+            locking: false,
             insert_spaces: true,
             auto_indent: true,
             line_numbers: true,
@@ -549,6 +556,9 @@ impl Preferences {
         if self.font_family.len() > 200 {
             bail!("font_family is too long");
         }
+        if self.tab_width > 32 {
+            bail!("tab_width must be 0–32");
+        }
         if self.global_keys.len()
             + self.editor_keys.len()
             + self.terminal_keys.len()
@@ -647,12 +657,17 @@ impl App {
         Ok(())
     }
     pub(super) fn load_preferences(&mut self) {
-        match crate::profiles::Layers::load(&self.root) {
+        match if self.ignore_rc {
+            Ok(crate::profiles::Layers::default())
+        } else {
+            crate::profiles::Layers::load(&self.root)
+        } {
             Ok(layers) => self.install_preferences(layers),
             Err(e) => self.status = format!("Settings error: {e:#}"),
         }
     }
-    pub(crate) fn install_preferences(&mut self, layers: crate::profiles::Layers) {
+    pub(crate) fn install_preferences(&mut self, mut layers: crate::profiles::Layers) {
+        crate::cli::apply_launch_options(&mut layers.base, &self.launch_options);
         self.preference_layers = layers;
         self.sync_document_preferences();
         self.overview_cache.clear();
@@ -680,6 +695,9 @@ impl App {
         };
         match name {
             "indent-width" => settings.indent_width = value.parse()?,
+            "tab-width" => settings.tab_width = value.parse()?,
+            "history-log" => settings.history_log = flag(value)?,
+            "locking" => settings.locking = flag(value)?,
             "insert-spaces" => settings.insert_spaces = flag(value)?,
             "auto-indent" => settings.auto_indent = flag(value)?,
             "line-numbers" => settings.line_numbers = flag(value)?,
@@ -756,6 +774,44 @@ impl App {
     }
     pub(super) fn light_theme(&self) -> bool {
         crate::theme::is_light(&self.colors.1)
+    }
+}
+
+impl App {
+    pub(crate) fn set_shortcut(&mut self, scope: &str, chord: &str, command: &str) -> Result<()> {
+        if crate::preferences::Preferences::path().exists() {
+            crate::preferences::Preferences::load()
+                .context("Fix settings.toml before changing shortcuts")?;
+        }
+        anyhow::ensure!(chord.len() <= 64 && !chord.is_empty(), "Enter a key chord");
+        let mut parts: Vec<_> = chord.split('+').collect();
+        let key = parts.pop().unwrap();
+        anyhow::ensure!(
+            !key.is_empty() && parts.iter().all(|p| ["Ctrl", "Alt", "Shift"].contains(p)),
+            "Use Ctrl+Shift+s or a key name such as F9"
+        );
+        anyhow::ensure!(
+            command.is_empty() || self.resolve_command_line(command).is_some(),
+            "Unknown command"
+        );
+        let mut p = self.preference_layers.base.clone();
+        let table = match scope {
+            "global" => &mut p.global_keys,
+            "editor" => &mut p.editor_keys,
+            "terminal" => &mut p.terminal_keys,
+            "debug" => &mut p.debug_keys,
+            _ => bail!("Unknown shortcut scope"),
+        };
+        if command.is_empty() {
+            table.remove(chord);
+        } else {
+            table.insert(chord.into(), command.into());
+        }
+        p.validate()?;
+        self.persist_profile_preferences(&p)?;
+        self.load_preferences();
+        self.status = "Shortcut saved".into();
+        Ok(())
     }
 }
 

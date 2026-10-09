@@ -205,11 +205,32 @@ can also show hover information (Alt+H, or rest the mouse on a word in the
 desktop editor), go to a definition, find references, rename a symbol across
 the workspace, apply code actions, format the document, and list the
 document's or workspace's symbols. Renames and code actions open the files they
-change as unsaved tabs, so every change can be reviewed and undone; edits
+change as unsaved tabs, so text changes can be reviewed and undone; edits
 computed for an older version of a file, or for files outside the workspace,
 are refused. **Format on save** is a setting. **Language servers** lists the
-running servers and their progress. Files without a server get an outline from
+running servers and their progress. **Signature help** shows parameter information and opens on server-advertised trigger characters. Files without a server get an outline from
 their syntax grammar.
+
+Language entries also accept nested `settings` and `initialization-options` tables:
+
+```toml
+[[language]]
+name = "Rust"
+server = ["rust-analyzer"]
+[language.settings.rust-analyzer.check]
+command = "clippy"
+[language.initialization-options]
+# Server-specific initialization values
+```
+
+Settings are supplied to `workspace/configuration` by section and via
+`workspace/didChangeConfiguration`. Reload settings/restart servers after changing
+a language entry. LSP create/rename/delete operations are validated in order with
+text edits before disk mutation. Failed disk operations are rolled back. Text edits
+remain unsaved and undoable; resource changes on disk are immediate. Operations
+are limited to 128 entries / 16 MiB of existing files, inside the workspace, and
+regular files only. Directories, symlinks, deletion of dirty buffers and overwriting
+open rename destinations are refused explicitly.
 
 ### Finding things
 
@@ -230,7 +251,12 @@ their syntax grammar.
 | Ctrl+F8 / Ctrl+Shift+F8 | Next / previous problem |
 
 Project search runs in the background as you type, searches unsaved documents
-as edited, and skips binary and ignored files. Results can be clicked, and long
+as edited. The search dialog exposes include/exclude globs (semicolon-separated),
+hidden and ignored file switches, and a per-file size limit (16 MiB by default).
+The terminal picker accepts Alt+H/Alt+I for visibility; **Project search settings**
+edits the same policy as JSON. Results report oversized, unreadable and binary/invalid
+files that were skipped. The limit applies to dirty buffers too; previews are bounded.
+Results can be clicked, and long
 lists page in as you scroll. Replace in files changes open documents in the
 editor and rewrites the others. It skips files that changed since the search
 and files with mixed line endings, and says so. **Undo replace in files** puts
@@ -240,6 +266,38 @@ These keys are in the default keymap. The finding keys also work from the file
 and Git panes, but never in a terminal, so shells keep Ctrl+P, Ctrl+E and
 Alt+arrows.
 
+Find and replace support **Regex** and **Selection** checkboxes in the GUI, or
+Alt+R / Alt+S in the terminal prompt. Regex replacements accept `$1`, `${name}`
+and `$$` for a literal dollar. Selection scope retains the initially selected
+region as matches move the caret. Up/Down recalls prompt history; enable
+`history_log = true` or `--historylog` to retain it across sessions.
+
+The Git pane offers unified and **Side-by-side diff** views. **Stage hunk** and
+**Unstage hunk** use the hunk under the cursor and refuse stale previews. New/deleted,
+renamed, binary or truncated previews require whole-file staging. Conflicted
+working documents offer **Conflict: accept ours/theirs/both** at the caret; these
+are undoable buffer edits. Save and stage the result when ready.
+
+`.editorconfig` applies indentation, separate tab width, line endings, UTF-8
+(with/without BOM), UTF-16LE/BE and exact Latin-1, trailing-whitespace trimming and
+final-newline insertion. The precedence for editor defaults is profile → global
+editor overrides → EditorConfig → workspace editor overrides → language overrides.
+Save formatting uses the destination's EditorConfig, runs on the I/O worker, and
+is undoable. Reload Settings refreshes the cached files. Trimming is limited to
+10,000 affected lines per save; an unrepresentable encoding or oversized edit
+refuses the save without changing the buffer or file.
+
+GUI Open Folder creates another workspace window. TUI Open Folder switches the
+root, configuration, tools, Git, trust and recovery session, asking to save/discard
+unsaved buffers first. Recent Projects is available in the File menu and command
+palette. Window geometry is saved locally and clamped to available screens at
+startup. GUI Settings includes a shortcut editor for global/editor/terminal/debug
+scopes. `locking = true` / `--locking` enables advisory file-in-use warnings;
+these do not prevent editing and do not replace save-conflict detection.
+
+See [the changelog](CHANGELOG.md) and [support/release policy](docs/SUPPORT.md) for
+supported distributions, compiler versions, recovery formats and diagnostics.
+
 ### Editing
 
 | Key | Action |
@@ -248,6 +306,7 @@ Alt+arrows.
 | Ctrl+Shift+L or Alt+Shift+L | A caret on every occurrence |
 | Ctrl+Alt+Up / Down | Add a caret above / below |
 | Alt+click | Add or remove a caret |
+| Alt+Shift+drag | Rectangular selection (tabs/graphemes respected, short lines clamped) |
 | Escape | Back to one caret |
 | Ctrl+Shift+[ / Ctrl+Shift+] or Alt+- / Alt+= | Fold / unfold the indented region (or click ▾/▸ in the gutter) |
 | Ctrl+Tab / Ctrl+Shift+Tab (or Ctrl+PageDown / PageUp) | Next / previous tab |
@@ -452,7 +511,9 @@ Slate stores no separate publishing credentials. Failed downloads never run an
 old cached manager. Publishing checks that the workspace version is newer than
 all published Slate versions, builds the package, reads `builds/latest-build.env`
 without evaluating shell code, validates the package name/version/architecture,
-and uploads with overwrite protection. `--dry-run` builds and validates without
+and uploads with overwrite protection. Real publication also requires clean,
+committed, pushed `main`, a successful latest **Slate checks** push workflow for
+that commit, and a package embedding that exact clean source commit. `--dry-run` builds and validates without
 uploading; `--package PATH` selects an already built package and skips rebuilding.
 Before the next release, bump `[workspace.package].version` in Cargo.toml, the
 source of truth; the build updates Cargo.lock to match. Generated packages and
@@ -469,8 +530,10 @@ slate`; subsequent releases arrive through normal APT updates.
   create untitled buffers, save, and save as a new file.
 - Grapheme-aware cursor movement, selection, mouse selection, copy/cut/paste,
   configurable line numbers, incremental undo/redo, and multiple documents.
-- Unicode literal search, forward/backward wrapping, match-case and whole-word
-  options, match highlighting, replace-next and undoable replace-all.
+- Unicode literal and regex search, forward/backward wrapping, match-case,
+  whole-word and selection scope; capture replacement, highlighting, replace-next
+  and undoable replace-all. Large operations run on a worker; replacement is limited
+  to 10,000 edits or 16 MiB of inserted text, with no partial change on overflow.
 - Go-to-line, configurable tab width/spaces, automatic indentation and selected
   line indentation/outdent. Syntax highlighting is shared by both frontends and
   runs on a separate worker using Syntect's bundled language definitions.

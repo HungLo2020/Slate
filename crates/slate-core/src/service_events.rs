@@ -17,6 +17,12 @@ impl App {
             }
             self.revision += 1;
             match reply {
+                Reply::PreparedSave(request, result) => {
+                    self.prepared_save(*request, result.map(|p| *p))
+                }
+                Reply::DocumentSearch(request, result) => {
+                    self.document_search_done(request, result)
+                }
                 Reply::Checkpoint(fingerprint, result) => {
                     self.checkpoint_finished(fingerprint, result)
                 }
@@ -83,26 +89,8 @@ impl App {
                 Reply::Formatted(doc, content, result) => self.formatted(doc, content, result),
                 Reply::Spelling(result) => self.spelling_result(result),
                 Reply::Disk(changes) => self.disk_changes(changes),
-                Reply::Output(_, _) if self.quit => {
-                    self.git.jobs = self.git.jobs.saturating_sub(1);
-                }
-                Reply::Output(title, text) => {
-                    self.git.jobs = self.git.jobs.saturating_sub(1);
-                    let doc = self.id();
-                    let d = Document::inspection(format!("{title} · read-only"), text);
-                    self.documents.insert(doc, d);
-                    let _ = self.editor_target();
-                    let view = self.id();
-                    self.views.insert(
-                        view,
-                        EditorView {
-                            document: doc,
-                            ..Default::default()
-                        },
-                    );
-                    self.add_tab(View::Editor(view));
-                    self.status = "Git diff · read-only".into();
-                }
+                Reply::GitPreview(Ok(preview)) => self.show_comparison(preview),
+                Reply::GitPreview(Err(error)) => self.git_operation_done(Err(error)),
                 _ => {}
             }
         }

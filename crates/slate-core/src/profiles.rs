@@ -24,6 +24,7 @@ pub fn validate_name(name: &str) -> Result<()> {
 #[derive(Clone, Copy)]
 pub(crate) struct EditorOptions {
     pub indent_width: usize,
+    pub tab_width: usize,
     pub insert_spaces: bool,
     pub auto_indent: bool,
     pub soft_wrap: bool,
@@ -36,6 +37,11 @@ impl From<&Preferences> for EditorOptions {
     fn from(p: &Preferences) -> Self {
         Self {
             indent_width: p.indent_width,
+            tab_width: if p.tab_width == 0 {
+                p.indent_width
+            } else {
+                p.tab_width
+            },
             insert_spaces: p.insert_spaces,
             auto_indent: p.auto_indent,
             soft_wrap: p.soft_wrap,
@@ -51,6 +57,7 @@ impl EditorOptions {
         macro_rules! install { ($($field:ident),*) => { $(p.$field = self.$field;)* }; }
         install!(
             indent_width,
+            tab_width,
             insert_spaces,
             auto_indent,
             soft_wrap,
@@ -65,6 +72,7 @@ impl EditorOptions {
 #[serde(default, deny_unknown_fields)]
 pub struct EditorOverrides {
     pub indent_width: Option<usize>,
+    pub tab_width: Option<usize>,
     pub insert_spaces: Option<bool>,
     pub auto_indent: Option<bool>,
     pub soft_wrap: Option<bool>,
@@ -78,6 +86,7 @@ impl EditorOverrides {
         macro_rules! apply { ($($field:ident),*) => { $(if let Some(value) = self.$field { p.$field = value; })* }; }
         apply!(
             indent_width,
+            tab_width,
             insert_spaces,
             auto_indent,
             soft_wrap,
@@ -91,6 +100,7 @@ impl EditorOverrides {
         macro_rules! sources { ($($field:ident),*) => { $(if self.$field.is_some() { out.insert(stringify!($field).into(), source.into()); })* }; }
         sources!(
             indent_width,
+            tab_width,
             insert_spaces,
             auto_indent,
             soft_wrap,
@@ -147,6 +157,7 @@ fn read(name: &str) -> Result<Profile> {
 
 pub(crate) struct Layers {
     pub base: Preferences,
+    pub(crate) editorconfig: crate::editorconfig::Cache,
     pub names: Vec<String>,
     global: Overrides,
     workspace: Overrides,
@@ -159,6 +170,7 @@ impl Default for Layers {
     fn default() -> Self {
         Self {
             base: Preferences::default(),
+            editorconfig: Default::default(),
             names: vec!["default".into(), "minimal".into(), "workspace".into()],
             global: Overrides::default(),
             workspace: Overrides::default(),
@@ -211,6 +223,7 @@ impl Layers {
             bail!("{error}");
         }
         Ok(Self {
+            editorconfig: Default::default(),
             base,
             names,
             active_path: None,
@@ -234,6 +247,14 @@ impl Layers {
     fn resolve(&self, path: Option<&Path>) -> EditorOptions {
         let mut p = EditorOptions::from(&self.base);
         self.global.editor.apply(&mut p);
+        if self.base.tab_width == 0 && self.global.editor.tab_width.is_none() {
+            p.tab_width = p.indent_width;
+        }
+        if let Some(path) = path {
+            if let Ok(settings) = self.editorconfig.get(path) {
+                settings.apply(&mut p);
+            }
+        }
         self.workspace.editor.apply(&mut p);
         if let Some(language) = self.language(path) {
             if let Some(overrides) = self.global.language.get(&language) {
@@ -269,6 +290,22 @@ impl App {
             .global
             .editor
             .sources("Global editor overrides", &mut out);
+        if let Some(path) = self
+            .active_editor()
+            .and_then(|id| self.documents[&self.views[&id].document].path.as_deref())
+        {
+            if let Ok(settings) = self.preference_layers.editorconfig.get(path) {
+                if settings.indent.is_some() {
+                    out.insert("indent_width".into(), "EditorConfig".into());
+                }
+                if settings.tab.is_some() {
+                    out.insert("tab_width".into(), "EditorConfig".into());
+                }
+                if settings.spaces.is_some() {
+                    out.insert("insert_spaces".into(), "EditorConfig".into());
+                }
+            }
+        }
         self.preference_layers
             .workspace
             .editor

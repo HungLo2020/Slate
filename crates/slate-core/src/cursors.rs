@@ -374,24 +374,30 @@ impl App {
     /// The word around a caret, as a byte range.
     fn word_at(&self, id: u64, offset: usize) -> Option<(usize, usize)> {
         let doc = &self.documents[&self.views[&id].document];
-        let line = doc.line_of(offset);
-        let (start, _) = doc.line_range(line);
-        let text = doc.line_text(line);
-        let column = offset - start;
+        let rope = doc.rope();
+        let middle = rope.byte_to_char(offset);
         let is_word = |c: char| c.is_alphanumeric() || c == '_';
-        let left = text[..column]
-            .char_indices()
-            .rev()
-            .take_while(|(_, c)| is_word(*c))
-            .last()
-            .map_or(column, |(i, _)| i);
-        let right = text[column..]
-            .char_indices()
-            .find(|(_, c)| !is_word(*c))
-            .map_or(text.trim_end_matches(['\n', '\r']).len(), |(i, _)| {
-                column + i
-            });
-        (left < right).then_some((start + left, start + right))
+        let mut left = middle;
+        let mut right = middle;
+        for c in rope.chars_at(middle).reversed() {
+            if !is_word(c) {
+                break;
+            }
+            left -= 1;
+            if middle - left > 64 * 1024 {
+                return None;
+            }
+        }
+        for c in rope.slice(middle..).chars() {
+            if !is_word(c) {
+                break;
+            }
+            right += 1;
+            if right - left > 64 * 1024 {
+                return None;
+            }
+        }
+        (left < right).then(|| (rope.char_to_byte(left), rope.char_to_byte(right)))
     }
 
     /// Ctrl+D: select the word at the caret, then add the next occurrence of
@@ -412,29 +418,13 @@ impl App {
             self.set_selections(id, all);
             return Ok(());
         }
-        let doc = &self.documents[&self.views[&id].document];
-        let needle = doc.slice(start, end).into_owned();
-        let after = selections.iter().map(|s| s.range().1).max().unwrap_or(end);
-        let text = doc.text();
-        let found = text[after..]
-            .find(&needle)
-            .map(|i| after + i)
-            .or_else(|| text.find(&needle))
-            .filter(|at| !selections.iter().any(|s| s.range().0 == *at));
-        let Some(at) = found else {
-            bail!("No more occurrences");
-        };
-        let mut all = selections;
-        all.insert(
-            0,
-            Selection {
-                cursor: at + needle.len(),
-                anchor: Some(at),
-            },
-        );
-        self.set_selections(id, all);
-        self.status = crate::counted(self.selections(id).len(), "cursor", "cursors");
-        Ok(())
+        if selections.len() >= MAX_CURSORS {
+            bail!("Cursor limit reached");
+        }
+        self.document_search(crate::document_search::Mode::Occurrences {
+            selections,
+            all: false,
+        })
     }
 
     /// Select every occurrence of the selection (or the word at the caret).
@@ -446,27 +436,42 @@ impl App {
                 .word_at(id, start)
                 .ok_or_else(|| anyhow::anyhow!("No word at the cursor"))?;
         }
-        let doc = &self.documents[&self.views[&id].document];
-        let needle = doc.slice(start, end).into_owned();
-        let text = doc.text();
-        let mut all: Vec<Selection> = text
-            .match_indices(&needle)
-            .take(MAX_CURSORS)
-            .map(|(at, _)| Selection {
-                cursor: at + needle.len(),
-                anchor: Some(at),
-            })
-            .collect();
-        // Keep the occurrence under the original caret primary.
-        if let Some(index) = all.iter().position(|s| s.range().0 == start) {
-            all.swap(0, index);
+        self.views.get_mut(&id).unwrap().anchor = Some(start);
+        self.views.get_mut(&id).unwrap().cursor = end;
+        self.document_search(crate::document_search::Mode::Occurrences {
+            selections: self.selections(id),
+            all: true,
+        })
+    }
+
+    /// Select a visual-column rectangle, clamping short lines and respecting graphemes and tabs.
+    pub(crate) fn select_rectangle(&mut self, id: u64, from: usize, to: usize) -> Result<()> {
+        let doc = self.views[&id].document;
+        let d = &self.documents[&doc];
+        let tab = self.preferences_for_document(doc).tab_width;
+        let (a, x) = d.line_col(from, tab);
+        let (b, y) = d.line_col(to, tab);
+        if a.abs_diff(b) >= MAX_CURSORS {
+            bail!("Rectangle exceeds {MAX_CURSORS} rows");
         }
-        let count = all.len();
-        self.set_selections(id, all);
-        self.status = format!(
-            "{} selected",
-            crate::counted(count, "occurrence", "occurrences")
-        );
+        let mut selections = Vec::new();
+        for line in a.min(b)..=a.max(b) {
+            let (start, end) = d.line_range(line);
+            let end = end - usize::from(end > start && d.slice(end - 1, end) == "\n");
+            let row = crate::wrap::Row {
+                start: 0,
+                end: end - start,
+                col: 0,
+            };
+            let anchor = self.offset_in_row(doc, line, row, x.min(y), true);
+            let cursor = self.offset_in_row(doc, line, row, x.max(y), true);
+            selections.push(Selection {
+                anchor: Some(anchor),
+                cursor,
+            });
+        }
+        self.set_selections(id, selections);
+        self.status = "Rectangular selection · type, cut or paste at each row".into();
         Ok(())
     }
 }

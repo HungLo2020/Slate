@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ast
 import gzip
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -189,6 +190,30 @@ def run(command: list[str], root: Path) -> int:
         return 127
 
 
+def ensure_release_source(root: Path) -> str:
+    """Real publication requires committed, pushed main and successful checks for its SHA."""
+    def output(command):
+        return subprocess.run(command, cwd=root, check=True, capture_output=True, text=True).stdout.strip()
+    if output(["git", "status", "--porcelain"]):
+        raise ValueError("Publication requires a clean committed source tree")
+    if output(["git", "branch", "--show-current"]) != "main":
+        raise ValueError("Publication requires main")
+    head = output(["git", "rev-parse", "HEAD"])
+    remote = output(["gh", "api", "repos/HungLo2020/Slate/branches/main", "--jq", ".commit.sha"])
+    if remote != head:
+        raise ValueError("Publication requires HEAD to be pushed to origin/main")
+    runs = json.loads(output(["gh", "run", "list", "--repo", "HungLo2020/Slate", "--workflow", "checks.yml", "--commit", head, "--event", "push", "--limit", "20", "--json", "headSha,status,conclusion"]))
+    if not runs or runs[0].get("headSha") != head or runs[0].get("status") != "completed" or runs[0].get("conclusion") != "success":
+        raise ValueError("Publication requires the latest Slate checks push workflow to succeed for HEAD")
+    return head
+
+
+def validate_artifact_source(artifact: Path, head: str) -> None:
+    result = subprocess.run(["dpkg-deb", "--show", "--showformat=${X-Slate-Source-Commit}\n${X-Slate-Source-Dirty}\n", "--", str(artifact)], check=True, capture_output=True, text=True)
+    if result.stdout.splitlines() != [head, "false"]:
+        raise ValueError("Package must have been built from this clean committed HEAD")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("doctor", "publish"))
@@ -220,6 +245,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[publish] ERROR: {error}", file=sys.stderr)
         return 1
 
+    try:
+        source_head = None if args.dry_run else ensure_release_source(root)
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        print(f"[publish] ERROR: source/CI gate failed: {error}", file=sys.stderr)
+        return 1
+
     if args.package is None:
         print("[publish] Building Debian package", flush=True)
         status = run(["bash", str(root / "DevUtils/Build.sh")], root)
@@ -234,6 +265,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             artifact = resolve_deb_artifact({"BUILD_ARTIFACT_TYPE": "deb", "BUILD_ARTIFACT_PATH": str(args.package)}, Path.cwd())
         validate_deb_artifact(artifact, version)
+        if source_head is not None:
+            if ensure_release_source(root) != source_head:
+                raise ValueError("Source changed during the build")
+            validate_artifact_source(artifact, source_head)
         # Repeat the version check after building to catch concurrent publication.
         ensure_version_is_new(version, published_versions(fetch_packages_index()))
     except (OSError, ValueError, subprocess.CalledProcessError) as error:

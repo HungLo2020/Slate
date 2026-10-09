@@ -22,7 +22,7 @@ fn fixture(text: &str, trusted: bool) -> Fixture {
     fs::write(
         config.join("languages.toml"),
         format!(
-            "[[language]]\nname = \"Fake\"\nextensions = [\"fk\"]\nserver = [\"python3\", \"{}\"]\n",
+            "[[language]]\nname = \"Fake\"\nextensions = [\"fk\"]\nserver = [\"python3\", \"{}\"]\nsettings = {{ fake = {{ enabled = true }} }}\ninitialization-options = {{ fixture = true }}\n",
             server.display()
         ),
     )
@@ -504,4 +504,44 @@ fn servers_for_projects_outside_trusted_folders_do_not_start() {
     f.action("hover", "");
     let prompt = f.app.prompt.clone().expect("asks to trust that folder");
     assert!(prompt.input.contains("elsewhere"), "{}", prompt.input);
+}
+
+#[test]
+fn initialization_configuration_and_manual_and_triggered_signatures() {
+    let mut f = fixture("call\n", true);
+    f.synced();
+    let dump = f.dir.path().join("dump");
+    f.wait("configuration exchange", |_| {
+        dump.join("settings.json").exists() && dump.join("configuration.json").exists()
+    });
+    let read = |name: &str| -> serde_json::Value {
+        serde_json::from_slice(&fs::read(dump.join(name)).unwrap()).unwrap()
+    };
+    let init = read("initialize.json");
+    assert_eq!(init["initializationOptions"]["fixture"], true);
+    assert_eq!(
+        init["capabilities"]["workspace"]["workspaceEdit"]["resourceOperations"],
+        serde_json::json!(["create", "rename", "delete"])
+    );
+    assert_eq!(
+        read("settings.json"),
+        serde_json::json!({"fake":{"enabled":true}})
+    );
+    assert_eq!(
+        read("configuration.json"),
+        serde_json::json!([{"enabled":true}])
+    );
+    f.action("signature-help", "");
+    f.wait("manual signature", |a| {
+        a.hover_view().is_some_and(|h| {
+            h.text.contains("call(arg: int)") && h.text.contains("Argument documentation")
+        })
+    });
+    f.press("Escape");
+    assert!(f.app.hover_view().is_none());
+    f.typed("(");
+    f.wait("triggered signature", |a| {
+        a.hover_view()
+            .is_some_and(|h| h.text.contains("call(arg: int)"))
+    });
 }

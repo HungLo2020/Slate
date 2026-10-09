@@ -129,6 +129,8 @@ class PublishMattOSPackageTests(unittest.TestCase):
                 patch.object(publish, "read_workspace_version", return_value="0.4.0"),
                 patch.object(publish, "fetch_packages_index", return_value=PACKAGES_INDEX),
                 patch.object(publish, "dpkg_version_greater", side_effect=simple_greater),
+                patch.object(publish, "ensure_release_source", return_value="a" * 40),
+                patch.object(publish, "validate_artifact_source"),
                 patch.object(publish, "validate_deb_artifact") as validate,
                 patch.object(publish, "run", return_value=0) as run,
             ):
@@ -233,6 +235,7 @@ class UploadValidationTests(unittest.TestCase):
             patch.object(publish, "download_latest_script"),
             patch.object(publish, "read_workspace_version", return_value="0.1.0"),
             patch.object(publish, "fetch_packages_index", return_value=""),
+            patch.object(publish, "ensure_release_source", return_value="a" * 40),
             patch.object(publish, "run", return_value=7) as run,
         ):
             self.assertEqual(publish.main(["publish"]), 7)
@@ -257,3 +260,40 @@ class UploadValidationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ReleaseSourceGateTests(unittest.TestCase):
+    def run_output(self, text):
+        result = Mock()
+        result.stdout = text
+        return result
+
+    def test_clean_pushed_main_with_latest_success_is_required(self):
+        head = "a" * 40
+        success = publish.json.dumps([{"headSha": head, "status": "completed", "conclusion": "success"}])
+        for changed, branch, remote, runs, allowed in [
+            ("", "main", head, success, True),
+            (" M README.md", "main", head, success, False),
+            ("", "feature", head, success, False),
+            ("", "main", "b" * 40, success, False),
+            ("", "main", head, "[]", False),
+            ("", "main", head, publish.json.dumps([{"headSha": head, "status": "in_progress", "conclusion": None}]), False),
+            ("", "main", head, publish.json.dumps([{"headSha": head, "status": "completed", "conclusion": "failure"}]), False),
+        ]:
+            with self.subTest(changed=changed, branch=branch, remote=remote, runs=runs):
+                outputs = [changed, branch, head, remote, runs]
+                with patch.object(publish.subprocess, "run", side_effect=[self.run_output(s) for s in outputs]):
+                    if allowed:
+                        self.assertEqual(publish.ensure_release_source(Path("/source")), head)
+                    else:
+                        with self.assertRaises(ValueError):
+                            publish.ensure_release_source(Path("/source"))
+
+    def test_artifact_source_marker_must_match_clean_head(self):
+        head = "a" * 40
+        for commit, dirty, allowed in [(head,"false",True),(head,"true",False),("b"*40,"false",False),("","",False)]:
+            with patch.object(publish.subprocess,"run",return_value=self.run_output(f"{commit}\n{dirty}\n")):
+                if allowed:
+                    publish.validate_artifact_source(Path("artifact.deb"),head)
+                else:
+                    with self.assertRaises(ValueError):
+                        publish.validate_artifact_source(Path("artifact.deb"),head)

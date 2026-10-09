@@ -170,13 +170,7 @@ impl Process {
     pub fn send(&self, message: &Value) -> bool {
         let bytes = frame(message);
         let size = bytes.len();
-        if self
-            .queued_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                n.checked_add(size).filter(|n| *n <= QUEUE_BYTES)
-            })
-            .is_err()
-        {
+        if !crate::budget::reserve(&self.queued_bytes, size, QUEUE_BYTES) {
             self.terminate_overloaded();
             return false;
         }

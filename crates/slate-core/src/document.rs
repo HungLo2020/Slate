@@ -779,7 +779,7 @@ impl Document {
     /// Change how the document is stored. The change is saved like an edit.
     pub fn set_format(&mut self, format: TextFormat) -> Result<()> {
         self.locked()?;
-        text_format::encode_rope(&self.text, &format)?;
+        text_format::validate_rope(&self.text, &format)?;
         self.format = format;
         self.generation += 1;
         Ok(())

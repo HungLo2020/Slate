@@ -111,15 +111,12 @@ impl App {
         let (start, end) = d.line_range(line);
         let options = self.preferences_for_document(doc);
         if options.soft_wrap {
-            let key = (doc, d.generation, line, width, options.indent_width);
+            let key = (doc, d.generation, line, width, options.tab_width);
             if let Some(rows) = self.wrap_cache.lock().unwrap().get(&key) {
                 return rows.clone();
             }
-            let rows = std::sync::Arc::new(wrap::rows(
-                &d.slice(start, end),
-                width,
-                options.indent_width,
-            ));
+            let rows =
+                std::sync::Arc::new(wrap::rows(&d.slice(start, end), width, options.tab_width));
             let mut cache = self.wrap_cache.lock().unwrap();
             cache.retain(|(id, generation, ..), _| *id != doc || *generation == d.generation);
             if cache.len() >= 128
@@ -147,10 +144,7 @@ impl App {
         let (start, _) = d.line_range(line);
         let rows = self.line_rows(v.document, line, self.text_width(id));
         let row = wrap::row_of(&rows, offset - start);
-        let (_, col) = d.line_col(
-            offset,
-            self.preferences_for_document(v.document).indent_width,
-        );
+        let (_, col) = d.line_col(offset, self.preferences_for_document(v.document).tab_width);
         (line, row, col - rows[row].col)
     }
     /// The byte offset shown at a column of a visual row.
@@ -164,7 +158,7 @@ impl App {
     ) -> usize {
         let d = &self.documents[&doc];
         let (start, _) = d.line_range(line);
-        let tab = self.preferences_for_document(doc).indent_width;
+        let tab = self.preferences_for_document(doc).tab_width;
         let text = d.slice(start + row.start, start + row.end);
         let text = text.as_ref();
         let target = row.col + col;
@@ -696,25 +690,6 @@ impl App {
         };
         Ok(())
     }
-    fn statistics(&self) -> Result<String> {
-        let (_, v) = self.editor_view()?;
-        let d = &self.documents[&v.document];
-        let (text, scope) = match v.anchor {
-            Some(a) if a != v.cursor => (d.slice(a.min(v.cursor), a.max(v.cursor)), "Selection"),
-            _ => (std::borrow::Cow::Owned(d.text()), "Document"),
-        };
-        let lines = if text.is_empty() {
-            0
-        } else {
-            text.matches('\n').count() + usize::from(!text.ends_with('\n'))
-        };
-        Ok(format!(
-            "{scope}: {}, {}, {}",
-            crate::counted(lines, "line", "lines"),
-            crate::counted(text.split_whitespace().count(), "word", "words"),
-            crate::counted(text.chars().count(), "character", "characters")
-        ))
-    }
     fn location_report(&self) -> Result<String> {
         let (_, v) = self.editor_view()?;
         let d = &self.documents[&v.document];
@@ -723,8 +698,8 @@ impl App {
         let (start, end) = d.line_range(row);
         let col = d.slice(start, v.cursor).chars().count() + 1;
         let cols = d.slice(start, end).chars().count() + 1;
-        let chars = d.text.chars().count();
-        let char = d.slice(0, v.cursor).chars().count();
+        let chars = d.rope().len_chars();
+        let char = d.rope().byte_to_char(v.cursor);
         let pct = |a: usize, b: usize| a * 100 / b.max(1);
         Ok(format!(
             "line {}/{lines} ({}%), col {col}/{cols} ({}%), char {char}/{chars} ({}%)",
@@ -852,13 +827,18 @@ impl App {
         let mut format = doc.format.clone();
         change(&mut format)?;
         format.mixed_line_endings = false;
-        doc.set_format(format)?;
-        self.status = format!("Saving as {}", doc.format.label());
-        Ok(())
+        self.document_search(crate::document_search::Mode::Format(format))
     }
 
     /// Execute a named action. Arguments come from prompts or the command line.
     pub(crate) fn run_action(&mut self, name: &str, argument: &str) -> Result<()> {
+        if ["justify", "spell-check", "next-misspelling"].contains(&name) {
+            let (_, view) = self.editor_view()?;
+            anyhow::ensure!(
+                self.documents[&view.document].len() <= 1024 * 1024,
+                "This command is limited to 1 MiB documents; search and editing remain available"
+            );
+        }
         match name {
             "move-left" | "move-right" | "move-up" | "move-down" | "word-left" | "word-right"
             | "line-start" | "line-end" | "page-up" | "page-down" | "document-start"
@@ -890,7 +870,7 @@ impl App {
                 self.edit(id, &text)?;
             }
             "justify" => self.justify()?,
-            "word-count" => self.status = self.statistics()?,
+            "word-count" => self.document_search(crate::document_search::Mode::Statistics)?,
             "location" => self.status = self.location_report()?,
             "spell-check" => self.spell_check()?,
             "next-misspelling" => self.next_misspelling(false)?,
@@ -1056,6 +1036,15 @@ impl App {
                     .unwrap_or_else(|| target.to_string());
                 self.execute(Command::Open { path: path.into() })?;
             }
+            "open-recent-project" => self.open_recent_project(argument)?,
+            "support-report" => self.support_report(),
+            "search-settings" => self.search_settings(argument)?,
+            "diff-side-by-side" => self.request_comparison()?,
+            "stage-hunk" => self.stage_diff_hunk(false)?,
+            "unstage-hunk" => self.stage_diff_hunk(true)?,
+            "accept-ours" => self.resolve_conflict("ours")?,
+            "accept-theirs" => self.resolve_conflict("theirs")?,
+            "accept-both" => self.resolve_conflict("both")?,
             "clear-recent" => {
                 self.recent.clear();
                 let _ = std::fs::remove_file(crate::paths::state_dir().join("slate/recent.json"));
@@ -1129,6 +1118,10 @@ impl App {
             "undo-replace-in-files" => self.undo_replace_in_files()?,
             "open-documents" => self.open_picker("documents", argument)?,
             "problems" => self.open_picker("diagnostics", argument)?,
+            "signature-help" => self.lsp_signature()?,
+            "select-rectangle" => {
+                self.execute(crate::Command::SelectRectangle)?;
+            }
             "hover" => self.lsp_hover()?,
             "go-to-definition" => self.lsp_definition()?,
             "find-references" => self.lsp_references()?,

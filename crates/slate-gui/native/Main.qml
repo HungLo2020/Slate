@@ -360,6 +360,21 @@ ApplicationWindow {
             CommandMenuItem { actionId: "open"; label: "Open File…" }
             CommandMenuItem { actionId: "open-folder"; label: "Open Folder…" }
             Menu {
+                id: recentProjectsMenu
+                title: "Recent Projects"
+                enabled: (root.frame.recent_projects || []).length > 0
+                Instantiator {
+                    model: root.frame.recent_projects || []
+                    delegate: Basic.MenuItem {
+                        required property string modelData
+                        text: modelData
+                        onTriggered: root.invokeAction("open-recent-project", modelData)
+                    }
+                    onObjectAdded: function(index, object) { recentProjectsMenu.insertItem(index, object); }
+                    onObjectRemoved: function(index, object) { recentProjectsMenu.removeItem(object); }
+                }
+            }
+            Menu {
                 id: recentMenu
                 objectName: "recentMenu"
                 title: "Open Recent"
@@ -397,6 +412,7 @@ ApplicationWindow {
             CommandMenuItem { actionId: "close"; label: "Close Tab" }
             MenuSeparator {}
             CommandMenuItem { actionId: "settings"; label: "Settings…" }
+            CommandMenuItem { actionId: "support-report"; label: "Support Report" }
             CommandMenuItem { actionId: "settings-reload"; label: "Reload Settings" }
             MenuSeparator {}
             CommandMenuItem { actionId: "quit"; label: "Quit" }
@@ -1222,6 +1238,7 @@ ApplicationWindow {
                         label: "View diff"
                         visible: panel.paneData.kind === "git"
                     }
+                    CommandMenuItem { actionId: "diff-side-by-side"; commandPane: panel.paneId; label: "Side-by-side diff"; visible: panel.paneData.kind === "git" }
                     CommandMenuItem {
                         actionId: "commit"
                         commandPane: panel.paneId
@@ -1454,13 +1471,20 @@ ApplicationWindow {
             "action": "dismiss_prompt"
         })
         function update() {
-            root.send({
-                "action": "update_prompt",
+            var searching = prompt.kind === "find" || prompt.kind === "replace";
+            var command = {
+                "action": searching ? "update_search_prompt" : "update_prompt",
                 "input": promptInput.text,
                 "replacement": replacementInput.text,
                 "case_sensitive": matchCase.checked,
                 "whole_word": wholeWord.checked
-            });
+            };
+            if (searching) {command.regex = regexSearch.checked;command.selection_only = selectionSearch.checked;}
+            root.send(command);
+            if (searching) {
+                regexSearch.checked = !!(root.frame.search || {}).regex_mode;
+                selectionSearch.checked = !!(root.frame.search || {}).selection_only;
+            }
         }
         contentItem: ScrollView {
             id: promptScroll
@@ -1498,12 +1522,18 @@ ApplicationWindow {
                     onAccepted: root.send({
                         "action": "submit_prompt"
                     })
+                    Keys.onUpPressed: root.send({"action":"search_history","backward":true,"field":0})
+                    Keys.onDownPressed: root.send({"action":"search_history","backward":false,"field":0})
                     Keys.onPressed: function (event) {
                         // Alt+C / Alt+W toggle the options, as in the terminal.
                         if ((event.modifiers & Qt.AltModifier) && editPrompt.searching
-                                && (event.key === Qt.Key_C || event.key === Qt.Key_W)) {
+                                && (event.key === Qt.Key_C || event.key === Qt.Key_W || event.key === Qt.Key_R || event.key === Qt.Key_S)) {
                             if (event.key === Qt.Key_C)
                                 matchCase.checked = !matchCase.checked;
+                            else if (event.key === Qt.Key_R)
+                                regexSearch.checked = !regexSearch.checked;
+                            else if (event.key === Qt.Key_S)
+                                selectionSearch.checked = !selectionSearch.checked;
                             else
                                 wholeWord.checked = !wholeWord.checked;
                             editPrompt.update();
@@ -1517,7 +1547,9 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     visible: editPrompt.prompt.kind === "replace"
                     text: editPrompt.prompt.replacement
-                    placeholderText: "Replacement text"
+                    Keys.onUpPressed: root.send({"action":"search_history","backward":true,"field":1})
+                    Keys.onDownPressed: root.send({"action":"search_history","backward":false,"field":1})
+                    placeholderText: "Replacement text (regex: $1 or ${name})"
                     onTextEdited: editPrompt.update()
                     onAccepted: root.send({
                         "action": "submit_prompt"
@@ -1533,6 +1565,8 @@ ApplicationWindow {
                         checked: editPrompt.prompt.case_sensitive
                         onClicked: editPrompt.update()
                     }
+                    CheckBox { id: regexSearch; objectName: "regexSearch"; text: "Regex"; checked: !!(root.frame.search || {}).regex_mode; onClicked: editPrompt.update() }
+                    CheckBox { id: selectionSearch; objectName: "selectionSearch"; text: "Selection"; checked: !!(root.frame.search || {}).selection_only; onClicked: editPrompt.update() }
                     CheckBox {
                         id: wholeWord
                         text: "Whole word"
@@ -1557,6 +1591,7 @@ ApplicationWindow {
                         })
                     }
                     ActionButton {
+                        objectName: "replaceAll"
                         text: "Replace all"
                         visible: editPrompt.prompt.kind === "replace"
                         onClicked: root.send({
@@ -1651,6 +1686,12 @@ ApplicationWindow {
         width: Math.min(root.width - 40, 760)
         height: Math.min(root.height - 40, 520)
         modal: true
+        function configurePolicy() {
+            root.send({"action":"configure_project_search","policy":{
+                "include":projectInclude.text,"exclude":projectExclude.text,
+                "hidden":projectHidden.checked,"ignored":projectIgnored.checked,
+                "max_bytes":projectMax.value*1024*1024}});
+        }
         onOpened: pickerQuery.forceActiveFocus()
         onClosed: {
             if (!closing && root.frame.picker)
@@ -1710,6 +1751,19 @@ ApplicationWindow {
                 ActionButton {
                     text: "Replace…"
                     onClicked: root.send({"action": "action", "name": "replace-in-files", "argument": ""})
+                }
+            }
+            ColumnLayout {
+                visible: pickerDialog.info.kind === "search"
+                Layout.fillWidth: true
+                TextField { id: projectInclude; objectName: "projectInclude"; Layout.fillWidth: true; text: (root.frame.project_search_policy || {}).include || ""; placeholderText: "Include globs: *.rs;src/** (empty: all files)"; onEditingFinished: pickerDialog.configurePolicy() }
+                TextField { id: projectExclude; objectName: "projectExclude"; Layout.fillWidth: true; text: (root.frame.project_search_policy || {}).exclude || ""; placeholderText: "Exclude globs: target/**;vendor/**"; onEditingFinished: pickerDialog.configurePolicy() }
+                Flow {
+                    Layout.fillWidth: true; spacing: 6
+                    CheckBox { id: projectHidden; objectName: "projectHidden"; text: "Hidden files"; checked: !!(root.frame.project_search_policy || {}).hidden; onClicked: pickerDialog.configurePolicy() }
+                    CheckBox { id: projectIgnored; text: "Ignored files"; checked: !!(root.frame.project_search_policy || {}).ignored; onClicked: pickerDialog.configurePolicy() }
+                    Label { text: "Maximum MiB per file" }
+                    SpinBox { id: projectMax; from: 1; to: 1024; value: ((root.frame.project_search_policy || {}).max_bytes || 16777216)/1048576; onValueModified: pickerDialog.configurePolicy() }
                 }
             }
             ListView {
@@ -1951,6 +2005,28 @@ ApplicationWindow {
                         text: modelData.replace(/_/g, " ") + ": " + root.frame.setting_sources[modelData]
                     }
                 }
+                Label { text: "Keyboard shortcuts"; font.bold: true }
+                ComboBox { id: shortcutScope; model: ["global","editor","terminal","debug"] }
+                RowLayout {
+                    Layout.fillWidth: true
+                    TextField { id: shortcutChord; objectName: "shortcutChord"; Layout.fillWidth: true; placeholderText: "Ctrl+Shift+s" }
+                    TextField { id: shortcutCommand; objectName: "shortcutCommand"; Layout.fillWidth: true; placeholderText: "save-all" }
+                }
+                RowLayout {
+                    Button { objectName: "saveShortcut"; text: "Save shortcut"; onClicked: root.send({"action":"set_shortcut","scope":shortcutScope.currentText,"chord":shortcutChord.text,"command":shortcutCommand.text}) }
+                    Button { text: "Remove shortcut"; onClicked: root.send({"action":"set_shortcut","scope":shortcutScope.currentText,"chord":shortcutChord.text,"command":""}) }
+                }
+                Repeater {
+                    model: Object.keys(root.settings[shortcutScope.currentText + "_keys"] || {}).sort()
+                    delegate: Button {
+                        required property string modelData
+                        Layout.fillWidth: true
+                        text: modelData + " → " + root.settings[shortcutScope.currentText + "_keys"][modelData]
+                        onClicked: { shortcutChord.text = modelData; shortcutCommand.text = root.settings[shortcutScope.currentText + "_keys"][modelData]; }
+                    }
+                }
+                CheckBox { text: "Remember search history across sessions"; checked: !!root.settings.history_log; onClicked: settingsDialog.configure("history-log",checked.toString()) }
+                CheckBox { text: "Warn when a file is open in another editor"; checked: !!root.settings.locking; onClicked: settingsDialog.configure("locking",checked.toString()) }
                 Label { text: "Startup"; font.bold: true }
                 Repeater {
                     model: [

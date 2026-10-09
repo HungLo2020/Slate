@@ -804,7 +804,7 @@ static void startFeatureSmoke(Bridge *state, QQuickWindow *window) {
         const auto frame = state->frame();
         switch (*step) {
         case 0:
-            if (frame.value("git_busy").toBool() || *ticks < 10)
+            if (frame.value("git_busy").toBool() || *ticks < 20)
                 return;
             if (!frame.value("git_repository").toBool()) {
                 finish(false, "Git repository metadata missing");
@@ -816,7 +816,7 @@ static void startFeatureSmoke(Bridge *state, QQuickWindow *window) {
             *baseline = frame;
             break;
         case 1:
-            if (*ticks < 30)
+            if (*ticks < 40)
                 return;
             if (*builds !=
                     state->send({{"action", "diagnostics"}}).value("screen_builds").toULongLong() ||
@@ -1148,6 +1148,8 @@ static void startFileDialogSmoke(Bridge *state, QQuickWindow *window) {
     const QString saved = dir + QString::fromUtf8("/workspace/saved 猫 #% .txt");
     const QString scratch = dir + "/workspace/scratch.txt";
     const QString folder = dir + QString::fromUtf8("/workspace/folder 猫 #%");
+    const QString requests = dir + "/workspace-requests.log";
+    qputenv("SLATE_GUI_NEW_WINDOW_LOG", requests.toUtf8());
     QDir().mkpath(folder);
     QFile fixture(picked);
     fixture.open(QIODevice::WriteOnly);
@@ -1268,7 +1270,8 @@ static void startFileDialogSmoke(Bridge *state, QQuickWindow *window) {
             select(folder);
             break;
         case 12:
-            if (frame.value("browser") != folder) return;
+            if (!read(requests).contains(("open-workspace:" + folder).toUtf8())) return;
+            if (frame.value("browser") != dir + "/workspace") { finish(false, "Opening a workspace changed the existing window root"); return; }
             if (state->send({{"action", "file_dialog_context"}}).value("path") != scratch) {
                 finish(false, "Opening a folder replaced the editor document");
                 return;
@@ -2236,7 +2239,71 @@ static void startAuditSmoke(Bridge *state, QQuickWindow *window) {
     });
     timer->start(100);
 }
+static void startProductionSmoke(Bridge *state, QQuickWindow *window) {
+    const QString dir = qEnvironmentVariable("SLATE_GUI_SMOKE_DIR");
+    auto timer = new QTimer(state); auto step = new int(0), ticks = new int(0);
+    auto finish = [=](bool pass, const QString &detail) {
+        QFile report(dir + "/report.json"); report.open(QIODevice::WriteOnly);
+        report.write(QJsonDocument(QJsonObject{{"pass",pass},{"detail",detail},{"steps",*step}}).toJson());
+        timer->stop(); QGuiApplication::exit(pass ? 0 : 2);
+    };
+    auto invoke = [=](const QString &id) { QMetaObject::invokeMethod(window,"invokeAction",Q_ARG(QVariant,QVariant(id)),Q_ARG(QVariant,QVariant("")),Q_ARG(QVariant,QVariant(0)),Q_ARG(QVariant,QVariant(-1))); };
+    auto control = [=](const QString &name) {return findItem(window->contentItem(),name);};
+    auto click = [=](const QString &name) {auto item=control(name); if (!item) return false; QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,item->mapToScene(QPointF(item->width()/2,item->height()/2)).toPoint()); return true;};
+    QObject::connect(timer,&QTimer::timeout,state,[=]() {
+        if (++*ticks > 100) { finish(false,QString("Production smoke timed out at %1: %2").arg(*step).arg(state->frame().value("status").toString())); return; }
+        state->refresh();
+        if (qEnvironmentVariableIsSet("SLATE_GUI_GEOMETRY_SMOKE")) {
+            if (*ticks < 8) return;
+            if (qEnvironmentVariable("SLATE_GUI_GEOMETRY_PHASE") == "save") {window->setGeometry(80,70,600,400);finish(true,"Saved normal window geometry");}
+            else {finish(window->geometry() == QRect(80,70,600,400),"Restored window geometry");}
+            return;
+        }
+        switch (*step) {
+        case 0: state->send({{"action","open"},{"path",dir+"/workspace/edit.txt"}}); break;
+        case 1:
+            if (state->send({{"action","document_text"}}).value("text") != "original\n") return;
+            invoke("select-all");
+            state->send({{"action","paste"},{"text","x=12\ny=34\n"}});
+            state->send({{"action","search"},{"query","x=12"},{"case_sensitive",true},{"whole_word",false},{"backward",false}});
+            invoke("prompt-replace"); break;
+        case 2: {
+            if (!control("regexSearch") || !control("selectionSearch")) return;
+            click("selectionSearch");click("regexSearch");
+            auto input=control("searchInput"); input->setProperty("text","([xy])=(\\d+)");QMetaObject::invokeMethod(input,"textEdited");
+            auto replacement=control("replacementInput");replacement->setProperty("text","$1:$2");QMetaObject::invokeMethod(replacement,"textEdited");break;
+        }
+        case 3: {
+            const auto options=state->frame().value("search").toMap();
+            if (!options.value("regex_mode").toBool() || !options.value("selection_only").toBool()) {finish(false,"Regex and selection controls did not configure shared search");return;}
+            if (!click("replaceAll")) return;break;
+        }
+        case 4:
+            if (state->send({{"action","document_text"}}).value("text") != "x:12\ny=34\n") {finish(false,"Selection-scoped capture replacement changed the wrong text: " + QJsonDocument::fromVariant(state->send({{"action","document_text"}})).toJson() + QJsonDocument::fromVariant(state->frame().value("prompt")).toJson() + state->frame().value("status").toString());return;}
+            state->send({{"action","dismiss_prompt"}});invoke("settings");break;
+        case 5:
+            if (!control("shortcutChord")) return;
+            control("shortcutChord")->setProperty("text","Ctrl+Alt+j");control("shortcutCommand")->setProperty("text","word-count");
+            QMetaObject::invokeMethod(control("saveShortcut"),"clicked");break;
+        case 6: {
+            if (state->frame().value("settings").toMap().value("global_keys").toMap().value("Ctrl+Alt+j") != "word-count") {finish(false,"Graphical shortcut editor failed to persist binding");return;}
+            auto dialog=window->findChild<QObject *>("settingsDialog");QMetaObject::invokeMethod(dialog,"close");invoke("search-in-files");break;
+        }
+        case 7:
+            if (!control("projectInclude")) return;
+            control("projectInclude")->setProperty("text","*.txt");QMetaObject::invokeMethod(control("projectInclude"),"editingFinished");
+            click("projectHidden");break;
+        case 8: {
+            const auto policy=state->frame().value("project_search_policy").toMap();
+            if (policy.value("include") != "*.txt" || !policy.value("hidden").toBool()) {finish(false,"Project search controls failed to configure scope");return;}
+            finish(true,"Regex/selection controls, capture replacement, graphical shortcut editor and project search policy");return;
+        }
+        }
+        ++*step;
+    }); timer->start(100);
+}
 void startSmoke(Bridge *state, QQuickWindow *window) {
+    if (qEnvironmentVariableIsSet("SLATE_GUI_PRODUCTION_SMOKE") || qEnvironmentVariableIsSet("SLATE_GUI_GEOMETRY_SMOKE")) {startProductionSmoke(state,window);return;}
     if (!qEnvironmentVariableIsEmpty("SLATE_GUI_AUDIT_SMOKE")) { startAuditSmoke(state, window); return; }
     if (QGuiApplication::desktopFileName() != "slate" ||
         QGuiApplication::windowIcon().pixmap(64, 64).isNull()) {
@@ -2342,8 +2409,11 @@ void startSmoke(Bridge *state, QQuickWindow *window) {
         auto frame = state->frame();
         switch (*step) {
         case 0: {
-            if (state->files()->rowCount() < 3)
-                return;
+            int fileIndex = -1;
+            const auto files = state->frame().value("files").toList();
+            for (int i = 0; i < files.size(); ++i)
+                if (files[i].toMap().value("name") == "edit.txt") fileIndex = i;
+            if (fileIndex < 0) return;
             if (state->paneIds().size() != 3) {
                 finish(false, "Default workspace did not contain three panes");
                 return;
@@ -2353,7 +2423,7 @@ void startSmoke(Bridge *state, QQuickWindow *window) {
                 finish(false, "Missing file browser");
                 return;
             }
-            click(browser, QPointF(60, window->property("fileRowHeight").toInt() * 1.5), true);
+            click(browser, QPointF(60, window->property("fileRowHeight").toInt() * (fileIndex + 0.5)), true);
             break;
         }
         case 1: {
@@ -2499,7 +2569,7 @@ void startSmoke(Bridge *state, QQuickWindow *window) {
         }
         case 12: {
             if (!frame.value("status").toString().startsWith("Match 1 of 1")) {
-                finish(false, "Find dialog did not select expected text");
+                finish(false, "Find dialog did not select expected text: " + frame.value("status").toString());
                 return;
             }
             key(Qt::Key_Escape);
@@ -2519,7 +2589,7 @@ void startSmoke(Bridge *state, QQuickWindow *window) {
         }
         case 14:
             if (read(dir + "/workspace/second.txt") != "NEW_OK") {
-                finish(false, "Replace dialog did not edit the selected match");
+                finish(false, "Replace dialog did not edit the selected match: " + QJsonDocument::fromVariant(state->send({{"action","document_text"}})).toJson() + QJsonDocument::fromVariant(state->frame().value("prompt")).toJson() + state->frame().value("status").toString());
                 return;
             }
             command("set indent-width 2");

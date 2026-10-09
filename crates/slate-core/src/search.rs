@@ -7,6 +7,12 @@ pub struct Search {
     pub query: String,
     pub case_sensitive: bool,
     pub whole_word: bool,
+    #[serde(default)]
+    pub regex_mode: bool,
+    #[serde(default)]
+    pub selection_only: bool,
+    #[serde(skip)]
+    pub scope: Option<(u64, usize, usize)>,
     #[serde(skip)]
     compiled: std::sync::OnceLock<std::result::Result<Regex, String>>,
     #[serde(skip)]
@@ -18,18 +24,29 @@ impl Search {
             query,
             case_sensitive,
             whole_word,
+            regex_mode: false,
+            selection_only: false,
+            scope: None,
             compiled: Default::default(),
             rope: Default::default(),
         }
     }
     /// The literal query as a pattern, with case and word options as flags.
-    fn pattern(&self) -> Result<String> {
+    pub(crate) fn pattern(&self) -> Result<String> {
+        anyhow::ensure!(
+            self.query.len() <= 64 * 1024,
+            "Search patterns are limited to 64 KiB"
+        );
         if self.query.is_empty() {
             bail!("Enter text to find");
         }
-        let query = regex::escape(&self.query);
+        let query = if self.regex_mode {
+            self.query.clone()
+        } else {
+            regex::escape(&self.query)
+        };
         let query = if self.whole_word {
-            format!(r"\b{query}\b")
+            format!(r"\b(?:{query})\b")
         } else {
             query
         };
@@ -74,7 +91,7 @@ pub fn find_all(regex: &RopeRegex, rope: &ropey::Rope) -> Vec<(usize, usize)> {
         .map(|m| (m.start(), m.end()))
         .collect()
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Default, Serialize)]
 pub struct Prompt {
     pub kind: String,
     pub input: String,

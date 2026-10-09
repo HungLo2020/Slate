@@ -19,6 +19,8 @@ fn missing_files_are_created_on_first_save_and_clean_quit_needs_no_prompt() {
     tui.send("hello");
     tui.send(b"\x13");
     wait_file(&path, b"hello");
+    // The disk write precedes the worker reply that marks the buffer clean.
+    tui.wait_for("Saved");
     tui.send(b"\x11");
     assert_eq!(tui.exit_code(), 0);
 }

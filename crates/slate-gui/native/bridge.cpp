@@ -1,3 +1,6 @@
+#include <QSettings>
+#include <QScreen>
+#include <QStandardPaths>
 #include "bridge.h"
 #include <QAccessible>
 #include <QAccessibleObject>
@@ -80,7 +83,7 @@ void EntryModel::replace(const QVariantList &rows) {
     }
 }
 QStringList Bridge::encodings() const {
-    return {"UTF-8", "UTF-16LE", "UTF-16BE", "windows-1252", "ISO-8859-15", "ISO-8859-2",
+    return {"UTF-8", "UTF-16LE", "UTF-16BE", "ISO-8859-1", "windows-1252", "ISO-8859-15", "ISO-8859-2",
             "windows-1251", "KOI8-R", "Shift_JIS", "EUC-JP", "GBK", "Big5", "EUC-KR"};
 }
 QStringList Bridge::fontFamilies() const {
@@ -281,7 +284,12 @@ void Bridge::print() {
 void Bridge::performRequests(const QVariantList &requests) {
     for (const auto &request : requests) {
         const auto name = request.toString();
-        if (name == "new-window") {
+        if (name.startsWith("open-workspace:")) {
+            const auto log = qEnvironmentVariable("SLATE_GUI_NEW_WINDOW_LOG");
+            if (!log.isEmpty()) { QFile file(log); if (file.open(QIODevice::Append)) file.write((name + "\n").toUtf8()); }
+            else if (!QProcess::startDetached(QCoreApplication::applicationFilePath(), {"--new-instance", name.mid(15)}))
+                send({{"action","report_error"},{"message","Failed to open workspace window"}});
+        } else if (name == "new-window") {
             const auto log = qEnvironmentVariable("SLATE_GUI_NEW_WINDOW_LOG");
             if (!log.isEmpty()) {
                 // Scripted tests record the request instead of opening a window.
@@ -1364,6 +1372,38 @@ extern "C" int slate_qt_run(void *context, int argc, char **argv) {
     }
     auto window = qobject_cast<QQuickWindow *>(engine.rootObjects().first());
     state.setWindow(window);
+#ifdef SLATE_SMOKE_TEST
+    if (qEnvironmentVariableIsSet("SLATE_GUI_GEOMETRY_SMOKE"))
+#endif
+    {
+    // Keep normal geometry separately from maximized/fullscreen dimensions.
+    auto geometrySettings = new QSettings(QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation) + "/slate/window.ini", QSettings::IniFormat, window);
+    QRect saved = geometrySettings->value("geometry").toRect();
+    QScreen *screen = QGuiApplication::screenAt(saved.center());
+    if (!screen) screen = QGuiApplication::primaryScreen();
+    if (screen && saved.isValid()) {
+        const QRect available = screen->availableGeometry();
+        saved.setSize(saved.size().expandedTo(QSize(480,320)).boundedTo(available.size()));
+        saved.moveLeft(qBound(available.left(),saved.left(),available.right()-saved.width()+1));
+        saved.moveTop(qBound(available.top(),saved.top(),available.bottom()-saved.height()+1));
+        window->setGeometry(saved);
+    }
+    if (geometrySettings->value("maximized",false).toBool()) window->showMaximized();
+    auto geometryTimer = new QTimer(window);
+    geometryTimer->setSingleShot(true); geometryTimer->setInterval(500);
+    auto scheduleGeometry = [geometryTimer]() { geometryTimer->start(); };
+    QObject::connect(window,&QWindow::xChanged,window,scheduleGeometry);
+    QObject::connect(window,&QWindow::yChanged,window,scheduleGeometry);
+    QObject::connect(window,&QWindow::widthChanged,window,scheduleGeometry);
+    QObject::connect(window,&QWindow::heightChanged,window,scheduleGeometry);
+    auto saveGeometry = [window,geometrySettings]() {
+        if (window->windowState() == Qt::WindowNoState) geometrySettings->setValue("geometry",window->geometry());
+        if (window->windowState() != Qt::WindowMinimized) geometrySettings->setValue("maximized",window->windowState() == Qt::WindowMaximized);
+        geometrySettings->sync();
+    };
+    QObject::connect(geometryTimer,&QTimer::timeout,window,saveGeometry);
+    QObject::connect(&app,&QCoreApplication::aboutToQuit,window,saveGeometry);
+    }
     QTimer timer;
     QObject::connect(&timer, &QTimer::timeout, &state, &Bridge::refresh);
     timer.start(1000); // Checkpoints and the external-change watcher.

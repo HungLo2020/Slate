@@ -16,6 +16,9 @@ fi
 cd "$repo_root"
 version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
 dpkg --validate-version "$version"
+source_commit="$(git rev-parse HEAD)"
+source_dirty=false
+if [[ -n "$(git status --porcelain)" ]]; then source_dirty=true; fi
 mkdir -p "$builds_dir"
 # A failed build must not leave metadata pointing at a previous package.
 rm -f "$build_meta"
@@ -32,6 +35,9 @@ install -m755 "$target_dir/release/slate-gui" "$package_root/usr/bin/slate-gui"
 install -Dm644 packaging/slate.desktop "$package_root/usr/share/applications/slate.desktop"
 install -Dm644 packaging/slate.metainfo.xml "$package_root/usr/share/metainfo/slate.metainfo.xml"
 install -Dm644 resources/slate.svg "$package_root/usr/share/icons/hicolor/scalable/apps/slate.svg"
+install -Dm644 packaging/slate.1 "$package_root/usr/share/man/man1/slate.1"
+install -Dm644 CHANGELOG.md "$package_root/usr/share/doc/slate/CHANGELOG.md"
+if [[ -f LICENSE ]]; then install -Dm644 LICENSE "$package_root/usr/share/doc/slate/copyright"; fi
 install -Dm644 README.md "$package_root/usr/share/doc/slate/README.md"
 
 echo "[build] Computing shared-library dependencies" >&2
@@ -60,6 +66,8 @@ Section: editors
 Priority: optional
 Architecture: amd64
 Maintainer: Slate Maintainers
+X-Slate-Source-Commit: $source_commit
+X-Slate-Source-Dirty: $source_dirty
 Installed-Size: $installed_size
 Depends: $shlib_depends, libglib2.0-bin
 Recommends: $gui_depends, $qml_depends, git, plasma-integration, qml6-module-org-kde-desktop, breeze-icon-theme, fonts-dejavu-core
@@ -75,9 +83,13 @@ Description: Shared graphical and terminal text editor
 EOF
 
 deb_path="$builds_dir/slate_${version}_amd64.deb"
+if [[ "$(git rev-parse HEAD)" != "$source_commit" ]]; then echo "[build] Source commit changed during build" >&2; exit 1; fi
+if [[ "$source_dirty" == false && -n "$(git status --porcelain)" ]]; then echo "[build] Source tree changed during build" >&2; exit 1; fi
 dpkg-deb --root-owner-group --build "$package_root" "$staging/slate.deb"
 mv -f "$staging/slate.deb" "$deb_path"
 cat > "$staging/latest-build.env" <<EOF
+BUILD_SOURCE_COMMIT=$source_commit
+BUILD_SOURCE_DIRTY=$source_dirty
 BUILD_PLATFORM=linux-amd64
 BUILD_ARTIFACT_TYPE=deb
 BUILD_ARTIFACT_PATH=$deb_path
