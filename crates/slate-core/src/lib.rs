@@ -12,6 +12,7 @@ mod diagnostics;
 pub mod document;
 mod document_search;
 mod editing;
+mod editor_wait;
 mod editorconfig;
 pub mod events;
 mod file_locks;
@@ -68,7 +69,7 @@ use layout::{Axis, Handle, Node, Rect, View};
 use preferences::{Preferences, StartupMode};
 use search::{Prompt, Search};
 use serde::{Deserialize, Serialize};
-use services::{Entry, GitEntry, IoJob, Job, Reply, Services};
+use services::{Entry, GitEntry, Job, Reply, Services};
 use std::time::{Duration, Instant};
 use std::{
     collections::BTreeMap,
@@ -617,6 +618,7 @@ pub struct App {
     /// Requests only a frontend can fulfil (new window, print), drained by it.
     frontend_requests: Vec<String>,
     inbox: Option<instance::Inbox>,
+    editor_waits: Vec<editor_wait::Waiting>,
     /// Cursor positions (line, column) for files whose open is in flight.
     pending_positions: BTreeMap<PathBuf, (usize, navigation::Column)>,
     /// Positions before jumps, for go-back and go-forward.
@@ -695,6 +697,7 @@ impl App {
         self.events.drain();
         self.poll();
         self.drain_inbox();
+        self.poll_editor_waits();
         self.sync_document_preferences();
         self.reap_terminals();
         self.lsp_sync();
@@ -946,6 +949,7 @@ impl App {
             self.status = format!("Error: {e:#}");
         }
         self.record_diagnostic_status();
+        self.poll_editor_waits();
         self.typing = false;
         self.sync_document_preferences();
         self.schedule_highlight();
@@ -1640,18 +1644,7 @@ impl App {
                 _ => {}
             },
             Command::Open { path } => {
-                let path = if path.is_absolute() {
-                    path
-                } else {
-                    self.root.join(path)
-                };
-                let token = self.id();
-                self.services
-                    .io
-                    .send(IoJob::Open(token, path))
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                self.pending_open.insert(token, self.focus);
-                self.status = "Opening file…".into();
+                self.queue_open(path)?;
             }
             Command::Browse { path } => self.browse(path)?,
             Command::New => {
@@ -3157,7 +3150,7 @@ pub fn key_chord(k: &Key) -> String {
     )
 }
 impl App {
-    fn finish_open(&mut self, pane: u64, mut d: Document) {
+    fn finish_open(&mut self, pane: u64, mut d: Document) -> u64 {
         let path = d.path.clone();
         let notice = d.notice.take();
         let doc = if let Some((id, _)) = self.documents.iter().find(|(_, old)| old.path == path) {
@@ -3205,6 +3198,7 @@ impl App {
             notice.map(|n| format!(" · {n}")).unwrap_or_default()
         );
         self.recovery.dirty = true;
+        doc
     }
     fn location(&self) -> String {
         if let Some(id) = self.active_editor() {

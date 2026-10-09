@@ -57,6 +57,7 @@ fn main() -> Result<()> {
     if let Some(result) = slate_core::fsio::elevated_save_entry(&arguments) {
         return result;
     }
+    let original_arguments = arguments.clone();
     let (args, qt_arguments) = split_arguments(arguments);
     let launch = cli::parse(args)?;
     if launch.help {
@@ -70,25 +71,43 @@ fn main() -> Result<()> {
     if launch.frontend == Some(Frontend::Tui) {
         return slate_cli::run(cli::start(&launch)?);
     }
-    // Only the GUI blocks signals for sigwait. The TUI must retain its
-    // own handlers, including when launched through slate-gui --tui.
-    slate_gui::handle_termination_signals();
+    let inherited_wait = slate_core::instance::WaitTicket::inherited()?;
     let smoke = std::env::var_os("SLATE_GUI_SMOKE_DIR").is_some();
-    // Files go to a running window, like other desktop editors. Directories,
-    // standard input and --new-instance always open a new window.
-    let single = slate_core::instance::can_share_window(&launch) && !smoke;
-    if single && !launch.files.is_empty() && slate_core::instance::forward(&launch.files) {
-        return Ok(());
+    let instance_enabled = !smoke || std::env::var_os("SLATE_GUI_WAIT_SMOKE").is_some();
+    let single = slate_core::instance::can_share_window(&launch) && instance_enabled;
+    if inherited_wait.is_none() {
+        if launch.wait {
+            if single && slate_core::instance::forward_wait(&launch.files)? {
+                return Ok(());
+            }
+            return slate_core::instance::start_waiting_gui(&original_arguments);
+        }
+        if single && !launch.files.is_empty() && slate_core::instance::forward(&launch.files) {
+            return Ok(());
+        }
     }
+    // Waiting launchers keep normal signal handling; only the GUI masks signals.
+    slate_gui::handle_termination_signals();
     if smoke {
         eprintln!("Smoke startup: constructing shared core");
     }
-    let mut app = cli::start(&launch)?;
+    let mut app = match cli::start(&launch) {
+        Ok(app) => app,
+        Err(error) => {
+            if let Some(ticket) = inherited_wait {
+                ticket.finish(Some(&error.to_string()));
+            }
+            return Err(error);
+        }
+    };
+    if let Some(ticket) = inherited_wait {
+        app.attach_editor_wait(ticket, &launch.files)?;
+    }
     if smoke {
         eprintln!("Smoke startup: core constructed");
         eprintln!("Smoke startup: workspace ready");
     }
-    let owns_socket = if !smoke && !launch.read_only && launch.stdin.is_none() {
+    let owns_socket = if instance_enabled && !launch.read_only && launch.stdin.is_none() {
         let events = app.events();
         match slate_core::instance::listen(move || events.notify()) {
             Some(inbox) => {

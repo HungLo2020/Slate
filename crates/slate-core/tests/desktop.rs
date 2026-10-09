@@ -333,11 +333,14 @@ fn files_handed_over_by_another_invocation_open_at_their_line() {
     let mut app = App::new(&first).unwrap();
     let inbox: slate_core::instance::Inbox = Default::default();
     app.attach_inbox(inbox.clone());
-    inbox.lock().unwrap().push(slate_core::cli::LaunchFile {
-        path: second.clone(),
-        line: Some(3),
-        column: None,
-    });
+    inbox.lock().unwrap().push(
+        slate_core::cli::LaunchFile {
+            path: second.clone(),
+            line: Some(3),
+            column: None,
+        }
+        .into(),
+    );
     app.events().notify();
     wait(&mut app, "handover", |a| a.status.starts_with("Opened"));
     assert_eq!(text(&app), "a\nb\nc\n");

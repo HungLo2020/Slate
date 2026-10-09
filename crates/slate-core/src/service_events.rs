@@ -27,6 +27,10 @@ impl App {
                     self.checkpoint_finished(fingerprint, result)
                 }
                 Reply::OpenedDirectory(token, path) => {
+                    self.editor_wait_opened(
+                        token,
+                        Err(anyhow::anyhow!("--wait requires files, not directories")),
+                    );
                     if let Some(pane) = self.pending_open.remove(&token) {
                         if self.layout.view(pane).is_some() {
                             self.focus = pane;
@@ -39,8 +43,14 @@ impl App {
                 Reply::Opened(token, result) => {
                     if let Some(pane) = self.pending_open.remove(&token) {
                         match result {
-                            Ok(d) => self.finish_open(pane, d),
-                            Err(e) => self.status = format!("Open failed: {e}"),
+                            Ok(d) => {
+                                let doc = self.finish_open(pane, d);
+                                self.editor_wait_opened(token, Ok(doc));
+                            }
+                            Err(e) => {
+                                self.status = format!("Open failed: {e}");
+                                self.editor_wait_opened(token, Err(anyhow::anyhow!(e)));
+                            }
                         }
                     }
                 }
@@ -95,5 +105,6 @@ impl App {
             }
         }
         self.offer_save_question();
+        self.poll_editor_waits();
     }
 }

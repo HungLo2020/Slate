@@ -2302,7 +2302,38 @@ static void startProductionSmoke(Bridge *state, QQuickWindow *window) {
         ++*step;
     }); timer->start(100);
 }
+// A test-only driver lets the process smoke close tabs through the real GUI bridge.
+static void startWaitSmoke(Bridge *state) {
+    const QString dir = qEnvironmentVariable("SLATE_GUI_SMOKE_DIR");
+    auto timer = new QTimer(state);
+    auto sequence = new int(0);
+    auto response = new QVariantMap;
+    QObject::connect(timer, &QTimer::timeout, state, [=]() {
+        QFile input(dir + "/wait-command.json");
+        if (input.open(QIODevice::ReadOnly)) {
+            const auto request = QJsonDocument::fromJson(input.readAll()).object();
+            const int incoming = request.value("sequence").toInt();
+            if (incoming > *sequence) {
+                *response = state->send(request.value("command").toObject().toVariantMap());
+                *sequence = incoming;
+            }
+        }
+        state->refresh();
+        QVariantMap report{{"pid", QCoreApplication::applicationPid()}, {"sequence", *sequence},
+                           {"response", *response}, {"frame", state->frame()},
+                           {"document", state->send({{"action", "document_text"}})}};
+        QFile output(dir + "/wait-state.json.tmp");
+        if (output.open(QIODevice::WriteOnly)) {
+            output.write(QJsonDocument::fromVariant(report).toJson()); output.close();
+            // POSIX rename atomically replaces the last observation.
+            ::rename((dir + "/wait-state.json.tmp").toLocal8Bit().constData(),
+                     (dir + "/wait-state.json").toLocal8Bit().constData());
+        }
+    });
+    timer->start(50);
+}
 void startSmoke(Bridge *state, QQuickWindow *window) {
+    if (qEnvironmentVariableIsSet("SLATE_GUI_WAIT_SMOKE")) { startWaitSmoke(state); return; }
     if (qEnvironmentVariableIsSet("SLATE_GUI_PRODUCTION_SMOKE") || qEnvironmentVariableIsSet("SLATE_GUI_GEOMETRY_SMOKE")) {startProductionSmoke(state,window);return;}
     if (!qEnvironmentVariableIsEmpty("SLATE_GUI_AUDIT_SMOKE")) { startAuditSmoke(state, window); return; }
     if (QGuiApplication::desktopFileName() != "slate" ||

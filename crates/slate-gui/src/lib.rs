@@ -152,6 +152,23 @@ pub fn run_with(mut app: App, qt_arguments: &[String]) -> i32 {
             );
         }
     }
+    if code == 0 && !TERMINATED.load(std::sync::atomic::Ordering::SeqCst) {
+        // The caller may read its files as soon as completion is delivered.
+        if let Err(error) = context.app.flush_workspace() {
+            context
+                .app
+                .finish_editor_waits(Some(&format!("Cannot finish editor session: {error:#}")));
+            eprintln!("Cannot finish editor session: {error:#}");
+            return 1;
+        }
+        context.app.finish_editor_waits(
+            (!context.app.quit).then_some("GUI closed before editing completed"),
+        );
+    } else {
+        context
+            .app
+            .finish_editor_waits(Some("GUI terminated before editing completed"));
+    }
     code
 }
 struct Target(*mut c_void);

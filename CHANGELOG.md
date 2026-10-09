@@ -1,7 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.1.8 — 2026-10-09
 
+- Add `--wait` for GUI editor integration, with per-document completion in new or existing windows and failure reporting on open errors or termination.
 - Bound document search, replacement and occurrence selection; perform large searches, word counts and save preparation on workers, and refuse stale results.
 - Add regex capture replacement, selection scope, rectangular selection, search history, and explicit project-search scope controls and skipped-file counts.
 - Apply EditorConfig indentation, tab width and save formatting. Support exact Latin-1 conversion.

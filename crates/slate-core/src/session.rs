@@ -229,6 +229,7 @@ impl App {
             overview_revision: 0,
             frontend_requests: vec![],
             inbox: None,
+            editor_waits: Vec::new(),
             pending_positions: BTreeMap::new(),
             back: Vec::new(),
             forward: Vec::new(),

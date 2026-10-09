@@ -31,6 +31,8 @@ pub struct Launch {
     pub startup: Option<StartupMode>,
     /// GUI: open a separate window instead of handing files to a running one.
     pub new_instance: bool,
+    /// GUI launchers wait until all requested files have been closed.
+    pub wait: bool,
     pub help: bool,
     pub version: bool,
 }
@@ -60,6 +62,7 @@ Options:
   --fresh            start without restoring the previous workspace
   --editor-only      show only the editor, regardless of startup settings
   --workspace        show the full workspace, regardless of startup settings
+  --wait             wait for requested files to close (requires FILE arguments)
   --new-instance     (GUI) open a new window instead of reusing a running Slate
   -h, --help         show this help
   -V, --version      show the version
@@ -172,6 +175,10 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Launch> {
                     launch.options.insert("tab_width".into(), n.to_string());
                     continue;
                 }
+                Some("--wait") => {
+                    launch.wait = true;
+                    continue;
+                }
                 Some("--new-instance") => {
                     launch.new_instance = true;
                     continue;
@@ -225,6 +232,16 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Launch> {
     }
     if pending.is_some() {
         bail!("+LINE must be followed by a file");
+    }
+    if launch.wait && !launch.help && !launch.version {
+        anyhow::ensure!(
+            !launch.files.is_empty() && launch.directory.is_none() && launch.stdin.is_none(),
+            "--wait requires named file arguments, not a directory or standard input"
+        );
+        anyhow::ensure!(
+            launch.files.len() <= 128,
+            "--wait accepts at most 128 files"
+        );
     }
     Ok(launch)
 }

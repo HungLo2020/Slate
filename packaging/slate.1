@@ -28,6 +28,15 @@ Choose the initial layout.
 .B --new-instance
 Open a separate graphical window.
 .TP
+.B --wait
+Wait until every requested file has no remaining open view, including in an
+already running GUI. Saving alone does not finish the request; Save As retains
+it. Confirmed discard also completes normally. Open failure, GUI termination or
+crash returns a nonzero status. The GUI can remain open after the caller returns.
+Accepts up to 128 named files, not a directory or standard input. The terminal interface
+retains its normal wait-until-quit behavior.
+Use VISUAL="slate-gui --wait" for programs that wait for an external editor.
+.TP
 .B -B, --backup
 Keep the previous saved file as NAME~.
 .TP

@@ -126,6 +126,20 @@ long lines at word boundaries; the cursor moves by screen rows.
 `slate-gui FILE…` opens files in the running window, as Kate and gedit do; the
 desktop entry passes every selected file (`%F`). Directories, `slate-gui -`
 and `--new-instance` start a new window, and **File → New Window** opens one.
+
+Use `VISUAL='slate-gui --wait'` (or `git -c core.editor='slate-gui --wait' commit`)
+when another program must wait for editing to finish. `--wait FILE…` stays running
+until every requested document's last view closes, including files forwarded to
+an existing window. Saving alone does not complete the request, and cancelling a
+close leaves it waiting. Save As keeps the same request attached to the document.
+Closing with confirmed discard also completes normally; callers must validate
+contents as usual. Open failures, GUI termination and crashes return a nonzero
+status. A newly started GUI remains available after its waiting launcher returns.
+Use `--new-instance --wait` to request a separate window. `slate --gui --wait` behaves
+the same way; in the TUI, `--wait` retains the normal wait-until-quit behavior.
+The option accepts up to 128 named files, not a workspace directory or standard input.
+Normal GUI launches retain immediate forwarding without `--wait`.
+
 Drop files from a file manager onto the window to open them. **File → Open
 Recent** lists the last 20 files, and **File → Print** prints the document.
 

@@ -26,7 +26,7 @@ pub struct Location {
 /// Jumps remembered for go-back / go-forward.
 const HISTORY: usize = 100;
 
-fn same_file(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
     a == b
         || match (a.canonicalize(), b.canonicalize()) {
             (Ok(a), Ok(b)) => a == b,
