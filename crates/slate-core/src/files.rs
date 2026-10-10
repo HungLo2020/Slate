@@ -55,6 +55,13 @@ impl FileOperation {
     }
 }
 
+/// A path that may no longer exist, with its folder resolved.
+fn resolved(path: &Path) -> PathBuf {
+    match (path.parent().map(Path::canonicalize), path.file_name()) {
+        (Some(Ok(parent)), Some(name)) => parent.join(name),
+        _ => path.to_path_buf(),
+    }
+}
 fn rename_no_replace(from: &Path, to: &Path) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -299,10 +306,21 @@ impl App {
                 let _ = self.execute(Command::Open { path });
             }
             FileOperation::Rename(from, to) => {
+                // Document paths stay canonical: the target may have been
+                // typed as `../name` or through a symlinked folder.
+                let (from, to) = (resolved(&from), to.canonicalize().unwrap_or(to));
+                // Joining an empty suffix would add a trailing separator.
+                let moved = |suffix: &Path| {
+                    if suffix.as_os_str().is_empty() {
+                        to.clone()
+                    } else {
+                        to.join(suffix)
+                    }
+                };
                 for doc in self.documents.values_mut() {
                     if let Some(suffix) = doc.path.as_ref().and_then(|p| p.strip_prefix(&from).ok())
                     {
-                        doc.path = Some(to.join(suffix));
+                        doc.path = Some(moved(suffix));
                         doc.generation += 1;
                     }
                 }
@@ -311,12 +329,12 @@ impl App {
                     .iter()
                     .map(|path| {
                         path.strip_prefix(&from)
-                            .map(|suffix| to.join(suffix))
+                            .map(moved)
                             .unwrap_or_else(|_| path.clone())
                     })
                     .collect();
                 if let Ok(suffix) = self.browser.strip_prefix(&from) {
-                    self.browser = to.join(suffix);
+                    self.browser = moved(suffix);
                 }
             }
             FileOperation::Trash(path) => {
@@ -418,5 +436,48 @@ mod tests {
             .contains("Wait for saves"));
         assert!(path.exists());
         assert!(!dir.path().join("renamed.txt").exists());
+    }
+    #[test]
+    fn renaming_an_open_file_keeps_a_canonical_savable_path() {
+        let _serial = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", dir.path().join("config"));
+        std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir(root.join("sub")).unwrap();
+        std::os::unix::fs::symlink(root.join("sub"), root.join("link")).unwrap();
+        let path = root.join("sub/source.txt");
+        fs::write(&path, "data").unwrap();
+        let mut app = App::new(&path).unwrap();
+        let id = *app.documents.keys().next().unwrap();
+        // Renamed out through `..`, then back in through a symlinked folder.
+        for (from, to, expected) in [
+            (
+                path.clone(),
+                root.join("sub/../moved.txt"),
+                root.join("moved.txt"),
+            ),
+            (
+                root.join("moved.txt"),
+                root.join("link/back.txt"),
+                root.join("sub/back.txt"),
+            ),
+        ] {
+            FileOperation::Rename(from.clone(), to.clone())
+                .run()
+                .unwrap();
+            app.file_operation_done(FileOperation::Rename(from, to), Ok(()));
+            assert_eq!(app.documents[&id].path.as_deref(), Some(&*expected));
+            assert_eq!(app.document_for(&expected), Some(id));
+        }
+        let doc = app.documents.get_mut(&id).unwrap();
+        doc.replace(0, 0, "saved ", 0).unwrap();
+        doc.save(None).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("sub/back.txt")).unwrap(),
+            "saved data"
+        );
     }
 }

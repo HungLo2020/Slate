@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.9 — 2026-10-10
+
+- Fix crashes from rectangular selection over lines ending in non-ASCII text and from a zero `tab_width` in project settings.
+- Ask before discarding from the command palette, typed commands and key bindings in every interface; keep unsaved, piped and waited-on buffers when layouts change or limits are reached.
+- Hand the terminal to sudo during elevated saves so Ctrl+C or Ctrl+Z cancels the save rather than Slate.
+- Keep the single-instance socket in a private, owner-checked directory and verify peer credentials on both ends.
+- Remember trust only for workspaces and repository roots, never for broad folders such as home or temporary directories; store trusted paths exactly, lock updates, and fail closed on unreadable trust files.
+- Read project configuration, changed files and save baselines with size limits and without blocking on special files.
+- Save settings by editing only the changed keys, preserving comments, other instances' edits and session-only options.
+- Clear inherited Git repository variables and relative `PATH` entries for helpers, servers, tasks and terminals; resolve helpers only from absolute, executable `PATH` entries.
+- Undo multi-cursor and large operations as whole steps, bound undo memory, normalize formatter and language-server line endings, and keep replace-in-files backups per run with atomic, retried restores.
+- Bound task output, report task exit when the task's shell exits, signal stopped tasks once, and restart crashed language servers with backoff while coalescing full-document changes for busy servers.
+- Recover from interrupted GUI requests with stable `.save` copies; handle termination before the GUI starts, worker-thread panics in the terminal interface, and plain-text rendering of untrusted names.
+- Reduce per-keystroke and per-frame work: incremental highlighting, soft wrap and caret rebasing, cached recovery blobs, compact GUI terminal rows, visible-only TUI lists, and event-driven input and timers.
+- Expire unused recovery stores, damaged checkpoints, temporary files and file-use locks safely; verify the repository manager by pinned commit and SHA-256 before publication.
+
 ## 0.1.8 — 2026-10-09
 
 - Add `--wait` for GUI editor integration, with per-document completion in new or existing windows and failure reporting on open errors or termination.

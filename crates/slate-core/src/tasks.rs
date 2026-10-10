@@ -20,11 +20,107 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::OnceLock,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 /// Output kept per task run.
 const OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+/// Output without a line break is delivered in pieces of this size, so it
+/// cannot grow without bound before reaching the output document.
+const CHUNK: usize = 64 * 1024;
+/// How long output may still arrive after a task has exited: a process it
+/// left running may hold its output open indefinitely.
+const DRAIN: Duration = Duration::from_millis(300);
+
+/// Take the output at the start of `pending` that is ready to show: whole
+/// lines, or everything when `all`, or a piece of `CHUNK` bytes cut at a
+/// character boundary when no line ends that soon. A lone carriage return
+/// (progress output redrawing a line) ends a line too, so that output reads
+/// as successive lines rather than one run-on line.
+fn take_output(pending: &mut Vec<u8>, all: bool) -> Option<String> {
+    let end = if all {
+        pending.len()
+    } else if let Some(i) = (0..pending.len()).rev().find(|&i| {
+        // A trailing `\r` waits: a `\n` may follow.
+        pending[i] == b'\n' || (pending[i] == b'\r' && i + 1 < pending.len())
+    }) {
+        i + 1
+    } else if pending.len() >= CHUNK {
+        chunk_end(&pending[..CHUNK])
+    } else {
+        0
+    };
+    if end == 0 {
+        return None;
+    }
+    let mut bytes: Vec<u8> = pending.drain(..end).collect();
+    // Also a carriage return that ends the output: nothing follows it.
+    let next = pending.first().copied();
+    for i in 0..bytes.len() {
+        let following = bytes.get(i + 1).copied().or(next);
+        if bytes[i] == b'\r' && following != Some(b'\n') {
+            bytes[i] = b'\n';
+        }
+    }
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// How much of `piece` to deliver without splitting a character: all of
+/// it, unless it ends inside a UTF-8 sequence, which then waits.
+fn chunk_end(piece: &[u8]) -> usize {
+    let len = piece.len();
+    // The last character's first byte: back over continuation bytes.
+    let Some(start) = (len.saturating_sub(4)..len)
+        .rev()
+        .find(|&i| piece[i] & 0xC0 != 0x80)
+    else {
+        return len;
+    };
+    let width = match piece[start] {
+        b if b & 0xE0 == 0xC0 => 2,
+        b if b & 0xF0 == 0xE0 => 3,
+        b if b & 0xF8 == 0xF0 => 4,
+        _ => 1,
+    };
+    if start > 0 && start + width > len {
+        start
+    } else {
+        len
+    }
+}
+
+/// A stream's output not yet delivered. Its reader delivers as output
+/// arrives; once the task has exited and `DRAIN` has passed, the waiting
+/// thread delivers what is left and closes it.
+#[derive(Default)]
+struct Stream {
+    pending: Vec<u8>,
+    closed: bool,
+}
+
+/// A task's process group. Signalled only while its leader is unreaped:
+/// until then the group's ID cannot belong to anyone else.
+struct Group {
+    pid: u32,
+    reaped: bool,
+    /// A stop was requested: what is left of the group when the leader
+    /// exits is killed.
+    stopping: bool,
+}
+impl Group {
+    fn signal(&self, signal: i32) {
+        if !self.reaped {
+            crate::process::kill_group(self.pid, signal);
+        }
+    }
+}
+
+/// Lock state shared with a task's threads. A thread that panicked while
+/// holding it must not keep the task from ending or being stopped.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct Task {
@@ -86,8 +182,11 @@ pub fn tasks(root: &Path, errors: &mut Vec<String>) -> Vec<Task> {
         detected.push(task("go build", "go build ./...", "build", "generic"));
         detected.push(task("go test", "go test ./...", "test", "generic"));
     }
-    if let Ok(package) = std::fs::read_to_string(root.join("package.json")) {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&package) {
+    // Detection runs before trust: never block on a FIFO or read a huge file.
+    if let Ok(package) =
+        crate::fsio::read_regular(&root.join("package.json"), crate::config::MAX_CONFIG_BYTES)
+    {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&package) {
             for (name, _) in json["scripts"].as_object().into_iter().flatten() {
                 let group = match name.as_str() {
                     "build" => "build",
@@ -269,7 +368,7 @@ pub fn problems(matcher: &str, output: &str, cwd: &Path) -> BTreeMap<PathBuf, Ve
 
 pub(crate) struct Running {
     task: Task,
-    pid: u32,
+    group: Arc<Mutex<Group>>,
     doc: u64,
     output: String,
     cwd: PathBuf,
@@ -277,6 +376,8 @@ pub(crate) struct Running {
     truncated: bool,
     /// When a stop was requested.
     stopping: Option<std::time::Instant>,
+    /// Forced after ignoring the stop request.
+    killed: bool,
 }
 
 impl App {
@@ -341,7 +442,7 @@ impl App {
             return Ok(());
         }
         let mut command = Command::new("sh");
-        command
+        crate::process::sanitize(&mut command)
             .args(["-c", &task.command])
             .current_dir(&cwd)
             .env("CARGO_TERM_COLOR", "never")
@@ -353,9 +454,17 @@ impl App {
         let mut child = command.spawn()?;
         let id = self.id();
         let output = self.services.reply_sender();
-        // Each stream is delivered in whole lines, so stdout and stderr
-        // interleave only between lines and UTF-8 is never split.
-        let readers: Vec<std::thread::JoinHandle<()>> = [
+        let pid = child.id();
+        let group = Arc::new(Mutex::new(Group {
+            pid,
+            reaped: false,
+            stopping: false,
+        }));
+        let (finished, readers_done) = std::sync::mpsc::channel::<()>();
+        // Each stream is delivered in whole lines (or bounded pieces cut at
+        // character boundaries), so stdout and stderr interleave only
+        // between lines and UTF-8 is never split.
+        let streams: Vec<Arc<Mutex<Stream>>> = [
             child
                 .stdout
                 .take()
@@ -368,12 +477,11 @@ impl App {
         .into_iter()
         .flatten()
         .map(|mut pipe| {
-            let output = output.clone();
+            let stream = Arc::new(Mutex::new(Stream::default()));
+            let (output, shared, finished) = (output.clone(), stream.clone(), finished.clone());
             std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
-                let mut pending: Vec<u8> = Vec::new();
-                let send = |bytes: &[u8]| {
-                    let text = String::from_utf8_lossy(bytes).into_owned();
+                let send = |text: String| {
                     output
                         .send(Reply::Ide(Event::TaskOutput { task: id, text }))
                         .is_ok()
@@ -382,27 +490,67 @@ impl App {
                     if n == 0 {
                         break;
                     }
-                    pending.extend_from_slice(&buf[..n]);
-                    if let Some(end) = pending.iter().rposition(|b| *b == b'\n') {
-                        let lines: Vec<u8> = pending.drain(..=end).collect();
-                        if !send(&lines) {
+                    let mut stream = lock(&shared);
+                    if stream.closed {
+                        return;
+                    }
+                    stream.pending.extend_from_slice(&buf[..n]);
+                    while let Some(text) = take_output(&mut stream.pending, false) {
+                        if !send(text) {
                             return;
                         }
                     }
                 }
-                if !pending.is_empty() {
-                    send(&pending);
+                let mut stream = lock(&shared);
+                if !stream.closed {
+                    stream.closed = true;
+                    if let Some(text) = take_output(&mut stream.pending, true) {
+                        send(text);
+                    }
                 }
-            })
+                drop(stream);
+                let _ = finished.send(());
+            });
+            stream
         })
         .collect();
-        let pid = child.id();
+        drop(finished);
         let exit = output.clone();
+        let waiter = group.clone();
         std::thread::spawn(move || {
-            let status = child.wait();
-            // Everything the task printed arrives before its exit.
-            for reader in readers {
-                let _ = reader.join();
+            // Exited, but not reaped while the group is still signalled.
+            #[cfg(unix)]
+            crate::process::wait_exited(pid);
+            #[cfg(not(unix))]
+            let _ = child.wait();
+            let status = {
+                let mut group = lock(&waiter);
+                #[cfg(unix)]
+                if group.stopping {
+                    group.signal(libc::SIGKILL);
+                }
+                let status = child.wait();
+                group.reaped = true;
+                status
+            };
+            // Output read before the exit arrives first. A process the task
+            // left running may keep its output open: it does not hold the
+            // exit back.
+            let deadline = Instant::now() + DRAIN;
+            for _ in &streams {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if readers_done.recv_timeout(left).is_err() {
+                    break;
+                }
+            }
+            for stream in &streams {
+                let mut stream = lock(stream);
+                if !stream.closed {
+                    stream.closed = true;
+                    if let Some(text) = take_output(&mut stream.pending, true) {
+                        let _ = exit.send(Reply::Ide(Event::TaskOutput { task: id, text }));
+                    }
+                }
             }
             let (code, error) = match status {
                 Ok(s) => (s.code(), String::new()),
@@ -454,12 +602,13 @@ impl App {
             id,
             Running {
                 task,
-                pid,
+                group,
                 doc,
                 output: String::new(),
                 cwd,
                 truncated: false,
                 stopping: None,
+                killed: false,
             },
         );
         Ok(())
@@ -596,23 +745,27 @@ impl App {
             bail!("No task is running");
         }
         for running in self.tasks.values_mut() {
+            let mut group = lock(&running.group);
+            group.stopping = true;
             #[cfg(unix)]
-            crate::process::kill_group(running.pid, libc::SIGTERM);
+            group.signal(libc::SIGTERM);
             running.stopping.get_or_insert_with(std::time::Instant::now);
         }
         self.status = "Stopping tasks…".into();
         Ok(())
     }
 
-    /// Force tasks that ignored a stop request.
+    /// Force tasks that ignored a stop request, once.
     pub(crate) fn expire_tasks(&mut self) {
-        for running in self.tasks.values() {
-            if running
-                .stopping
-                .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(3))
+        for running in self.tasks.values_mut() {
+            if !running.killed
+                && running
+                    .stopping
+                    .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(3))
             {
+                running.killed = true;
                 #[cfg(unix)]
-                crate::process::kill_group(running.pid, libc::SIGKILL);
+                lock(&running.group).signal(libc::SIGKILL);
             }
         }
     }
@@ -623,13 +776,15 @@ impl App {
             return;
         }
         for running in self.tasks.values() {
+            let mut group = lock(&running.group);
+            group.stopping = true;
             #[cfg(unix)]
-            crate::process::kill_group(running.pid, libc::SIGTERM);
+            group.signal(libc::SIGTERM);
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
         for running in self.tasks.values() {
             #[cfg(unix)]
-            crate::process::kill_group(running.pid, libc::SIGKILL);
+            lock(&running.group).signal(libc::SIGKILL);
         }
         self.tasks.clear();
     }
@@ -705,6 +860,65 @@ mod tests {
         );
         assert!(problems("none", go, cwd).is_empty());
         assert_eq!(plain("\x1b[1m\x1b[31merror\x1b[0m: x\r\n"), "error: x\n");
+    }
+
+    #[test]
+    fn output_is_delivered_in_lines_or_bounded_pieces() {
+        let mut pending = b"one\ntwo\r\nthr".to_vec();
+        assert_eq!(take_output(&mut pending, false).unwrap(), "one\ntwo\r\n");
+        assert_eq!(pending, b"thr");
+        assert_eq!(take_output(&mut pending, false), None);
+        // Progress output: a lone carriage return ends a line, a trailing
+        // one waits for what follows.
+        let mut pending = b"\r10%\r20%\r".to_vec();
+        assert_eq!(take_output(&mut pending, false).unwrap(), "\n10%\n");
+        assert_eq!(pending, b"20%\r");
+        pending.extend_from_slice(b"\ndone\n");
+        assert_eq!(take_output(&mut pending, false).unwrap(), "20%\r\ndone\n");
+        // No line break at all: pieces of at most CHUNK bytes, never
+        // splitting a character.
+        let mut pending = b"a".to_vec();
+        pending.extend("é".repeat(CHUNK).as_bytes());
+        let mut text = String::new();
+        while let Some(piece) = take_output(&mut pending, false) {
+            assert!(piece.len() <= CHUNK);
+            text.push_str(&piece);
+        }
+        assert!(pending.len() < CHUNK);
+        text.push_str(&take_output(&mut pending, true).unwrap());
+        assert!(!text.contains('\u{fffd}'));
+        assert_eq!(text.chars().filter(|c| *c == 'é').count(), CHUNK);
+    }
+
+    #[test]
+    fn pieces_around_the_chunk_size_never_split_characters() {
+        // Reads are 8 KiB, so exactly CHUNK pending bytes is common.
+        for len in [CHUNK - 1, CHUNK, CHUNK + 1] {
+            let mut pending = vec![b'x'; len];
+            let taken = take_output(&mut pending, false);
+            assert_eq!(taken.map(|t| t.len()), (len >= CHUNK).then_some(CHUNK));
+        }
+        // Characters of every width straddling the cut at each offset.
+        for c in ['é', '€', '😀'] {
+            for offset in 0..4 {
+                let mut pending = vec![b'x'; CHUNK - offset];
+                pending.extend(c.to_string().repeat(4).as_bytes());
+                let original = pending.clone();
+                let mut text = take_output(&mut pending, false).unwrap_or_default();
+                assert!(!text.contains('\u{fffd}'), "{c} at {offset}");
+                text.push_str(&take_output(&mut pending, true).unwrap_or_default());
+                assert_eq!(text.as_bytes(), &original[..], "{c} at {offset}");
+            }
+        }
+        // Exactly CHUNK bytes ending inside a character: it waits.
+        let mut pending = vec![b'x'; CHUNK - 1];
+        pending.push("é".as_bytes()[0]);
+        assert_eq!(take_output(&mut pending, false).unwrap().len(), CHUNK - 1);
+        assert_eq!(pending, ["é".as_bytes()[0]]);
+        // A carriage return that ends the output ends a line.
+        let mut pending = b"50%\r".to_vec();
+        assert_eq!(take_output(&mut pending, false), None);
+        assert_eq!(take_output(&mut pending, true).unwrap(), "50%\n");
     }
 
     #[test]

@@ -11,17 +11,29 @@ use std::{
 };
 extern "C" {
     fn slate_qt_run(context: *mut c_void, argc: i32, argv: *mut *mut c_char) -> i32;
-    fn slate_qt_quit();
 }
 
 static TERMINATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Readable once a termination signal arrived. The GUI thread watches it, so
+/// the signal thread never touches Qt (which may not exist yet).
+#[cfg(unix)]
+static TERMINATION_PIPE: std::sync::OnceLock<std::os::unix::net::UnixStream> =
+    std::sync::OnceLock::new();
 
 /// Turn SIGTERM, SIGHUP and SIGINT into an orderly quit: recovery state is
 /// flushed (or NAME.save files written) and the single-instance socket is
 /// removed. Call before starting other threads, which inherit the mask.
+/// A signal that arrives before the event loop runs ends startup instead.
 pub fn handle_termination_signals() {
     #[cfg(unix)]
     unsafe {
+        use std::io::Write;
+        let Ok((reader, mut writer)) = std::os::unix::net::UnixStream::pair() else {
+            return;
+        };
+        if writer.set_nonblocking(true).is_err() || TERMINATION_PIPE.set(reader).is_err() {
+            return;
+        }
         let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut set);
         for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
@@ -35,9 +47,30 @@ pub fn handle_termination_signals() {
             let mut signal = 0;
             if libc::sigwait(&waiting, &mut signal) == 0 {
                 TERMINATED.store(true, std::sync::atomic::Ordering::SeqCst);
-                slate_qt_quit();
+                let _ = writer.write(&[1]);
             }
         });
+    }
+}
+/// Whether a termination signal has arrived.
+pub fn terminated() -> bool {
+    TERMINATED.load(std::sync::atomic::Ordering::SeqCst)
+}
+#[no_mangle]
+extern "C" fn slate_terminated() -> bool {
+    terminated()
+}
+/// The descriptor Qt watches for termination signals, or -1.
+#[no_mangle]
+extern "C" fn slate_termination_fd() -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        TERMINATION_PIPE.get().map_or(-1, |pipe| pipe.as_raw_fd())
+    }
+    #[cfg(not(unix))]
+    {
+        -1
     }
 }
 struct GuiContext {
@@ -91,17 +124,91 @@ struct SurfacePatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     screen: Option<TerminalPatch>,
 }
+/// A terminal row as runs of equally styled cells: `(style, columns, text)`.
+/// A plain ASCII run has one character per column (blank cells are spaces);
+/// any other cell is a run of its own, a wide glyph covering its
+/// continuation cell.
 #[derive(Serialize)]
 struct TerminalRow {
     row: usize,
-    cells: Vec<slate_core::terminal::Cell>,
+    runs: Vec<(usize, usize, String)>,
 }
 #[derive(Serialize)]
 struct TerminalPatch {
     rows: u16,
     cols: u16,
     cursor: Option<(u16, u16)>,
+    /// `(foreground, background, bold | italic << 1 | underline << 2)`,
+    /// indexed by the runs of this patch.
+    styles: Vec<(String, String, u8)>,
     lines: Vec<TerminalRow>,
+}
+impl TerminalPatch {
+    fn new(screen: &slate_core::terminal::Screen) -> Self {
+        Self {
+            rows: screen.rows,
+            cols: screen.cols,
+            cursor: screen.cursor,
+            styles: vec![],
+            lines: vec![],
+        }
+    }
+    fn style(&mut self, cell: &slate_core::terminal::Cell) -> usize {
+        let flags =
+            u8::from(cell.bold) | u8::from(cell.italic) << 1 | u8::from(cell.underline) << 2;
+        match self
+            .styles
+            .iter()
+            .position(|(fg, bg, f)| *fg == cell.fg && *bg == cell.bg && *f == flags)
+        {
+            Some(index) => index,
+            None => {
+                self.styles.push((cell.fg.clone(), cell.bg.clone(), flags));
+                self.styles.len() - 1
+            }
+        }
+    }
+    fn push_row(&mut self, row: usize, cells: &[slate_core::terminal::Cell]) {
+        let mut runs: Vec<(usize, usize, String)> = vec![];
+        let mut col = 0;
+        while let Some(cell) = cells.get(col) {
+            let style = self.style(cell);
+            let plain = !cell.wide
+                && !cell.continuation
+                && (cell.text.is_empty() || cell.text.len() == 1 && cell.text.is_ascii());
+            if plain {
+                let glyph = if cell.text.is_empty() {
+                    " "
+                } else {
+                    &cell.text
+                };
+                match runs.last_mut() {
+                    Some((last, columns, text))
+                        if *last == style && text.len() == *columns && text.is_ascii() =>
+                    {
+                        text.push_str(glyph);
+                        *columns += 1;
+                    }
+                    _ => runs.push((style, 1, glyph.into())),
+                }
+                col += 1;
+            } else {
+                let columns = if cell.wide && cells.get(col + 1).is_some_and(|c| c.continuation) {
+                    2
+                } else {
+                    1
+                };
+                let text = if cell.continuation {
+                    String::new()
+                } else {
+                    cell.text.clone()
+                };
+                runs.push((style, columns, text));
+                col += columns;
+            }
+        }
+        self.lines.push(TerminalRow { row, runs });
+    }
 }
 #[derive(Serialize)]
 struct GuiUpdate {
@@ -131,15 +238,20 @@ pub fn run_with(mut app: App, qt_arguments: &[String]) -> i32 {
         .map(|a| a.as_ptr() as *mut c_char)
         .chain(std::iter::once(std::ptr::null_mut()))
         .collect();
-    let code = unsafe {
-        slate_qt_run(
-            (&mut context as *mut GuiContext).cast(),
-            arguments.len() as i32,
-            pointers.as_mut_ptr(),
-        )
+    // Terminated while the workspace was restored: never open the window.
+    let code = if terminated() {
+        0
+    } else {
+        unsafe {
+            slate_qt_run(
+                (&mut context as *mut GuiContext).cast(),
+                arguments.len() as i32,
+                pointers.as_mut_ptr(),
+            )
+        }
     };
     drop(arguments);
-    if TERMINATED.load(std::sync::atomic::Ordering::SeqCst) && !context.app.wants_recovery() {
+    if terminated() && !context.app.wants_recovery() {
         let saved = context.app.emergency_save();
         if !saved.is_empty() {
             eprintln!(
@@ -152,7 +264,7 @@ pub fn run_with(mut app: App, qt_arguments: &[String]) -> i32 {
             );
         }
     }
-    if code == 0 && !TERMINATED.load(std::sync::atomic::Ordering::SeqCst) {
+    if code == 0 && !terminated() {
         // The caller may read its files as soon as completion is delivered.
         if let Err(error) = context.app.flush_workspace() {
             context
@@ -225,7 +337,15 @@ unsafe extern "C" fn slate_request(context: *mut c_void, request: *const c_char)
         state.panes.clear();
         state.editors.clear();
         state.terminals.clear();
-        state.app.status = "Error: an internal error interrupted the last action".into();
+        // The interrupted action may have left the core half-updated. Keep
+        // working (the user must be able to save), but copy unsaved text to
+        // NAME.save files now and stop checkpoints, which could replace the
+        // last consistent recovery state with an inconsistent one.
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            state
+                .app
+                .quarantine("An internal error interrupted the last action")
+        }));
         "{\"status\":\"Internal error processing GUI request\"}".into()
     });
     // JSON escapes NUL characters, so the response never contains one.
@@ -270,11 +390,7 @@ fn dispatch_gui(state: &mut GuiContext, request: serde_json::Value) -> String {
     let result = (|| -> anyhow::Result<serde_json::Value> {
         let mut command = resolve_gui_command(app, &request)?;
         let id = command.action_id();
-        if let Some(info) = id.as_ref().and_then(|id| {
-            app.command_catalog("")
-                .into_iter()
-                .find(|info| &info.id == id)
-        }) {
+        if let Some(info) = id.as_deref().and_then(|id| app.command_info(id)) {
             anyhow::ensure!(info.enabled, "{}", info.reason);
         }
         // Force is a backend capability, not permission to skip a GUI dialog.
@@ -282,7 +398,9 @@ fn dispatch_gui(state: &mut GuiContext, request: serde_json::Value) -> String {
         let confirmation = match command {
             Command::Quit { force: false } if app.dirty() => Some("quit"),
             Command::Quit { force: true } => Some("discard-quit"),
-            Command::CloseDocument { force: true } => Some("discard-document"),
+            Command::CloseDocument { force: true } | Command::CloseTab { force: true, .. } => {
+                Some("discard-document")
+            }
             _ => None,
         };
         if request["confirmed"] != true {
@@ -374,6 +492,8 @@ fn respond(state: &mut GuiContext, request: serde_json::Value) -> String {
             serde_json::json!({ "screen_builds": app.screen_builds, "revision": app.revision() })
                 .to_string()
         }
+        #[cfg(test)]
+        "test_panic" => panic!("injected GUI request failure"),
         "catalog" => {
             let query = request["query"].as_str().unwrap_or_default();
             let pane = request["pane"].as_u64().unwrap_or(app.focus);
@@ -493,26 +613,19 @@ fn respond(state: &mut GuiContext, request: serde_json::Value) -> String {
                             cursor: screen.cursor,
                             line_count: 0,
                             lines: vec![],
-                            screen: Some(TerminalPatch {
-                                rows: screen.rows,
-                                cols: screen.cols,
-                                cursor: screen.cursor,
-                                lines: screen
-                                    .cells
-                                    .iter()
-                                    .enumerate()
-                                    .filter_map(|(row, cells)| {
-                                        let unchanged = patch
-                                            && state.terminals.get(&pane.id).is_some_and(|old| {
-                                                old.cols == screen.cols
-                                                    && old.cells.get(row) == Some(cells)
-                                            });
-                                        (!unchanged).then(|| TerminalRow {
-                                            row,
-                                            cells: cells.clone(),
-                                        })
-                                    })
-                                    .collect(),
+                            screen: Some({
+                                let mut compact = TerminalPatch::new(&screen);
+                                for (row, cells) in screen.cells.iter().enumerate() {
+                                    let unchanged = patch
+                                        && state.terminals.get(&pane.id).is_some_and(|old| {
+                                            old.cols == screen.cols
+                                                && old.cells.get(row) == Some(cells)
+                                        });
+                                    if !unchanged {
+                                        compact.push_row(row, cells);
+                                    }
+                                }
+                                compact
                             }),
                         });
                     }
@@ -1042,10 +1155,16 @@ mod tests {
             assert_eq!(request(&mut state, input)["confirmation"], "discard-quit");
             assert!(!state.app.quit && state.app.dirty());
         }
+        let pane = state.app.focus;
+        let Some(slate_core::layout::View::Editor(view)) = state.app.layout.view(pane).cloned()
+        else {
+            panic!("an editor is focused");
+        };
         for input in [
             serde_json::json!({"action":"invoke_action","id":"discard-document"}),
             serde_json::json!({"action":"command","text":"discard-document"}),
             serde_json::json!({"action":"key","key":"f4"}),
+            serde_json::json!({"action":"close_tab","pane":pane,"view":view,"force":true}),
         ] {
             assert_eq!(
                 request(&mut state, input)["confirmation"],
@@ -1208,5 +1327,288 @@ mod tests {
             assert_eq!(state.app.prompt.as_ref().unwrap().kind, "layout-save");
             request(&mut state, serde_json::json!({"action":"dismiss_prompt"}));
         }
+    }
+    /// A workspace with `panic.txt` open, "BEFORE_PANIC " typed and
+    /// checkpointed, then one injected request failure.
+    fn quarantined_workspace(root: &std::path::Path) -> (GuiContext, serde_json::Value) {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join("panic.txt"), "hello\n").unwrap();
+        let mut state = GuiContext::new(
+            test_app(root, Some(slate_core::preferences::StartupMode::Workspace)).unwrap(),
+        );
+        state.app.enable_workspace(false).unwrap();
+        assert!(state.app.wants_recovery());
+        let update = serde_json::json!({"action":"update","width":1280,"height":720});
+        request(&mut state, update.clone());
+        request(
+            &mut state,
+            serde_json::json!({"action":"command","text":"open panic.txt"}),
+        );
+        settle(&mut state, &update);
+        request(
+            &mut state,
+            serde_json::json!({"action":"paste","text":"BEFORE_PANIC "}),
+        );
+        state.app.flush_workspace().unwrap();
+        assert!(checkpoints(root).iter().any(|c| c.contains("BEFORE_PANIC")));
+        let response = request(&mut state, serde_json::json!({"action":"test_panic"}));
+        assert_eq!(response["status"], "Internal error processing GUI request");
+        (state, update)
+    }
+    /// This workspace's live recovery checkpoint, if any.
+    fn checkpoints(root: &std::path::Path) -> Vec<String> {
+        let state = std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap());
+        let mut found = vec![];
+        for entry in std::fs::read_dir(state.join("slate/workspaces")).unwrap() {
+            let dir = entry.unwrap().path();
+            let Ok(session) = std::fs::read_to_string(dir.join("session.json")) else {
+                continue;
+            };
+            if session.contains(root.to_str().unwrap()) {
+                found.push(session);
+            }
+        }
+        found
+    }
+    fn set_aside(root: &std::path::Path) -> Vec<String> {
+        let state = std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap());
+        let mut found = vec![];
+        for entry in std::fs::read_dir(state.join("slate/workspaces")).unwrap() {
+            for file in std::fs::read_dir(entry.unwrap().path()).unwrap() {
+                let path = file.unwrap().path();
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if name.starts_with("session.damaged-") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    if text.contains(root.to_str().unwrap()) {
+                        found.push(text);
+                    }
+                }
+            }
+        }
+        found
+    }
+    fn save_copies(root: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".save"))
+            .collect();
+        names.sort();
+        names
+    }
+    #[test]
+    fn interrupted_requests_refresh_one_copy_and_exit_never_restores_stale_buffers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        let file = root.join("panic.txt");
+        let (mut state, update) = quarantined_workspace(&root);
+        // Unsaved text was copied without trusting the rest of the state.
+        assert_eq!(
+            std::fs::read_to_string(root.join("panic.txt.save")).unwrap(),
+            "BEFORE_PANIC hello\n"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello\n");
+        // The session keeps running with a persistent error.
+        request(
+            &mut state,
+            serde_json::json!({"action":"paste","text":"AFTER_PANIC "}),
+        );
+        request(
+            &mut state,
+            serde_json::json!({"action":"key","key":"Right"}),
+        );
+        let frame = request(&mut state, update.clone());
+        let status = frame["status"].as_str().unwrap();
+        assert!(
+            status.starts_with("Error: An internal error interrupted the last action.")
+                && status.contains("panic.txt.save")
+                && status.contains("save your documents and restart Slate"),
+            "{status}"
+        );
+        // Repeated failures refresh the same copy instead of adding files.
+        for _ in 0..3 {
+            request(&mut state, serde_json::json!({"action":"test_panic"}));
+        }
+        assert_eq!(save_copies(&root), ["panic.txt.save"]);
+        assert_eq!(
+            std::fs::read_to_string(root.join("panic.txt.save")).unwrap(),
+            "BEFORE_PANIC AFTER_PANIC hello\n"
+        );
+        // Checkpoints keep the last consistent state while buffers are unsaved.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        request(&mut state, update.clone());
+        let live = checkpoints(&root);
+        assert!(live.iter().any(|c| c.contains("BEFORE_PANIC")));
+        assert!(!live.iter().any(|c| c.contains("AFTER_PANIC")));
+        // Termination and exit (single-file NAME.save and the workspace
+        // flush) refresh the copy with the latest text, still one file.
+        request(
+            &mut state,
+            serde_json::json!({"action":"paste","text":"LATEST "}),
+        );
+        state.app.emergency_save();
+        state.app.flush_workspace().unwrap();
+        assert_eq!(save_copies(&root), ["panic.txt.save"]);
+        assert_eq!(
+            std::fs::read_to_string(root.join("panic.txt.save")).unwrap(),
+            "BEFORE_PANIC AFTER_PANIC hLATEST ello\n"
+        );
+        // With every buffer copied, the stale checkpoint is set aside rather
+        // than restored at the next start.
+        assert!(checkpoints(&root).is_empty());
+        assert!(set_aside(&root).iter().any(|c| c.contains("BEFORE_PANIC")));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello\n");
+    }
+    #[test]
+    fn saving_everything_after_an_interrupted_request_retires_the_stale_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        let file = root.join("panic.txt");
+        let (mut state, update) = quarantined_workspace(&root);
+        request(
+            &mut state,
+            serde_json::json!({"action":"paste","text":"SAVED "}),
+        );
+        request(
+            &mut state,
+            serde_json::json!({"action":"invoke_action","id":"save"}),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !checkpoints(&root).is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Stale checkpoint kept"
+            );
+            request(&mut state, update.clone());
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "BEFORE_PANIC SAVED hello\n"
+        );
+        // A crash now restores nothing older than the saved file.
+        assert!(set_aside(&root).iter().any(|c| c.contains("BEFORE_PANIC")));
+        state.app.flush_workspace().unwrap();
+        assert!(checkpoints(&root).is_empty());
+    }
+    #[test]
+    fn terminal_rows_are_compact_runs_that_reproduce_every_cell() {
+        use slate_core::terminal::{Cell, Screen};
+        let styled = |text: &str, fg: &str, bold: bool| Cell {
+            fg: fg.into(),
+            bold,
+            ..Cell::text(text)
+        };
+        let wide = |text: &str| Cell {
+            wide: true,
+            ..Cell::text(text)
+        };
+        let continuation = Cell {
+            continuation: true,
+            ..Cell::text("")
+        };
+        let row = vec![
+            Cell::text("a"),
+            Cell::text("b"),
+            Cell::text(""),
+            styled("c", "#ff0000", true),
+            styled("d", "#ff0000", true),
+            wide("猫"),
+            continuation.clone(),
+            Cell::text("e\u{301}"),
+            wide("👩‍💻"),
+            continuation,
+            Cell {
+                underline: true,
+                italic: true,
+                bg: "#000000".into(),
+                ..Cell::text("")
+            },
+            Cell::text("<"),
+        ];
+        let screen = Screen {
+            cells: vec![row.clone()],
+            cursor: Some((0, 1)),
+            rows: 1,
+            cols: row.len() as u16,
+        };
+        let mut patch = TerminalPatch::new(&screen);
+        patch.push_row(0, &row);
+        let json = serde_json::to_value(&patch).unwrap();
+        assert_eq!(
+            json["lines"][0]["runs"],
+            serde_json::json!([
+                [0, 3, "ab "],
+                [1, 2, "cd"],
+                [0, 2, "猫"],
+                [0, 1, "e\u{301}"],
+                [0, 2, "👩‍💻"],
+                [2, 1, " "],
+                [0, 1, "<"]
+            ])
+        );
+        // Every column keeps its text (blank cells are spaces, a wide glyph
+        // covers its continuation) and its style.
+        let styles = json["styles"].as_array().unwrap();
+        let mut column = 0;
+        for run in json["lines"][0]["runs"].as_array().unwrap() {
+            let style = &styles[run[0].as_u64().unwrap() as usize];
+            let columns = run[1].as_u64().unwrap() as usize;
+            let text = run[2].as_str().unwrap();
+            let plain = text.len() == columns && text.is_ascii();
+            for offset in 0..columns {
+                let cell = &row[column + offset];
+                let expected = if cell.text.is_empty() && !cell.continuation {
+                    " "
+                } else {
+                    cell.text.as_str()
+                };
+                if plain {
+                    assert_eq!(&text[offset..offset + 1], expected);
+                } else if offset == 0 {
+                    assert_eq!(text, expected);
+                } else {
+                    assert!(cell.continuation);
+                }
+                if !cell.continuation {
+                    let flags = u64::from(cell.bold)
+                        | u64::from(cell.italic) << 1
+                        | u64::from(cell.underline) << 2;
+                    assert_eq!(style, &serde_json::json!([cell.fg, cell.bg, flags]));
+                }
+            }
+            column += columns;
+        }
+        assert_eq!(column, row.len());
+
+        // A full 240x60 screen of styled text: tens of kilobytes, not megabytes.
+        let line: Vec<Cell> = (0..240)
+            .map(|col| {
+                let text = char::from(b'a' + (col % 26) as u8).to_string();
+                styled(
+                    &text,
+                    if col / 10 % 2 == 0 {
+                        "#d8dee9"
+                    } else {
+                        "#88c0d0"
+                    },
+                    false,
+                )
+            })
+            .collect();
+        let screen = Screen {
+            cells: vec![line; 60],
+            cursor: None,
+            rows: 60,
+            cols: 240,
+        };
+        let mut patch = TerminalPatch::new(&screen);
+        for (row, cells) in screen.cells.iter().enumerate() {
+            patch.push_row(row, cells);
+        }
+        let compact = serde_json::to_string(&patch).unwrap().len();
+        let per_cell = serde_json::to_string(&screen.cells).unwrap().len();
+        assert!(compact < 40_000, "{compact} bytes");
+        assert!(compact * 20 < per_cell, "{compact} vs {per_cell} bytes");
     }
 }

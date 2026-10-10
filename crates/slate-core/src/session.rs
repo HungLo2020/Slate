@@ -97,7 +97,11 @@ impl App {
             document.label = None;
             opened.push((document, spec.line, spec.column));
         }
-        for file in &launch.files {
+        // Recovery checkpoints hold a bounded number of documents; opening
+        // more would leave the whole session without crash recovery.
+        let room = workspace::MAX_DOCUMENTS.saturating_sub(opened.len());
+        let skipped = launch.files.len().saturating_sub(room);
+        for file in launch.files.iter().take(room) {
             let document = if file.path.exists() {
                 Document::open(&file.path)
                     .with_context(|| format!("Cannot open {}", file.path.display()))?
@@ -153,8 +157,29 @@ impl App {
             positions.push((view, line, column));
         }
         let mut layout = Node::default_layout(11, 12);
+        // Beyond one pane's tab limit, further files open in editor panes
+        // split beside it.
+        let mut chunks = tabs.chunks(crate::layout::MAX_TABS);
         if let Some((pane_tabs, _)) = layout.pane_mut(2) {
-            *pane_tabs = tabs;
+            *pane_tabs = chunks.next().unwrap_or_default().to_vec();
+        }
+        let mut last = 2;
+        for chunk in chunks {
+            ids += 2;
+            let (pane, split) = (ids - 1, ids);
+            layout.split(last, Axis::Vertical, pane, split, chunk[0].clone());
+            if let Some((pane_tabs, _)) = layout.pane_mut(pane) {
+                *pane_tabs = chunk.to_vec();
+            }
+            last = pane;
+        }
+        if skipped > 0 {
+            notices.push(format!(
+                "Opened {} of {} files: a session holds at most {} documents",
+                launch.files.len() - skipped,
+                launch.files.len(),
+                workspace::MAX_DOCUMENTS
+            ));
         }
         let mut app = Self {
             browser: root.clone(),
@@ -181,6 +206,8 @@ impl App {
             revision: 1,
             files_revision: 1,
             render_cache: BTreeMap::new(),
+            shared_files: Default::default(),
+            shared_git: Default::default(),
             screen_builds: 0,
             typing: false,
             ids,
@@ -242,6 +269,7 @@ impl App {
             project_search_policy: Default::default(),
             last_search_files: Vec::new(),
             replace_backups: Vec::new(),
+            replace_undoing: false,
             lsp: Default::default(),
             formatting: Default::default(),
             tasks: BTreeMap::new(),
@@ -250,10 +278,14 @@ impl App {
             trusted: trust::is_trusted(&root),
             pending_trust: None,
             trust_cache: Default::default(),
+            trust_generation: 0,
+            session_trust: Vec::new(),
             fold_cache: Default::default(),
             wrap_cache: Default::default(),
             fuzzy_worker: None,
             search_worker: None,
+            outline_worker: None,
+            outline_ticket: Default::default(),
         };
         app.read_layouts();
         app.load_preferences();

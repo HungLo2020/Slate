@@ -18,12 +18,25 @@ use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 /// Diagnostics kept per file and publication.
 const DIAGNOSTIC_LIMIT: usize = 2_000;
 /// Completion items kept per request.
 const COMPLETION_LIMIT: usize = 2_000;
+/// Messages held per server until it has initialized, and their size.
+const STARTUP_QUEUE: usize = 128;
+const STARTUP_QUEUE_BYTES: usize = 16 * 1024 * 1024;
+/// Waits before restarting a server that exited unexpectedly, one per
+/// exit within `CRASH_WINDOW`; one more exit and it stays stopped until
+/// restarted by hand.
+const RESTART_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+];
+const CRASH_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Diagnostic {
@@ -52,8 +65,9 @@ struct Server {
     capabilities: Value,
     settings: Value,
     ready: bool,
-    /// Messages held until the server has initialized.
-    queue: Vec<Value>,
+    /// Messages held until the server has initialized, with the key that
+    /// lets a later message replace them (see `deliver`) and their size.
+    queue: Vec<(Option<String>, Value, usize)>,
     queued_bytes: usize,
 }
 
@@ -63,6 +77,31 @@ struct OpenDoc {
     path: PathBuf,
     version: i64,
     content: u64,
+    /// A change was not delivered (the server was busy): the next sync
+    /// sends the whole text.
+    resync: bool,
+    /// Lets this opening's latest full text replace an unsent one, but
+    /// never move ahead of a close and reopen of the same document.
+    change_key: String,
+}
+
+/// What decides a document's language server, without a server yet: its
+/// path, whether it is a tool's output, its first line (a `#!` line can
+/// name the language), and trust.
+#[derive(PartialEq)]
+struct PlacementKey {
+    path: PathBuf,
+    labelled: bool,
+    first_line: u64,
+    trust: u64,
+}
+
+/// `lsp_sync`'s decision for such a document: the language and server
+/// root, when both are trusted. Kept until its key changes, so passes of
+/// the event loop do not search the file system for project roots.
+struct Placement {
+    key: PlacementKey,
+    target: Option<(Language, PathBuf)>,
 }
 
 #[derive(Debug)]
@@ -159,7 +198,17 @@ pub(crate) struct Lsp {
     servers: BTreeMap<u64, Server>,
     keys: HashMap<(String, PathBuf), u64>,
     failed: HashSet<(String, PathBuf)>,
+    /// Recent unexpected exits by server, and when it may start again.
+    crashes: HashMap<(String, PathBuf), Vec<Instant>>,
+    restart_at: HashMap<(String, PathBuf), Instant>,
+    placements: HashMap<u64, Placement>,
     docs: BTreeMap<u64, OpenDoc>,
+    /// Documents closed while their server was too busy to be told: the
+    /// close is retried, and the document is not opened there again
+    /// before it is sent.
+    unclosed: HashSet<(u64, String)>,
+    /// Counts openings, for `OpenDoc::change_key`.
+    openings: u64,
     languages: Option<Vec<Language>>,
     pending: HashMap<(u64, i64), Pending>,
     deadlines: HashMap<(u64, i64), std::time::Instant>,
@@ -321,6 +370,11 @@ type Replacements = Vec<(usize, usize, String)>;
 /// Where a request goes: (view, document, server, offset, LSP parameters).
 type RequestAt = (u64, u64, u64, usize, Value);
 
+/// An edit's replacement text with `\n` line endings, as buffers hold them.
+fn new_text(edit: &Value) -> String {
+    crate::text_format::normalize_input(edit["newText"].as_str().unwrap_or_default()).into_owned()
+}
+
 fn text_edits(d: &crate::document::Document, edits: &Value) -> Replacements {
     let mut out: Vec<(usize, usize, String)> = edits
         .as_array()
@@ -331,11 +385,7 @@ fn text_edits(d: &crate::document::Document, edits: &Value) -> Replacements {
             let (el, ec) = position(&e["range"]["end"]);
             let start = d.offset_of(sl, sc);
             let end = d.offset_of(el, ec).max(start);
-            (
-                start,
-                end,
-                e["newText"].as_str().unwrap_or_default().to_string(),
-            )
+            (start, end, new_text(e))
         })
         .collect();
     // Edits at the same position apply in the order given.
@@ -462,9 +512,7 @@ impl App {
             return None;
         }
         let path = d.path.clone()?;
-        let (_, end) = d.line_range(0);
-        let hint = d.slice(0, d.floor_boundary(end.min(4096)));
-        let syntax = crate::highlight::syntax_for(Some(&path), &hint)
+        let syntax = crate::highlight::syntax_of(Some(&path), d.rope())
             .name
             .clone();
         crate::languages::find(self.languages(), &path, &syntax).cloned()
@@ -488,6 +536,12 @@ impl App {
         }
         if self.lsp.failed.contains(&key) {
             return None;
+        }
+        if let Some(at) = self.lsp.restart_at.get(&key) {
+            if Instant::now() < *at {
+                return None;
+            }
+            self.lsp.restart_at.remove(&key);
         }
         let Some(command) = language.server_command() else {
             self.lsp.failed.insert(key);
@@ -590,37 +644,54 @@ impl App {
         self.lsp.next_id
     }
 
-    fn send_to(&mut self, server: u64, message: Value) {
-        if let Some(s) = self.lsp.servers.get_mut(&server) {
-            if s.ready {
-                s.process.send(&message);
-            } else {
-                let size = serde_json::to_vec(&message).map_or(usize::MAX, |bytes| bytes.len());
-                if s.queue.len() < 128
-                    && size <= (16 * 1024 * 1024usize).saturating_sub(s.queued_bytes)
-                {
-                    s.queued_bytes += size;
-                    s.queue.push(message);
-                } else {
-                    s.process.kill();
-                }
-            }
-        }
+    fn send_to(&mut self, server: u64, message: Value) -> bool {
+        self.deliver(server, message, None)
     }
 
-    fn notify(&mut self, server: u64, method: &str, params: Value) {
+    /// Send `message` now, or once the server has initialized. A message
+    /// with a `key` replaces an unsent one with the same key, in its place
+    /// (a document's full text, which makes the earlier text obsolete).
+    /// False when it was not sent: the server is gone or busy. A busy
+    /// server keeps running; what it missed is sent again or reported.
+    fn deliver(&mut self, server: u64, message: Value, key: Option<String>) -> bool {
+        let Some(s) = self.lsp.servers.get_mut(&server) else {
+            return false;
+        };
+        if s.ready {
+            return match &key {
+                Some(key) => s.process.send_replacing(key, &message),
+                None => s.process.send(&message),
+            };
+        }
+        let size = serde_json::to_vec(&message).map_or(usize::MAX, |bytes| bytes.len());
+        let earlier = key
+            .as_ref()
+            .and_then(|key| s.queue.iter().position(|(k, ..)| k.as_ref() == Some(key)));
+        let freed = earlier.map_or(0, |i| s.queue[i].2);
+        let queued = s.queued_bytes - freed;
+        if (earlier.is_none() && s.queue.len() >= STARTUP_QUEUE)
+            || size > STARTUP_QUEUE_BYTES.saturating_sub(queued)
+        {
+            return false;
+        }
+        s.queued_bytes = queued + size;
+        match earlier {
+            Some(i) => s.queue[i] = (key, message, size),
+            None => s.queue.push((key, message, size)),
+        }
+        true
+    }
+
+    fn notify(&mut self, server: u64, method: &str, params: Value) -> bool {
         self.send_to(
             server,
             json!({"jsonrpc": "2.0", "method": method, "params": params}),
-        );
+        )
     }
 
     fn request(&mut self, server: u64, method: &str, params: Value, pending: Pending) {
         if self.lsp.pending.len() >= 1024 {
-            if let Some(s) = self.lsp.servers.get_mut(&server) {
-                s.process.kill();
-            }
-            self.abandon(pending, "Language server overloaded");
+            self.abandon(pending, "Language server busy");
             return;
         }
         let id = self.next_request();
@@ -628,10 +699,15 @@ impl App {
         self.lsp
             .deadlines
             .insert((server, id), std::time::Instant::now());
-        self.send_to(
+        if !self.send_to(
             server,
             json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
-        );
+        ) {
+            self.lsp.deadlines.remove(&(server, id));
+            if let Some(pending) = self.lsp.pending.remove(&(server, id)) {
+                self.abandon(pending, "Language server busy");
+            }
+        }
     }
 
     /// Keep servers and their documents in step with the editor. Runs on
@@ -660,14 +736,17 @@ impl App {
             })
             .map(|(doc, _)| *doc)
             .collect();
+        let unclosed: Vec<(u64, String)> = self.lsp.unclosed.drain().collect();
+        for (server, uri) in unclosed {
+            self.close_document(server, uri);
+        }
         for doc in gone {
             let open = self.lsp.docs.remove(&doc).unwrap();
-            self.notify(
-                open.server,
-                "textDocument/didClose",
-                json!({"textDocument": {"uri": open.uri}}),
-            );
+            self.close_document(open.server, open.uri);
         }
+        self.lsp
+            .placements
+            .retain(|doc, _| self.documents.contains_key(doc));
         let ids: Vec<u64> = self.documents.keys().copied().collect();
         for doc in ids {
             if self.documents[&doc].len() > 8 * 1024 * 1024 {
@@ -677,29 +756,30 @@ impl App {
                 self.lsp_sync_changes(doc);
                 continue;
             }
-            let Some(language) = self.language_for(doc) else {
+            let Some((language, root)) = self.placement(doc) else {
                 continue;
             };
-            let path = self.documents[&doc].path.clone().unwrap();
-            let root = language.root_for(&path, &self.root);
-            // A server runs the project's code (build scripts, plugins).
-            if !self.trusted_path(&root) || !self.trusted_path(path.parent().unwrap_or(&path)) {
-                continue;
-            }
             let Some(server) = self.start_server(&language, root) else {
                 continue;
             };
+            let path = self.documents[&doc].path.clone().unwrap();
             let d = self.documents.get_mut(&doc).unwrap();
             // Edits made before opening are part of the full text sent now.
             let _ = d.take_changes();
             let text = d.text();
             let content = d.content_version();
             let uri = uri(&path);
-            self.notify(
+            if self.lsp.unclosed.contains(&(server, uri.clone())) {
+                continue;
+            }
+            // A busy server is offered the document again on a later pass.
+            if !self.notify(
                 server,
                 "textDocument/didOpen",
                 json!({"textDocument": {"uri": uri, "languageId": language.id(), "version": 1, "text": text}}),
-            );
+            ) {
+                continue;
+            }
             self.lsp.docs.insert(
                 doc,
                 OpenDoc {
@@ -708,9 +788,90 @@ impl App {
                     path,
                     version: 1,
                     content,
+                    resync: false,
+                    change_key: format!("didChange {doc} {}", self.lsp.openings),
                 },
             );
+            self.lsp.openings += 1;
         }
+    }
+
+    /// Tell `server` a document closed; a busy server is told later.
+    fn close_document(&mut self, server: u64, uri: String) {
+        if self.lsp.servers.contains_key(&server)
+            && !self.notify(
+                server,
+                "textDocument/didClose",
+                json!({"textDocument": {"uri": uri}}),
+            )
+        {
+            self.lsp.unclosed.insert((server, uri));
+        }
+    }
+
+    /// A message queued for a server while it started that it would not
+    /// take once it was ready: undo what sending it assumed.
+    fn refused(&mut self, server: u64, message: &Value) {
+        let uri = message["params"]["textDocument"]["uri"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let ours = |d: &OpenDoc| d.server == server && d.uri == uri;
+        match message["method"].as_str() {
+            // Opened again on the next sync.
+            Some("textDocument/didOpen") => self.lsp.docs.retain(|_, d| !ours(d)),
+            Some("textDocument/didChange") => {
+                for d in self.lsp.docs.values_mut().filter(|d| ours(d)) {
+                    d.resync = true;
+                }
+            }
+            Some("textDocument/didClose") => {
+                self.lsp.unclosed.insert((server, uri));
+            }
+            _ => {
+                if let Some(id) = message["id"].as_i64() {
+                    self.lsp.deadlines.remove(&(server, id));
+                    if let Some(pending) = self.lsp.pending.remove(&(server, id)) {
+                        self.abandon(pending, "Language server busy");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The language and server root for a document not yet open in a
+    /// server, when it has a language and both the root and the document's
+    /// folder are trusted: a server runs the project's code (build scripts,
+    /// plugins).
+    fn placement(&mut self, doc: u64) -> Option<(Language, PathBuf)> {
+        use std::hash::{Hash, Hasher};
+        let d = &self.documents[&doc];
+        let path = d.path.clone()?;
+        let mut first_line = std::collections::hash_map::DefaultHasher::new();
+        crate::highlight::first_line_hint(d.rope()).hash(&mut first_line);
+        let key = PlacementKey {
+            path,
+            labelled: d.label.is_some(),
+            first_line: first_line.finish(),
+            trust: self.trust_generation,
+        };
+        if let Some(placement) = self.lsp.placements.get(&doc).filter(|p| p.key == key) {
+            return placement.target.clone();
+        }
+        let path = &key.path;
+        let target = self.language_for(doc).and_then(|language| {
+            let root = language.root_for(path, &self.root);
+            (self.trusted_path(&root) && self.trusted_path(path.parent().unwrap_or(path)))
+                .then_some((language, root))
+        });
+        self.lsp.placements.insert(
+            doc,
+            Placement {
+                key,
+                target: target.clone(),
+            },
+        );
+        target
     }
 
     fn lsp_sync_changes(&mut self, doc: u64) {
@@ -719,6 +880,7 @@ impl App {
         let changes = d.take_changes();
         let content = d.content_version();
         let full = match &changes {
+            _ if open.resync => true,
             Some(list) if !list.is_empty() => false,
             Some(_) if content == open.content => return,
             _ => true,
@@ -731,7 +893,7 @@ impl App {
             sync.as_u64().or_else(|| sync["change"].as_u64()) == Some(2)
         });
         // Diagnostics move with the text until the server reports again.
-        if let (Some(list), false) = (&changes, full) {
+        if let Some(list) = changes.as_ref().filter(|list| !list.is_empty()) {
             let path = self.documents[&doc].path.clone();
             if let Some(diagnostics) = path.and_then(|p| self.lsp.diagnostics.get_mut(&p)) {
                 for change in list {
@@ -740,7 +902,8 @@ impl App {
                 self.lsp.revision += 1;
             }
         }
-        let content_changes: Vec<Value> = if full || !incremental {
+        let whole = full || !incremental;
+        let content_changes: Vec<Value> = if whole {
             vec![json!({"text": self.documents[&doc].text()})]
         } else {
             changes
@@ -754,11 +917,17 @@ impl App {
                 })
                 .collect()
         };
-        self.notify(
-            server,
-            "textDocument/didChange",
-            json!({"textDocument": {"uri": uri, "version": version}, "contentChanges": content_changes}),
-        );
+        let message = json!({"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {"textDocument": {"uri": uri, "version": version}, "contentChanges": content_changes}});
+        // Without incremental sync each change carries the whole text, so an
+        // unsent one is obsolete: replace it rather than queue every
+        // keystroke's copy. Versions still increase; requests queued after
+        // it see the newer text. Never for incremental servers, whose later
+        // changes are relative to the text before them.
+        let key = (whole && !incremental).then(|| self.lsp.docs[&doc].change_key.clone());
+        let sent = self.deliver(server, message, key);
+        if let Some(open) = self.lsp.docs.get_mut(&doc) {
+            open.resync = !sent;
+        }
         // Edits invalidate a shown hover.
         if self.lsp.hover.as_ref().is_some_and(|h| h.doc == doc) {
             self.lsp.hover = None;
@@ -783,6 +952,9 @@ impl App {
     pub(crate) fn lsp_restart(&mut self) {
         self.lsp_stop_all();
         self.lsp.failed.clear();
+        self.lsp.crashes.clear();
+        self.lsp.restart_at.clear();
+        self.lsp.placements.clear();
         self.lsp.languages = None;
     }
 
@@ -810,6 +982,7 @@ impl App {
         self.lsp.deadlines.retain(|(s, _), _| *s != server);
         self.lsp.keys.retain(|_, id| *id != server);
         self.lsp.docs.retain(|_, d| d.server != server);
+        self.lsp.unclosed.retain(|(s, _)| *s != server);
         let dropped: Vec<Pending> = {
             let keys: Vec<(u64, i64)> = self
                 .lsp
@@ -891,14 +1064,41 @@ impl App {
             Event::Lsp { server, message } => self.lsp_message(server, message),
             Event::LspExited { server, reason } => {
                 if let Some(s) = self.lsp.servers.remove(&server) {
-                    self.status = format!("{} language server stopped ({reason})", s.language);
-                    // Do not restart a crashing server in a loop.
-                    self.lsp.failed.insert((s.language, s.root));
+                    self.server_crashed(s.language, s.root, &reason);
                 }
+                // Its documents open again when it restarts.
                 self.forget_server(server, "the language server stopped");
             }
             _ => {}
         }
+    }
+
+    /// A server exited without being asked to: start it again after a
+    /// growing wait, but not in a loop. Too many exits in a short time and
+    /// it stays stopped until restarted by hand.
+    fn server_crashed(&mut self, language: String, root: PathBuf, reason: &str) {
+        let now = Instant::now();
+        let key = (language, root);
+        let crashes = self.lsp.crashes.entry(key.clone()).or_default();
+        crashes.retain(|at| now.duration_since(*at) < CRASH_WINDOW);
+        crashes.push(now);
+        let Some(delay) = RESTART_DELAYS.get(crashes.len() - 1).copied() else {
+            self.status = format!("{} language server stopped ({reason})", key.0);
+            self.lsp.failed.insert(key);
+            return;
+        };
+        self.status = format!(
+            "{} language server stopped ({reason}); restarting in {} s",
+            key.0,
+            delay.as_secs()
+        );
+        self.lsp.restart_at.insert(key, now + delay);
+        // Wake the event loop when the wait is over.
+        let events = self.events.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            events.notify();
+        });
     }
 
     fn lsp_message(&mut self, server: u64, message: Value) {
@@ -1084,14 +1284,24 @@ impl App {
                         .send(&json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
                     s.process.send(&json!({"jsonrpc": "2.0", "method": "workspace/didChangeConfiguration", "params": {"settings": s.settings}}));
                     s.queued_bytes = 0;
-                    for message in std::mem::take(&mut s.queue) {
-                        s.process.send(&message);
+                    let mut refused = Vec::new();
+                    for (key, message, _) in std::mem::take(&mut s.queue) {
+                        let sent = match &key {
+                            Some(key) => s.process.send_replacing(key, &message),
+                            None => s.process.send(&message),
+                        };
+                        if !sent {
+                            refused.push(message);
+                        }
                     }
                     let name = result["serverInfo"]["name"]
                         .as_str()
                         .unwrap_or(&s.language)
                         .to_string();
                     self.status = format!("{name} ready");
+                    for message in refused {
+                        self.refused(server, &message);
+                    }
                 }
             }
             Pending::Signature {
@@ -1943,11 +2153,13 @@ impl App {
                     let (el, ec) = position(&range_value["end"]);
                     (d.offset_of(sl, sc), d.offset_of(el, ec))
                 });
-                let insert = edit["newText"]
-                    .as_str()
-                    .or_else(|| item["insertText"].as_str())
-                    .unwrap_or(&label)
-                    .to_string();
+                let insert = crate::text_format::normalize_input(
+                    edit["newText"]
+                        .as_str()
+                        .or_else(|| item["insertText"].as_str())
+                        .unwrap_or(&label),
+                )
+                .into_owned();
                 let additional = item["additionalTextEdits"]
                     .as_array()
                     .into_iter()
@@ -1955,11 +2167,7 @@ impl App {
                     .map(|e| {
                         let (sl, sc) = position(&e["range"]["start"]);
                         let (el, ec) = position(&e["range"]["end"]);
-                        (
-                            d.offset_of(sl, sc),
-                            d.offset_of(el, ec),
-                            e["newText"].as_str().unwrap_or_default().to_string(),
-                        )
+                        (d.offset_of(sl, sc), d.offset_of(el, ec), new_text(e))
                     })
                     .collect();
                 Candidate {
@@ -1977,9 +2185,7 @@ impl App {
             })
             .collect();
         // Snippets for the language join the list.
-        let (_, end) = d.line_range(0);
-        let hint = d.slice(0, d.floor_boundary(end.min(4096)));
-        let language = crate::highlight::syntax_for(d.path.as_deref(), &hint)
+        let language = crate::highlight::syntax_of(d.path.as_deref(), d.rope())
             .name
             .clone();
         let mut snippet_errors = Vec::new();
@@ -2524,6 +2730,259 @@ impl App {
 mod tests {
     use super::*;
 
+    /// An app editing `main.fk`, whose language's server is `server`.
+    fn with_server(dir: &Path, server: &[&str], trusted: bool) -> (App, u64) {
+        std::env::set_var("XDG_CONFIG_HOME", dir.join("config"));
+        std::env::set_var("XDG_STATE_HOME", dir.join("state"));
+        std::fs::create_dir_all(dir.join("config/slate")).unwrap();
+        std::fs::write(
+            dir.join("config/slate/languages.toml"),
+            format!(
+                "[[language]]\nname = \"Fake\"\nextensions = [\"fk\"]\nserver = {}\n",
+                serde_json::to_string(server).unwrap()
+            ),
+        )
+        .unwrap();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("main.fk"), "text\n").unwrap();
+        let mut app = App::new(&project.join("main.fk")).unwrap();
+        app.set_session_trust(trusted);
+        let doc = *app.documents.keys().next().unwrap();
+        (app, doc)
+    }
+
+    fn settle(app: &mut App, what: &str, check: impl Fn(&App) -> bool) {
+        for _ in 0..1000 {
+            app.process_events();
+            if check(app) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("Timed out waiting for {what}: {}", app.status);
+    }
+
+    #[test]
+    fn a_busy_server_keeps_running_and_full_text_changes_are_coalesced() {
+        let _serial = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        // Never answers `initialize`: everything waits in its queue.
+        let (mut app, doc) = with_server(dir.path(), &["sleep", "60"], true);
+        app.process_events();
+        let server = app.lsp.docs[&doc].server;
+        for _ in 0..300 {
+            app.dispatch(crate::Command::Paste { text: "x".into() });
+            app.process_events();
+        }
+        let queued: Vec<&str> = app.lsp.servers[&server]
+            .queue
+            .iter()
+            .map(|(_, message, _)| message["method"].as_str().unwrap())
+            .collect();
+        assert_eq!(queued, ["textDocument/didOpen", "textDocument/didChange"]);
+        let change = &app.lsp.servers[&server].queue[1].1;
+        assert_eq!(change["params"]["textDocument"]["version"], 301);
+        assert_eq!(
+            change["params"]["contentChanges"][0]["text"],
+            app.documents[&doc].text()
+        );
+        // More requests than the queue holds are refused, not fatal.
+        for _ in 0..STARTUP_QUEUE {
+            app.request(server, "textDocument/hover", json!({}), Pending::Ignore);
+        }
+        assert_eq!(app.lsp.servers[&server].queue.len(), STARTUP_QUEUE);
+        assert!(app.lsp.pending.len() < STARTUP_QUEUE + 1);
+        std::thread::sleep(Duration::from_millis(100));
+        app.process_events();
+        assert!(app.lsp.servers.contains_key(&server), "{}", app.status);
+        assert!(app.lsp.failed.is_empty());
+    }
+
+    fn queued_methods(app: &App, server: u64) -> Vec<String> {
+        app.lsp.servers[&server]
+            .queue
+            .iter()
+            .map(|(_, message, _)| message["method"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn full_text_changes_never_move_ahead_of_a_close_and_reopen() {
+        let _serial = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, doc) = with_server(dir.path(), &["sleep", "60"], true);
+        app.process_events();
+        let server = app.lsp.docs[&doc].server;
+        app.dispatch(crate::Command::Paste { text: "a".into() });
+        app.process_events();
+        let path = app.documents[&doc].path.clone();
+        app.documents.get_mut(&doc).unwrap().path = Some(dir.path().join("project/main.txt"));
+        app.process_events();
+        app.documents.get_mut(&doc).unwrap().path = path;
+        app.process_events();
+        app.dispatch(crate::Command::Paste { text: "b".into() });
+        app.process_events();
+        assert_eq!(
+            queued_methods(&app, server),
+            [
+                "textDocument/didOpen",
+                "textDocument/didChange",
+                "textDocument/didClose",
+                "textDocument/didOpen",
+                "textDocument/didChange"
+            ]
+        );
+        let queue = &app.lsp.servers[&server].queue;
+        assert_ne!(queue[1].0, queue[4].0);
+        assert_eq!(
+            queue[4].1["params"]["contentChanges"][0]["text"],
+            app.documents[&doc].text()
+        );
+    }
+
+    #[test]
+    fn messages_a_busy_server_refused_are_sent_again() {
+        let _serial = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, doc) = with_server(dir.path(), &["sleep", "60"], true);
+        app.process_events();
+        let server = app.lsp.docs[&doc].server;
+        while app.lsp.servers[&server].queue.len() < STARTUP_QUEUE {
+            app.request(server, "textDocument/hover", json!({}), Pending::Ignore);
+        }
+        // A close the server could not take is retried, and the document
+        // is not opened there again before the close is sent.
+        let path = app.documents[&doc].path.clone();
+        app.documents.get_mut(&doc).unwrap().path = Some(dir.path().join("project/main.txt"));
+        app.process_events();
+        assert_eq!(app.lsp.unclosed.len(), 1);
+        app.documents.get_mut(&doc).unwrap().path = path;
+        app.process_events();
+        assert!(!app.lsp.docs.contains_key(&doc));
+        let s = app.lsp.servers.get_mut(&server).unwrap();
+        s.queue.clear();
+        s.queued_bytes = 0;
+        app.process_events();
+        assert_eq!(
+            queued_methods(&app, server),
+            ["textDocument/didClose", "textDocument/didOpen"]
+        );
+        assert!(app.lsp.docs.contains_key(&doc) && app.lsp.unclosed.is_empty());
+        // Refused when the startup queue is flushed: a change is resent
+        // whole, an opening is repeated.
+        let uri = app.lsp.docs[&doc].uri.clone();
+        let message =
+            |method: &str| json!({"method": method, "params": {"textDocument": {"uri": uri}}});
+        app.refused(server, &message("textDocument/didChange"));
+        assert!(app.lsp.docs[&doc].resync);
+        app.refused(server, &message("textDocument/didOpen"));
+        assert!(!app.lsp.docs.contains_key(&doc));
+        app.refused(server, &message("textDocument/didClose"));
+        assert!(app.lsp.unclosed.contains(&(server, uri)));
+    }
+
+    #[test]
+    fn crashed_servers_restart_with_a_backoff_and_then_stay_stopped() {
+        let _serial = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("starts");
+        // Crashes on its first start only.
+        let once = format!(
+            "echo >> '{0}'; [ $(wc -l < '{0}') -gt 1 ] && exec sleep 60; exit 1",
+            log.display()
+        );
+        let (mut app, doc) = with_server(dir.path(), &["sh", "-c", &once], true);
+        let starts = || {
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        settle(&mut app, "the crash", |a| {
+            a.status.contains("restarting in 1 s")
+        });
+        assert!(app.lsp.docs.is_empty());
+        let crashed = std::time::Instant::now();
+        // The document is offered to the restarted server.
+        settle(&mut app, "the restart", |a| a.lsp.docs.contains_key(&doc));
+        assert!(crashed.elapsed() >= Duration::from_millis(900));
+        settle(&mut app, "the second start", |_| starts() == 2);
+        std::thread::sleep(Duration::from_millis(100));
+        app.process_events();
+        assert!(app.lsp.docs.contains_key(&doc), "{}", app.status);
+        app.lsp_stop_all();
+
+        // A server that keeps crashing is restarted three times, then not.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("starts");
+        let always = format!("echo >> '{}'; exit 1", log.display());
+        let (mut app, _) = with_server(dir.path(), &["sh", "-c", &always], true);
+        for delay in [1, 5, 30] {
+            settle(&mut app, "a crash", |a| {
+                a.status.contains(&format!("restarting in {delay} s"))
+            });
+            // As if the wait were over.
+            app.lsp.restart_at.clear();
+        }
+        settle(&mut app, "giving up", |a| !a.lsp.failed.is_empty());
+        assert!(!app.status.contains("restarting"), "{}", app.status);
+        app.process_events();
+        std::thread::sleep(Duration::from_millis(200));
+        app.process_events();
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap().lines().count(),
+            4,
+            "one start and three restarts"
+        );
+    }
+
+    #[test]
+    fn placement_decisions_follow_trust_and_paths() {
+        let _serial = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, doc) = with_server(dir.path(), &["sleep", "60"], false);
+        app.process_events();
+        assert!(app.lsp.servers.is_empty());
+        assert!(app.lsp.placements[&doc].target.is_none());
+        let generation = app.trust_generation;
+        // Trusting is noticed without reopening the document.
+        app.set_session_trust(true);
+        assert!(app.trust_generation > generation);
+        app.process_events();
+        assert!(app.lsp.docs.contains_key(&doc));
+        let (language, root) = app.lsp.placements[&doc].target.clone().unwrap();
+        assert_eq!(
+            (language.name.as_str(), root.as_path()),
+            ("Fake", dir.path().join("project").as_path())
+        );
+        // A new name without the language leaves the server.
+        let renamed = dir.path().join("project/main.txt");
+        app.documents.get_mut(&doc).unwrap().path = Some(renamed.clone());
+        app.process_events();
+        assert!(!app.lsp.docs.contains_key(&doc));
+        assert_eq!(app.lsp.placements[&doc].key.path, renamed);
+        assert!(app.lsp.placements[&doc].target.is_none());
+        app.documents.get_mut(&doc).unwrap().path = Some(dir.path().join("project/main.fk"));
+        app.process_events();
+        assert!(app.lsp.docs.contains_key(&doc));
+        // Restricting stops the server and keeps it from starting again.
+        app.set_session_trust(false);
+        app.process_events();
+        assert!(app.lsp.servers.is_empty() && app.lsp.docs.is_empty());
+        assert!(app.lsp.placements[&doc].target.is_none());
+    }
+
     #[test]
     fn timed_out_requests_are_removed_without_waiting_on_a_server() {
         let _serial = crate::paths::TEST_ENV
@@ -2617,6 +3076,32 @@ mod tests {
         assert_eq!(app.documents[&id].text(), "Xbc\n");
         assert!(app.documents.values().any(|d| d.text() == "Ybc\n"));
         assert_eq!(std::fs::read_to_string(b).unwrap(), "abc\n");
+    }
+
+    #[test]
+    fn edits_with_crlf_text_keep_buffers_lf_and_save_single_crlf() {
+        let _serial = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", dir.path().join("config"));
+        std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
+        let a = dir.path().join("a.txt");
+        std::fs::write(&a, "a\r\nb\r\n").unwrap();
+        let mut app = App::new(&a).unwrap();
+        let id = *app.documents.keys().next().unwrap();
+        // The second range is measured in the buffer, after the first line.
+        let edit = json!({"changes":{uri(&a):[
+            {"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":0}},"newText":"x\r\ny\r\n"},
+            {"range":{"start":{"line":1,"character":1},"end":{"line":1,"character":1}},"newText":"\r\nz"},
+        ]}});
+        app.apply_workspace_edit(&edit, None).unwrap();
+        assert_eq!(app.documents[&id].text(), "a\nx\ny\nb\nz\n");
+        app.documents.get_mut(&id).unwrap().save(None).unwrap();
+        assert_eq!(
+            std::fs::read(&a).unwrap(),
+            b"a\r\nx\r\ny\r\nb\r\nz\r\n".to_vec()
+        );
     }
 
     #[test]

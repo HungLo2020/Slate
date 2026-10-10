@@ -37,11 +37,15 @@
 #include <QTextCharFormat>
 #include <QTextDocument>
 #include <QTextLayout>
+#include <QThread>
 #include <QTimer>
 #include <QWheelEvent>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 extern "C" int slate_event_fd(void *);
+extern "C" int slate_termination_fd();
+extern "C" bool slate_terminated();
 extern "C" char *slate_request(void *, const char *);
 extern "C" void slate_response_free(char *);
 extern "C" void slate_set_waker(void *, void (*)(void *), void *);
@@ -311,6 +315,12 @@ void Bridge::performRequests(const QVariantList &requests) {
 void Bridge::scheduleRefresh() {
     if (!m_refreshTimer.isActive()) m_refreshTimer.start();
 }
+void Bridge::tick() {
+    // The core's time-based work (disk checks, checkpoints, request
+    // timeouts) runs when it is polled; a recent refresh already did that.
+    if (m_lastRefresh.isValid() && m_lastRefresh.elapsed() < 900) return;
+    refresh();
+}
 QVariantMap Bridge::diagnostics() const {
     return {{"updates", m_updates}, {"last_update_bytes", m_lastBytes},
             {"clipboard_reads", m_clipboardReads}, {"catalog_requests", m_catalogRequests}};
@@ -400,22 +410,44 @@ void Bridge::applyTheme() {
     m_theme = theme;
     send(theme);
 }
-static QVariantMap patchTerminal(QVariantMap prior, const QVariantMap &patch) {
-    auto cells = prior.value("cells").toList();
-    const int rows = patch.value("rows").toInt();
-    while (cells.size() > rows) cells.removeLast();
-    while (cells.size() < rows) cells.append(QVariant(QVariantList()));
+// Terminal rows arrive as runs: [style, columns, text], styles as
+// [foreground, background, bold | italic << 1 | underline << 2]. Changed rows
+// are parsed once into the grid every view of the pane paints from.
+static void patchTerminal(TerminalGrid &grid, const QVariantMap &patch) {
+    grid.rows = qMax(0, patch.value("rows").toInt());
+    grid.cols = qMax(0, patch.value("cols").toInt());
+    grid.lines.resize(grid.rows);
+    QVector<TerminalRun> styles;
+    for (const auto &value : patch.value("styles").toList()) {
+        const auto style = value.toList();
+        const int flags = style.value(2).toInt();
+        TerminalRun run;
+        run.foreground = QColor(style.value(0).toString());
+        run.background = QColor(style.value(1).toString());
+        run.bold = flags & 1;
+        run.italic = flags & 2;
+        run.underline = flags & 4;
+        styles.append(run);
+    }
     for (const auto &entry : patch.value("lines").toList()) {
         const auto line = entry.toMap();
         const int row = line.value("row").toInt();
-        if (row >= 0 && row < cells.size()) cells[row] = line.value("cells");
+        if (row < 0 || row >= grid.rows) continue;
+        QVector<TerminalRun> runs;
+        int column = 0;
+        for (const auto &value : line.value("runs").toList()) {
+            const auto data = value.toList();
+            TerminalRun run = styles.value(data.value(0).toInt());
+            run.column = column;
+            run.columns = qMax(1, data.value(1).toInt());
+            run.text = data.value(2).toString();
+            run.perColumn = run.text.size() == run.columns &&
+                std::all_of(run.text.cbegin(), run.text.cend(), [](QChar c) { return c.unicode() < 0x80; });
+            column += run.columns;
+            runs.append(run);
+        }
+        grid.lines[row] = runs;
     }
-    // Complete cached surfaces are used when a pane delegate is recreated.
-    if (patch.contains("cells")) cells = patch.value("cells").toList();
-    prior = patch;
-    prior.remove("lines");
-    prior.insert("cells", cells);
-    return prior;
 }
 // Assemble compact native content separately from the small metadata QML sees.
 static QVariantMap patchSurface(QVariantMap prior, const QVariantMap &patch) {
@@ -436,9 +468,24 @@ static QVariantMap patchSurface(QVariantMap prior, const QVariantMap &patch) {
         prior.insert("lines", lines);
     }
     for (auto it = patch.begin(); it != patch.end(); ++it)
-        if (it.key() == "screen") prior.insert("screen", patchTerminal(prior.value("screen").toMap(), it.value().toMap()));
-        else if (it.key() != "lines") prior.insert(it.key(), it.value());
+        if (it.key() != "lines" && it.key() != "screen") prior.insert(it.key(), it.value());
     return prior;
+}
+QVariantMap Bridge::surface(int pane) const {
+    auto surface = m_surfaces.value(pane);
+    if (const auto grid = terminal(pane)) {
+        QVariantList lines;
+        for (const auto &row : grid->lines) {
+            QVariantList runs;
+            for (const auto &run : row)
+                runs.append(QVariantMap{{"column", run.column}, {"columns", run.columns}, {"text", run.text},
+                                        {"fg", run.foreground.name()}, {"bg", run.background.name()},
+                                        {"bold", run.bold}, {"italic", run.italic}, {"underline", run.underline}});
+            lines.append(QVariant(runs));
+        }
+        surface.insert("screen", QVariantMap{{"rows", grid->rows}, {"cols", grid->cols}, {"lines", lines}});
+    }
+    return surface;
 }
 void Bridge::refresh() {
     if (m_refreshing) { scheduleRefresh(); return; }
@@ -447,25 +494,34 @@ void Bridge::refresh() {
     auto frame = send({{"action", "update"}, {"width", m_width}, {"height", m_height},
                        {"cell_width", m_cellWidth}, {"cell_height", m_cellHeight},
                        {"header_height", m_headerHeight}, {"minimum_width", qMax(160, m_headerHeight * 4)}});
+    m_lastRefresh.start();
     if (frame.value("unchanged").toBool()) { emit refreshFinished(); return; }
     ++m_updates;
     const auto surfaces = frame.take("surfaces").toList();
-    for (const auto &key : {"files", "git", "settings", "global_shortcuts"})
+    // Rows are only sent when their revision changed. They go to the models,
+    // never into the frame QML converts on every change.
+    const bool fileChange = frame.contains("files"), gitChange = frame.contains("git");
+    const auto files = frame.take("files").toList(), git = frame.take("git").toList();
+    for (const auto &key : {"settings", "global_shortcuts"})
         if (!frame.contains(key)) frame.insert(key, m_frame.value(key));
     QVariantList panes, handles;
     for (const auto &p : frame.value("panes").toList()) {
         const auto pane = p.toMap();
         const int id = pane.value("id").toInt();
         panes.append(pane.value("id"));
-        if (m_surfaces.value(id).value("kind") != pane.value("kind")) m_surfaces.remove(id);
+        if (m_surfaces.value(id).value("kind") != pane.value("kind")) {
+            m_surfaces.remove(id);
+            m_terminals.remove(id);
+        }
     }
     for (auto it = m_surfaces.begin(); it != m_surfaces.end();) {
         if (!panes.contains(it.key())) it = m_surfaces.erase(it); else ++it;
     }
+    for (auto it = m_terminals.begin(); it != m_terminals.end();) {
+        if (!panes.contains(it.key())) it = m_terminals.erase(it); else ++it;
+    }
     for (const auto &h : frame.value("handles").toList()) handles.append(h.toMap().value("id"));
     const bool structure = panes != m_paneIds || handles != m_handleIds;
-    const bool fileChange = frame.value("files") != m_frame.value("files"),
-               gitChange = frame.value("git") != m_frame.value("git");
     m_frame = frame;
     m_paneIds = panes;
     m_handleIds = handles;
@@ -473,8 +529,9 @@ void Bridge::refresh() {
     // Store before delegates are created, so a restored/recreated view can
     // immediately attach to complete native content even on a metadata-only frame.
     for (const auto &entry : surfaces) {
-        const auto patch = entry.toMap();
+        auto patch = entry.toMap();
         const int id = patch.value("id").toInt();
+        if (patch.contains("screen")) patchTerminal(m_terminals[id], patch.take("screen").toMap());
         m_surfaces.insert(id, patchSurface(m_surfaces.value(id), patch));
         if (auto view = m_views.value(id)) view->applySurface(patch);
     }
@@ -483,8 +540,8 @@ void Bridge::refresh() {
         const auto pane = p.toMap();
         if (auto view = m_views.value(pane.value("id").toInt())) view->setPane(pane);
     }
-    if (fileChange) { m_files.replace(m_frame.value("files").toList()); emit filesChanged(); }
-    if (gitChange) { m_git.replace(m_frame.value("git").toList()); emit gitChanged(); }
+    if (fileChange) { m_files.replace(files); emit filesChanged(); }
+    if (gitChange) { m_git.replace(git); emit gitChanged(); }
     emit frameChanged();
     emit refreshFinished();
     if (frame.value("quit").toBool()) QCoreApplication::quit();
@@ -593,7 +650,10 @@ CellView::CellView(QQuickItem *parent) : QQuickPaintedItem(parent) {
     m_blink.setInterval(qMax(200, QGuiApplication::styleHints()->cursorFlashTime() / 2));
     connect(&m_blink, &QTimer::timeout, this, [this]() {
         m_cursorShown = !m_cursorShown;
-        update();
+        // Only the cursor changes; the rest of the grid stays painted.
+        const auto cursor = cursorRectangle();
+        if (cursor.isValid()) update(cursor.toAlignedRect().adjusted(-2, -2, 2, 2));
+        else update();
     });
     m_hoverTimer.setSingleShot(true);
     m_hoverTimer.setInterval(600);
@@ -650,6 +710,10 @@ void CellView::setPane(const QVariantMap &pane) {
         m_lines.clear(); m_columns.clear(); m_lineData.clear(); m_overlays.clear();
         m_layoutPreedit.clear(); m_preeditPosition.clear();
     }
+    if (kindChanged && m_scrollPixels != 0) {
+        m_scrollPixels = 0;
+        emit scrollPixelsChanged();
+    }
     // A cursor-driven scroll (not the wheel) aligns rows to the top again.
     const int top = pane.value("editor").toMap().value("top", -1).toInt();
     if (top != m_lastTop) {
@@ -683,8 +747,7 @@ void CellView::applySurface(const QVariantMap &patch) {
     const auto previousCursor = m_cursor;
     m_cursor = patch.value("cursor").toList();
     if (patch.value("kind") == "terminal") {
-        if (patch.contains("screen")) m_screen = patchTerminal(m_screen, patch.value("screen").toMap());
-        update();
+        update(); // The bridge holds the grid.
         return;
     }
     const int count = patch.value("line_count").toInt();
@@ -761,7 +824,9 @@ QRectF CellView::cursorRectangle() const {
     if (m_cursor.size() != 2 || !bridge) return {};
     const int row = m_cursor[0].toInt(), col = m_cursor[1].toInt();
     const qreal x = 1 + (isEditor() ? cursorX(row, col) : col * bridge->cellWidth());
-    return QRectF(x, 1 + row * bridge->cellHeight() - m_scrollPixels, bridge->cellWidth(), bridge->cellHeight());
+    // Only editors scroll by pixels; terminals draw rows at fixed positions.
+    const qreal offset = isEditor() ? m_scrollPixels : 0;
+    return QRectF(x, 1 + row * bridge->cellHeight() - offset, bridge->cellWidth(), bridge->cellHeight());
 }
 static QTextLayout::FormatRange textFormat(const QVariantMap &span, bool overlay = false) {
     QTextCharFormat format;
@@ -826,65 +891,45 @@ void CellView::paint(QPainter *p) {
     const bool editor = m_pane.value("kind") == "editor";
     const QColor background(bridge->frame().value(editor ? "background" : "terminal_background").toString());
     p->fillRect(boundingRect(), background);
-    const auto screen = m_screen;
     const int cw = bridge->cellWidth(), ch = bridge->cellHeight();
     const qreal offset = editor ? m_scrollPixels : 0;
+    // A cursor blink repaints only the cursor: skip rows outside the clip.
+    const QRectF clip = p->hasClipping() ? p->clipBoundingRect() : boundingRect();
     if (editor) {
         layoutText();
         for (int row = 0; row < int(m_lines.size()); ++row) {
             if (!m_lines[row]) continue;
             const qreal y = 1 + row * ch - offset;
-            if (y > height()) break;
+            if (y > height() || y > clip.bottom()) break;
+            if (y + ch < clip.top()) continue;
             QList<QTextLayout::FormatRange> overlays;
             for (const auto &span : m_overlays[row]) overlays.append(textFormat(span.toMap(), true));
             m_lines[row]->draw(p, QPointF(1, y), overlays);
         }
-    } else {
+    } else if (const auto grid = bridge->terminal(m_paneId)) {
         // Runs of cells with the same style are drawn together; wide and
-        // non-ASCII glyphs keep their own cell so columns never drift.
-        const auto rows = screen.value("cells").toList();
+        // non-ASCII glyphs are runs of their own so columns never drift.
         const auto ascent = QFontMetrics(bridge->font()).ascent();
-        for (int row = 0; row < rows.size(); ++row) {
-            const auto line = rows[row].toList();
-            int col = 0;
-            while (col < line.size()) {
-                const auto cell = line[col].toMap();
-                const auto fg = cell.value("fg").toString(), bg = cell.value("bg").toString();
-                const bool bold = cell.value("bold").toBool(), italic = cell.value("italic").toBool(),
-                           underline = cell.value("underline").toBool();
-                QString text = cell.value("continuation").toBool() ? QString() : cell.value("text").toString();
-                const bool simple = text.size() == 1 && text[0].unicode() < 0x80 && !cell.value("wide").toBool();
-                int end = col + 1;
-                if (simple) {
-                    while (end < line.size()) {
-                        const auto next = line[end].toMap();
-                        const auto glyph = next.value("text").toString();
-                        if (next.value("fg") != fg || next.value("bg") != bg || next.value("bold").toBool() != bold ||
-                            next.value("italic").toBool() != italic || next.value("underline").toBool() != underline ||
-                            glyph.size() != 1 || glyph[0].unicode() >= 0x80 || next.value("wide").toBool() ||
-                            next.value("continuation").toBool())
-                            break;
-                        text += glyph;
-                        ++end;
-                    }
+        for (int row = 0; row < grid->lines.size(); ++row) {
+            const QRectF line(0, 1 + row * ch, width(), ch);
+            if (line.top() > clip.bottom()) break;
+            if (line.bottom() < clip.top()) continue;
+            for (const auto &run : grid->lines[row]) {
+                const QRect rect(1 + run.column * cw, 1 + row * ch, run.columns * cw, ch);
+                p->fillRect(rect, run.background);
+                if (run.text.isEmpty() || run.text.trimmed().isEmpty()) continue;
+                QFont font = bridge->font(run.bold, run.italic);
+                font.setUnderline(run.underline);
+                p->setFont(font);
+                p->setPen(run.foreground);
+                if (run.perColumn) {
+                    // Monospace: place each glyph on its cell boundary.
+                    for (int i = 0; i < run.text.size(); ++i)
+                        if (run.text[i] != ' ')
+                            p->drawText(rect.x() + i * cw, rect.y() + ascent, QString(run.text[i]));
+                } else {
+                    p->drawText(rect.x(), rect.y() + ascent, run.text);
                 }
-                const QRect rect(1 + col * cw, 1 + row * ch, (end - col) * cw, ch);
-                p->fillRect(rect, QColor(bg));
-                if (!text.isEmpty() && text != QLatin1String(" ")) {
-                    QFont font = bridge->font(bold, italic);
-                    font.setUnderline(underline);
-                    p->setFont(font);
-                    p->setPen(QColor(fg));
-                    if (simple) {
-                        // Monospace: place each glyph on its cell boundary.
-                        for (int i = 0; i < text.size(); ++i)
-                            if (text[i] != ' ')
-                                p->drawText(rect.x() + i * cw, rect.y() + ascent, QString(text[i]));
-                    } else {
-                        p->drawText(rect.x(), rect.y() + ascent, text);
-                    }
-                }
-                col = end;
             }
         }
     }
@@ -1308,11 +1353,16 @@ void Minimap::mouseMoveEvent(QMouseEvent *e) {
 
 // ---------------------------------------------------------------------------
 static void initializeResources() { Q_INIT_RESOURCE(resources); }
-// Thread-safe request to leave the event loop (termination signals).
-extern "C" void slate_qt_quit() {
-    if (auto app = QCoreApplication::instance())
-        QMetaObject::invokeMethod(app, "quit", Qt::QueuedConnection);
+#ifdef SLATE_SMOKE_TEST
+// Tests stand in for slow startup phases: wait here for a termination signal.
+static void holdForSmoke(const char *phase) {
+    if (qEnvironmentVariable("SLATE_GUI_SMOKE_HOLD") != QLatin1String(phase)) return;
+    std::fprintf(stderr, "Smoke startup: holding at %s\n", phase);
+    QElapsedTimer held;
+    held.start();
+    while (!slate_terminated() && held.elapsed() < 10000) QThread::msleep(10);
 }
+#endif
 static void wake(void *target) {
     // Called from Rust worker threads; queue a refresh on the GUI thread.
     QMetaObject::invokeMethod(static_cast<Bridge *>(target), "scheduleRefresh", Qt::QueuedConnection);
@@ -1329,7 +1379,22 @@ extern "C" int slate_qt_run(void *context, int argc, char **argv) {
 #ifdef SLATE_SMOKE_TEST
     if (tracing)
         std::fprintf(stderr, "Smoke startup: QApplication ready\n");
+    holdForSmoke("qapplication");
 #endif
+    // Termination signals are delivered on the GUI thread, as a readable
+    // descriptor. One that arrived while the workspace was restored or Qt
+    // started ends startup now; later ones quit once the event loop runs.
+    if (slate_terminated()) return 0;
+    if (const int terminationFd = slate_termination_fd(); terminationFd >= 0) {
+        auto termination = new QSocketNotifier(terminationFd, QSocketNotifier::Read, &app);
+        QObject::connect(termination, &QSocketNotifier::activated, &app, [termination]() {
+            termination->setEnabled(false);
+            // Not quit(): windows may veto that (closing with unsaved work
+            // asks first). Recovery or NAME.save copies are written after the
+            // loop returns.
+            QCoreApplication::exit(0);
+        });
+    }
     app.setApplicationName("Slate");
     app.setOrganizationName("Slate");
     app.setDesktopFileName("slate");
@@ -1404,9 +1469,15 @@ extern "C" int slate_qt_run(void *context, int argc, char **argv) {
     QObject::connect(geometryTimer,&QTimer::timeout,window,saveGeometry);
     QObject::connect(&app,&QCoreApplication::aboutToQuit,window,saveGeometry);
     }
+    // The core's clock: disk checks for externally changed files, delayed
+    // recovery checkpoints and request timeouts run when it is polled. Worker
+    // results wake the event descriptor instead. An idle poll answers
+    // "unchanged", is skipped after a recent refresh, and is coarse so the
+    // system can batch the wakeup with others.
     QTimer timer;
-    QObject::connect(&timer, &QTimer::timeout, &state, &Bridge::refresh);
-    timer.start(1000); // Checkpoints and the external-change watcher.
+    timer.setTimerType(Qt::VeryCoarseTimer);
+    QObject::connect(&timer, &QTimer::timeout, &state, &Bridge::tick);
+    timer.start(1000);
     QObject::connect(&app, &QGuiApplication::paletteChanged, &state, [&state]() {
         state.applyTheme();
         state.refresh();
@@ -1436,6 +1507,7 @@ extern "C" int slate_qt_run(void *context, int argc, char **argv) {
         startSmoke(&state, window);
 #endif
 #ifdef SLATE_SMOKE_TEST
+    holdForSmoke("loading");
     if (tracing)
         std::fprintf(stderr, "Smoke startup: entering event loop\n");
 #endif

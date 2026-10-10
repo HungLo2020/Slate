@@ -45,7 +45,7 @@ ApplicationWindow {
             "git_branch": frame.git_branch,
             "git_busy": frame.git_busy,
             "git_error": frame.git_error,
-            "git": frame.git || [],
+            "git": slate.gitEntries,
             "focus": frame.focus
         };
     }
@@ -176,12 +176,14 @@ ApplicationWindow {
             spacing: 24
             Text {
                 text: (commandItem.checkable ? (commandItem.checked ? "✓  " : "    ") : "") + commandItem.text
+                textFormat: Text.PlainText
                 font: commandItem.font
                 color: commandItem.highlighted ? Theme.highlightedTextColor : commandItem.enabled ? Theme.textColor : Theme.disabledTextColor
                 Layout.fillWidth: true
             }
             Text {
                 text: commandItem.commandInfo.shortcut || ""
+                textFormat: Text.PlainText
                 font: commandItem.font
                 color: commandItem.highlighted ? Theme.highlightedTextColor : Theme.disabledTextColor
             }
@@ -190,6 +192,22 @@ ApplicationWindow {
             color: commandItem.highlighted ? Theme.highlightColor : "transparent"
         }
         onTriggered: root.invokeAction(actionId, argument, commandPane)
+    }
+    // Menu entries naming files, folders and tabs. A control's default label
+    // renders text that looks like markup as rich text, so `caption` is shown
+    // as plain text; `text` keeps the mnemonic (escape `&` in names as `&&`).
+    component PlainMenuItem: Basic.MenuItem {
+        id: plainItem
+        required property string caption
+        contentItem: Text {
+            leftPadding: plainItem.checkable && plainItem.indicator ? plainItem.indicator.width + plainItem.spacing : 0
+            text: plainItem.caption
+            textFormat: Text.PlainText
+            font: plainItem.font
+            elide: Text.ElideMiddle
+            verticalAlignment: Text.AlignVCenter
+            color: plainItem.palette.windowText
+        }
     }
     // A label with the characters at `positions` bold and underlined.
     function marked(label, positions) {
@@ -365,9 +383,10 @@ ApplicationWindow {
                 enabled: (root.frame.recent_projects || []).length > 0
                 Instantiator {
                     model: root.frame.recent_projects || []
-                    delegate: Basic.MenuItem {
+                    delegate: PlainMenuItem {
                         required property string modelData
-                        text: modelData
+                        text: modelData.replace(/&/g, "&&")
+                        caption: modelData
                         onTriggered: root.invokeAction("open-recent-project", modelData)
                     }
                     onObjectAdded: function(index, object) { recentProjectsMenu.insertItem(index, object); }
@@ -381,11 +400,13 @@ ApplicationWindow {
                 enabled: (root.frame.recent || []).length > 0
                 Instantiator {
                     model: root.frame.recent || []
-                    delegate: Basic.MenuItem {
+                    delegate: PlainMenuItem {
                         required property string modelData
                         required property int index
+                        readonly property string entry: modelData.substring(modelData.lastIndexOf("/") + 1) + "   —   " + modelData
                         objectName: "recent_" + index
-                        text: (index < 9 ? "&" + (index + 1) + "  " : "") + modelData.substring(modelData.lastIndexOf("/") + 1) + "   —   " + modelData
+                        text: (index < 9 ? "&" + (index + 1) + "  " : "") + entry.replace(/&/g, "&&")
+                        caption: (index < 9 ? (index + 1) + "  " : "") + entry
                         onTriggered: root.invokeAction("open-recent", modelData)
                     }
                     onObjectAdded: function (index, object) {
@@ -769,10 +790,11 @@ ApplicationWindow {
                                     id: tabMenu
                                     Instantiator {
                                         model: tabs.entries
-                                        delegate: MenuItem {
+                                        delegate: PlainMenuItem {
                                             required property var modelData
                                             required property int index
-                                            text: modelData.title
+                                            text: modelData.title.replace(/&/g, "&&")
+                                            caption: modelData.title
                                             checkable: true
                                             checked: modelData.active
                                             onTriggered: root.send({
@@ -2002,6 +2024,7 @@ ApplicationWindow {
                         required property string modelData
                         Layout.fillWidth: true
                         wrapMode: Text.Wrap
+                        textFormat: Text.PlainText
                         text: modelData.replace(/_/g, " ") + ": " + root.frame.setting_sources[modelData]
                     }
                 }
@@ -2019,9 +2042,19 @@ ApplicationWindow {
                 Repeater {
                     model: Object.keys(root.settings[shortcutScope.currentText + "_keys"] || {}).sort()
                     delegate: Button {
+                        id: shortcutEntry
                         required property string modelData
                         Layout.fillWidth: true
                         text: modelData + " → " + root.settings[shortcutScope.currentText + "_keys"][modelData]
+                        // Configured chords and commands are shown verbatim.
+                        contentItem: Label {
+                            text: shortcutEntry.text
+                            textFormat: Text.PlainText
+                            font: shortcutEntry.font
+                            elide: Text.ElideRight
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
                         onClicked: { shortcutChord.text = modelData; shortcutCommand.text = root.settings[shortcutScope.currentText + "_keys"][modelData]; }
                     }
                 }

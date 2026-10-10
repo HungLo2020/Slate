@@ -127,6 +127,28 @@ fn save_all_formats_each_named_document_using_its_settings() {
     assert_eq!(fs::read_to_string(second).unwrap(), "TWOORIGINAL");
 }
 #[test]
+fn crlf_formatter_output_keeps_the_buffer_lf_and_saves_single_crlf() {
+    let (dir, _guard) = setup();
+    let config = dir.path().join("config/slate");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("languages.toml"), "[[language]]\nname = 'Fake'\nextensions = ['fk']\nformatter = ['python3', '-c', 'import sys; sys.stdout.buffer.write(sys.stdin.read().upper().replace(\"\\\\n\", \"\\\\r\\\\n\").encode())']\n").unwrap();
+    fs::write(
+        config.join("trusted-folders"),
+        dir.path().to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+    let path = dir.path().join("one.fk");
+    fs::write(&path, "a\r\nb\r\n").unwrap();
+    let mut app = open(&path);
+    app.command_line("format-document");
+    wait(&mut app, |a| a.status == "Formatted");
+    let doc = app.documents.values().next().unwrap();
+    assert_eq!(doc.text(), "A\nB\n");
+    app.command_line("save");
+    wait(&mut app, |a| !a.dirty());
+    assert_eq!(fs::read(&path).unwrap(), b"A\r\nB\r\n");
+}
+#[test]
 fn close_modified_tab_can_save_then_close() {
     let (dir, _guard) = setup();
     let path = dir.path().join("test.txt");
@@ -167,6 +189,30 @@ fn workspace_language_overrides_follow_the_active_document_without_polluting_glo
             .indent_width,
         4
     );
+}
+#[test]
+fn zero_tab_width_overrides_follow_the_indent_width() {
+    let (dir, _guard) = setup();
+    fs::create_dir_all(dir.path().join(".slate")).unwrap();
+    fs::write(
+        dir.path().join(".slate/settings.toml"),
+        "[editor]\nindent_width = 3\ntab_width = 0\n[language.rust]\ntab_width = 0\n",
+    )
+    .unwrap();
+    let rust = dir.path().join("one.rs");
+    fs::write(&rust, "\tfn main() {}\n\t\tx\n").unwrap();
+    let mut app = open(&rust);
+    assert_eq!(app.preferences.tab_width, 3);
+    // Rendering, wrapping and moving across tabs never divide by zero.
+    app.command_line("set soft-wrap true");
+    app.snapshot(40, 10, 1, 1, 1, 3);
+    app.dispatch(Command::Key {
+        key: Key {
+            key: "Down".into(),
+            ..Default::default()
+        },
+    });
+    app.snapshot(40, 10, 1, 1, 1, 3);
 }
 #[test]
 fn profiles_restore_preferences_and_layout_after_restart() {
@@ -281,4 +327,52 @@ fn opening_a_named_pipe_is_rejected_without_blocking() {
     });
     wait(&mut app, |a| a.status.starts_with("Save failed"));
     assert!(app.dirty());
+}
+#[test]
+fn discard_actions_from_every_input_route_ask_first() {
+    let (dir, _guard) = setup();
+    let path = dir.path().join("keep.txt");
+    fs::write(&path, "saved").unwrap();
+    let mut app = open(&path);
+    type_text(&mut app, "edit ");
+    let key = |app: &mut slate_core::App, name: &str| {
+        app.dispatch(Command::Key {
+            key: Key {
+                key: name.into(),
+                ..Default::default()
+            },
+        })
+    };
+    let prompt = |app: &slate_core::App| app.prompt.as_ref().map(|p| p.kind.clone());
+    // The palette, a typed command and a key binding all ask.
+    app.dispatch(Command::InvokeAction {
+        id: "discard-quit".into(),
+        argument: String::new(),
+    });
+    assert_eq!(prompt(&app).as_deref(), Some("quit"));
+    key(&mut app, "Escape");
+    app.command_line("discard-quit");
+    assert_eq!(prompt(&app).as_deref(), Some("quit"));
+    key(&mut app, "Escape");
+    app.preferences
+        .global_keys
+        .insert("f9".into(), "discard-document".into());
+    key(&mut app, "F9");
+    assert_eq!(prompt(&app).as_deref(), Some("close-tab"));
+    key(&mut app, "Enter");
+    assert!(!app.quit);
+    let doc = app.documents.values().find(|d| d.path.is_some()).unwrap();
+    assert_eq!(doc.text(), "edit saved");
+    assert!(doc.dirty());
+    // Accepting the prompt discards.
+    app.command_line("discard-document");
+    key(&mut app, "d");
+    assert!(app.documents.values().all(|d| d.path.is_none()));
+    // With nothing to lose, discard-and-quit just quits.
+    app.dispatch(Command::InvokeAction {
+        id: "discard-quit".into(),
+        argument: String::new(),
+    });
+    assert!(app.quit);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "saved");
 }

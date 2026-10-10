@@ -14,6 +14,9 @@ use std::{
     time::Instant,
 };
 
+/// The most documents a recovery checkpoint holds.
+pub(crate) const MAX_DOCUMENTS: usize = 128;
+
 #[derive(Serialize, Deserialize)]
 pub struct Workspace {
     pub version: u32,
@@ -35,7 +38,7 @@ impl Workspace {
             || self.root != root
             || !self.layout.validate()
             || self.documents.is_empty()
-            || self.documents.len() > 128
+            || self.documents.len() > MAX_DOCUMENTS
             || self.views.len() > 512
             || self.terminals.len() > 128
             || !self.layout.panes().contains(&self.focus)
@@ -150,8 +153,12 @@ impl Workspace {
                 .unwrap_or_default()
         };
         let mut documents = BTreeMap::new();
-        for (id, v) in entries("documents") {
-            if documents.len() == 128 {
+        // Buffers carrying their own text (unsaved work, untitled input) are
+        // kept before references to clean files, which can be reopened.
+        let mut stored = entries("documents");
+        stored.sort_by_key(|(_, v)| v.get("reference").and_then(Value::as_bool) == Some(true));
+        for (id, v) in stored {
+            if documents.len() == MAX_DOCUMENTS {
                 break;
             }
             if let Ok(mut d) = serde_json::from_value::<Document>(v) {
@@ -266,13 +273,159 @@ impl Workspace {
 pub struct WorkspaceStore {
     pub path: PathBuf,
     _lock: File,
+    alive: std::sync::Mutex<Alive>,
+}
+/// When `keep_alive` last checked the store and marked it used.
+#[derive(Default)]
+struct Alive {
+    checked: Option<Instant>,
+    touched: Option<Instant>,
+    held: bool,
 }
 impl Drop for WorkspaceStore {
     fn drop(&mut self) {
+        crate::recovery_io::forget(&self.path);
         // A concurrently forked worker can briefly inherit this descriptor.
         // Release the lock explicitly rather than waiting for every inherited
         // descriptor to close, so an immediate restart can acquire the store.
         let _ = FileExt::unlock(&self._lock);
+    }
+}
+
+/// Recovery state of a workspace not opened for this long is removed, but
+/// only when it holds no unsaved work and no instance has it open.
+const UNUSED_WORKSPACE_DAYS: u64 = 90;
+/// Damaged checkpoints are kept for inspection: always the newest three,
+/// older ones for 30 days.
+const DAMAGED_KEPT: usize = 3;
+const DAMAGED_DAYS: u64 = 30;
+const DAY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Whether `file` is still the entry at `path`. A store being expired is
+/// renamed away while locked; a lock taken on its old file protects nothing.
+fn still_at(file: &File, path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (file.metadata(), fs::symlink_metadata(path)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, path);
+        true
+    }
+}
+/// When a store was last used: its lock (touched on every acquisition) or
+/// its checkpoint, whichever is newer.
+fn last_used(dir: &Path) -> Option<std::time::SystemTime> {
+    ["lock", "session.json"]
+        .iter()
+        .filter_map(|name| fs::symlink_metadata(dir.join(name)).ok()?.modified().ok())
+        .max()
+}
+fn unused_for(dir: &Path, days: u64) -> bool {
+    last_used(dir)
+        .and_then(|time| time.elapsed().ok())
+        .is_some_and(|age| age > DAY * days as u32)
+}
+/// Remove another workspace's unused recovery state. Kept whenever anything
+/// is uncertain: it is open (locked), recently used, holds unsaved buffers
+/// or a checkpoint that cannot be read, or contains files Slate did not put
+/// there.
+fn expire_store(dir: &Path, tombstone: &Path) -> Result<()> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join("lock"))?;
+    lock.try_lock_exclusive()?;
+    if !still_at(&lock, &dir.join("lock")) || !unused_for(dir, UNUSED_WORKSPACE_DAYS) {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let kind = entry.file_type()?;
+        let known = match name.as_str() {
+            "lock" => kind.is_file(),
+            "buffers" => kind.is_dir(),
+            _ if name.starts_with(".tmp") => true,
+            _ if name.ends_with(".json") => {
+                kind.is_file()
+                    && crate::recovery_io::read_metadata(&entry.path())
+                        .is_ok_and(|bytes| !crate::recovery_io::holds_unsaved_work(&bytes))
+            }
+            _ => false,
+        };
+        if !known {
+            return Ok(());
+        }
+    }
+    // Renamed while still locked: an instance opening it now creates a
+    // fresh store instead of sharing one being deleted.
+    fs::rename(dir, tombstone)?;
+    fs::remove_dir_all(tombstone)?;
+    Ok(())
+}
+fn expire_stores(workspaces: &Path, own: &Path) {
+    let Ok(entries) = fs::read_dir(workspaces) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        if let Some(rest) = name.strip_prefix(".expired-") {
+            // Left by an interrupted removal; nothing opens these names.
+            if rest.len() == 64 {
+                let _ = fs::remove_dir_all(&path);
+            }
+        } else if name.len() == 64
+            && name.bytes().all(|b| b.is_ascii_hexdigit())
+            && path != own
+            && unused_for(&path, UNUSED_WORKSPACE_DAYS)
+        {
+            let _ = expire_store(&path, &workspaces.join(format!(".expired-{name}")));
+        }
+    }
+}
+/// Remove what a killed instance can leave in a store it held: partially
+/// written checkpoints and buffers, and damaged checkpoints past their time
+/// (see `DAMAGED_KEPT`). Only called while holding the store's lock.
+fn clean_store(dir: &Path) {
+    for folder in [dir.to_path_buf(), dir.join("buffers")] {
+        if let Ok(entries) = fs::read_dir(&folder) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(".tmp") {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut damaged: Vec<(u64, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let stamp = name
+                .strip_prefix("session.damaged-")?
+                .strip_suffix(".json")?;
+            Some((stamp.parse().ok()?, entry.path()))
+        })
+        .collect();
+    damaged.sort_by(|a, b| b.cmp(a));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for (stamp, path) in damaged.into_iter().skip(DAMAGED_KEPT) {
+        if now.saturating_sub(stamp) > DAY.as_secs() * DAMAGED_DAYS {
+            // Their buffers are collected by the next checkpoint.
+            let _ = fs::remove_file(path);
+        }
     }
 }
 impl WorkspaceStore {
@@ -282,34 +435,79 @@ impl WorkspaceStore {
     }
     pub fn acquire_in(root: &Path, state: &Path) -> Result<Self> {
         let hash = format!("{:x}", Sha256::digest(root.as_os_str().as_encoded_bytes()));
-        let dir = state.join("slate/workspaces").join(hash);
-        fs::create_dir_all(&dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
-        }
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(dir.join("lock"))?;
-        lock.try_lock_exclusive().context(
-            "Workspace is already open; this instance will not replace its recovery state",
-        )?;
-        // A killed instance can leave a partially written temporary checkpoint.
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                if entry.file_name().to_string_lossy().starts_with(".tmp") {
-                    let _ = fs::remove_file(entry.path());
+        let workspaces = state.join("slate/workspaces");
+        let dir = workspaces.join(hash);
+        let path = dir.join("lock");
+        let mut attempts = 0;
+        let lock = loop {
+            attempts += 1;
+            let last = attempts >= 10;
+            // An expiry pass (see `expire_stores`) can rename the folder away
+            // at any step, and holds a store's lock only briefly.
+            let opened = (|| {
+                fs::create_dir_all(&dir)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
                 }
+                OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+            })();
+            let lock = match opened {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !last => continue,
+                lock => lock?,
+            };
+            match lock.try_lock_exclusive() {
+                // Only a lock on the file still at the path protects the store.
+                Ok(()) if still_at(&lock, &path) => break lock,
+                Ok(()) if last => bail!("Workspace recovery folder keeps changing; try again"),
+                Ok(()) => {}
+                Err(_) if !last => {}
+                Err(e) => return Err(e).context(
+                    "Workspace is already open; this instance will not replace its recovery state",
+                ),
             }
-        }
+            drop(lock);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        // Marks the store as used (see `expire_stores`).
+        let _ = lock.set_modified(std::time::SystemTime::now());
+        clean_store(&dir);
+        expire_stores(&workspaces, &dir);
         Ok(Self {
             path: dir.join("session.json"),
             _lock: lock,
+            alive: Default::default(),
         })
+    }
+    /// Whether this instance still holds its store: while it does, checked
+    /// at most once a minute. The store is also marked used daily, so the recovery state of
+    /// a long-running idle instance never looks abandoned (an expiry pass
+    /// cannot always see the lock, for example on NFS with local locks).
+    pub(crate) fn keep_alive(&self) -> bool {
+        let mut alive = self
+            .alive
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let due = |at: Option<Instant>, every| at.is_none_or(|at| at.elapsed() >= every);
+        // Once lost, checked on every call so a restored store is noticed.
+        if !alive.held || due(alive.checked, std::time::Duration::from_secs(60)) {
+            alive.checked = Some(Instant::now());
+            alive.held = self
+                .path
+                .parent()
+                .is_some_and(|dir| still_at(&self._lock, &dir.join("lock")));
+            if alive.held && due(alive.touched, DAY) {
+                alive.touched = Some(Instant::now());
+                let _ = self._lock.set_modified(std::time::SystemTime::now());
+            }
+        }
+        alive.held
     }
     pub fn load(&self, root: &Path) -> Result<Option<Workspace>> {
         Ok(self.load_tolerant(root)?.map(|(w, _)| w))
@@ -358,6 +556,14 @@ pub(crate) struct RecoveryState {
     pub persisted: u64,
     pub pending: Option<u64>,
     pub warning: Option<String>,
+    /// An internal failure shown for the rest of the session.
+    pub failure: Option<String>,
+    /// No further checkpoints: in-memory state may be inconsistent, and the
+    /// last checkpoint written before that is the one to restore.
+    pub frozen: bool,
+    /// While frozen: each unsaved document's NAME.save copy and a digest of
+    /// the bytes it holds. Later copies rewrite the same file.
+    pub copies: BTreeMap<u64, (PathBuf, u64, crate::fsio::Baseline)>,
 }
 impl RecoveryState {
     pub fn new(key: PathBuf) -> Self {
@@ -369,6 +575,9 @@ impl RecoveryState {
             persisted: 0,
             pending: None,
             warning: None,
+            failure: None,
+            frozen: false,
+            copies: BTreeMap::new(),
         }
     }
 }
@@ -550,7 +759,7 @@ impl App {
         hasher.finish()
     }
     pub(super) fn checkpoint(&mut self) {
-        if self.recovery.pending.is_some() {
+        if self.recovery.pending.is_some() || self.recovery.frozen {
             return;
         }
         let fingerprint = self.checkpoint_fingerprint();
@@ -603,7 +812,130 @@ impl App {
     pub fn recovery_warning(&self) -> Option<&str> {
         self.recovery.warning.as_deref()
     }
+    /// A failure inside Slate itself (a worker thread or an interrupted
+    /// request). It stays visible for the rest of the session and is kept in
+    /// the diagnostics history.
+    pub fn report_internal_failure(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.status = format!("Error: {message}");
+        self.recovery.failure = Some(message);
+        self.revision += 1;
+    }
+    pub fn internal_failure(&self) -> Option<&str> {
+        self.recovery.failure.as_deref()
+    }
+    /// After an operation was interrupted midway the application state may be
+    /// inconsistent. Unsaved buffers are copied to NAME.save files (their text
+    /// alone, without the derived state), and checkpoints stop so that the
+    /// last consistent recovery state is not replaced. Repeated failures
+    /// refresh the same copies. Returns the copies.
+    pub fn quarantine(&mut self, reason: &str) -> Vec<PathBuf> {
+        self.recovery.frozen = true;
+        self.write_quarantine_copies();
+        let saved: Vec<PathBuf> = self
+            .recovery
+            .copies
+            .values()
+            .map(|(path, ..)| path.clone())
+            .collect();
+        let copies = match saved.len() {
+            0 => String::new(),
+            1 => format!(" Unsaved work was copied to {}.", saved[0].display()),
+            n => format!(" Unsaved work was copied to {n} .save files."),
+        };
+        self.report_internal_failure(format!(
+            "{reason}.{copies} Recovery checkpoints are paused: save your documents and restart Slate"
+        ));
+        saved
+    }
+    /// Copy every unsaved buffer of a quarantined session. A document keeps
+    /// the file chosen for its first copy, rewritten only when its text has
+    /// changed since. Returns whether every unsaved buffer has a current copy.
+    pub(crate) fn write_quarantine_copies(&mut self) -> bool {
+        let mut complete = true;
+        for (id, doc) in &self.documents {
+            if !doc.dirty() {
+                continue;
+            }
+            let Ok(bytes) = doc.encoded() else {
+                complete = false;
+                continue;
+            };
+            let digest = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                bytes.hash(&mut hasher);
+                hasher.finish()
+            };
+            let previous = self.recovery.copies.get(id);
+            if previous.is_some_and(|(path, copied, _)| *copied == digest && path.is_file()) {
+                continue;
+            }
+            // Rewrite the earlier copy only while it is still exactly what was
+            // written; otherwise the new copy goes to a new NAME.save file.
+            let rewritten = previous.and_then(|(path, _, baseline)| {
+                let written =
+                    crate::fsio::write_file(path, &bytes, Some(baseline), Default::default());
+                Some((path.clone(), written.ok()?))
+            });
+            let copy = rewritten.or_else(|| {
+                let target = crate::actions::save_copy_target(&self.root, *id, doc);
+                let written = crate::fsio::write_file(&target, &bytes, None, Default::default());
+                Some((target, written.ok()?))
+            });
+            match copy {
+                Some((path, baseline)) => {
+                    self.recovery.copies.insert(*id, (path, digest, baseline));
+                }
+                None => complete = false,
+            }
+        }
+        complete
+    }
+    /// A frozen checkpoint holds buffers from before the failure. Once every
+    /// unsaved buffer has a current NAME.save copy (or none is left), it would
+    /// only restore stale text over newer saves and copies, so it is set
+    /// aside as `session.damaged-TIME.json` (kept for inspection, never
+    /// restored) instead.
+    pub(crate) fn retire_frozen_checkpoint(&mut self) {
+        if !self.recovery.frozen || self.recovery.pending.is_some() {
+            return;
+        }
+        let Some(store) = &self.recovery.store else {
+            return;
+        };
+        if !store.path.exists() {
+            return;
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let aside = store
+            .path
+            .with_file_name(format!("session.damaged-{stamp}.json"));
+        if let Err(error) = fs::rename(&store.path, &aside) {
+            self.recovery.warning = Some(format!(
+                "Could not set aside the recovery state from before the internal error: {error}"
+            ));
+        }
+    }
+    /// While quarantined: as soon as nothing is unsaved, the frozen
+    /// checkpoint is retired (see `retire_frozen_checkpoint`).
+    pub(crate) fn settle_quarantine(&mut self) {
+        if self.recovery.frozen && !self.dirty() && self.saves.pending_save.is_empty() {
+            self.retire_frozen_checkpoint();
+        }
+    }
     pub(crate) fn visible_status(&self) -> String {
+        if let Some(failure) = self.internal_failure() {
+            let headline = format!("Error: {failure}");
+            return if self.status.is_empty() || self.status == headline {
+                headline
+            } else {
+                format!("{headline} · {}", self.status)
+            };
+        }
         match self.recovery_warning() {
             Some(warning) => format!("Error: {warning} · {}", self.status),
             None => self.status.clone(),
@@ -654,6 +986,15 @@ impl App {
             if Instant::now() >= deadline {
                 anyhow::bail!("Save flush timed out");
             }
+        }
+        if self.recovery.frozen {
+            // No checkpoint of possibly inconsistent state (see `quarantine`):
+            // current NAME.save copies instead, then the stale checkpoint is
+            // set aside. If a copy fails, the frozen checkpoint is kept.
+            if self.write_quarantine_copies() {
+                self.retire_frozen_checkpoint();
+            }
+            return Ok(());
         }
         if let Some(store) = &self.recovery.store {
             if let Err(error) = write_checkpoint(&store.path, &self.workspace()) {
@@ -713,6 +1054,96 @@ mod tests {
         std::fs::write(&path, "barrier").unwrap();
         app.services.io.send(IoJob::Open(999, path)).unwrap();
         app.flush_workspace().unwrap();
+    }
+
+    #[test]
+    fn acquiring_a_store_removes_crash_leftovers_and_expired_damaged_checkpoints() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let store = WorkspaceStore::acquire_in(root.path(), state.path()).unwrap();
+        let dir = store.path.parent().unwrap().to_path_buf();
+        drop(store);
+        fs::create_dir_all(dir.join("buffers")).unwrap();
+        for leftover in [".tmpAbc123", "buffers/.tmpXyz789"] {
+            fs::write(dir.join(leftover), "partial").unwrap();
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let damaged = |stamp: u64| dir.join(format!("session.damaged-{stamp}.json"));
+        let month = 31 * 24 * 3600;
+        // One recent and four old: the newest three stay, older ones only
+        // while recent.
+        let stamps = [
+            now - 60,
+            now - month,
+            now - month - 1,
+            now - month - 2,
+            now - month - 3,
+        ];
+        for stamp in stamps {
+            fs::write(damaged(stamp), "{}").unwrap();
+        }
+        let recent: Vec<u64> = (1..=4).map(|i| now - i * 3600).collect();
+        let _store = WorkspaceStore::acquire_in(root.path(), state.path()).unwrap();
+        assert!(!dir.join(".tmpAbc123").exists());
+        assert!(!dir.join("buffers/.tmpXyz789").exists());
+        let kept: Vec<bool> = stamps.iter().map(|s| damaged(*s).exists()).collect();
+        assert_eq!(kept, [true, true, true, false, false]);
+        drop(_store);
+        for stamp in &recent {
+            fs::write(damaged(*stamp), "{}").unwrap();
+        }
+        let _store = WorkspaceStore::acquire_in(root.path(), state.path()).unwrap();
+        assert!(
+            recent.iter().all(|s| damaged(*s).exists()),
+            "Recent ones stay"
+        );
+        assert!(!damaged(now - month).exists());
+    }
+
+    #[test]
+    fn a_held_store_is_marked_used_and_its_loss_is_noticed() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let store = WorkspaceStore::acquire_in(root.path(), state.path()).unwrap();
+        let dir = store.path.parent().unwrap().to_path_buf();
+        let old = std::time::SystemTime::now() - DAY * 100;
+        store._lock.set_modified(old).unwrap();
+        let reset = |store: &WorkspaceStore| *store.alive.lock().unwrap() = Alive::default();
+        reset(&store);
+        assert!(store.keep_alive());
+        assert!(
+            !unused_for(&dir, 1),
+            "An idle instance keeps its store in use"
+        );
+        // Removed behind its back: noticed instead of failing silently.
+        fs::rename(&dir, state.path().join("moved")).unwrap();
+        reset(&store);
+        assert!(!store.keep_alive());
+        // Another holder is reported after brief retries.
+        drop(store);
+        fs::rename(state.path().join("moved"), &dir).unwrap();
+        let held = OpenOptions::new()
+            .read(true)
+            .open(dir.join("lock"))
+            .unwrap();
+        held.try_lock_exclusive().unwrap();
+        let started = Instant::now();
+        assert!(WorkspaceStore::acquire_in(root.path(), state.path())
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("already open"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // A lock that is released shortly (an expiry pass) is waited for.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            drop(held);
+        });
+        let _store = WorkspaceStore::acquire_in(root.path(), state.path()).unwrap();
+        releaser.join().unwrap();
     }
 
     #[test]

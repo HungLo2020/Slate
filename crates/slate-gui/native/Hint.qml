@@ -22,8 +22,10 @@ Basic.ToolTip {
         color: Theme.backgroundColor
         border.color: Qt.alpha(Theme.textColor, 0.3)
     }
+    // Hints show file names, Git output and status messages: never markup.
     contentItem: Text {
         text: hint.text
+        textFormat: Text.PlainText
         font: hint.font
         color: Theme.textColor
         wrapMode: Text.WrapAnywhere

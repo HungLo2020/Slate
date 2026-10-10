@@ -3,6 +3,7 @@
 //! and language-server results. Frontends draw `PickerView` and send the
 //! picker commands; typing, selection and acceptance live here.
 use crate::{
+    fsio::{Baseline, SaveErrorKind},
     navigation::{Column, Location},
     project::{Hit, SearchOptions},
     services::Reply,
@@ -33,6 +34,8 @@ pub(crate) type SearchRequest = (
     HashMap<PathBuf, ropey::Rope>,
     u64,
 );
+/// A grammar outline: (document, text, path, ticket).
+pub(crate) type OutlineRequest = (u64, ropey::Rope, Option<PathBuf>, u64);
 type FilterRequest = (u64, Arc<Vec<Entry>>, String);
 /// One worker retains only the newest query; stale matching stops between files.
 pub(crate) struct FilterWorker {
@@ -714,9 +717,18 @@ impl App {
         let d = &self.documents[&doc];
         let rope = d.rope().clone();
         let path = d.path.clone();
-        self.services.background(move || {
-            Reply::Outline(doc, crate::outline::symbols(&rope, path.as_deref()))
+        let ticket = self.outline_ticket.fetch_add(1, Ordering::Relaxed) + 1;
+        let latest = self.outline_ticket.clone();
+        let output = self.services.reply_sender();
+        let worker = self.outline_worker.get_or_insert_with(|| {
+            crate::services::LatestWorker::new(move |(doc, rope, path, ticket): OutlineRequest| {
+                let cancelled = || latest.load(Ordering::Relaxed) != ticket;
+                if let Some(symbols) = crate::outline::symbols(&rope, path.as_deref(), &cancelled) {
+                    let _ = output.send(Reply::Outline(doc, symbols));
+                }
+            })
         });
+        worker.submit((doc, rope, path, ticket));
     }
 
     pub(crate) fn symbols_ready(&mut self, doc: u64, symbols: Vec<crate::outline::Symbol>) {
@@ -761,6 +773,9 @@ impl App {
     /// normalise them); their previous contents are kept for
     /// undo-replace-in-files.
     pub(crate) fn replace_in_files(&mut self, replacement: &str) -> Result<()> {
+        if self.replace_undoing {
+            bail!("Wait for the files being restored");
+        }
         let options = self
             .last_search
             .clone()
@@ -798,9 +813,7 @@ impl App {
         let replacement = replacement.to_string();
         self.services.background(move || {
             for (path, hash) in closed {
-                // (replacements, content before, content after)
-                type Rewrite = (usize, Vec<u8>, Vec<u8>);
-                let result = (|| -> anyhow::Result<Option<Rewrite>> {
+                let result = (|| -> anyhow::Result<Option<(usize, ReplaceBackup)>> {
                     let before = std::fs::read(&path)?;
                     if hash.is_some_and(|h| h != crate::project::content_hash(&before)) {
                         anyhow::bail!("changed since the search; search again");
@@ -815,15 +828,22 @@ impl App {
                     }
                     doc.replace_many(&edits, 0)?;
                     doc.save(None)?;
-                    let after = std::fs::read(&path)?;
-                    Ok(Some((edits.len(), before, after)))
+                    // Only a digest of what was written is kept: undo needs
+                    // it to tell whether the file changed again since.
+                    let backup = ReplaceBackup {
+                        path: doc.path.clone().unwrap_or_else(|| path.clone()),
+                        before,
+                        after: doc.disk.clone().unwrap_or_else(|| Baseline::of(&[])),
+                        retried: false,
+                    };
+                    Ok(Some((edits.len(), backup)))
                 })();
                 match result {
                     Ok(None) => {}
-                    Ok(Some((count, before, after))) => {
+                    Ok(Some((count, backup))) => {
                         report.files += 1;
                         report.matches += count;
-                        report.backups.push((path, before, after));
+                        report.backups.push(backup);
                     }
                     Err(e) => report.problems.push(format!("{}: {e:#}", path.display())),
                 }
@@ -854,37 +874,77 @@ impl App {
             status.push_str(&format!(" · skipped {}", report.problems.join("; ")));
         }
         self.status = status;
-        self.replace_backups = report.backups;
+        self.keep_replace_run(report.backups);
         self.index_at = None;
     }
 
-    /// Put back the files the last replace-in-files rewrote, unless they
-    /// changed again since.
+    /// Each run is undone separately, latest first; the oldest runs'
+    /// backups go once several are kept.
+    fn keep_replace_run(&mut self, run: Vec<ReplaceBackup>) {
+        if run.is_empty() {
+            return;
+        }
+        while self.replace_backups.len() >= REPLACE_RUNS_KEPT {
+            self.replace_backups.remove(0);
+        }
+        self.replace_backups.push(run);
+    }
+
+    /// Put back the files the latest replace-in-files rewrote, unless they
+    /// changed again since. Files are restored on a worker. One that fails
+    /// keeps its backup for a single further attempt, so a file that cannot
+    /// be written never blocks undoing older runs.
     pub(crate) fn undo_replace_in_files(&mut self) -> Result<()> {
-        let backups = std::mem::take(&mut self.replace_backups);
-        if backups.is_empty() {
-            bail!("No replace-in-files to undo");
+        if self.replace_undoing {
+            bail!("Wait for the files being restored");
         }
-        let (mut restored, mut kept) = (0, Vec::new());
-        for (path, before, after) in backups {
-            if std::fs::read(&path).ok().as_deref() != Some(after.as_slice()) {
-                kept.push(path.display().to_string());
-                continue;
-            }
-            // Written in place, keeping the file's permissions and links.
-            std::fs::write(&path, &before)?;
-            restored += 1;
-        }
-        self.status = format!(
-            "Restored {restored} file{}{}",
-            if restored == 1 { "" } else { "s" },
-            if kept.is_empty() {
-                String::new()
-            } else {
-                format!(" · changed since, left alone: {}", kept.join(", "))
-            }
-        );
+        let backups = self
+            .replace_backups
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("No replace-in-files to undo"))?;
+        self.replace_undoing = true;
+        self.services.background(move || {
+            // Always answer, so restoring is never left marked as running.
+            let report =
+                crate::panics::catch_handled(|| restore_backups(backups)).unwrap_or_else(|_| {
+                    RestoreReport {
+                        problems: vec!["restoring stopped unexpectedly".into()],
+                        ..Default::default()
+                    }
+                });
+            Reply::ReplaceUndone(report)
+        });
+        self.status = "Restoring files…".into();
         Ok(())
+    }
+
+    pub(crate) fn replace_undone(&mut self, report: RestoreReport) {
+        self.replace_undoing = false;
+        let restored = report.restored;
+        let mut status = format!(
+            "Restored {restored} file{}",
+            if restored == 1 { "" } else { "s" }
+        );
+        if !report.kept.is_empty() {
+            status.push_str(&format!(
+                " · changed since, left alone: {}",
+                report.kept.join(", ")
+            ));
+        }
+        if !report.problems.is_empty() {
+            status.push_str(&format!(
+                " · could not restore {}{}",
+                report.problems.join("; "),
+                if report.failed.is_empty() {
+                    ""
+                } else {
+                    " (undo again to retry)"
+                }
+            ));
+        }
+        self.status = status;
+        self.keep_replace_run(report.failed);
+        self.index_at = None;
     }
 
     /// Remember the accepted search so replace-in-files can repeat it.
@@ -933,6 +993,9 @@ impl App {
     }
 }
 
+/// Replace-in-files runs that can still be undone.
+const REPLACE_RUNS_KEPT: usize = 8;
+
 /// The outcome of replace-in-files.
 #[derive(Default)]
 pub struct ReplaceReport {
@@ -940,8 +1003,59 @@ pub struct ReplaceReport {
     open_files: usize,
     matches: usize,
     problems: Vec<String>,
-    /// (file, previous bytes, written bytes) for undo.
-    backups: Vec<(PathBuf, Vec<u8>, Vec<u8>)>,
+    backups: Vec<ReplaceBackup>,
+}
+
+/// A file replace-in-files rewrote: what it held before, for undo, and the
+/// digest of what was written.
+pub struct ReplaceBackup {
+    path: PathBuf,
+    before: Vec<u8>,
+    after: Baseline,
+    /// An undo already failed to write it back once.
+    retried: bool,
+}
+
+/// Write backups back over what replace wrote. Failures are kept for one
+/// retry; files changed since are left alone.
+fn restore_backups(backups: Vec<ReplaceBackup>) -> RestoreReport {
+    let mut report = RestoreReport::default();
+    for mut backup in backups {
+        // The usual save path: atomic where possible, keeping the file's
+        // permissions and links, and only over what replace wrote.
+        match crate::fsio::write_file(
+            &backup.path,
+            &backup.before,
+            Some(&backup.after),
+            Default::default(),
+        ) {
+            Ok(_) => report.restored += 1,
+            Err(e) if crate::fsio::error_kind(&e) == SaveErrorKind::Conflict => {
+                report.kept.push(backup.path.display().to_string())
+            }
+            Err(e) => {
+                report
+                    .problems
+                    .push(format!("{}: {e:#}", backup.path.display()));
+                if !backup.retried {
+                    backup.retried = true;
+                    report.failed.push(backup);
+                }
+            }
+        }
+    }
+    report
+}
+
+/// The outcome of undo-replace-in-files.
+#[derive(Default)]
+pub struct RestoreReport {
+    restored: usize,
+    /// Files that changed again since, left alone.
+    kept: Vec<String>,
+    problems: Vec<String>,
+    /// Backups that could not be written back.
+    failed: Vec<ReplaceBackup>,
 }
 
 /// The replacements for every match of `regex` in `text`. In regex mode
@@ -970,6 +1084,52 @@ fn replacements(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replace_undo_history_stays_bounded_and_unblocked() {
+        let _guard = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", dir.path().join("config"));
+        std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
+        let mut app = App::new(dir.path()).unwrap();
+        let backup = |name: &str| ReplaceBackup {
+            path: dir.path().join(name),
+            before: Vec::new(),
+            after: Baseline::of(b"x"),
+            retried: false,
+        };
+        for n in 0..REPLACE_RUNS_KEPT + 3 {
+            app.replaced(ReplaceReport {
+                backups: vec![backup(&format!("run{n}"))],
+                ..Default::default()
+            });
+        }
+        assert_eq!(app.replace_backups.len(), REPLACE_RUNS_KEPT);
+        // Failures put back after an undo, while another run arrived, still
+        // respect the bound.
+        app.replace_undoing = true;
+        assert!(app.replace_in_files("x").is_err());
+        app.replace_undone(RestoreReport {
+            problems: vec!["failed".into()],
+            failed: vec![backup("failed")],
+            ..Default::default()
+        });
+        assert!(!app.replace_undoing);
+        assert_eq!(app.replace_backups.len(), REPLACE_RUNS_KEPT);
+        assert_eq!(
+            app.replace_backups.last().unwrap()[0].path,
+            dir.path().join("failed")
+        );
+        // A backup that already failed once is given up on.
+        let mut retried = backup("gone/dir/file");
+        retried.retried = true;
+        let report = restore_backups(vec![retried, backup("other/file")]);
+        assert_eq!(report.problems.len(), 2);
+        assert_eq!(report.failed.len(), 1);
+        assert!(report.failed[0].retried);
+    }
 
     #[test]
     fn fuzzy_filtering_ranks_and_marks_matches() {

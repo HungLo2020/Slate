@@ -59,6 +59,7 @@ Basic.Button {
             visible: control.iconOnly && !glyph.valid
             anchors.fill: parent
             text: control.fallbackGlyph
+            textFormat: Text.PlainText
             font: control.font
             color: caption.color
             horizontalAlignment: Text.AlignHCenter
@@ -70,7 +71,9 @@ Basic.Button {
             x: glyph.visible ? glyph.width + 6 : 0
             width: Math.max(0, parent.width - x)
             height: parent.height
+            // Captions include tab titles (file names): never markup.
             text: control.text
+            textFormat: Text.PlainText
             font: control.font
             elide: Text.ElideMiddle
             horizontalAlignment: Text.AlignHCenter

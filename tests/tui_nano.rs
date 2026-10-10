@@ -463,6 +463,58 @@ fn permission_denied_offers_a_sudo_save() {
 
 #[cfg(unix)]
 #[test]
+fn ctrl_c_at_the_sudo_password_prompt_cancels_the_save_but_not_slate() {
+    // A stand-in sudo that asks for a password on the terminal, as sudo
+    // does: it must be the terminal's foreground to read it, and Ctrl+C
+    // must reach it rather than Slate.
+    use std::os::unix::fs::PermissionsExt;
+    let target = std::path::Path::new("/etc/hostname");
+    if unsafe { libc::geteuid() } == 0 || !target.exists() || slate_core::fsio::writable(target) {
+        return;
+    }
+    let env = Env::new();
+    let bin = env.path("bin");
+    fs::create_dir(&bin).unwrap();
+    let record = env.path("sudo-record");
+    let sudo = bin.join("sudo");
+    fs::write(
+        &sudo,
+        format!(
+            "#!/bin/sh\nprintf 'Password for fake sudo: ' > /dev/tty\nread password < /dev/tty\n[ \"$password\" = secret ] || exit 1\ncat > '{}'\n",
+            record.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&sudo, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut command = env.command(env!("CARGO_BIN_EXE_slate"));
+    command.arg(target);
+    command.env(
+        "PATH",
+        format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+    );
+    let mut tui = Tui::spawn(command, 100, 30);
+    tui.send("edited-");
+    tui.send(b"\x13");
+    tui.wait_for("save with sudo");
+    tui.send("y");
+    tui.wait_for("Password for fake sudo");
+    tui.send(b"\x03");
+    tui.wait_for("cancelled");
+    assert!(!record.exists());
+    // Slate is still there, with the edit, and a second try succeeds.
+    tui.send(b"\x13");
+    tui.wait_for("save with sudo");
+    tui.send("y");
+    tui.wait_for("Password for fake sudo");
+    tui.send("secret\r");
+    tui.wait_for("with sudo");
+    tui.wait_gone(" *");
+    let data = fs::read_to_string(&record).unwrap();
+    assert!(data.split_once('\n').unwrap().1.starts_with("edited-"));
+}
+
+#[cfg(unix)]
+#[test]
 fn desktop_clipboard_tools_are_used_when_a_display_exists() {
     use std::os::unix::fs::PermissionsExt;
     let env = Env::new();
@@ -538,4 +590,36 @@ fn external_changes_reload_clean_files_and_ask_about_modified_ones() {
     tui.wait_for("Kept your version");
     tui.send(b"\x13");
     wait_file(&path, b"again third version\n");
+}
+
+#[test]
+fn palette_discard_commands_ask_before_discarding() {
+    let env = Env::new();
+    let path = env.path("keep.txt");
+    fs::write(&path, "saved\n").unwrap();
+    let mut tui = env.slate(&[path.to_str().unwrap()]);
+    tui.wait_for("saved");
+    tui.send("edit ");
+    tui.wait_for("edit saved");
+    // Picking the catalog entry asks first; cancelling keeps the edit.
+    tui.send(b"\x1bOP");
+    tui.send("discard-quit");
+    tui.wait_for("Discard changes and quit");
+    tui.send(b"\r");
+    tui.wait_for("Save changes before quitting?");
+    tui.send(b"\x1b");
+    tui.wait_gone("Save changes before quitting?");
+    tui.wait_for("edit saved");
+    // Raw palette commands ask too.
+    tui.command("discard-document");
+    tui.wait_for("before closing?");
+    tui.send(b"\x1b");
+    tui.wait_gone("before closing?");
+    tui.wait_for("edit saved");
+    // Only accepting the prompt discards.
+    tui.command("discard-quit");
+    tui.wait_for("Save changes before quitting?");
+    tui.send("d");
+    assert_eq!(tui.exit_code(), 0);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "saved\n");
 }

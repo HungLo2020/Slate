@@ -16,9 +16,10 @@ use ratatui::{
 use slate_core::{layout::Axis, terminal::Screen, App, Command, Key, Snapshot};
 use std::{
     io::{self, Write},
+    os::fd::{AsRawFd, RawFd},
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicI32, Ordering},
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -29,9 +30,67 @@ use colors::ColorMode;
 
 /// Set by SIGHUP/SIGTERM; the main loop saves unsaved work and exits.
 static TERMINATE: AtomicBool = AtomicBool::new(false);
+/// The input thread sleeps until the terminal has input or this pipe is
+/// written: by signal handlers, pause/resume and shutdown. Its write end is
+/// never closed, so a signal handler can always use the descriptor.
+static WAKE_PIPE: std::sync::OnceLock<(
+    std::os::unix::net::UnixStream,
+    std::os::unix::net::UnixStream,
+)> = std::sync::OnceLock::new();
+static WAKE_FD: AtomicI32 = AtomicI32::new(-1);
+/// Async-signal-safe.
+fn wake_input() {
+    let fd = WAKE_FD.load(Ordering::SeqCst);
+    if fd >= 0 {
+        #[cfg(target_os = "linux")]
+        let errno = unsafe { *libc::__errno_location() };
+        unsafe {
+            libc::write(fd, [1u8].as_ptr().cast(), 1);
+        }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            *libc::__errno_location() = errno;
+        }
+    }
+}
+/// The read end of the wake pipe, created on first use.
+fn wake_reader() -> io::Result<RawFd> {
+    if WAKE_PIPE.get().is_none() {
+        let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
+        reader.set_nonblocking(true)?;
+        writer.set_nonblocking(true)?;
+        let _ = WAKE_PIPE.set((reader, writer));
+    }
+    let (reader, writer) = WAKE_PIPE.get().unwrap();
+    WAKE_FD.store(writer.as_raw_fd(), Ordering::SeqCst);
+    Ok(reader.as_raw_fd())
+}
+fn drain_wakes(fd: RawFd) {
+    let mut bytes = [0u8; 64];
+    while unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) } > 0 {}
+}
+/// Block until one of `fds` is readable; reports which ones are.
+fn wait_readable<const N: usize>(fds: [RawFd; N]) -> [bool; N] {
+    let mut polled = fds.map(|fd| libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    });
+    if unsafe { libc::poll(polled.as_mut_ptr(), N as libc::nfds_t, -1) } <= 0 {
+        // Interrupted by a signal: its handler wrote the wake pipe.
+        return [false; N];
+    }
+    polled.map(|p| p.revents != 0)
+}
 #[cfg(unix)]
 extern "C" fn on_terminate(_: libc::c_int) {
     TERMINATE.store(true, Ordering::SeqCst);
+    wake_input();
+}
+/// The main loop measures the terminal when it wakes.
+#[cfg(unix)]
+extern "C" fn on_resize(_: libc::c_int) {
+    wake_input();
 }
 
 struct InputReader {
@@ -45,6 +104,7 @@ impl InputReader {
     /// suspend) receives the keyboard.
     fn pause(&self) {
         self.paused.store(true, Ordering::SeqCst);
+        wake_input();
         let deadline = std::time::Instant::now() + Duration::from_millis(500);
         while !self.idle.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
@@ -52,16 +112,89 @@ impl InputReader {
     }
     fn resume(&self) {
         self.paused.store(false, Ordering::SeqCst);
+        wake_input();
     }
 }
 impl Drop for InputReader {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
         self.paused.store(false, Ordering::SeqCst);
+        wake_input();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
+}
+/// The terminal crossterm reads: standard input when it is a terminal,
+/// otherwise /dev/tty.
+fn terminal_input() -> io::Result<(RawFd, Option<std::fs::File>)> {
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+        return Ok((libc::STDIN_FILENO, None));
+    }
+    let tty = std::fs::File::open("/dev/tty")?;
+    Ok((tty.as_raw_fd(), Some(tty)))
+}
+
+type PanicHook = Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync>;
+/// Reinstates the panic hook that was active before the interface started.
+struct PanicHookGuard(Option<PanicHook>);
+impl Drop for PanicHookGuard {
+    fn drop(&mut self) {
+        // Setting a hook while unwinding would abort; the process is ending.
+        if let (Some(previous), false) = (self.0.take(), std::thread::panicking()) {
+            let _ = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| previous(info)));
+        }
+    }
+}
+/// A panic on the interface thread restores the outer terminal before the
+/// previous hook prints its message. A worker thread's panic (language
+/// servers, highlighting, file I/O) leaves the screen alone: printing over
+/// the running editor would garble it and leaving raw mode would break it.
+/// Its message is recorded in `failures` for the interface thread to show,
+/// and `notify` wakes that thread. Panics their caller catches and handles
+/// (see `slate_core::panics`) are neither.
+fn install_panic_hook(
+    restore: impl Fn() + Send + Sync + 'static,
+    failures: Arc<Mutex<Option<String>>>,
+    notify: impl Fn() + Send + Sync + 'static,
+) -> PanicHookGuard {
+    let interface = std::thread::current().id();
+    let previous: PanicHook = Arc::from(std::panic::take_hook());
+    let chained = previous.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        // Its caller catches it and reports what failed; the session is fine.
+        if slate_core::panics::is_handled() {
+            return;
+        }
+        let thread = std::thread::current();
+        if thread.id() == interface {
+            restore();
+            chained(info);
+            return;
+        }
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("unknown cause");
+        let location = info
+            .location()
+            .map(|l| format!(" at {}:{}", l.file(), l.line()))
+            .unwrap_or_default();
+        let message = format!(
+            "thread '{}' panicked{location}: {}",
+            thread.name().unwrap_or("<unnamed>"),
+            payload.chars().take(300).collect::<String>()
+        );
+        failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert(message);
+        notify();
+    }));
+    PanicHookGuard(Some(previous))
 }
 
 /// Terminal modes Slate enables; restored on exit, suspend and sudo handover.
@@ -172,7 +305,7 @@ fn erase_is_control_h() -> bool {
 }
 
 /// Programs that hold the desktop clipboard, when a display is available.
-fn clipboard_programs(read: bool) -> Vec<(&'static str, &'static [&'static str])> {
+fn clipboard_programs(read: bool) -> Vec<(std::path::PathBuf, &'static [&'static str])> {
     let mut programs: Vec<(&'static str, &'static [&'static str])> = vec![];
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
         programs.push(if read {
@@ -193,21 +326,23 @@ fn clipboard_programs(read: bool) -> Vec<(&'static str, &'static [&'static str])
             ("xsel", &["-ib"])
         });
     }
+    // Resolved to absolute paths: never a helper in the current folder.
     programs
         .into_iter()
-        .filter(|(p, _)| slate_core::fsio::which(p).is_some())
+        .filter_map(|(p, args)| Some((slate_core::fsio::which(p)?, args)))
         .collect()
 }
 fn write_system_clipboard(text: &str) {
     if let Some((program, args)) = clipboard_programs(false).into_iter().next() {
         let text = text.to_string();
         std::thread::spawn(move || {
-            if let Ok(mut child) = std::process::Command::new(program)
-                .args(args)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
+            if let Ok(mut child) =
+                slate_core::process::sanitize(&mut std::process::Command::new(program))
+                    .args(args)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
             {
                 if let Some(mut stdin) = child.stdin.take() {
                     let _ = stdin.write_all(text.as_bytes());
@@ -219,7 +354,7 @@ fn write_system_clipboard(text: &str) {
 }
 fn read_system_clipboard() -> Option<String> {
     let (program, args) = clipboard_programs(true).into_iter().next()?;
-    let output = std::process::Command::new(program)
+    let output = slate_core::process::sanitize(&mut std::process::Command::new(program))
         .args(args)
         .stderr(std::process::Stdio::null())
         .output()
@@ -241,6 +376,9 @@ pub fn run(mut app: App) -> Result<()> {
             libc::SIGTERM,
             on_terminate as *const () as libc::sighandler_t,
         );
+        // Installed before crossterm reads events: its own SIGWINCH handler
+        // chains to this one.
+        libc::signal(libc::SIGWINCH, on_resize as *const () as libc::sighandler_t);
     }
     if slate_core::fsio::which("sudo").is_some() && unsafe { libc::geteuid() } != 0 {
         app.elevation_mode = slate_core::ElevationMode::Terminal;
@@ -261,16 +399,17 @@ pub fn run(mut app: App) -> Result<()> {
     modes.lock().unwrap().enhanced = enhanced;
     let _guard = Guard(modes.clone());
     enter(*modes.lock().unwrap())?;
-    // Restore the outer terminal before a panic message is printed.
+    let events = app.events();
+    let worker_failures = Arc::new(Mutex::new(None));
     let hook_modes = modes.clone();
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        leave(*hook_modes.lock().unwrap_or_else(|e| e.into_inner()));
-        default_hook(info);
-    }));
+    let hook_events = events.clone();
+    let _panic_hook = install_panic_hook(
+        move || leave(*hook_modes.lock().unwrap_or_else(|e| e.into_inner())),
+        worker_failures.clone(),
+        move || hook_events.notify(),
+    );
     let backspace_is_ctrl_h = erase_is_control_h();
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let events = app.events();
     let (input_tx, input_rx) = std::sync::mpsc::channel();
     let running = Arc::new(AtomicBool::new(true));
     let paused = Arc::new(AtomicBool::new(false));
@@ -278,17 +417,40 @@ pub fn run(mut app: App) -> Result<()> {
     let (reader_running, reader_paused, reader_idle) =
         (running.clone(), paused.clone(), idle.clone());
     let input_events = events.clone();
+    let wake = wake_reader()?;
+    let (tty, tty_file) = terminal_input()?;
     let thread = std::thread::spawn(move || {
+        let _tty_file = tty_file;
+        // Set after the terminal reported input: give crossterm a moment to
+        // see it, so input it has not consumed yet cannot spin this loop.
+        let mut input_ready = false;
         while reader_running.load(Ordering::Acquire) {
             if reader_paused.load(Ordering::SeqCst) {
                 reader_idle.store(true, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(10));
+                // Another program owns the keyboard: wait for resume or exit.
+                wait_readable([wake]);
+                drain_wakes(wake);
                 continue;
             }
             reader_idle.store(false, Ordering::SeqCst);
-            match event::poll(Duration::from_millis(50)) {
-                Ok(false) => continue,
+            let timeout = if input_ready {
+                Duration::from_millis(50)
+            } else {
+                Duration::ZERO
+            };
+            match event::poll(timeout) {
+                Ok(false) => {
+                    // Idle: sleep until the terminal has input or a signal,
+                    // pause or shutdown writes the wake pipe.
+                    let [input, woken] = wait_readable([tty, wake]);
+                    input_ready = input;
+                    if woken {
+                        drain_wakes(wake);
+                        input_events.notify();
+                    }
+                }
                 Ok(true) => {
+                    input_ready = false;
                     if reader_paused.load(Ordering::SeqCst) {
                         continue;
                     }
@@ -354,6 +516,16 @@ pub fn run(mut app: App) -> Result<()> {
     let mut terminal_capture = None;
     let mut clipboard = String::new();
     while !app.quit {
+        if let Some(failure) = worker_failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            // The interface keeps running so unsaved work can still be saved.
+            app.report_internal_failure(format!(
+                "A background task stopped unexpectedly ({failure}); save your documents and restart Slate"
+            ));
+        }
         if TERMINATE.load(Ordering::SeqCst) {
             // The terminal is going away. Keep unsaved work: recovery
             // checkpoints for workspaces, nano-style NAME.save files otherwise.
@@ -376,6 +548,11 @@ pub fn run(mut app: App) -> Result<()> {
         app.process_events();
         if let Some(request) = app.take_elevation() {
             let mut result = Ok(());
+            // Outside raw mode Ctrl+C, Ctrl+\ and Ctrl+Z signal the
+            // terminal's foreground: sudo while it runs, Slate just before
+            // and after. Slate must survive them with its unsaved buffers.
+            #[cfg(unix)]
+            let signals = slate_core::process::HoldTerminalSignals::new();
             handover(&mut terminal, &mut || {
                 println!(
                     "Slate: saving {} with sudo (Ctrl+C cancels)",
@@ -389,6 +566,8 @@ pub fn run(mut app: App) -> Result<()> {
                     true,
                 );
             })?;
+            #[cfg(unix)]
+            drop(signals);
             app.finish_elevation(request, result);
             redraw = true;
         }
@@ -422,7 +601,7 @@ pub fn run(mut app: App) -> Result<()> {
             prior_size = size;
             redraw = true;
         }
-        let mut catalog = app.command_catalog(palette.as_deref().unwrap_or_default());
+        let mut catalog = palette_catalog(&app, palette.as_deref());
         if redraw {
             terminal.draw(|frame| {
                 render(
@@ -476,7 +655,7 @@ pub fn run(mut app: App) -> Result<()> {
                         3,
                     );
                 }
-                catalog = app.command_catalog(palette.as_deref().unwrap_or_default());
+                catalog = palette_catalog(&app, palette.as_deref());
             }
             if burst < 256 {
                 if let Ok(event) = input_rx.try_recv() {
@@ -760,7 +939,6 @@ pub fn run(mut app: App) -> Result<()> {
         }
     }
     terminal.show_cursor()?;
-    let _ = std::panic::take_hook();
     Ok(())
 }
 /// Read the desktop clipboard into Slate's clipboard before pasting.
@@ -990,8 +1168,15 @@ fn render(
                 }
             }
         } else {
+            // Build only the rows that fit: lists may hold 100,000 entries.
+            let total = if p.kind == "files" {
+                s.files.len()
+            } else {
+                s.git.len()
+            };
+            let (rows, selected) = list_window(total, p.selected, content.height as usize);
             let items: Vec<ListItem> = if p.kind == "files" {
-                s.files
+                s.files[rows]
                     .iter()
                     .map(|e| {
                         ListItem::new(clean(&format!(
@@ -1002,14 +1187,14 @@ fn render(
                     })
                     .collect()
             } else {
-                s.git
+                s.git[rows]
                     .iter()
                     .map(|e| {
                         ListItem::new(clean(&format!("[{}] {} {}", e.group, e.status, e.path)))
                     })
                     .collect()
             };
-            let mut state = ListState::default().with_selected(Some(p.selected));
+            let mut state = ListState::default().with_selected(Some(selected));
             frame.render_stateful_widget(
                 List::new(items).highlight_style(colors.highlight()),
                 content,
@@ -1168,6 +1353,13 @@ fn render(
         ));
     }
 }
+/// The rows of a `total`-row list that fit `height`, and the selection
+/// within them: the window List scrolls to for a selection given afresh.
+fn list_window(total: usize, selected: usize, height: usize) -> (std::ops::Range<usize>, usize) {
+    let selected = selected.min(total.saturating_sub(1));
+    let first = (selected + 1).saturating_sub(height.max(1));
+    (first..total.min(first + height), selected - first)
+}
 /// The command palette's box on a screen of `size`.
 fn palette_area(size: Rect) -> Rect {
     let height = size.height.saturating_sub(4).min(16);
@@ -1191,6 +1383,11 @@ fn palette_rows(size: Rect) -> Rect {
 /// The first command drawn, keeping `selected` in view (two rows each).
 fn palette_top(rows: Rect, selected: usize) -> usize {
     (selected + 1).saturating_sub((rows.height as usize / 2).max(1))
+}
+/// The palette's matching commands. Describing every action (with its
+/// availability) is only worth doing while the palette shows them.
+fn palette_catalog(app: &App, palette: Option<&str>) -> Vec<slate_core::commands::CommandInfo> {
+    palette.map_or_else(Vec::new, |query| app.command_catalog(query))
 }
 fn run_palette_action(app: &mut App, id: String) {
     if id == "paste" {
@@ -1247,6 +1444,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn worker_panics_are_recorded_and_only_the_interface_restores_the_terminal() {
+        use std::sync::atomic::AtomicUsize;
+        let restored = Arc::new(AtomicUsize::new(0));
+        let notified = Arc::new(AtomicUsize::new(0));
+        let failures = Arc::new(Mutex::new(None));
+        let (restore, notify) = (restored.clone(), notified.clone());
+        let hook = install_panic_hook(
+            move || {
+                restore.fetch_add(1, Ordering::SeqCst);
+            },
+            failures.clone(),
+            move || {
+                notify.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        let worker = std::thread::Builder::new()
+            .name("highlight".into())
+            .spawn(|| panic!("worker failure marker"))
+            .unwrap();
+        assert!(worker.join().is_err());
+        // The editor's screen and raw mode stay; the main loop is told.
+        assert_eq!(restored.load(Ordering::SeqCst), 0);
+        assert!(notified.load(Ordering::SeqCst) >= 1);
+        let failure = failures.lock().unwrap().take().unwrap();
+        assert!(
+            failure.starts_with("thread 'highlight' panicked at ")
+                && failure.ends_with(": worker failure marker"),
+            "{failure}"
+        );
+        // A panic its caller catches and reports is not a session failure.
+        let notifications = notified.load(Ordering::SeqCst);
+        let handled = std::thread::spawn(|| {
+            slate_core::panics::catch_handled(|| panic!("handled marker")).is_err()
+        });
+        assert!(handled.join().unwrap());
+        assert!(slate_core::panics::catch_handled(|| panic!("handled marker")).is_err());
+        assert_eq!(notified.load(Ordering::SeqCst), notifications);
+        assert_eq!(restored.load(Ordering::SeqCst), 0);
+        assert!(failures.lock().unwrap().is_none());
+        // The interface thread's own panic restores the terminal first.
+        assert!(std::panic::catch_unwind(|| panic!("interface failure marker")).is_err());
+        assert_eq!(restored.load(Ordering::SeqCst), 1);
+        // Leaving the interface reinstates the previous hook.
+        drop(hook);
+        let notifications = notified.load(Ordering::SeqCst);
+        assert!(std::thread::spawn(|| panic!("after exit marker"))
+            .join()
+            .is_err());
+        assert_eq!(notified.load(Ordering::SeqCst), notifications);
+        assert!(failures.lock().unwrap().is_none());
+    }
+
+    #[test]
     fn legacy_control_bytes_map_to_their_punctuation() {
         let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
         assert_eq!(
@@ -1275,5 +1525,35 @@ mod tests {
         );
         let chord = slate_core::key_chord(&translate(normalize_key(ctrl('5'), false, false)));
         assert_eq!(chord, "Ctrl+]");
+    }
+
+    #[test]
+    fn windowed_lists_draw_like_the_whole_list() {
+        let draw = |items: Vec<String>, selected: usize, height: u16| {
+            let area = Rect::new(0, 0, 12, height);
+            let mut buffer = Buffer::empty(area);
+            let mut state = ListState::default().with_selected(Some(selected));
+            StatefulWidget::render(
+                List::new(items.into_iter().map(ListItem::new))
+                    .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
+                area,
+                &mut buffer,
+                &mut state,
+            );
+            buffer
+        };
+        for total in [0, 1, 5, 40] {
+            let items: Vec<String> = (0..total).map(|i| format!("row {i}")).collect();
+            for height in [1, 3, 10] {
+                for selected in 0..total + 3 {
+                    let (rows, within) = list_window(total, selected, height as usize);
+                    assert_eq!(
+                        draw(items[rows].to_vec(), within, height),
+                        draw(items.clone(), selected, height),
+                        "{total} rows, {height} high, row {selected} selected"
+                    );
+                }
+            }
+        }
     }
 }

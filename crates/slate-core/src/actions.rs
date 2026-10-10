@@ -111,23 +111,10 @@ impl App {
         let (start, end) = d.line_range(line);
         let options = self.preferences_for_document(doc);
         if options.soft_wrap {
-            let key = (doc, d.generation, line, width, options.tab_width);
-            if let Some(rows) = self.wrap_cache.lock().unwrap().get(&key) {
-                return rows.clone();
-            }
-            let rows =
-                std::sync::Arc::new(wrap::rows(&d.slice(start, end), width, options.tab_width));
-            let mut cache = self.wrap_cache.lock().unwrap();
-            cache.retain(|(id, generation, ..), _| *id != doc || *generation == d.generation);
-            if cache.len() >= 128
-                || cache.values().map(|rows| rows.len()).sum::<usize>() + rows.len() > 131_072
-            {
-                cache.clear();
-            }
-            if rows.len() <= 131_072 {
-                cache.insert(key, rows.clone());
-            }
-            rows
+            self.wrap_cache
+                .lock()
+                .unwrap()
+                .rows(doc, d, line, width, options.tab_width)
         } else {
             std::sync::Arc::new(vec![wrap::Row {
                 start: 0,
@@ -515,33 +502,29 @@ impl App {
         );
         self.documents.insert(doc, fresh);
         self.highlights.remove(&doc);
+        self.wrap_cache.lock().unwrap().forget(doc);
         self.clamp_views(doc);
     }
     /// Write `NAME.save` copies of unsaved buffers, as nano does when it is
-    /// killed by a signal. Returns the files written.
+    /// killed by a signal. Returns the files written. A quarantined session
+    /// refreshes its existing copies instead of adding more.
     pub fn emergency_save(&mut self) -> Vec<PathBuf> {
+        if self.recovery.frozen {
+            self.write_quarantine_copies();
+            return self
+                .documents
+                .iter()
+                .filter(|(_, doc)| doc.dirty())
+                .filter_map(|(id, _)| Some(self.recovery.copies.get(id)?.0.clone()))
+                .collect();
+        }
         let mut written = vec![];
         for (id, doc) in &self.documents {
             if !doc.dirty() {
                 continue;
             }
-            let target = match &doc.path {
-                Some(path) => {
-                    let mut name = path.file_name().unwrap_or_default().to_os_string();
-                    name.push(".save");
-                    path.with_file_name(name)
-                }
-                None => self
-                    .root
-                    .join(format!("slate.{}.{id}.save", std::process::id())),
-            };
             let Ok(bytes) = doc.encoded() else { continue };
-            let mut candidate = target.clone();
-            let mut n = 1;
-            while candidate.exists() {
-                candidate = PathBuf::from(format!("{}.{n}", target.display()));
-                n += 1;
-            }
+            let candidate = save_copy_target(&self.root, *id, doc);
             if crate::fsio::write_file(&candidate, &bytes, None, WriteOptions::default()).is_ok() {
                 written.push(candidate);
             }
@@ -1182,6 +1165,26 @@ impl App {
         }
         Ok(())
     }
+}
+
+/// A new `NAME.save` file beside the document (untitled buffers: in the
+/// workspace root), never replacing an existing file.
+pub(crate) fn save_copy_target(root: &Path, id: u64, doc: &Document) -> PathBuf {
+    let target = match &doc.path {
+        Some(path) => {
+            let mut name = path.file_name().unwrap_or_default().to_os_string();
+            name.push(".save");
+            path.with_file_name(name)
+        }
+        None => root.join(format!("slate.{}.{id}.save", std::process::id())),
+    };
+    let mut candidate = target.clone();
+    let mut n = 1;
+    while candidate.exists() {
+        candidate = PathBuf::from(format!("{}.{n}", target.display()));
+        n += 1;
+    }
+    candidate
 }
 
 #[cfg(test)]

@@ -86,7 +86,9 @@ impl App {
             },
         );
         let _ = self.editor_target();
-        self.add_tab(crate::layout::View::Editor(view));
+        if !self.show_new_document(view) {
+            return;
+        }
         self.status = "Support report · read-only · select and copy to share".into();
     }
 }

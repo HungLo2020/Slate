@@ -3,7 +3,7 @@ from pathlib import Path
 import shutil
 import tempfile
 import unittest
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, patch
 
 
 SCRIPT_PATH = Path(__file__).parents[1] / "DevUtils/PublishMattOSPackage.py"
@@ -28,6 +28,40 @@ Version: 0.2.0
 def simple_greater(candidate, existing):
     """Stand-in for dpkg --compare-versions for plain dotted versions."""
     return tuple(map(int, candidate.split("."))) > tuple(map(int, existing.split(".")))
+
+
+SCRIPT = b"print('pinned repository manager')\n"
+
+
+def pinned_script():
+    """Accept SCRIPT as the pinned repository manager."""
+    return patch.object(publish, "REPOSITORY_SCRIPT_SHA256", publish.hashlib.sha256(SCRIPT).hexdigest())
+
+
+class RecordingRun:
+    """Stand-in for run(): records commands and the manager script they execute."""
+
+    def __init__(self, status=0):
+        self.status = status
+        self.commands = []
+        self.scripts = []
+
+    def __call__(self, command, root):
+        self.commands.append((command, root))
+        if command[:2] == [publish.sys.executable, "-I"]:
+            self.scripts.append((Path(command[2]), Path(command[2]).read_bytes()))
+        return self.status
+
+    def manager_arguments(self, root):
+        """The manager's arguments, after checking how it was run."""
+        managers = [command for command, _ in self.commands if command[:2] == [publish.sys.executable, "-I"]]
+        assert len(managers) == 1, self.commands
+        script, content = self.scripts[0]
+        assert content == SCRIPT
+        assert script.name == "ManageMattOSRepository.py"
+        assert root not in script.parents, "the manager ran from the repository"
+        assert not script.exists(), "the private copy was left behind"
+        return managers[0][3:]
 
 
 class FakeResponse:
@@ -99,19 +133,32 @@ class PublishMattOSPackageTests(unittest.TestCase):
     def test_doctor_passes_explicit_repository(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            run = RecordingRun()
             with (
+                pinned_script(),
                 patch.object(publish, "repository_root", return_value=root),
-                patch.object(publish, "download_latest_script") as download,
-                patch.object(publish, "run", return_value=0) as run,
+                patch.object(publish, "download_latest_script", return_value=SCRIPT) as download,
+                patch.object(publish, "run", side_effect=run),
             ):
                 self.assertEqual(publish.main(["doctor"]), 0)
 
             download.assert_called_once_with(root / publish.SCRIPT_RELATIVE_PATH)
-            run.assert_called_once_with(
-                [publish.sys.executable, str(root / publish.SCRIPT_RELATIVE_PATH),
-                 "--repo", "mattpackages", "doctor"],
-                root,
-            )
+            self.assertEqual(run.manager_arguments(root), ["--repo", "mattpackages", "doctor"])
+
+    def test_manager_runs_isolated_from_a_private_copy_of_the_verified_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # The cached download is replaced after verification: never run.
+            cached = root / publish.SCRIPT_RELATIVE_PATH
+            cached.parent.mkdir(parents=True)
+            cached.write_text("raise SystemExit('replaced script ran')\n")
+            run = RecordingRun(status=3)
+            with pinned_script(), patch.object(publish, "run", side_effect=run):
+                self.assertEqual(publish.run_manager(SCRIPT, ["doctor"], root), 3)
+            self.assertEqual(run.manager_arguments(root), ["--repo", "mattpackages", "doctor"])
+            # Bytes that are not the pinned script are refused before running.
+            with self.assertRaisesRegex(ValueError, "pinned SHA-256"):
+                publish.run_manager(b"print('other')\n", ["doctor"], root)
 
     def test_upload_passes_explicit_repository(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -123,29 +170,26 @@ class PublishMattOSPackageTests(unittest.TestCase):
                 "BUILD_ARTIFACT_TYPE=deb\nBUILD_ARTIFACT_PATH=builds/pkg.deb\n",
                 encoding="utf-8",
             )
+            run = RecordingRun()
             with (
+                pinned_script(),
                 patch.object(publish, "repository_root", return_value=root),
-                patch.object(publish, "download_latest_script") as download,
+                patch.object(publish, "download_latest_script", return_value=SCRIPT) as download,
                 patch.object(publish, "read_workspace_version", return_value="0.4.0"),
                 patch.object(publish, "fetch_packages_index", return_value=PACKAGES_INDEX),
                 patch.object(publish, "dpkg_version_greater", side_effect=simple_greater),
                 patch.object(publish, "ensure_release_source", return_value="a" * 40),
                 patch.object(publish, "validate_artifact_source"),
                 patch.object(publish, "validate_deb_artifact") as validate,
-                patch.object(publish, "run", return_value=0) as run,
+                patch.object(publish, "run", side_effect=run),
             ):
                 self.assertEqual(publish.main(["publish"]), 0)
 
             download.assert_called_once_with(root / publish.SCRIPT_RELATIVE_PATH)
             validate.assert_called_once_with(artifact.resolve(), "0.4.0")
-            self.assertEqual(run.call_args_list, [
-                call(["bash", str(root / "DevUtils/Build.sh")], root),
-                call(
-                    [publish.sys.executable, str(root / publish.SCRIPT_RELATIVE_PATH),
-                     "--repo", "mattpackages", "upload", "--no-overwrites", str(artifact.resolve())],
-                    root,
-                ),
-            ])
+            self.assertEqual(run.commands[0], (["bash", str(root / "DevUtils/Build.sh")], root))
+            self.assertEqual(run.manager_arguments(root),
+                             ["--repo", "mattpackages", "upload", "--no-overwrites", str(artifact.resolve())])
 
     def test_parse_build_metadata(self):
         metadata = publish.parse_build_metadata(
@@ -171,11 +215,42 @@ class PublishMattOSPackageTests(unittest.TestCase):
                 )
 
     def test_validates_downloaded_script_content(self):
-        self.assertIn("print", publish.validate_script_content(b"print('repository manager')\n"))
+        def pinned(content):
+            return publish.validate_script_content(content, publish.hashlib.sha256(content).hexdigest())
+
+        self.assertIn("print", pinned(b"print('repository manager')\n"))
         with self.assertRaisesRegex(ValueError, "empty"):
-            publish.validate_script_content(b" \n")
+            pinned(b" \n")
         with self.assertRaisesRegex(ValueError, "valid UTF-8 Python"):
-            publish.validate_script_content(b"not valid python !!!")
+            pinned(b"not valid python !!!")
+
+    def test_script_is_pinned_to_a_commit_and_digest(self):
+        self.assertRegex(publish.REPOSITORY_SCRIPT_COMMIT, r"^[0-9a-f]{40}$")
+        self.assertRegex(publish.REPOSITORY_SCRIPT_SHA256, r"^[0-9a-f]{64}$")
+        self.assertIn(f"/{publish.REPOSITORY_SCRIPT_COMMIT}/", publish.REPOSITORY_SCRIPT_URL)
+        self.assertNotIn("/master/", publish.REPOSITORY_SCRIPT_URL)
+
+    def test_rejects_script_that_does_not_match_the_pinned_digest(self):
+        # Valid Python from a changed (or compromised) upstream is still refused.
+        with self.assertRaisesRegex(ValueError, "does not match the pinned SHA-256"):
+            publish.validate_script_content(b"print('changed upstream')\n")
+
+    def test_download_saves_only_the_verified_pinned_script(self):
+        content = b"print('pinned manager')\r\n"
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "ManageMattOSRepository.py"
+            target.write_text("old cached script", encoding="utf-8")
+            opener = Mock(return_value=FakeResponse(b"print('tampered')\n"))
+            with patch.object(publish, "REPOSITORY_SCRIPT_SHA256", publish.hashlib.sha256(content).hexdigest()):
+                with self.assertRaisesRegex(ValueError, "pinned SHA-256"):
+                    publish.download_latest_script(target, opener=opener)
+                self.assertEqual(target.read_text(encoding="utf-8"), "old cached script")
+                self.assertEqual(list(target.parent.glob("*.tmp")), [])
+
+                opener = Mock(return_value=FakeResponse(content))
+                self.assertEqual(publish.download_latest_script(target, opener=opener), content)
+            self.assertEqual(target.read_bytes(), content)
+            self.assertEqual(opener.call_args.args[0].full_url, publish.REPOSITORY_SCRIPT_URL)
 
     def test_failed_download_does_not_reuse_cached_script(self):
         class FailedResponse:
@@ -215,20 +290,21 @@ class UploadValidationTests(unittest.TestCase):
             root = Path(directory)
             artifact = root / "slate.deb"
             artifact.touch()
+            run = RecordingRun()
             with (
+                pinned_script(),
                 patch.object(publish, "repository_root", return_value=root),
-                patch.object(publish, "download_latest_script"),
+                patch.object(publish, "download_latest_script", return_value=SCRIPT),
                 patch.object(publish, "read_workspace_version", return_value="0.1.0"),
                 patch.object(publish, "fetch_packages_index", return_value=""),
                 patch.object(publish, "validate_deb_artifact") as validate,
-                patch.object(publish, "run", return_value=0) as run,
+                patch.object(publish, "run", side_effect=run),
             ):
                 self.assertEqual(publish.main(["publish", "--dry-run", "--package", str(artifact)]), 0)
             validate.assert_called_once_with(artifact, "0.1.0")
-            run.assert_called_once_with(
-                [publish.sys.executable, str(root / publish.SCRIPT_RELATIVE_PATH),
-                 "--repo", "mattpackages", "--dry-run", "upload", "--no-overwrites", str(artifact)], root,
-            )
+            self.assertEqual(len(run.commands), 1)
+            self.assertEqual(run.manager_arguments(root),
+                             ["--repo", "mattpackages", "--dry-run", "upload", "--no-overwrites", str(artifact)])
 
     def test_build_failure_does_not_upload_a_stale_artifact(self):
         with (

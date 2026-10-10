@@ -107,6 +107,15 @@ fn main() -> Result<()> {
         eprintln!("Smoke startup: core constructed");
         eprintln!("Smoke startup: workspace ready");
     }
+    // Tests stand in for a slow workspace restore: wait here for a signal.
+    #[cfg(feature = "smoke")]
+    if smoke && std::env::var_os("SLATE_GUI_SMOKE_HOLD").is_some_and(|phase| phase == "core") {
+        eprintln!("Smoke startup: holding at core");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !slate_gui::terminated() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
     let owns_socket = if instance_enabled && !launch.read_only && launch.stdin.is_none() {
         let events = app.events();
         match slate_core::instance::listen(move || events.notify()) {

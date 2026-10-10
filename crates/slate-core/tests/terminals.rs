@@ -113,6 +113,30 @@ fn a_shell_closes_even_when_a_background_job_keeps_the_terminal_open() {
 }
 
 #[test]
+fn shells_do_not_inherit_the_repository_of_a_git_that_started_slate() {
+    let (dir, _serial) = isolated();
+    // What Git exports to Slate as its commit editor.
+    std::env::set_var("GIT_DIR", "/elsewhere/.git");
+    std::env::set_var("GIT_INDEX_FILE", "/elsewhere/.git/index");
+    let mut app = App::new_with_startup(dir.path(), Some(StartupMode::Workspace)).unwrap();
+    app.dispatch(Command::NewTerminal);
+    let out = dir.path().join("env.txt");
+    run(
+        &mut app,
+        &format!(
+            "echo \"${{GIT_DIR-unset}} ${{GIT_INDEX_FILE-unset}}\" > '{}'",
+            out.display()
+        ),
+    );
+    wait(&mut app, "the shell's answer", |_| {
+        std::fs::read_to_string(&out).is_ok_and(|s| s.ends_with('\n'))
+    });
+    std::env::remove_var("GIT_DIR");
+    std::env::remove_var("GIT_INDEX_FILE");
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "unset unset\n");
+}
+
+#[test]
 fn stalled_pty_rejects_pastes_without_blocking_editor_or_shutdown() {
     use slate_core::terminal::TerminalSession;
     use std::time::Instant;

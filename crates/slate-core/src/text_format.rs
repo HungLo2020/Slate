@@ -107,34 +107,78 @@ fn looks_binary(bytes: &[u8]) -> bool {
 
 /// Decode file contents. `forced` reinterprets the bytes with a chosen encoding.
 pub fn decode(bytes: &[u8], forced: Option<&str>) -> Result<Decoded> {
+    decode_owned(bytes.to_vec(), forced).map_err(|(error, _)| error)
+}
+
+/// `decode`, consuming the bytes so a large file is not held twice: UTF-8
+/// becomes the text without a copy, other encodings drop the bytes once
+/// decoded, and line endings are normalized in place. A failure returns
+/// the bytes unchanged, to try another encoding.
+pub(crate) fn decode_owned(
+    mut bytes: Vec<u8>,
+    forced: Option<&str>,
+) -> Result<Decoded, (anyhow::Error, Vec<u8>)> {
     let mut notice = None;
-    let (encoding, bom, body): (String, bool, &[u8]) = if let Some(label) = forced {
-        let name = encoding_name(label)?;
-        let (bom, body) = strip_bom(bytes, &name);
-        (name, bom, body)
-    } else if let Some(body) = bytes.strip_prefix(b"\xEF\xBB\xBF") {
-        ("UTF-8".into(), true, body)
-    } else if let Some(body) = bytes.strip_prefix(b"\xFF\xFE") {
-        ("UTF-16LE".into(), true, body)
-    } else if let Some(body) = bytes.strip_prefix(b"\xFE\xFF") {
-        ("UTF-16BE".into(), true, body)
-    } else if looks_binary(bytes) {
-        bail!("This looks like a binary file (it contains NUL bytes); Slate edits text files");
-    } else if std::str::from_utf8(bytes).is_ok() {
-        ("UTF-8".into(), false, bytes)
+    let (mut encoding, bom, skip): (String, bool, usize) = if let Some(label) = forced {
+        let name = match encoding_name(label) {
+            Ok(name) => name,
+            Err(error) => return Err((error, bytes)),
+        };
+        let (bom, body) = strip_bom(&bytes, &name);
+        let skip = bytes.len() - body.len();
+        (name, bom, skip)
+    } else if bytes.starts_with(b"\xEF\xBB\xBF") {
+        ("UTF-8".into(), true, 3)
+    } else if bytes.starts_with(b"\xFF\xFE") {
+        ("UTF-16LE".into(), true, 2)
+    } else if bytes.starts_with(b"\xFE\xFF") {
+        ("UTF-16BE".into(), true, 2)
+    } else if looks_binary(&bytes) {
+        let error = anyhow::anyhow!(
+            "This looks like a binary file (it contains NUL bytes); Slate edits text files"
+        );
+        return Err((error, bytes));
     } else {
-        notice = Some("Not valid UTF-8; opened as windows-1252 (Latin-1)".to_string());
-        ("windows-1252".into(), false, bytes)
+        // UTF-8 unless it is invalid (then windows-1252, below).
+        ("UTF-8".into(), false, 0)
     };
-    let text = decode_body(body, &encoding)?;
-    let (text, line_ending, mixed) = normalize(&text);
+    let text = if encoding == "UTF-8" {
+        let prefix = bytes[..skip].to_vec();
+        bytes.drain(..skip);
+        match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(error) => {
+                let utf8 = error.utf8_error();
+                let mut bytes = error.into_bytes();
+                bytes.splice(0..0, prefix);
+                if forced.is_some() || bom {
+                    let error = anyhow::Error::new(utf8).context("The file is not valid UTF-8");
+                    return Err((error, bytes));
+                }
+                notice = Some("Not valid UTF-8; opened as windows-1252 (Latin-1)".to_string());
+                encoding = "windows-1252".into();
+                match decode_body(&bytes, &encoding) {
+                    Ok(text) => text,
+                    Err(error) => return Err((error, bytes)),
+                }
+            }
+        }
+    } else {
+        let text = match decode_body(&bytes[skip..], &encoding) {
+            Ok(text) => text,
+            Err(error) => return Err((error, bytes)),
+        };
+        drop(bytes);
+        text
+    };
+    let (text, line_ending, mixed) = normalize_owned(text);
     if mixed {
         notice.get_or_insert_with(|| {
             format!("Mixed line endings; saving uses {}", line_ending.label())
         });
     }
     Ok(Decoded {
-        text: text.into_owned(),
+        text,
         format: TextFormat {
             encoding,
             bom,
@@ -217,6 +261,48 @@ pub fn normalize(text: &str) -> (Cow<'_, str>, LineEnding, bool) {
             c => out.push(c),
         }
     }
+    let (ending, mixed) = dominant(lf, crlf, cr);
+    (Cow::Owned(out), ending, mixed)
+}
+
+/// `normalize` within the text's own buffer (line breaks are ASCII, so
+/// UTF-8 sequences are never split).
+fn normalize_owned(text: String) -> (String, LineEnding, bool) {
+    if !text.as_bytes().contains(&b'\r') {
+        return (text, LineEnding::Lf, false);
+    }
+    let (mut lf, mut crlf, mut cr) = (0usize, 0usize, 0usize);
+    let mut bytes = text.into_bytes();
+    let (mut read, mut write) = (0, 0);
+    while read < bytes.len() {
+        let byte = bytes[read];
+        read += 1;
+        bytes[write] = match byte {
+            b'\r' if bytes.get(read) == Some(&b'\n') => {
+                read += 1;
+                crlf += 1;
+                b'\n'
+            }
+            b'\r' => {
+                cr += 1;
+                b'\n'
+            }
+            b'\n' => {
+                lf += 1;
+                b'\n'
+            }
+            byte => byte,
+        };
+        write += 1;
+    }
+    bytes.truncate(write);
+    let (ending, mixed) = dominant(lf, crlf, cr);
+    let text = String::from_utf8(bytes).expect("replacing ASCII line breaks keeps UTF-8 valid");
+    (text, ending, mixed)
+}
+
+/// The style most lines use, and whether more than one occurs.
+fn dominant(lf: usize, crlf: usize, cr: usize) -> (LineEnding, bool) {
     let kinds = [lf, crlf, cr].iter().filter(|n| **n > 0).count();
     let ending = if crlf >= lf && crlf >= cr {
         LineEnding::Crlf
@@ -225,7 +311,7 @@ pub fn normalize(text: &str) -> (Cow<'_, str>, LineEnding, bool) {
     } else {
         LineEnding::Lf
     };
-    (Cow::Owned(out), ending, kinds > 1)
+    (ending, kinds > 1)
 }
 
 /// Normalize text arriving from paste, IME or other programs to `\n` lines.

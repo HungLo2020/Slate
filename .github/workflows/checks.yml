@@ -60,6 +60,7 @@ jobs:
       - run: SLATE_GUI_FILE_DIALOG_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: python3 scripts/single-instance-smoke.py target/debug/slate-gui
       - run: python3 scripts/editor-wait-smoke.py target/debug/slate-gui
+      - run: python3 scripts/gui-termination-smoke.py target/debug/slate
       - name: Require KDE style and desktop integration coverage
         if: matrix.distro == 'debian:trixie'
         run: apt-get install -y qml6-module-org-kde-desktop plasma-integration qt6-wayland xvfb xauth dbus-x11 weston python3-gi gir1.2-atspi-2.0 at-spi2-core orca
@@ -74,6 +75,7 @@ jobs:
           xvfb-run -a python3 scripts/gui-desktop-integration.py target/debug/slate
           dbus-run-session -- python3 scripts/gui-wayland-smoke.py target/debug/slate
       - run: SLATE_GUI_AUDIT_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
+      - run: SLATE_GUI_MARKUP_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: python3 scripts/recovery-smoke.py target/debug/slate
       - run: cargo build --release --package slate --package slate-gui --features slate-gui/smoke
       - run: python3 scripts/gui-performance-smoke.py target/release/slate

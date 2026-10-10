@@ -843,6 +843,7 @@ python3 scripts/gui-layout-smoke.py target/debug/slate  # Qt Test, Basic/Fusion/
 SLATE_GUI_DESKTOP_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
 SLATE_GUI_IDE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
 python3 scripts/single-instance-smoke.py target/debug/slate-gui
+python3 scripts/gui-termination-smoke.py target/debug/slate # SIGTERM at each startup phase
 SLATE_GUI_FEATURE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
 SLATE_GUI_FILE_DIALOG_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
 SLATE_GUI_TAB_CLOSE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
@@ -850,6 +851,7 @@ QT_QPA_PLATFORMTHEME=kde SLATE_GUI_PLATFORM=wayland SLATE_GUI_REQUIRE_KDE_DIALOG
 SLATE_GUI_GIT_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
 SLATE_GUI_COMMAND_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
 SLATE_GUI_AUDIT_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
+SLATE_GUI_MARKUP_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate # file names never render as markup
 SLATE_GUI_PLATFORM=wayland python3 scripts/gui-desktop-integration.py target/debug/slate # private AT-SPI bus
 python3 scripts/gui-wayland-smoke.py target/debug/slate # Weston headless + KDE integration
 cargo build --release -p slate -p slate-gui --features slate-gui/smoke

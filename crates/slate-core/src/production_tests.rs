@@ -124,6 +124,70 @@ fn rectangular_selection_respects_tabs_unicode_and_short_lines() {
     assert_eq!(a.documents[&doc].text(), "a界bc\n\txyz\na\n123456\n");
 }
 #[test]
+fn rectangular_selection_handles_lines_ending_in_multibyte_characters() {
+    let (dir, _guard) = setup();
+    let mut a = app(&dir.path().join("workspace"));
+    let (doc, view) = content(&mut a, "abé\nab界\nab😀\nabcd");
+    let to = a.documents[&doc].line_offset(3) + 4;
+    a.select_rectangle(view, 2, to).unwrap();
+    assert_eq!(a.selections_text(view), "é\n界\n😀\ncd");
+}
+#[test]
+fn split_views_of_one_document_are_both_highlighted() {
+    let (dir, _guard) = setup();
+    let mut a = app(&dir.path().join("workspace"));
+    let (doc, view) = content(&mut a, &"fn f() {}\n".repeat(3000));
+    a.command_line("split-right");
+    let other = a.active_editor().unwrap();
+    assert_ne!(other, view);
+    assert_eq!(a.views[&other].document, doc);
+    a.views.get_mut(&other).unwrap().top = 2500;
+    let current = |a: &App, line| a.line_spans(doc, line).is_some_and(|(_, c)| c);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !(current(&a, 0) && current(&a, 2500)) {
+        assert!(Instant::now() < deadline, "both views highlighted");
+        a.process_events();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !current(&a, 1500),
+        "lines between distant views are not requested"
+    );
+}
+#[test]
+fn many_carets_move_other_views_folds_and_history_once() {
+    let (dir, _guard) = setup();
+    let mut a = app(&dir.path().join("workspace"));
+    let (doc, view) = content(&mut a, &"x\n".repeat(10_000));
+    a.command_line("split-right");
+    let other = a.active_editor().unwrap();
+    {
+        let o = a.views.get_mut(&other).unwrap();
+        o.cursor = 2 * 7_000 + 1;
+        o.anchor = Some(2 * 7_000);
+        o.folds = vec![2 * 5_000];
+    }
+    a.back.push((doc, 2 * 9_000));
+    let carets = (0..10_000)
+        .map(|line| crate::cursors::Selection::caret(2 * line))
+        .collect();
+    a.set_selections(view, carets);
+    let key = crate::Key {
+        key: "a".into(),
+        text: "ab".into(),
+        ..Default::default()
+    };
+    assert!(a.multi_key(view, &key).unwrap());
+    assert_eq!(a.documents[&doc].text(), "abx\n".repeat(10_000));
+    let o = &a.views[&other];
+    // Each line gained two bytes before these positions.
+    assert_eq!((o.cursor, o.anchor), (4 * 7_000 + 3, Some(4 * 7_000)));
+    assert_eq!(o.folds, [4 * 5_000]);
+    assert_eq!(a.back.last(), Some(&(doc, 4 * 9_000)));
+    assert_eq!(a.selections(view).len(), 10_000);
+    assert!(a.selections(view).iter().all(|s| s.cursor % 4 == 2));
+}
+#[test]
 fn editorconfig_save_is_async_preserves_format_and_shutdown_waits_for_write() {
     let (dir, _guard) = setup();
     let root = dir.path().join("workspace");
@@ -547,4 +611,321 @@ fn diagnostics_drain_latest_error_on_immediate_shutdown() {
     let report = &a.documents[&a.views[&a.active_editor().unwrap()].document];
     assert!(report.read_only);
     assert!(report.text().contains("fixture 149"));
+}
+
+/// A layout with no room anywhere: every pane at the depth limit holds the
+/// most tabs a pane may have.
+fn saturated(a: &mut App, depth: usize, tab: &crate::layout::View) -> crate::layout::Node {
+    use crate::layout::{Axis, Node, MAX_DEPTH, MAX_TABS};
+    if depth == MAX_DEPTH {
+        return Node::Pane {
+            id: a.id(),
+            tabs: vec![tab.clone(); MAX_TABS],
+            active: 0,
+        };
+    }
+    Node::Split {
+        id: a.id(),
+        axis: Axis::Vertical,
+        ratio: 0.5,
+        first: Box::new(saturated(a, depth + 1, tab)),
+        second: Box::new(saturated(a, depth + 1, tab)),
+    }
+}
+#[test]
+fn opening_into_a_full_layout_leaves_other_tabs_alone() {
+    use crate::layout::View;
+    let (dir, _guard) = setup();
+    let root = dir.path().join("workspace");
+    let mut a = app(&root);
+    let (_, view) = content(&mut a, "one\ntwo\n");
+    a.views.get_mut(&view).unwrap().cursor = 2;
+    a.layout = saturated(&mut a, 0, &View::Files);
+    let pane = a.layout.panes()[0];
+    a.layout.pane_mut(pane).unwrap().0[0] = View::Editor(view);
+    a.focus = pane;
+    let path = root.join("more.txt");
+    std::fs::write(&path, "more\n").unwrap();
+    let path = path.canonicalize().unwrap();
+    a.pending_positions
+        .insert(path.clone(), (1, crate::navigation::Column::Byte(0)));
+    let documents = a.documents.len();
+    assert!(a.finish_open(pane, Document::open(&path).unwrap()).is_err());
+    assert!(a.status.starts_with("Too many tabs"), "{}", a.status);
+    assert_eq!(a.documents.len(), documents);
+    assert!(a.document_for(&path).is_none());
+    assert!(a.pending_positions.is_empty());
+    assert_eq!(a.views[&view].cursor, 2);
+}
+#[test]
+fn layout_changes_keep_a_tab_for_unsaved_documents() {
+    use crate::layout::View;
+    let (dir, _guard) = setup();
+    let mut a = app(&dir.path().join("workspace"));
+    let (doc, view) = content(&mut a, "unsaved");
+    assert!(a.documents[&doc].dirty());
+    let (clean, clean_view) = (a.id(), a.id());
+    a.documents.insert(clean, Document::scratch());
+    a.views.insert(
+        clean_view,
+        EditorView {
+            document: clean,
+            ..Default::default()
+        },
+    );
+    // Only shells and one clean document, everywhere, at every limit.
+    a.layout = saturated(&mut a, 0, &View::Terminal(999));
+    let pane = a.layout.panes()[7];
+    a.layout.pane_mut(pane).unwrap().0[3] = View::Editor(clean_view);
+    a.adopt_orphans();
+    assert_eq!(a.layout.tabs(pane).unwrap()[3], View::Editor(view));
+    assert!(a.documents[&doc].dirty());
+    assert!(!a.documents.contains_key(&clean));
+    assert!(!a.views.contains_key(&clean_view));
+    assert!(a.layout.validate());
+}
+#[test]
+fn layout_changes_never_close_buffers_that_would_be_lost() {
+    use crate::layout::View;
+    let (dir, _guard) = setup();
+    let root = dir.path().join("workspace");
+    let path = root.join("waited.txt");
+    std::fs::write(&path, "waited\n").unwrap();
+    let mut a = launch_files(&root, 0);
+    a.execute(Command::Open { path: path.clone() }).unwrap();
+    drain(&mut a, |a| a.document_for(&path).is_some());
+    let waited = a.document_for(&path).unwrap();
+    let (_client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+    a.attach_editor_wait(
+        crate::instance::WaitTicket::new(server).unwrap(),
+        &[crate::cli::LaunchFile {
+            path: path.clone(),
+            line: None,
+            column: None,
+        }],
+    )
+    .unwrap();
+    // Read-only standard input never counts as dirty, but has no file.
+    let (stdin, stdin_view) = (a.id(), a.id());
+    let mut input = Document::from_bytes(b"piped log", "standard input").unwrap();
+    input.read_only = true;
+    a.documents.insert(stdin, input);
+    a.views.insert(
+        stdin_view,
+        EditorView {
+            document: stdin,
+            ..Default::default()
+        },
+    );
+    let waited_view = *a
+        .views
+        .iter()
+        .find(|(_, v)| v.document == waited)
+        .unwrap()
+        .0;
+    let doc = a.id();
+    let mut unsaved = Document::scratch();
+    unsaved.replace(0, 0, "unsaved", 0).unwrap();
+    a.documents.insert(doc, unsaved);
+    a.layout = saturated(&mut a, 0, &View::Terminal(999));
+    let pane = a.layout.panes()[3];
+    a.layout.pane_mut(pane).unwrap().0[0] = View::Editor(stdin_view);
+    a.layout.pane_mut(pane).unwrap().0[1] = View::Editor(waited_view);
+    a.adopt_orphans();
+    assert_eq!(a.layout.tabs(pane).unwrap()[0], View::Editor(stdin_view));
+    assert_eq!(a.layout.tabs(pane).unwrap()[1], View::Editor(waited_view));
+    assert_eq!(a.documents[&stdin].text(), "piped log");
+    assert!(a.documents.contains_key(&waited));
+    // The unsaved buffer could not be shown, but stays open.
+    assert!(a.documents[&doc].dirty());
+    assert!(a.status.starts_with("Too many tabs"), "{}", a.status);
+}
+fn launch_files(root: &Path, count: usize) -> App {
+    let files = (0..count)
+        .map(|n| {
+            let path = root.join(format!("file{n}.txt"));
+            std::fs::write(&path, format!("{n}\n")).unwrap();
+            crate::cli::LaunchFile {
+                path,
+                line: None,
+                column: None,
+            }
+        })
+        .collect();
+    App::launch(
+        &Launch {
+            files,
+            recover: false,
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap()
+}
+#[test]
+fn launching_many_files_keeps_the_session_recoverable() {
+    let (dir, _guard) = setup();
+    let root = dir.path().join("workspace");
+    let a = launch_files(&root, 40);
+    assert_eq!(a.documents.len(), 40);
+    assert!(a.layout.validate());
+    let shown = a.layout.views();
+    assert!(a
+        .views
+        .keys()
+        .all(|id| shown.contains(&crate::layout::View::Editor(*id))));
+    crate::recovery_io::write(&dir.path().join("forty.json"), &a.workspace()).unwrap();
+    drop(a);
+    let a = launch_files(&root, 130);
+    assert_eq!(a.documents.len(), crate::workspace::MAX_DOCUMENTS);
+    assert!(a.status.contains("Opened 128 of 130 files"), "{}", a.status);
+    assert!(a.layout.validate());
+    crate::recovery_io::write(&dir.path().join("many.json"), &a.workspace()).unwrap();
+}
+#[test]
+fn documents_are_found_by_any_path_to_their_file() {
+    let (dir, _guard) = setup();
+    let root = dir.path().join("workspace");
+    let mut a = app(&root);
+    let (doc, _) = content(&mut a, "text");
+    let real = root.join("real.txt");
+    a.execute(Command::SaveAs {
+        path: real.clone(),
+        overwrite: false,
+    })
+    .unwrap();
+    drain(&mut a, |a| !a.documents[&doc].dirty());
+    let link = root.join("link.txt");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert_eq!(a.document_for(&link), Some(doc));
+    assert_eq!(a.document_for(&root.join("./real.txt")), Some(doc));
+    // Save As moves the lookup to the new file.
+    let moved = root.join("moved.txt");
+    a.execute(Command::SaveAs {
+        path: moved.clone(),
+        overwrite: false,
+    })
+    .unwrap();
+    drain(&mut a, |a| {
+        a.documents[&doc].path.as_deref() == Some(&*moved.canonicalize().unwrap_or_default())
+    });
+    assert_eq!(a.document_for(&moved), Some(doc));
+    assert_eq!(a.document_for(&link), None);
+    let view = a.active_editor().unwrap();
+    a.close_tab(a.focus, view, true).unwrap();
+    assert_eq!(a.document_for(&moved), None);
+}
+#[test]
+fn closing_a_document_forgets_what_was_cached_for_it() {
+    let (dir, _guard) = setup();
+    let mut a = app(&dir.path().join("workspace"));
+    let text = "fn a() {\n    one;\n}\n".repeat(2000);
+    let (doc, view) = content(&mut a, &text);
+    a.views.get_mut(&view).unwrap().folds = vec![0];
+    assert!(!a.hidden_lines(view).is_empty());
+    a.overview_for(doc);
+    assert!(a.overview_pending.contains_key(&doc) && a.overview_workers.contains_key(&doc));
+    a.snapshot(100, 30, 1, 1, 1, 3);
+    assert!(a.render_cache.contains_key(&view));
+    a.close_tab(a.focus, view, true).unwrap();
+    assert!(!a.documents.contains_key(&doc) && !a.views.contains_key(&view));
+    assert!(!a.fold_cache.lock().unwrap().contains_key(&view));
+    assert!(!a.render_cache.contains_key(&view));
+    assert!(!a.overview_cache.contains_key(&doc));
+    assert!(!a.overview_pending.contains_key(&doc));
+    assert!(!a.overview_workers.contains_key(&doc));
+    assert!(!a.highlights.contains_key(&doc) && !a.highlight_pending.contains_key(&doc));
+}
+#[test]
+fn editor_signatures_follow_carets_and_nothing_else() {
+    let (dir, _guard) = setup();
+    let mut a = app(&dir.path().join("workspace"));
+    let (_, view) = content(&mut a, "one two three\n");
+    let before = a.editor_signature(view);
+    assert_eq!(a.editor_signature(view), before);
+    a.views
+        .get_mut(&view)
+        .unwrap()
+        .extra
+        .push(crate::cursors::Selection::caret(4));
+    let one = a.editor_signature(view);
+    assert_ne!(one, before);
+    a.views.get_mut(&view).unwrap().extra[0].anchor = Some(7);
+    assert_ne!(a.editor_signature(view), one);
+    a.views.get_mut(&view).unwrap().extra.clear();
+    assert_eq!(a.editor_signature(view), before);
+    a.views.get_mut(&view).unwrap().cursor = 3;
+    assert_ne!(a.editor_signature(view), before);
+    // Fields drawn from neither the view nor the screen leave it alone.
+    a.views.get_mut(&view).unwrap().cursor = 0;
+    a.views.get_mut(&view).unwrap().goal = Some(9);
+    assert_eq!(a.editor_signature(view), before);
+}
+#[test]
+fn editor_signatures_follow_the_path_and_diff_markers() {
+    let (dir, _guard) = setup();
+    let mut a = app(&dir.path().join("workspace"));
+    let (doc, view) = content(&mut a, "one\n");
+    let before = a.editor_signature(view);
+    // Diagnostics are looked up by path: Save As must redraw.
+    a.documents.get_mut(&doc).unwrap().path = Some(dir.path().join("workspace/saved.rs"));
+    let saved = a.editor_signature(view);
+    assert_ne!(saved, before);
+    // Diff hunk markers show once a document becomes an inspection.
+    a.show_comparison(crate::comparison::Preview {
+        context: crate::git::Context {
+            root: dir.path().into(),
+            scope: None,
+        },
+        path: "file.txt".into(),
+        display: "file.txt".into(),
+        staged: false,
+        untracked: false,
+        patch: "@@ -1 +1 @@\n-a\n+b\n".into(),
+        side_by_side: false,
+    });
+    let inspection = a.diff_inspections.values().next().unwrap().clone();
+    a.diff_inspections.insert(doc, inspection);
+    assert_ne!(a.editor_signature(view), saved);
+}
+#[test]
+fn open_documents_stay_within_what_recovery_holds() {
+    let (dir, _guard) = setup();
+    let root = dir.path().join("workspace");
+    let mut a = launch_files(&root, crate::workspace::MAX_DOCUMENTS);
+    a.execute(Command::New).unwrap();
+    assert!(
+        a.status.starts_with("Too many open documents"),
+        "{}",
+        a.status
+    );
+    let path = root.join("one-more.txt");
+    std::fs::write(&path, "more\n").unwrap();
+    assert!(a
+        .finish_open(a.focus, Document::open(&path).unwrap())
+        .is_err());
+    assert_eq!(a.documents.len(), crate::workspace::MAX_DOCUMENTS);
+    a.workspace().validate(&a.root).unwrap();
+}
+#[test]
+fn salvage_keeps_unsaved_buffers_before_clean_references() {
+    let (dir, _guard) = setup();
+    let root = dir.path().join("workspace");
+    let mut a = launch_files(&root, 2);
+    let mut w = a.workspace();
+    let template = w.documents.values().next().unwrap().recovery_copy();
+    assert!(template.reference);
+    // More clean references than a checkpoint holds, with the one unsaved
+    // buffer last in id order.
+    for id in 1000..1000 + crate::workspace::MAX_DOCUMENTS as u64 {
+        w.documents.insert(id, template.recovery_copy());
+    }
+    let mut unsaved = Document::scratch();
+    unsaved.replace(0, 0, "unsaved work", 0).unwrap();
+    let last = a.id() + 10_000;
+    w.documents.insert(last, unsaved.recovery_copy());
+    let bytes = serde_json::to_vec(&w).unwrap();
+    let salvaged = crate::workspace::Workspace::salvage(&bytes, &root).unwrap();
+    assert_eq!(salvaged.documents.len(), crate::workspace::MAX_DOCUMENTS);
+    assert_eq!(salvaged.documents[&last].text(), "unsaved work");
 }

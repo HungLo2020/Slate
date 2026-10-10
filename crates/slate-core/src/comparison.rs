@@ -64,12 +64,8 @@ pub(crate) fn apply_hunk(preview: &Preview, index: usize) -> Result<String, Stri
     let first = ranges.first().ok_or("No text hunks")?.0;
     let patch = format!("{}{}", &preview.patch[..first], &preview.patch[a..b]);
     for check in [true, false] {
-        let mut command = std::process::Command::new("git");
-        command.arg("-C").arg(&preview.context.root).args([
-            "apply",
-            "--cached",
-            "--whitespace=nowarn",
-        ]);
+        let mut command = crate::git::command(&preview.context.root);
+        command.args(["apply", "--cached", "--whitespace=nowarn"]);
         if preview.staged {
             command.arg("--reverse");
         }
@@ -180,7 +176,9 @@ impl App {
                 preview.clone(),
                 rows.clone(),
             );
-            self.add_tab(View::Editor(l));
+            if !self.show_new_document(l) {
+                return;
+            }
             let r = self.inspect_diff(&format!("After · {title}"), right, preview, rows);
             let pane = self.id();
             let split = self.id();
@@ -188,8 +186,8 @@ impl App {
                 self.layout
                     .split(self.focus, Axis::Horizontal, pane, split, View::Editor(r));
                 self.focus = pane;
-            } else {
-                self.add_tab(View::Editor(r));
+            } else if !self.show_new_document(r) {
+                return;
             }
         } else {
             let rows = preview
@@ -210,7 +208,9 @@ impl App {
                 preview.display
             );
             let view = self.inspect_diff(&title, preview.patch.clone(), preview, rows);
-            self.add_tab(View::Editor(view));
+            if !self.show_new_document(view) {
+                return;
+            }
         }
         self.status = "Diff · read-only · stage-hunk / unstage-hunk at the cursor".into();
     }

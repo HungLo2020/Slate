@@ -18,6 +18,8 @@ with tempfile.TemporaryDirectory(prefix='slate-gui-offscreen-', dir=fixture_pare
     workspace.mkdir()
     (workspace/'edit.txt').write_text('original\n')
     (workspace/'second.txt').write_text('second original')
+    if os.environ.get('SLATE_GUI_MARKUP_SMOKE'):
+        (workspace/'<i>marked<i>.txt').write_text('A file name that looks like markup\n')
     git_smoke = bool(os.environ.get('SLATE_GUI_GIT_SMOKE'))
     command_smoke = bool(os.environ.get('SLATE_GUI_COMMAND_SMOKE'))
     if os.environ.get('SLATE_GUI_FEATURE_SMOKE') or git_smoke or command_smoke:

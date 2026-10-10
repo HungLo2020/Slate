@@ -162,6 +162,11 @@ impl TerminalSession {
         cmd.cwd(cwd);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        // A Git that started Slate as its editor describes its repository
+        // in the environment; shells here find their own.
+        for name in crate::process::REPOSITORY_ENV {
+            cmd.env_remove(name);
+        }
         if let Some(command) = command {
             cmd.args(["-c", command]);
         }

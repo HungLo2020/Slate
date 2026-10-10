@@ -31,6 +31,7 @@ mod lsp;
 pub mod navigation;
 pub mod outline;
 mod panes;
+pub mod panics;
 pub mod paths;
 pub mod picker;
 pub mod preferences;
@@ -40,6 +41,7 @@ pub mod process;
 mod production_tests;
 pub mod profiles;
 pub mod project;
+mod rebase;
 mod recovery_io;
 mod render;
 pub mod rpc;
@@ -476,14 +478,15 @@ pub struct Snapshot {
     pub panes: Vec<PaneSnapshot>,
     pub handles: Vec<Handle>,
     pub focus: u64,
-    pub files: Vec<Entry>,
-    pub git: Vec<GitEntry>,
+    /// Shared with the app until the listing changes, so frames do not copy
+    /// it. Empty in a graphical snapshot that already has this revision.
+    pub files: std::sync::Arc<Vec<Entry>>,
+    pub git: std::sync::Arc<Vec<GitEntry>>,
     pub browser: String,
     pub search: Search,
     pub status: String,
     pub dirty: bool,
     pub quit: bool,
-    pub clipboard: String,
     pub layouts: Vec<String>,
     pub prompt: Option<Prompt>,
     pub location: String,
@@ -496,7 +499,6 @@ pub struct Snapshot {
     pub terminal_selection: String,
     /// Selection background, so monochrome terminals can show reverse video.
     pub selection: String,
-    pub commands: Vec<commands::CommandInfo>,
     pub settings: Preferences,
     pub profiles: Vec<String>,
     pub setting_sources: BTreeMap<String, String>,
@@ -582,7 +584,11 @@ pub struct App {
     events: events::Events,
     revision: u64,
     files_revision: u64,
-    render_cache: BTreeMap<u64, (String, u64, std::sync::Arc<Screen>)>,
+    /// The file and Git listings last handed to snapshots, by revision.
+    shared_files: (u64, std::sync::Arc<Vec<Entry>>),
+    shared_git: (u64, std::sync::Arc<Vec<GitEntry>>),
+    /// Pane screens by view: (signature, build number, screen).
+    render_cache: BTreeMap<u64, (u64, u64, std::sync::Arc<Screen>)>,
     pub screen_builds: u64,
     typing: bool,
     /// Launched with files (or standard input) rather than a directory.
@@ -636,8 +642,10 @@ pub struct App {
     last_search: Option<project::SearchOptions>,
     project_search_policy: project::SearchPolicy,
     last_search_files: Vec<(PathBuf, Option<u64>)>,
-    /// Files the last replace-in-files rewrote: (file, before, after).
-    replace_backups: Vec<(PathBuf, Vec<u8>, Vec<u8>)>,
+    /// Files each replace-in-files run rewrote, latest run last.
+    replace_backups: Vec<Vec<picker::ReplaceBackup>>,
+    /// An undo-replace-in-files is writing files back.
+    replace_undoing: bool,
     /// Language servers, their documents and diagnostics.
     lsp: lsp::Lsp,
     /// Documents being formatted.
@@ -652,14 +660,21 @@ pub struct App {
     trusted: bool,
     /// A command waiting for the user to trust the workspace.
     pending_trust: Option<(PathBuf, Command)>,
-    /// Trust decisions for folders outside the workspace.
+    /// Trust decisions for folders outside the workspace, by the path as
+    /// asked.
     trust_cache: std::sync::Mutex<std::collections::HashMap<PathBuf, bool>>,
+    /// Changes whenever trust may have changed (`trust_changed`), so
+    /// decisions derived from trust know when to look again.
+    trust_generation: u64,
+    /// Folders outside the workspace trusted for this session only.
+    session_trust: Vec<PathBuf>,
     /// Wrapped rows are shared across cursor movement and rendering.
-    #[allow(clippy::type_complexity)]
-    wrap_cache:
-        std::sync::Mutex<BTreeMap<(u64, u64, usize, usize, usize), std::sync::Arc<Vec<wrap::Row>>>>,
+    wrap_cache: std::sync::Mutex<wrap::Cache>,
     fuzzy_worker: Option<picker::FilterWorker>,
     search_worker: Option<services::LatestWorker<picker::SearchRequest>>,
+    /// Grammar outlines: the newest request wins and older ones stop.
+    outline_worker: Option<services::LatestWorker<picker::OutlineRequest>>,
+    outline_ticket: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Hidden line ranges per view, keyed by what they were computed from.
     #[allow(clippy::type_complexity)]
     fold_cache: std::sync::Mutex<BTreeMap<u64, ((u64, Vec<usize>, usize), folding::Hidden)>>,
@@ -721,6 +736,19 @@ impl App {
         self.schedule_highlight();
         if self.recovery.dirty && self.recovery.at.elapsed() >= Duration::from_secs(1) {
             self.checkpoint();
+        }
+        self.settle_quarantine();
+        let lost =
+            "Recovery unavailable: its folder was removed by another program; save your documents";
+        if self
+            .recovery
+            .store
+            .as_ref()
+            .is_some_and(|store| !store.keep_alive())
+            && self.recovery.warning.as_deref() != Some(lost)
+        {
+            self.recovery.warning = Some(lost.into());
+            self.revision += 1;
         }
     }
     fn id(&mut self) -> u64 {
@@ -837,13 +865,9 @@ impl App {
                 .0
                 .push(View::Editor(editor));
         }
-        self.views.remove(&view);
+        self.forget_view(view);
         if !shared {
-            self.views.retain(|_, v| v.document != doc);
-            self.documents.remove(&doc);
-            self.diff_inspections.remove(&doc);
-            self.highlights.remove(&doc);
-            self.highlight_pending.remove(&doc);
+            self.forget_document(doc);
         }
         if self.editor_only && !matches!(self.focused(), Some(View::Editor(_))) {
             self.expand_workspace()?;
@@ -884,10 +908,7 @@ impl App {
                     *active = (*active).min(tabs.len().saturating_sub(1));
                 }
             }
-            self.views.remove(&view);
-            self.documents.remove(&doc);
-            self.diff_inspections.remove(&doc);
-            self.highlights.remove(&doc);
+            self.forget_document(doc);
         }
     }
     /// Activate the tab `step` places after (or before) the current one.
@@ -905,18 +926,19 @@ impl App {
         }
         Ok(())
     }
-    fn add_tab(&mut self, view: View) {
+    /// Returns false when the layout has no room for the view.
+    fn add_tab(&mut self, view: View) -> bool {
         // Files and Git are singleton views within a pane. Reopening them
         // should reveal the existing tab instead of crowding the tab bar.
         if matches!(view, View::Files | View::Git) {
             if let Some((tabs, active)) = self.layout.pane_mut(self.focus) {
                 if let Some(index) = tabs.iter().position(|tab| *tab == view) {
                     *active = index;
-                    return;
+                    return true;
                 }
             }
         }
-        self.show_view(view);
+        self.show_view(view)
     }
     pub fn dispatch(&mut self, cmd: Command) {
         // Passive pointer motion has no editing effect. Only terminals requesting
@@ -1298,7 +1320,8 @@ impl App {
             Command::OpenWorkspace { path } => self.open_workspace(path)?,
             Command::OpenSettings => {
                 if !Preferences::path().exists() {
-                    self.preferences.save()?;
+                    // Defaults, never this session's launch options.
+                    Preferences::default().save()?;
                 }
                 self.execute(Command::Open {
                     path: Preferences::path(),
@@ -1659,7 +1682,7 @@ impl App {
                         ..Default::default()
                     },
                 );
-                self.add_tab(View::Editor(view));
+                self.show_new_document(view);
             }
             Command::Save | Command::SaveAs { .. } => {
                 let (destination, overwrite) = if let Command::SaveAs { path, overwrite } = cmd {
@@ -1718,8 +1741,27 @@ impl App {
                     d.redo(view.cursor)
                 };
                 if let Some(cursor) = cursor {
-                    for (start, old, new) in changes {
-                        self.rebase_views(view.document, start, start + old, new);
+                    // A redone group runs from its last replacement to its
+                    // first, an undone one the other way; either moves views
+                    // once unless its replacements touch.
+                    let edits: Vec<_> = changes
+                        .iter()
+                        .map(|(start, old, new)| rebase::Edit {
+                            start: *start,
+                            end: start + old,
+                            len: *new,
+                            pushed: None,
+                        })
+                        .collect();
+                    let batch = rebase::Batch::new(edits.iter().copied())
+                        .or_else(|| rebase::Batch::ascending(&edits));
+                    match batch {
+                        Some(batch) => self.rebase_views_batch(view.document, batch),
+                        None => {
+                            for (start, old, new) in changes {
+                                self.rebase_views(view.document, start, start + old, new);
+                            }
+                        }
                     }
                     let v = self.views.get_mut(&id).unwrap();
                     v.cursor = cursor;
@@ -2233,91 +2275,81 @@ impl App {
             .get_mut(&doc)
             .context("The document was closed")?
             .replace_many(edits, cursor)?;
-        // From the end, each range is still in the original coordinates.
-        let mut order: Vec<usize> = (0..edits.len()).collect();
-        order.sort_by_key(|i| std::cmp::Reverse((edits[*i].0, edits[*i].1)));
-        for i in order {
-            let (start, end, text) = &edits[i];
-            self.rebase_views_text(doc, *start, *end, text);
-        }
+        self.rebase_views_many(doc, edits);
         self.clamp_views_soft(doc);
         Ok(placed)
     }
     /// Move everything that points into a document across an edit that
     /// replaced `start..end` with `length` bytes (already applied).
     fn rebase_views(&mut self, doc: u64, start: usize, end: usize, length: usize) {
-        self.rebase_views_for(doc, start, end, length, None);
+        let edit = rebase::Edit {
+            start,
+            end,
+            len: length,
+            pushed: None,
+        };
+        if let Some(batch) = rebase::Batch::new([edit]) {
+            self.rebase_views_batch(doc, batch);
+        }
     }
     /// `rebase_views` for an edit whose inserted text is known.
     fn rebase_views_text(&mut self, doc: u64, start: usize, end: usize, text: &str) {
-        self.rebase_views_for(doc, start, end, text.len(), Some(text));
+        if let Some(batch) = rebase::Batch::new([rebase::Edit::text(start, end, text)]) {
+            self.rebase_views_batch(doc, batch);
+        }
     }
-    fn rebase_views_for(
-        &mut self,
-        doc: u64,
-        start: usize,
-        end: usize,
-        length: usize,
-        inserted: Option<&str>,
-    ) {
-        let position = |p: usize| {
-            if p <= start {
-                p
-            } else if p >= end {
-                p - end + start + length
-            } else {
-                start + length
-            }
-        };
+    /// `rebase_views` for replacements applied together, each in the
+    /// coordinates of the text before any of them (as `replace_many` takes
+    /// them). Every position moves once, however many carets edited.
+    pub(crate) fn rebase_views_many(&mut self, doc: u64, edits: &[(usize, usize, String)]) {
+        let edits = edits
+            .iter()
+            .map(|(start, end, text)| rebase::Edit::text(*start, *end, text));
+        if let Some(batch) = rebase::Batch::sorted(edits) {
+            self.rebase_views_batch(doc, batch);
+        }
+    }
+    fn rebase_views_batch(&mut self, doc: u64, mut batch: rebase::Batch) {
+        use rebase::Mode;
         if let Some((scope_doc, a, b)) = &mut self.search.scope {
             if *scope_doc == doc {
-                *a = position(*a);
-                *b = position(*b);
+                *a = batch.position(*a);
+                *b = batch.position(*b);
             }
         }
-        let insertion = start == end;
-        // Text inserted at a line start that contains a line break pushes
-        // that line down: marks on it (folds, breakpoints) follow the line.
-        let pushed_line = inserted.and_then(|text| text.rfind('\n').map(|i| start + i + 1));
-        let line_mark = |p: usize| -> Option<usize> {
-            if insertion && p == start {
-                Some(pushed_line.unwrap_or(p))
-            } else if start <= p && p < end {
-                // The line's start was replaced: the mark goes with it.
-                None
-            } else {
-                Some(position(p))
-            }
-        };
         for other in self.views.values_mut().filter(|o| o.document == doc) {
-            other.cursor = position(other.cursor);
-            other.anchor = other.anchor.map(position);
+            other.cursor = batch.position(other.cursor);
+            other.anchor = other.anchor.map(|p| batch.position(p));
             for s in &mut other.extra {
-                s.cursor = position(s.cursor);
-                s.anchor = s.anchor.map(position);
+                s.cursor = batch.position(s.cursor);
+                s.anchor = s.anchor.map(|p| batch.position(p));
             }
             // The field being typed in grows with text typed at its end;
             // a later field that starts where the text went moves right.
             for (a, b) in other.current_stop.iter_mut() {
-                let grows = *b == start && *a <= start;
-                *a = position(*a);
-                *b = if grows { start + length } else { position(*b) };
+                *a = batch.position(*a);
+                *b = batch.map(Mode::After, *b).unwrap_or(*b);
             }
             for stop in other.stops.iter_mut().chain(other.visited.iter_mut()) {
                 for (a, b) in stop.iter_mut() {
-                    let follows = insertion && *a == start;
-                    *b = if follows { *b + length } else { position(*b) };
-                    *a = if follows { *a + length } else { position(*a) };
+                    (*a, *b) = batch.field(*a, *b);
                 }
             }
-            other.folds = other.folds.iter().filter_map(|f| line_mark(*f)).collect();
+            // Text inserted at a line start that contains a line break pushes
+            // that line down: marks on it (folds, breakpoints) follow the
+            // line. A mark whose line start was replaced goes with it.
+            other.folds = other
+                .folds
+                .iter()
+                .filter_map(|f| batch.map(Mode::Line, *f))
+                .collect();
         }
         for (history_doc, offset) in self.back.iter_mut().chain(self.forward.iter_mut()) {
             if *history_doc == doc {
-                *offset = position(*offset);
+                *offset = batch.position(*offset);
             }
         }
-        self.rebase_breakpoints(doc, |p| line_mark(p).unwrap_or(start));
+        self.rebase_breakpoints(doc, |p| batch.map(Mode::Breakpoint, p).unwrap_or(p));
     }
     /// Apply one smart replacement at the primary caret.
     fn apply_single(&mut self, id: u64, typed: smart::Typed) -> Result<()> {
@@ -2856,7 +2888,7 @@ impl App {
     pub fn command_line(&mut self, line: &str) {
         self.revision += 1;
         match self.resolve_command_input(line) {
-            Ok(cmd) => self.dispatch(cmd),
+            Ok(cmd) => self.dispatch(cmd.confirming_discard()),
             Err(error) => self.status = format!("Error: {error:#}"),
         }
     }
@@ -3150,16 +3182,19 @@ pub fn key_chord(k: &Key) -> String {
     )
 }
 impl App {
-    fn finish_open(&mut self, pane: u64, mut d: Document) -> u64 {
+    /// Show an opened file. Fails, without disturbing other tabs, when the
+    /// layout has no room for another tab.
+    fn finish_open(&mut self, pane: u64, mut d: Document) -> Result<u64> {
         let path = d.path.clone();
         let notice = d.notice.take();
-        let doc = if let Some((id, _)) = self.documents.iter().find(|(_, old)| old.path == path) {
-            *id
-        } else {
-            let id = self.id();
-            self.documents.insert(id, d);
-            id
-        };
+        let (doc, fresh) =
+            if let Some((id, _)) = self.documents.iter().find(|(_, old)| old.path == path) {
+                (*id, false)
+            } else {
+                let id = self.id();
+                self.documents.insert(id, d);
+                (id, true)
+            };
         if matches!(self.layout.view(pane), Some(View::Editor(_))) {
             self.focus = pane;
         } else {
@@ -3177,7 +3212,16 @@ impl App {
                     ..Default::default()
                 },
             );
-            self.add_tab(View::Editor(id));
+            // A document opened just now closes again when it cannot be shown.
+            let shown = if fresh {
+                self.show_new_document(id)
+            } else {
+                self.add_tab(View::Editor(id))
+            };
+            if !shown {
+                self.pending_positions.remove(path.as_ref().unwrap());
+                bail!("{}", self.status);
+            }
             self.drop_pristine_scratch(self.focus, id);
         }
         let path = path.unwrap();
@@ -3198,7 +3242,7 @@ impl App {
             notice.map(|n| format!(" · {n}")).unwrap_or_default()
         );
         self.recovery.dirty = true;
-        doc
+        Ok(doc)
     }
     fn location(&self) -> String {
         if let Some(id) = self.active_editor() {

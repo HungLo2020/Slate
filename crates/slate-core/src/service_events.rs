@@ -42,10 +42,11 @@ impl App {
                 }
                 Reply::Opened(token, result) => {
                     if let Some(pane) = self.pending_open.remove(&token) {
-                        match result {
-                            Ok(d) => {
-                                let doc = self.finish_open(pane, d);
-                                self.editor_wait_opened(token, Ok(doc));
+                        match result.map(|d| self.finish_open(pane, d)) {
+                            Ok(Ok(doc)) => self.editor_wait_opened(token, Ok(doc)),
+                            Ok(Err(e)) => {
+                                self.status = format!("{e}");
+                                self.editor_wait_opened(token, Err(e));
                             }
                             Err(e) => {
                                 self.status = format!("Open failed: {e}");
@@ -91,6 +92,7 @@ impl App {
                 Reply::SearchDone(generation, result) => self.search_done(generation, result),
                 Reply::Outline(doc, symbols) => self.symbols_ready(doc, symbols),
                 Reply::Replaced(report) => self.replaced(report),
+                Reply::ReplaceUndone(report) => self.replace_undone(report),
                 Reply::Ide(event) => self.ide_event(event),
                 Reply::Previews(generation, previews) => self.previews_ready(generation, previews),
                 Reply::ToolDone(name, output, target, result) => {

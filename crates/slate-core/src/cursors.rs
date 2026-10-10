@@ -140,14 +140,8 @@ impl App {
             .get_mut(&doc)
             .unwrap()
             .replace_many(&edits, before)?;
-        // Other views (and folds) follow every replacement. From the end,
-        // each range is still in the coordinates of the original text.
-        let mut order: Vec<usize> = (0..edits.len()).collect();
-        order.sort_by_key(|i| std::cmp::Reverse(edits[*i].0));
-        for i in order {
-            let (start, end, text) = &edits[i];
-            self.rebase_views_text(doc, *start, *end, text);
-        }
+        // Other views (and folds) follow every replacement, all at once.
+        self.rebase_views_many(doc, &edits);
         let selections = typed
             .iter()
             .zip(placed)
@@ -456,8 +450,8 @@ impl App {
         }
         let mut selections = Vec::new();
         for line in a.min(b)..=a.max(b) {
+            // `line_range` already excludes the line break.
             let (start, end) = d.line_range(line);
-            let end = end - usize::from(end > start && d.slice(end - 1, end) == "\n");
             let row = crate::wrap::Row {
                 start: 0,
                 end: end - start,

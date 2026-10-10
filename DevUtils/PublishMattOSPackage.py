@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ast
 import gzip
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,9 +19,16 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 
+# The repository manager runs with this script's privileges, so it is pinned to
+# a reviewed upstream commit and its SHA-256 is checked before it is saved or
+# run. To update, review the new revision, then set both values:
+#   git ls-remote https://github.com/HungLo2020/LinuxScripts master
+#   curl -fsSL <REPOSITORY_SCRIPT_URL at that commit> | sha256sum
+REPOSITORY_SCRIPT_COMMIT = "da40e3473e4d8f6b9d492ad63be33af966036773"
+REPOSITORY_SCRIPT_SHA256 = "cd3ad79486f35655fe2e8c8e907a91fecdac89421effd823793e9ca5cebdead7"
 REPOSITORY_SCRIPT_URL = (
-    "https://raw.githubusercontent.com/HungLo2020/LinuxScripts/master/"
-    "GenericScripts/ManageMattOSRepository.py"
+    "https://raw.githubusercontent.com/HungLo2020/LinuxScripts/"
+    f"{REPOSITORY_SCRIPT_COMMIT}/GenericScripts/ManageMattOSRepository.py"
 )
 SCRIPT_RELATIVE_PATH = Path("DevUtils/.downloaded/ManageMattOSRepository.py")
 BUILD_METADATA_RELATIVE_PATH = Path("builds/latest-build.env")
@@ -36,10 +44,18 @@ def repository_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def validate_script_content(content: bytes) -> str:
-    """Return decoded script text, or raise if the download is not Python."""
+def validate_script_content(content: bytes, expected_sha256: str | None = None) -> str:
+    """Return decoded script text, or raise unless it is the pinned Python script."""
+    expected_sha256 = expected_sha256 or REPOSITORY_SCRIPT_SHA256
     if not content.strip():
         raise ValueError("downloaded repository-management script is empty")
+    digest = hashlib.sha256(content).hexdigest()
+    if digest != expected_sha256:
+        raise ValueError(
+            "downloaded repository-management script does not match the pinned SHA-256 "
+            f"(expected {expected_sha256}, got {digest}); review the upstream change at commit "
+            f"{REPOSITORY_SCRIPT_COMMIT} and update REPOSITORY_SCRIPT_COMMIT/REPOSITORY_SCRIPT_SHA256"
+        )
     try:
         text = content.decode("utf-8")
         tree = ast.parse(text, filename="ManageMattOSRepository.py")
@@ -50,8 +66,11 @@ def validate_script_content(content: bytes) -> str:
     return text
 
 
-def download_latest_script(target: Path, opener: Callable[..., object] = urlopen) -> None:
-    """Download the authoritative script and atomically replace *target*."""
+def download_latest_script(target: Path, opener: Callable[..., object] = urlopen) -> bytes:
+    """Download the pinned script, verify it, and atomically replace *target*.
+
+    The verified bytes are returned; they, not *target*, are what runs.
+    """
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
     try:
@@ -64,20 +83,37 @@ def download_latest_script(target: Path, opener: Callable[..., object] = urlopen
             },
         )
         with opener(request, timeout=30) as response:  # type: ignore[union-attr]
-            text = validate_script_content(response.read())  # type: ignore[union-attr]
+            content = response.read()  # type: ignore[union-attr]
+        validate_script_content(content)
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
         )
         temporary_path = Path(temporary_name)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as temporary_file:
-            temporary_file.write(text)
+        # Write the verified bytes unchanged: they are exactly what was hashed.
+        with os.fdopen(descriptor, "wb") as temporary_file:
+            temporary_file.write(content)
             temporary_file.flush()
             os.fsync(temporary_file.fileno())
         os.replace(temporary_path, target)
         temporary_path = None
+        return content
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
+
+
+def run_manager(content: bytes, arguments: list[str], root: Path) -> int:
+    """Run the verified repository manager with *arguments*.
+
+    It runs from a fresh private copy of the verified bytes, so nothing can
+    replace it between verification and execution, and in isolated mode, so
+    neither its directory nor the environment adds modules to its imports.
+    """
+    validate_script_content(content)
+    with tempfile.TemporaryDirectory(prefix="slate-repository-manager-") as directory:
+        script = Path(directory) / "ManageMattOSRepository.py"
+        script.write_bytes(content)
+        return run([sys.executable, "-I", str(script), "--repo", "mattpackages", *arguments], root)
 
 
 def parse_build_metadata(metadata_text: str) -> Mapping[str, str]:
@@ -226,16 +262,15 @@ def main(argv: list[str] | None = None) -> int:
     root = repository_root()
     downloaded_script = root / SCRIPT_RELATIVE_PATH
     try:
-        print(f"[publish] Downloading latest repository-management script from {REPOSITORY_SCRIPT_URL}", flush=True)
-        download_latest_script(downloaded_script)
+        print(f"[publish] Downloading pinned repository-management script from {REPOSITORY_SCRIPT_URL}", flush=True)
+        manager = download_latest_script(downloaded_script)
     except (OSError, ValueError) as error:
         print(f"[publish] ERROR: download failed; cached scripts are not used: {error}", file=sys.stderr)
         return 1
 
-    manager = [sys.executable, str(downloaded_script), "--repo", "mattpackages"]
     if args.command == "doctor":
         print("[publish] Running repository doctor")
-        return run(manager + ["doctor"], root)
+        return run_manager(manager, ["doctor"], root)
 
     try:
         version = read_workspace_version(root)
@@ -276,9 +311,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(f"[publish] Handing package to authoritative repository manager: {artifact}")
-    if args.dry_run:
-        manager += ["--dry-run"]
-    return run(manager + ["upload", "--no-overwrites", str(artifact)], root)
+    options = ["--dry-run"] if args.dry_run else []
+    return run_manager(manager, options + ["upload", "--no-overwrites", str(artifact)], root)
 
 
 if __name__ == "__main__":

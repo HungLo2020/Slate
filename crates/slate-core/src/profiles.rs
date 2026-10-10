@@ -264,6 +264,11 @@ impl Layers {
                 overrides.apply(&mut p);
             }
         }
+        // An override layer may also set zero: it follows the indent width,
+        // and tab stops are never zero columns wide.
+        if p.tab_width == 0 {
+            p.tab_width = p.indent_width;
+        }
         p
     }
 }
@@ -323,15 +328,26 @@ impl App {
         }
         out
     }
-    pub(crate) fn persist_profile_preferences(&self, preferences: &Preferences) -> Result<()> {
-        match preferences.profile.as_str() {
-            "default" | "minimal" | "workspace" => preferences.save(),
+    /// Change the active profile's saved preferences: settings.toml, or a
+    /// custom profile's `[preferences]` (see `edit_preferences`).
+    pub(crate) fn edit_profile_preferences(
+        &self,
+        change: impl FnOnce(&mut Preferences) -> Result<()>,
+    ) -> Result<()> {
+        match self.preference_layers.base.profile.as_str() {
+            "default" | "minimal" | "workspace" => crate::preferences::edit_preferences(
+                &Preferences::path(),
+                None,
+                Preferences::parse,
+                change,
+            ),
             name => {
-                let mut profile = read(name)?;
-                profile.preferences = preferences.clone();
-                crate::fsio::write_private(
+                validate_name(name)?;
+                crate::preferences::edit_preferences(
                     &path(name),
-                    toml::to_string_pretty(&profile)?.as_bytes(),
+                    Some("preferences"),
+                    |source| Ok(toml::from_str::<Profile>(source)?.preferences),
+                    change,
                 )
             }
         }
@@ -346,8 +362,16 @@ impl App {
         let mut global = Preferences::load()?;
         global.profile = name.into();
         // Validate the profile and both override layers before persisting selection.
-        let layers = Layers::load_with_preferences(&self.root, global.clone())?;
-        global.save()?;
+        let layers = Layers::load_with_preferences(&self.root, global)?;
+        crate::preferences::edit_preferences(
+            &Preferences::path(),
+            None,
+            Preferences::parse,
+            |p| {
+                p.profile = name.into();
+                Ok(())
+            },
+        )?;
         self.install_preferences(layers);
         if let Some(profile) = profile {
             self.restore_layout(profile.layout)?;
@@ -373,8 +397,14 @@ impl App {
         if ["default", "minimal", "workspace"].contains(&argument) {
             bail!("Choose a custom profile name");
         }
+        // Saved settings, without this session's launch options.
+        let preferences = if self.ignore_rc {
+            Preferences::default()
+        } else {
+            Layers::load(&self.root)?.base
+        };
         let profile = Profile {
-            preferences: self.preference_layers.base.clone(),
+            preferences,
             layout: self.layout.clone(),
             editor_only: self.editor_only,
         };

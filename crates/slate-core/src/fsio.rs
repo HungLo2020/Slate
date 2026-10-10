@@ -104,9 +104,77 @@ pub fn backup_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// Open a file for reading only if it is a regular file. Opening never
+/// blocks: a FIFO or device (perhaps swapped in after a stat) is refused.
+pub(crate) fn open_regular(path: &Path) -> std::io::Result<(fs::File, fs::Metadata)> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::other(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok((file, meta))
+}
+
+/// A regular file's contents (see `open_regular`), refusing more than
+/// `limit` bytes so an untrusted path cannot exhaust memory.
+pub(crate) fn read_regular(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    let (file, meta) = open_regular(path)?;
+    let too_large = || {
+        std::io::Error::other(format!(
+            "{} is larger than {} KiB",
+            path.display(),
+            limit / 1024
+        ))
+    };
+    if meta.len() > limit {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(too_large());
+    }
+    Ok(bytes)
+}
+
+/// Whether the file at `path` still holds `expected`, streamed through the
+/// hash without buffering it (a save may check several times).
+fn matches_baseline(path: &Path, expected: &Baseline) -> std::io::Result<bool> {
+    let (mut file, meta) = open_regular(path)?;
+    if meta.len() != expected.len {
+        return Ok(false);
+    }
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0; 64 * 1024];
+    let mut len = 0u64;
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buffer[..n]);
+        len += n as u64;
+    }
+    Ok(len == expected.len && format!("{:x}", hash.finalize()) == expected.hash)
+}
+
 fn check_baseline(path: &Path, baseline: Option<&Baseline>) -> Result<()> {
-    match (baseline, fs::read(path)) {
-        (Some(expected), Ok(current)) if Baseline::of(&current) != *expected => Err(save_error(
+    let current = match baseline {
+        Some(expected) => matches_baseline(path, expected),
+        None => fs::metadata(path).map(|_| true),
+    };
+    match (baseline, current) {
+        (Some(_), Ok(false)) => Err(save_error(
             SaveErrorKind::Conflict,
             "File changed on disk. Reload it, or Save As to a new path to keep both versions",
         )),
@@ -468,6 +536,31 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Run `update` holding an exclusive lock beside `path`, so instances
+/// that read, modify and replace the same application file (trust,
+/// settings) never lose each other's changes. `update` must re-read the
+/// file itself, under the lock.
+pub(crate) fn with_lock<T>(path: &Path, update: impl FnOnce() -> Result<T>) -> Result<T> {
+    use fs2::FileExt;
+    let dir = path.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(dir)?;
+    let mut name = std::ffi::OsString::from(".");
+    name.push(path.file_name().unwrap_or_default());
+    name.push(".lock");
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options.open(dir.join(name))?;
+    lock.lock_exclusive()?;
+    let result = update();
+    let _ = FileExt::unlock(&lock);
+    result
+}
+
 /// The privileged subprocess uses the same conflict checks, atomic writes,
 /// metadata preservation and rollback as an ordinary save. Never truncate via tee.
 pub fn write_elevated(
@@ -496,13 +589,26 @@ pub fn write_elevated(
         crate::process::run(&mut command, Some(input), timeout, program)
     }
     .map_err(anyhow::Error::msg)?;
-    anyhow::ensure!(
-        result.status.success(),
-        "{program} could not save {}: {}",
-        path.display(),
-        String::from_utf8_lossy(&result.stderr).trim()
-    );
-    Ok(())
+    if result.status.success() {
+        return Ok(());
+    }
+    // Ctrl+C at the password prompt, or while the helper ran.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if result.status.signal() == Some(libc::SIGINT) {
+            anyhow::bail!("Saving {} with {program} was cancelled", path.display());
+        }
+    }
+    let message = String::from_utf8_lossy(&result.stderr).trim().to_string();
+    if message.is_empty() {
+        // An interactive helper's messages went to the terminal.
+        anyhow::bail!(
+            "{program} did not save {} (cancelled or not authorized)",
+            path.display()
+        );
+    }
+    anyhow::bail!("{program} could not save {}: {message}", path.display())
 }
 
 /// Recognized before parsing ordinary frontend arguments or loading config.
@@ -549,16 +655,85 @@ pub fn elevated_save_entry(args: &[std::ffi::OsString]) -> Option<Result<()>> {
     })())
 }
 
+/// The absolute path of the executable `program` would run, searching only
+/// the absolute entries of `PATH`: an empty or relative entry would find a
+/// file in the current folder, which may be an untrusted checkout. Run the
+/// returned path rather than the bare name.
 pub fn which(program: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
+    which_in(program, &paths)
+}
+
+fn which_in(program: &str, paths: &std::ffi::OsStr) -> Option<PathBuf> {
+    if program.is_empty() || program.contains('/') {
+        return None;
+    }
+    std::env::split_paths(paths)
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(program))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| executable(candidate))
+}
+
+/// A regular file (after following links) that Slate may execute: the
+/// check `execve` makes, with the effective user and groups, so a file
+/// `execvp` would skip is skipped here too.
+fn executable(path: &Path) -> bool {
+    if !fs::metadata(path).is_ok_and(|meta| meta.is_file()) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0 }
+    }
+    #[cfg(not(unix))]
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn which_finds_only_executables_in_absolute_path_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, data) = (dir.path().join("bin"), dir.path().join("data"));
+        fs::create_dir_all(bin.join("folder")).unwrap();
+        fs::create_dir_all(&data).unwrap();
+        for (path, mode) in [(bin.join("tool"), 0o755), (data.join("tool"), 0o644)] {
+            fs::write(&path, "#!/bin/sh\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let path = |entries: &[&std::path::Path]| std::env::join_paths(entries).unwrap();
+        assert_eq!(which_in("tool", &path(&[&bin])), Some(bin.join("tool")));
+        // Not executable, or not a file.
+        assert_eq!(which_in("tool", &path(&[&data])), None);
+        assert_eq!(which_in("folder", &path(&[&bin])), None);
+        // Empty and relative entries would mean the current folder.
+        let relative = std::ffi::OsString::from(":.:bin:relative/bin");
+        assert_eq!(which_in("tool", &relative), None);
+        let mut mixed = relative.clone();
+        mixed.push(":");
+        mixed.push(&bin);
+        assert_eq!(which_in("tool", &mixed), Some(bin.join("tool")));
+        assert_eq!(which_in("bin/tool", &path(&[dir.path()])), None);
+        // Executable by others, but not by us: skipped, like `execvp` does.
+        if unsafe { libc::geteuid() } != 0 {
+            let first = dir.path().join("first");
+            fs::create_dir(&first).unwrap();
+            fs::copy(bin.join("tool"), first.join("tool")).unwrap();
+            fs::set_permissions(first.join("tool"), fs::Permissions::from_mode(0o601)).unwrap();
+            assert_eq!(
+                which_in("tool", &path(&[&first, &bin])),
+                Some(bin.join("tool"))
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -775,5 +950,48 @@ mod tests {
         let length =
             unsafe { libc::getxattr(c_path.as_ptr(), name.as_ptr(), value.as_mut_ptr().cast(), 4) };
         assert_eq!(&value[..length as usize], b"v");
+    }
+    #[test]
+    fn baseline_checks_stream_and_never_block_on_special_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        fs::write(&path, b"original").unwrap();
+        let baseline = Baseline::of(b"original");
+        check_baseline(&path, Some(&baseline)).unwrap();
+        // Same length, different bytes: a conflict found by hashing.
+        fs::write(&path, b"ORIGINAL").unwrap();
+        let error = check_baseline(&path, Some(&baseline)).unwrap_err();
+        assert_eq!(error_kind(&error), SaveErrorKind::Conflict);
+        // A different length is a conflict without reading the file.
+        fs::write(&path, b"longer original").unwrap();
+        assert!(!matches_baseline(&path, &baseline).unwrap());
+        fs::remove_file(&path).unwrap();
+        let error = check_baseline(&path, Some(&baseline)).unwrap_err();
+        assert!(error.to_string().contains("removed externally"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let fifo = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+            // Neither check opens the pipe in a way that waits for a writer.
+            let error = check_baseline(&path, Some(&baseline)).unwrap_err();
+            assert!(error.to_string().contains("not a regular file"), "{error}");
+            let error = check_baseline(&path, None).unwrap_err();
+            assert_eq!(error_kind(&error), SaveErrorKind::Conflict);
+            assert!(read_regular(&path, 1024).is_err());
+        }
+    }
+
+    #[test]
+    fn bounded_reads_refuse_oversized_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        fs::write(&path, vec![b'x'; 2048]).unwrap();
+        assert_eq!(read_regular(&path, 2048).unwrap().len(), 2048);
+        assert!(read_regular(&path, 2047)
+            .unwrap_err()
+            .to_string()
+            .contains("larger than"));
+        assert!(read_regular(dir.path(), 2048).is_err());
     }
 }

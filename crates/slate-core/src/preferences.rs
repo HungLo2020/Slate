@@ -574,9 +574,12 @@ impl Preferences {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let source = fs::read_to_string(path)?;
-        let table: toml::Table = toml::from_str(&source).context("Invalid settings.toml")?;
-        let mut settings: Self = toml::from_str(&source).context("Invalid settings.toml")?;
+        Self::parse(&fs::read_to_string(path)?)
+    }
+    /// Settings as a settings.toml text defines them, older files migrated.
+    pub(crate) fn parse(source: &str) -> Result<Self> {
+        let table: toml::Table = toml::from_str(source).context("Invalid settings.toml")?;
+        let mut settings: Self = toml::from_str(source).context("Invalid settings.toml")?;
         // Preserve an older explicit light/dark choice. Older automatic
         // settings gain the darker content defaults without changing Qt chrome.
         if !table.contains_key("editor_theme") && settings.theme != "auto" {
@@ -617,6 +620,97 @@ impl Preferences {
     pub fn save(&self) -> Result<()> {
         self.validate()?;
         crate::fsio::write_private(&Self::path(), toml::to_string_pretty(self)?.as_bytes())
+    }
+}
+
+/// Change one preferences file in place. The file is re-read under a lock
+/// (another instance or the user may have edited it), `change` applies to
+/// what it says (`read` parses it), and only settings whose values change
+/// are written: comments, layout and everything else stay as they are, and
+/// session-only state (launch options, profile defaults) never reaches it.
+/// `section` names the table holding the preferences, or the file's root.
+pub(crate) fn edit_preferences(
+    path: &std::path::Path,
+    section: Option<&str>,
+    read: impl Fn(&str) -> Result<Preferences>,
+    change: impl FnOnce(&mut Preferences) -> Result<()>,
+) -> Result<()> {
+    crate::fsio::with_lock(path, || {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let source = match fs::read_to_string(path) {
+            Ok(source) => source,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e.into()),
+        };
+        let before = read(&source)
+            .and_then(|p| p.validate().map(|()| p))
+            .map_err(|e| anyhow::anyhow!("Not saving over {name} until it is fixed: {e:#}"))?;
+        let mut after = before.clone();
+        change(&mut after)?;
+        after.validate()?;
+        let old = toml::Table::try_from(&before)?;
+        let new = toml::Table::try_from(&after)?;
+        let mut keys: Vec<&String> = new.keys().filter(|k| old.get(*k) != new.get(*k)).collect();
+        // Key tables are migrated together (see `load`): writing one writes
+        // them all with the revision they belong to.
+        if keys.iter().any(|k| k.ends_with("_keys")) {
+            keys = new
+                .keys()
+                .filter(|k| k.ends_with("_keys") || *k == "keys_revision" || keys.contains(k))
+                .collect();
+        }
+        let mut document: toml_edit::DocumentMut =
+            source.parse().with_context(|| format!("Invalid {name}"))?;
+        let table = match section {
+            None => document.as_table_mut(),
+            Some(section) => document
+                .get_mut(section)
+                .and_then(toml_edit::Item::as_table_mut)
+                .with_context(|| format!("{name} has no [{section}] table"))?,
+        };
+        for key in keys {
+            let fragment =
+                toml::to_string(&toml::Table::from_iter([(key.clone(), new[key].clone())]))?;
+            let mut fragment: toml_edit::DocumentMut = fragment.parse()?;
+            let item = fragment.remove(key).context("Setting did not serialize")?;
+            merge(table, key, item);
+        }
+        let text = document.to_string();
+        anyhow::ensure!(
+            toml::Table::try_from(read(&text)?)? == new,
+            "Could not update {name} without changing other settings"
+        );
+        crate::fsio::write_private(path, text.as_bytes())
+    })
+}
+
+/// Set `key` in `table`, keeping what surrounds unchanged values: comments
+/// beside a value and inside a table (such as a key table) survive.
+fn merge(table: &mut toml_edit::Table, key: &str, item: toml_edit::Item) {
+    use toml_edit::Item;
+    match (table.get_mut(key), item) {
+        (Some(Item::Value(old)), Item::Value(mut value)) => {
+            if old.to_string().trim() != value.to_string().trim() {
+                *value.decor_mut() = old.decor().clone();
+                *old = value;
+            }
+        }
+        (Some(Item::Table(old)), Item::Table(new)) => {
+            let stale: Vec<String> = old
+                .iter()
+                .map(|(k, _)| k.to_string())
+                .filter(|k| !new.contains_key(k))
+                .collect();
+            for k in stale {
+                old.remove(&k);
+            }
+            for (k, value) in new {
+                merge(old, &k, value);
+            }
+        }
+        (_, item) => {
+            table.insert(key, item);
+        }
     }
 }
 
@@ -687,61 +781,64 @@ impl App {
         if name == "profile" {
             return self.select_profile(value);
         }
-        let mut settings = self.preference_layers.base.clone();
         let flag = |value: &str| -> Result<bool> {
             value
                 .parse()
                 .map_err(|_| anyhow::anyhow!("{name} must be true or false"))
         };
-        match name {
-            "indent-width" => settings.indent_width = value.parse()?,
-            "tab-width" => settings.tab_width = value.parse()?,
-            "history-log" => settings.history_log = flag(value)?,
-            "locking" => settings.locking = flag(value)?,
-            "insert-spaces" => settings.insert_spaces = flag(value)?,
-            "auto-indent" => settings.auto_indent = flag(value)?,
-            "line-numbers" => settings.line_numbers = flag(value)?,
-            "theme" | "editor-theme" => {
-                settings.theme = value.into();
-                settings.editor_theme = value.into();
+        // Applied to the settings file as it is now, not to this session's
+        // settings (which include launch options and profile defaults).
+        self.edit_profile_preferences(|settings| {
+            match name {
+                "indent-width" => settings.indent_width = value.parse()?,
+                "tab-width" => settings.tab_width = value.parse()?,
+                "history-log" => settings.history_log = flag(value)?,
+                "locking" => settings.locking = flag(value)?,
+                "insert-spaces" => settings.insert_spaces = flag(value)?,
+                "auto-indent" => settings.auto_indent = flag(value)?,
+                "line-numbers" => settings.line_numbers = flag(value)?,
+                "theme" | "editor-theme" => {
+                    settings.theme = value.into();
+                    settings.editor_theme = value.into();
+                }
+                "terminal-theme" => settings.terminal_theme = value.into(),
+                "file-startup" => settings.file_startup = value.parse()?,
+                "directory-startup" => settings.directory_startup = value.parse()?,
+                "keymap" => {
+                    let (global, editor, terminal) = keymap(value)?;
+                    settings.keymap = value.into();
+                    settings.global_keys = global;
+                    settings.editor_keys = editor;
+                    settings.terminal_keys = terminal;
+                }
+                "soft-wrap" => settings.soft_wrap = flag(value)?,
+                "wrap-column" => settings.wrap_column = value.parse()?,
+                "hard-wrap" => settings.hard_wrap = flag(value)?,
+                "backup" => settings.backup = flag(value)?,
+                "file-recovery" => settings.file_recovery = flag(value)?,
+                "tui-mouse" | "mouse" => settings.tui_mouse = flag(value)?,
+                "show-whitespace" => settings.show_whitespace = flag(value)?,
+                "auto-reload" => settings.auto_reload = flag(value)?,
+                "terminal-scrollback" => settings.terminal_scrollback = value.parse()?,
+                "auto-close-brackets" => settings.auto_close_brackets = flag(value)?,
+                "format-on-save" => settings.format_on_save = flag(value)?,
+                "terminal-clipboard" => settings.terminal_clipboard = flag(value)?,
+                "complete-while-typing" => settings.complete_while_typing = flag(value)?,
+                "accept-completion-on-enter" => settings.accept_completion_on_enter = flag(value)?,
+                "minimap" => settings.minimap = flag(value)?,
+                "font-family" => settings.font_family = value.trim().into(),
+                "font-size" => settings.font_size = value.parse()?,
+                _ => bail!(
+                    "Options: {}, minimap, font-family, font-size",
+                    SETTINGS
+                        .iter()
+                        .map(|s| s.name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             }
-            "terminal-theme" => settings.terminal_theme = value.into(),
-            "file-startup" => settings.file_startup = value.parse()?,
-            "directory-startup" => settings.directory_startup = value.parse()?,
-            "keymap" => {
-                let (global, editor, terminal) = keymap(value)?;
-                settings.keymap = value.into();
-                settings.global_keys = global;
-                settings.editor_keys = editor;
-                settings.terminal_keys = terminal;
-            }
-            "soft-wrap" => settings.soft_wrap = flag(value)?,
-            "wrap-column" => settings.wrap_column = value.parse()?,
-            "hard-wrap" => settings.hard_wrap = flag(value)?,
-            "backup" => settings.backup = flag(value)?,
-            "file-recovery" => settings.file_recovery = flag(value)?,
-            "tui-mouse" | "mouse" => settings.tui_mouse = flag(value)?,
-            "show-whitespace" => settings.show_whitespace = flag(value)?,
-            "auto-reload" => settings.auto_reload = flag(value)?,
-            "terminal-scrollback" => settings.terminal_scrollback = value.parse()?,
-            "auto-close-brackets" => settings.auto_close_brackets = flag(value)?,
-            "format-on-save" => settings.format_on_save = flag(value)?,
-            "terminal-clipboard" => settings.terminal_clipboard = flag(value)?,
-            "complete-while-typing" => settings.complete_while_typing = flag(value)?,
-            "accept-completion-on-enter" => settings.accept_completion_on_enter = flag(value)?,
-            "minimap" => settings.minimap = flag(value)?,
-            "font-family" => settings.font_family = value.trim().into(),
-            "font-size" => settings.font_size = value.parse()?,
-            _ => bail!(
-                "Options: {}, minimap, font-family, font-size",
-                SETTINGS
-                    .iter()
-                    .map(|s| s.name)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        }
-        self.persist_profile_preferences(&settings)?;
+            Ok(())
+        })?;
         self.load_preferences();
         self.status = format!("Set {name} to {value}");
         Ok(())
@@ -794,21 +891,21 @@ impl App {
             command.is_empty() || self.resolve_command_line(command).is_some(),
             "Unknown command"
         );
-        let mut p = self.preference_layers.base.clone();
-        let table = match scope {
-            "global" => &mut p.global_keys,
-            "editor" => &mut p.editor_keys,
-            "terminal" => &mut p.terminal_keys,
-            "debug" => &mut p.debug_keys,
-            _ => bail!("Unknown shortcut scope"),
-        };
-        if command.is_empty() {
-            table.remove(chord);
-        } else {
-            table.insert(chord.into(), command.into());
-        }
-        p.validate()?;
-        self.persist_profile_preferences(&p)?;
+        self.edit_profile_preferences(|p| {
+            let table = match scope {
+                "global" => &mut p.global_keys,
+                "editor" => &mut p.editor_keys,
+                "terminal" => &mut p.terminal_keys,
+                "debug" => &mut p.debug_keys,
+                _ => bail!("Unknown shortcut scope"),
+            };
+            if command.is_empty() {
+                table.remove(chord);
+            } else {
+                table.insert(chord.into(), command.into());
+            }
+            Ok(())
+        })?;
         self.load_preferences();
         self.status = "Shortcut saved".into();
         Ok(())
@@ -864,6 +961,60 @@ mod tests {
         let migrated = Preferences::load().unwrap();
         assert_eq!(migrated.editor_theme, "light");
         assert_eq!(migrated.terminal_theme, "dark");
+    }
+
+    #[test]
+    fn saving_a_setting_edits_the_file_without_session_state() {
+        let _env = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", dir.path().join("config"));
+        std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, "hello").unwrap();
+        std::fs::create_dir_all(dir.path().join("config/slate")).unwrap();
+        let original = "# My settings\nprofile = \"minimal\"\nindent_width = 3 # narrow\n\n[editor_keys]\n# mine\n\"Ctrl+p\" = \"print\"\n";
+        std::fs::write(Preferences::path(), original).unwrap();
+        // Launch options (-S soft wrap, -B backups) are for this session only.
+        let args = ["-S", "-B", file.to_str().unwrap()];
+        let launch = crate::cli::parse(args.iter().map(std::ffi::OsString::from)).unwrap();
+        let mut app = crate::App::launch(&launch, None).unwrap();
+        assert!(app.preferences.soft_wrap && app.preferences.backup);
+        assert_eq!(app.preferences.directory_startup, StartupMode::EditorOnly);
+        // Another instance (or the user) changes the file meanwhile.
+        let edited = original.replace("indent_width = 3", "indent_width = 2");
+        std::fs::write(Preferences::path(), &edited).unwrap();
+        app.configure("line-numbers", "false").unwrap();
+        let saved = std::fs::read_to_string(Preferences::path()).unwrap();
+        assert!(
+            saved.starts_with("# My settings\nprofile = \"minimal\"\nindent_width = 2 # narrow\n"),
+            "{saved}"
+        );
+        assert!(saved.contains("line_numbers = false"), "{saved}");
+        for session in ["soft_wrap", "backup", "file_startup", "directory_startup"] {
+            assert!(!saved.contains(session), "{session} leaked into {saved}");
+        }
+        assert_eq!(app.preferences.indent_width, 2, "Reloaded from disk");
+        assert!(app.preferences.soft_wrap, "Launch options still apply");
+        // A shortcut keeps the table's comment and the user's binding.
+        app.set_shortcut("editor", "Ctrl+Shift+k", "cut-line")
+            .unwrap();
+        let saved = std::fs::read_to_string(Preferences::path()).unwrap();
+        assert!(saved.contains("# mine\n"), "{saved}");
+        let loaded = Preferences::load().unwrap();
+        assert_eq!(loaded.editor_keys["Ctrl+p"], "print");
+        assert_eq!(loaded.editor_keys["Ctrl+Shift+k"], "cut-line");
+        assert!(!loaded.soft_wrap && !loaded.backup && !loaded.line_numbers);
+        assert_eq!(loaded.directory_startup, StartupMode::Workspace);
+        // A file that does not parse is never replaced.
+        std::fs::write(Preferences::path(), "indent_width = [\n").unwrap();
+        assert!(app.configure("line-numbers", "true").is_err());
+        assert!(app.set_shortcut("editor", "Ctrl+Shift+k", "").is_err());
+        assert_eq!(
+            std::fs::read_to_string(Preferences::path()).unwrap(),
+            "indent_width = [\n"
+        );
     }
 
     #[test]

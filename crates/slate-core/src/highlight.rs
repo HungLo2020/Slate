@@ -20,6 +20,8 @@ use syntect::{
 };
 
 const STRIDE: usize = 32;
+/// Lines longer than this (minified or generated) are left unparsed.
+pub const LONG_LINE: usize = 64 * 1024;
 /// Lines highlighted beyond the visible ones, so scrolling shows colour.
 pub const MARGIN: usize = 64;
 
@@ -45,18 +47,44 @@ fn themes() -> &'static ThemeSet {
     THEMES.get_or_init(ThemeSet::load_defaults)
 }
 
+/// Bytes of the first line examined for a grammar: a minified file's first
+/// line can be hundreds of megabytes.
+const FIRST_LINE_HINT: usize = 4096;
+
 /// The grammar for a file name, or the first line (shebang, modelines).
 pub fn syntax_for<'a>(path: Option<&Path>, first_line: &str) -> &'a SyntaxReference {
+    by_name(path)
+        .or_else(|| syntaxes().find_syntax_by_first_line(first_line))
+        .unwrap_or_else(|| syntaxes().find_syntax_plain_text())
+}
+/// The grammar for a document's text; its first line is read (bounded) only
+/// when the file name does not decide.
+pub fn syntax_of<'a>(path: Option<&Path>, rope: &Rope) -> &'a SyntaxReference {
+    by_name(path).unwrap_or_else(|| syntax_for(None, &first_line_hint(rope)))
+}
+fn by_name<'a>(path: Option<&Path>) -> Option<&'a SyntaxReference> {
     let ss = syntaxes();
-    path.and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-        .and_then(|name| {
-            // Whole names first (Makefile, Dockerfile, .bashrc), then extensions.
-            ss.find_syntax_by_extension(name)
-                .or_else(|| ss.find_syntax_by_extension(name.rsplit('.').next().unwrap_or(name)))
-        })
-        .or_else(|| ss.find_syntax_by_first_line(first_line))
-        .unwrap_or_else(|| ss.find_syntax_plain_text())
+    let name = path?.file_name()?.to_str()?;
+    // Whole names first (Makefile, Dockerfile, .bashrc), then extensions.
+    ss.find_syntax_by_extension(name)
+        .or_else(|| ss.find_syntax_by_extension(name.rsplit('.').next().unwrap_or(name)))
+}
+/// The start of the first line, without its line break, cut at a character
+/// boundary after at most `FIRST_LINE_HINT` bytes.
+pub fn first_line_hint(rope: &Rope) -> std::borrow::Cow<'_, str> {
+    let line = rope.line(0);
+    let chars = line.len_chars();
+    let content = if chars > 0 && line.char(chars - 1) == '\n' {
+        line.len_bytes() - 1
+    } else {
+        line.len_bytes()
+    };
+    let end = line.char_to_byte(line.byte_to_char(content.min(FIRST_LINE_HINT)));
+    let slice = line.byte_slice(..end);
+    match slice.as_str() {
+        Some(s) => std::borrow::Cow::Borrowed(s),
+        None => std::borrow::Cow::Owned(slice.to_string()),
+    }
 }
 
 pub struct Request {
@@ -65,8 +93,9 @@ pub struct Request {
     pub rope: Rope,
     pub path: Option<PathBuf>,
     pub light: bool,
-    pub first: usize,
-    pub last: usize,
+    /// Line ranges wanted (one per group of overlapping views), ascending
+    /// and disjoint.
+    pub ranges: Vec<(usize, usize)>,
     /// The first line changed since the previous request for this document.
     pub dirty_from: usize,
 }
@@ -74,8 +103,8 @@ pub struct Response {
     pub doc: u64,
     pub generation: u64,
     pub light: bool,
-    pub first: usize,
-    pub lines: Vec<LineSpans>,
+    /// Spans for each requested range, from its first line.
+    pub ranges: Vec<(usize, Vec<LineSpans>)>,
 }
 
 struct DocState {
@@ -136,9 +165,7 @@ fn highlight_request(
     request: &Request,
     latest: &Mutex<HashMap<u64, u64>>,
 ) -> Option<Response> {
-    let ss = syntaxes();
-    let first_line = line_text(&request.rope, 0);
-    let syntax = syntax_for(request.path.as_deref(), &first_line);
+    let syntax = syntax_of(request.path.as_deref(), &request.rope);
     let theme = &themes().themes[if request.light {
         "InspiredGitHub"
     } else {
@@ -168,8 +195,39 @@ fn highlight_request(
         ));
     }
     let total = request.rope.len_lines();
-    let last = request.last.min(total);
-    let first = request.first.min(last);
+    let mut ranges = Vec::with_capacity(request.ranges.len());
+    let mut failed = false;
+    for &(first, last) in &request.ranges {
+        let last = last.min(total);
+        let first = first.min(last);
+        if failed {
+            ranges.push((first, (first..last).map(|_| Arc::new(vec![])).collect()));
+            continue;
+        }
+        let (lines, ok) = highlight_range(state, request, latest, &highlighter, first, last)?;
+        failed = !ok;
+        ranges.push((first, lines));
+    }
+    Some(Response {
+        doc: request.doc,
+        generation: request.generation,
+        light: request.light,
+        ranges,
+    })
+}
+
+/// Spans for `first..last`, resuming from the nearest checkpoint (earlier
+/// ranges of the same request leave checkpoints behind). `None` when
+/// superseded; false when the grammar failed.
+fn highlight_range(
+    state: &mut DocState,
+    request: &Request,
+    latest: &Mutex<HashMap<u64, u64>>,
+    highlighter: &Highlighter,
+    first: usize,
+    last: usize,
+) -> Option<(Vec<LineSpans>, bool)> {
+    let ss = syntaxes();
     let start_checkpoint = (first / STRIDE).min(state.checkpoints.len() - 1);
     let (mut parse, mut highlight) = state.checkpoints[start_checkpoint].clone();
     let mut lines = Vec::with_capacity(last - first);
@@ -188,7 +246,7 @@ fn highlight_request(
             return None;
         }
         // Minified/generated lines must not monopolize the syntax worker.
-        if request.rope.line(line).len_bytes() > 64 * 1024 {
+        if request.rope.line(line).len_bytes() > LONG_LINE {
             if line >= first {
                 lines.push(Arc::new(Vec::new()));
             }
@@ -198,17 +256,17 @@ fn highlight_request(
         let Ok(ops) = parse.parse_line(&text, ss) else {
             // A grammar failure leaves the rest of the document plain.
             lines.extend((line.max(first)..last).map(|_| Arc::new(vec![])));
-            break;
+            return Some((lines, false));
         };
         if line < first {
             // Advance the highlighter state without collecting spans.
-            for _ in RangedHighlightIterator::new(&mut highlight, &ops, &text, &highlighter) {}
+            for _ in RangedHighlightIterator::new(&mut highlight, &ops, &text, highlighter) {}
             continue;
         }
         let content = text.trim_end_matches('\n').len();
         let mut spans = vec![];
         for (style, _, range) in
-            RangedHighlightIterator::new(&mut highlight, &ops, &text, &highlighter)
+            RangedHighlightIterator::new(&mut highlight, &ops, &text, highlighter)
         {
             let end = range.end.min(content);
             if range.start >= end {
@@ -226,13 +284,7 @@ fn highlight_request(
         }
         lines.push(Arc::new(spans));
     }
-    Some(Response {
-        doc: request.doc,
-        generation: request.generation,
-        light: request.light,
-        first,
-        lines,
-    })
+    Some((lines, true))
 }
 
 /// Highlight a whole text at once (tests).
@@ -242,18 +294,20 @@ pub fn highlight_text(text: &str, path: Option<&Path>, light: bool) -> Vec<Vec<S
     let request = Request {
         doc: 0,
         generation: 0,
-        last: rope.len_lines(),
+        ranges: vec![(0, rope.len_lines())],
         rope,
         path: path.map(Path::to_path_buf),
         light,
-        first: 0,
         dirty_from: 0,
     };
     let mut states = HashMap::new();
     highlight_request(&mut states, &request, &Mutex::new(HashMap::new()))
-        .map(|r| r.lines.iter().map(|l| l.to_vec()).collect())
+        .map(|r| r.ranges[0].1.iter().map(|l| l.to_vec()).collect())
         .unwrap_or_default()
 }
+
+/// Watermarks kept before stale lines are marked one by one.
+const WATERMARKS: usize = 64;
 
 /// The core's per-document line cache: spans and whether they are current.
 #[derive(Default)]
@@ -261,11 +315,19 @@ pub struct LineCache {
     pub light: bool,
     /// Changes whenever spans change, for render caches.
     pub revision: u64,
-    pub lines: Vec<Option<(LineSpans, bool)>>,
+    /// Spans per line, with the edit count when they were stored current
+    /// (`None`: stale when stored).
+    lines: Vec<Option<(LineSpans, Option<u64>)>>,
     /// Edits since the last complete response, for mapping late responses:
     /// (generation after the edit, first line, old line count, new line count).
     pub edits: Vec<(u64, usize, usize, usize)>,
     pub dirty_from: usize,
+    /// Edits applied so far.
+    epoch: u64,
+    /// (epoch, line): edit `epoch` made every line from `line` on stale.
+    /// Both strictly increase, so the first entry after a line's epoch is
+    /// the lowest watermark it has to respect.
+    stale_from: Vec<(u64, usize)>,
 }
 impl LineCache {
     pub fn new(lines: usize, light: bool) -> Self {
@@ -275,7 +337,28 @@ impl LineCache {
             lines: vec![None; lines],
             edits: vec![],
             dirty_from: 0,
+            epoch: 0,
+            stale_from: vec![],
         }
+    }
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+    /// Spans for a line (fresh or stale) and whether they are current.
+    pub fn spans(&self, line: usize) -> Option<(LineSpans, bool)> {
+        let (spans, _) = self.lines.get(line)?.as_ref()?;
+        Some((spans.clone(), self.fresh(line)))
+    }
+    fn fresh(&self, line: usize) -> bool {
+        let Some(Some((_, Some(stored)))) = self.lines.get(line) else {
+            return false;
+        };
+        let later = self
+            .stale_from
+            .partition_point(|(epoch, _)| epoch <= stored);
+        self.stale_from
+            .get(later)
+            .is_none_or(|(_, from)| line < *from)
     }
     /// Shift the cache for an edit replacing `old` lines from `first` (the
     /// first included) with `new` lines. Touched lines keep their old spans
@@ -286,14 +369,33 @@ impl LineCache {
         let mut replacement: Vec<_> = self.lines[first..end]
             .iter()
             .take(new)
-            .map(|entry| entry.as_ref().map(|(spans, _)| (spans.clone(), false)))
+            .map(|entry| entry.as_ref().map(|(spans, _)| (spans.clone(), None)))
             .collect();
         replacement.resize(new, None);
         self.lines.splice(first..end, replacement);
         // A change can alter the state of everything below (e.g. an
         // unclosed comment): later lines stay visible but become stale.
-        for entry in self.lines.iter_mut().skip(first + new).flatten() {
-            entry.1 = false;
+        // Lines in between were replaced above, so watermarks need no
+        // shifting; a lower one supersedes higher ones.
+        self.epoch += 1;
+        let watermark = first + new;
+        while self
+            .stale_from
+            .last()
+            .is_some_and(|(_, from)| *from >= watermark)
+        {
+            self.stale_from.pop();
+        }
+        self.stale_from.push((self.epoch, watermark));
+        if self.stale_from.len() > WATERMARKS {
+            for line in 0..self.lines.len() {
+                if !self.fresh(line) {
+                    if let Some((_, stored)) = &mut self.lines[line] {
+                        *stored = None;
+                    }
+                }
+            }
+            self.stale_from.clear();
         }
         self.dirty_from = self.dirty_from.min(first);
         self.revision += 1;
@@ -325,7 +427,7 @@ impl LineCache {
                 line = line + new - old;
             }
             if let Some(entry) = self.lines.get_mut(line) {
-                *entry = Some((spans, fresh));
+                *entry = Some((spans, fresh.then_some(self.epoch)));
             }
         }
         if fresh {
@@ -338,8 +440,7 @@ impl LineCache {
     }
     /// The first line in a range without current spans.
     pub fn first_missing(&self, first: usize, last: usize) -> Option<usize> {
-        (first..last.min(self.lines.len()))
-            .find(|line| !matches!(self.lines.get(*line), Some(Some((_, true)))))
+        (first..last.min(self.lines.len())).find(|line| !self.fresh(*line))
     }
 }
 
@@ -361,9 +462,20 @@ impl App {
                 ));
             }
         }
+        // Views of one document share a request: overlapping or adjacent
+        // ranges merge, distant ones (split views) stay separate.
         visible.sort_unstable();
-        visible.dedup_by_key(|(doc, ..)| *doc);
+        let mut wanted: Vec<(u64, Vec<(usize, usize)>)> = vec![];
         for (doc, first, last) in visible {
+            match wanted.last_mut() {
+                Some((d, ranges)) if *d == doc => match ranges.last_mut() {
+                    Some(range) if first <= range.1 => range.1 = range.1.max(last),
+                    _ => ranges.push((first, last)),
+                },
+                _ => wanted.push((doc, vec![(first, last)])),
+            }
+        }
+        for (doc, ranges) in wanted {
             let Some(d) = self.documents.get_mut(&doc) else {
                 continue;
             };
@@ -382,12 +494,17 @@ impl App {
                 }
                 None => *cache = LineCache::new(lines, light),
             }
-            if cache.light != light || cache.lines.len() != lines {
+            if cache.light != light || cache.line_count() != lines {
                 *cache = LineCache::new(lines, light);
             }
-            let Some(missing) = cache.first_missing(first, last) else {
+            // Each range from its first line without current spans.
+            let ranges: Vec<_> = ranges
+                .into_iter()
+                .filter_map(|(first, last)| Some((cache.first_missing(first, last)?, last)))
+                .collect();
+            if ranges.is_empty() {
                 continue;
-            };
+            }
             if self
                 .highlight_pending
                 .get(&doc)
@@ -408,8 +525,7 @@ impl App {
                 rope: self.documents[&doc].rope().clone(),
                 path: self.documents[&doc].path.clone(),
                 light,
-                first: missing,
-                last,
+                ranges,
                 dirty_from,
             };
             if self.services.highlight.try_send(request).is_ok() {
@@ -436,12 +552,14 @@ impl App {
             return;
         }
         if let Some(cache) = self.highlights.get_mut(&response.doc) {
-            cache.apply(response.generation, current, response.first, response.lines);
+            for (first, lines) in response.ranges {
+                cache.apply(response.generation, current, first, lines);
+            }
         }
     }
     /// Spans for a line (fresh or stale) and whether they are current.
     pub(crate) fn line_spans(&self, doc: u64, line: usize) -> Option<(LineSpans, bool)> {
-        self.highlights.get(&doc)?.lines.get(line)?.clone()
+        self.highlights.get(&doc)?.spans(line)
     }
 }
 
@@ -479,34 +597,104 @@ mod tests {
         cache.apply(1, 1, 0, (0..5).map(|i| spans(i + 1)).collect());
         // Sending a request resets the dirty marker.
         cache.dirty_from = usize::MAX;
-        assert!(cache.lines.iter().all(|l| l.as_ref().unwrap().1));
+        assert!((0..5).all(|l| cache.spans(l).unwrap().1));
         // Line 1 becomes three lines.
         cache.edit(2, 1, 1, 3);
-        assert_eq!(cache.lines.len(), 7);
+        assert_eq!(cache.line_count(), 7);
+        assert!(cache.spans(0).unwrap().1, "lines above stay current");
         assert!(
-            cache.lines[0].as_ref().unwrap().1,
-            "lines above stay current"
-        );
-        assert!(
-            !cache.lines[1].as_ref().unwrap().1,
+            !cache.spans(1).unwrap().1,
             "the edited line is stale but kept"
         );
-        assert!(cache.lines[2].is_none());
-        assert_eq!(
-            cache.lines[4].as_ref().unwrap().0[0].fg,
-            3,
-            "later lines shift"
-        );
-        assert!(!cache.lines[4].as_ref().unwrap().1);
+        assert!(cache.spans(2).is_none());
+        assert_eq!(cache.spans(4).unwrap().0[0].fg, 3, "later lines shift");
+        assert!(!cache.spans(4).unwrap().1);
         assert_eq!(cache.dirty_from, 1);
         // A response for generation 1 arriving after the edit: old line 3 maps
         // to line 5, the edited line 1 is skipped, and nothing is current.
         cache.apply(1, 2, 0, (0..5).map(|i| spans(10 + i)).collect());
-        assert_eq!(cache.lines[5].as_ref().unwrap().0[0].fg, 13);
-        assert!(!cache.lines[5].as_ref().unwrap().1);
+        assert_eq!(cache.spans(5).unwrap().0[0].fg, 13);
+        assert!(!cache.spans(5).unwrap().1);
         assert_eq!(cache.first_missing(0, 7), Some(0));
         cache.apply(2, 2, 0, (0..7).map(|i| spans(20 + i)).collect());
         assert_eq!(cache.first_missing(0, 7), None);
+    }
+
+    #[test]
+    fn first_line_hints_are_bounded_at_character_boundaries() {
+        let rope = Rope::from("#!/usr/bin/env python\nprint()\n");
+        assert_eq!(first_line_hint(&rope), "#!/usr/bin/env python");
+        assert_eq!(syntax_of(None, &rope).name, "Python");
+        let long = format!("#!/bin/sh {}\n", "é".repeat(FIRST_LINE_HINT));
+        let rope = Rope::from(long.as_str());
+        let hint = first_line_hint(&rope);
+        assert!(hint.len() <= FIRST_LINE_HINT && hint.starts_with("#!/bin/sh"));
+        assert_eq!(syntax_of(None, &rope).name, "Bourne Again Shell (bash)");
+        // A file name decides without reading the text.
+        assert_eq!(syntax_of(Some(Path::new("a.rs")), &rope).name, "Rust");
+    }
+
+    #[test]
+    fn stale_watermarks_match_marking_every_later_line() {
+        let spans = || Arc::new(Vec::new());
+        // The cache against a direct model: (has spans, current) per line.
+        let mut cache = LineCache::new(200, false);
+        let mut model = vec![(false, false); 200];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let mut generation = 0;
+        for round in 0..3000 {
+            if round % 7 == 0 {
+                // A current response for a window of lines.
+                let first = next(model.len());
+                let count = next(40).min(model.len() - first);
+                cache.apply(generation, generation, first, vec![spans(); count]);
+                for entry in &mut model[first..first + count] {
+                    *entry = (true, true);
+                }
+            } else {
+                generation += 1;
+                // Runs of edits moving down the document raise the
+                // watermark each time, past the number kept.
+                let first = if round > 2000 {
+                    (round - 2000) % model.len()
+                } else {
+                    next(model.len())
+                };
+                let old = 1 + next(3).min(model.len() - first - 1);
+                let new = 1 + next(3);
+                cache.edit(generation, first, old, new);
+                let mut replacement: Vec<_> = model[first..first + old]
+                    .iter()
+                    .take(new)
+                    .map(|(has, _)| (*has, false))
+                    .collect();
+                replacement.resize(new, (false, false));
+                model.splice(first..first + old, replacement);
+                for entry in &mut model[first + new..] {
+                    entry.1 = false;
+                }
+                if model.len() < 20 {
+                    cache.edit(generation, 0, 0, 20);
+                    model.splice(0..0, vec![(false, false); 20]);
+                }
+            }
+            assert_eq!(cache.line_count(), model.len());
+            for (line, (has, current)) in model.iter().enumerate() {
+                let entry = cache.spans(line);
+                assert_eq!(entry.is_some(), *has, "round {round} line {line}");
+                assert_eq!(
+                    entry.is_some_and(|(_, c)| c),
+                    *current,
+                    "round {round} line {line}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -519,23 +707,39 @@ mod tests {
         let path = Some(PathBuf::from("a.rs"));
         let mut states = HashMap::new();
         let latest = Mutex::new(HashMap::new());
-        let request = |generation, first, last, dirty_from| Request {
+        let request = |generation, ranges, dirty_from| Request {
             doc: 1,
             generation,
             rope: rope.clone(),
             path: path.clone(),
             light: false,
-            first,
-            last,
+            ranges,
             dirty_from,
         };
-        let full = highlight_request(&mut states, &request(1, 0, 200, 0), &latest).unwrap();
-        let partial =
-            highlight_request(&mut states, &request(2, 150, 160, usize::MAX), &latest).unwrap();
-        assert_eq!(partial.lines, full.lines[150..160].to_vec());
+        let full = highlight_request(&mut states, &request(1, vec![(0, 200)], 0), &latest).unwrap();
+        let full = &full.ranges[0].1;
+        let partial = highlight_request(
+            &mut states,
+            &request(2, vec![(150, 160)], usize::MAX),
+            &latest,
+        )
+        .unwrap();
+        assert_eq!(partial.ranges[0].1, full[150..160].to_vec());
         assert_eq!(states[&1].checkpoints.len(), 200 / STRIDE + 1);
+        // Separate ranges (split views) each get their own lines, from a
+        // fresh parse too.
+        states.clear();
+        let split = highlight_request(
+            &mut states,
+            &request(2, vec![(3, 9), (170, 190)], 0),
+            &latest,
+        )
+        .unwrap();
+        assert_eq!(split.ranges.len(), 2);
+        assert_eq!(split.ranges[0], (3, full[3..9].to_vec()));
+        assert_eq!(split.ranges[1], (170, full[170..190].to_vec()));
         // A superseded request stops early.
         latest.lock().unwrap().insert(1, 9);
-        assert!(highlight_request(&mut states, &request(3, 0, 200, 0), &latest).is_none());
+        assert!(highlight_request(&mut states, &request(3, vec![(0, 200)], 0), &latest).is_none());
     }
 }

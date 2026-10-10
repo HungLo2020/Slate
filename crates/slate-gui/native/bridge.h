@@ -36,9 +36,25 @@ class EntryModel : public QAbstractListModel {
         return {{Qt::UserRole + 1, "modelData"}, {Qt::UserRole + 2, "group"}};
     }
     void replace(const QVariantList &rows);
+    const QVariantList &rows() const { return m_rows; }
 
   private:
     QVariantList m_rows;
+};
+
+// A terminal row is drawn as runs of equally styled cells: plain ASCII runs
+// hold one character per column; any other run is one (wide or combining)
+// cell drawn as a whole.
+struct TerminalRun {
+    int column = 0, columns = 1;
+    QString text;
+    QColor foreground, background;
+    bool bold = false, italic = false, underline = false;
+    bool perColumn = false;
+};
+struct TerminalGrid {
+    int rows = 0, cols = 0;
+    QVector<QVector<TerminalRun>> lines;
 };
 
 // Desktop theme icons for QML (`image://icon/NAME?#rrggbb`), tinted like text
@@ -59,6 +75,7 @@ class Bridge : public QObject {
     Q_PROPERTY(QVariantList handleIds READ handleIds NOTIFY structureChanged)
     Q_PROPERTY(QAbstractItemModel *files READ files CONSTANT)
     Q_PROPERTY(QAbstractItemModel *git READ git CONSTANT)
+    Q_PROPERTY(QVariantList gitEntries READ gitEntries NOTIFY gitChanged)
     Q_PROPERTY(int cellWidth READ cellWidth NOTIFY fontChanged)
     Q_PROPERTY(int cellHeight READ cellHeight NOTIFY fontChanged)
     Q_PROPERTY(bool pathDialogOpen READ pathDialogOpen NOTIFY pathDialogOpenChanged)
@@ -73,6 +90,14 @@ class Bridge : public QObject {
     QVariantList handleIds() const { return m_handleIds; }
     QAbstractItemModel *files() { return &m_files; }
     QAbstractItemModel *git() { return &m_git; }
+    // File and Git rows live in their models, not in the QML frame, which is
+    // converted to JavaScript whenever it changes.
+    QVariantList gitEntries() const { return m_git.rows(); }
+    QVariantList fileEntries() const { return m_files.rows(); }
+    const TerminalGrid *terminal(int pane) const {
+        const auto found = m_terminals.constFind(pane);
+        return found == m_terminals.cend() ? nullptr : &found.value();
+    }
     int cellWidth() const { return m_cellWidth; }
     int cellHeight() const { return m_cellHeight; }
     const QFont &font() const { return m_font; }
@@ -85,13 +110,14 @@ class Bridge : public QObject {
     Q_INVOKABLE QString localPath(const QUrl &url) const;
     Q_INVOKABLE bool hasIcon(const QString &name) const;
     // The complete native content of a pane (tests and accessibility tools).
-    Q_INVOKABLE QVariantMap surface(int pane) const { return m_surfaces.value(pane); }
+    Q_INVOKABLE QVariantMap surface(int pane) const;
     Q_INVOKABLE QVariantMap overview(int pane);
     void applyTheme();
     Q_INVOKABLE void command(const QString &text);
     Q_INVOKABLE void viewport(int width, int height);
     Q_INVOKABLE void refresh();
     Q_INVOKABLE void scheduleRefresh();
+    void tick();
     Q_INVOKABLE QVariantMap diagnostics() const;
     void attachView(int id, CellView *view);
     void detachView(int id, CellView *view);
@@ -124,9 +150,11 @@ class Bridge : public QObject {
     QPointer<QMessageBox> m_closeDialog;
     QPointer<QQuickWindow> m_window;
     QTimer m_refreshTimer;
+    QElapsedTimer m_lastRefresh;
     bool m_refreshing = false;
     QHash<int, CellView *> m_views;
     QHash<int, QVariantMap> m_surfaces;
+    QHash<int, TerminalGrid> m_terminals;
     qulonglong m_updates = 0, m_lastBytes = 0, m_clipboardReads = 0, m_catalogRequests = 0;
     void *m_context;
     QVariantMap m_frame;
@@ -195,7 +223,7 @@ class CellView : public QQuickPaintedItem {
 
   private:
     int m_paneId = 0;
-    QVariantMap m_pane, m_screen;
+    QVariantMap m_pane;
     QVariantList m_cursor;
     QVector<QVariantMap> m_lineData;
     QVector<QVariantList> m_overlays;

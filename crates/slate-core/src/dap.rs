@@ -156,14 +156,18 @@ impl App {
         };
         s.seq += 1;
         let seq = s.seq;
-        s.pending.insert(seq, request);
-        s.deadlines.insert(seq, Instant::now());
-        s.process.send(&json!({
+        let sent = s.process.send(&json!({
             "seq": seq,
             "type": "request",
             "command": command,
             "arguments": arguments,
         }));
+        // A busy adapter keeps running; the request is not made.
+        if !sent {
+            bail!("Debug adapter busy");
+        }
+        s.pending.insert(seq, request);
+        s.deadlines.insert(seq, Instant::now());
         Ok(())
     }
 
@@ -894,7 +898,11 @@ impl App {
 
     /// Move a document's breakpoints with an edit (`position` maps old
     /// offsets to new ones).
-    pub(crate) fn rebase_breakpoints(&mut self, doc: u64, position: impl Fn(usize) -> usize) {
+    pub(crate) fn rebase_breakpoints(
+        &mut self,
+        doc: u64,
+        mut position: impl FnMut(usize) -> usize,
+    ) {
         let Some(anchors) = self.debug.anchors.get_mut(&doc) else {
             return;
         };

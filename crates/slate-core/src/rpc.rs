@@ -3,14 +3,13 @@
 //! writing happen on their own threads; the editor never blocks on a tool.
 use serde_json::Value;
 use std::{
+    collections::VecDeque,
     io::{self, BufRead, BufReader, Read, Write},
     path::Path,
     process::{Child, Command, Stdio},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        mpsc, Arc, Mutex,
-    },
+    sync::{Arc, Condvar, Mutex},
     thread,
+    time::{Duration, Instant},
 };
 
 /// Messages larger than this end the connection.
@@ -20,11 +19,25 @@ const HEADER_LIMIT: u64 = 8 * 1024;
 /// Standard error kept for error reports.
 const STDERR_TAIL: usize = 4096;
 const QUEUE_BYTES: usize = 16 * 1024 * 1024;
+const QUEUE_MESSAGES: usize = 1024;
+/// A write to the child blocked this long: it no longer reads its input.
+const STALLED: Duration = Duration::from_secs(10);
+
+/// Messages waiting for the writer thread.
+#[derive(Default)]
+struct Outgoing {
+    /// Framed messages, each with the key of `send_replacing`.
+    queue: VecDeque<(Option<String>, Vec<u8>)>,
+    /// Queued bytes, and those being written.
+    bytes: usize,
+    /// Since when the writer has been blocked writing to the child.
+    writing: Option<Instant>,
+    closed: bool,
+}
 
 pub struct Process {
     child: Child,
-    input: mpsc::SyncSender<Vec<u8>>,
-    queued_bytes: Arc<AtomicUsize>,
+    outgoing: Arc<(Mutex<Outgoing>, Condvar)>,
 }
 
 pub fn frame(message: &Value) -> Vec<u8> {
@@ -84,7 +97,8 @@ impl Process {
             .split_first()
             .ok_or_else(|| io::Error::other("empty command"))?;
         let mut cmd = Command::new(program);
-        cmd.args(args)
+        crate::process::sanitize(&mut cmd)
+            .args(args)
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -108,14 +122,31 @@ impl Process {
             .stderr
             .take()
             .ok_or_else(|| io::Error::other("no stderr"))?;
-        let (input, queued) = mpsc::sync_channel::<Vec<u8>>(128);
-        let queued_bytes = Arc::new(AtomicUsize::new(0));
-        let budget = queued_bytes.clone();
+        let outgoing = Arc::new((Mutex::new(Outgoing::default()), Condvar::new()));
+        let writer = outgoing.clone();
         thread::spawn(move || {
-            for bytes in queued {
+            let (state, wake) = &*writer;
+            loop {
+                let bytes = {
+                    let mut s = state.lock().unwrap();
+                    while s.queue.is_empty() && !s.closed {
+                        s = wake.wait(s).unwrap();
+                    }
+                    let Some((_, bytes)) = s.queue.pop_front() else {
+                        break;
+                    };
+                    s.writing = Some(Instant::now());
+                    bytes
+                };
                 let result = stdin.write_all(&bytes).and_then(|_| stdin.flush());
-                budget.fetch_sub(bytes.len(), Ordering::Relaxed);
+                let mut s = state.lock().unwrap();
+                // Counted until written, like the queue.
+                s.bytes -= bytes.len();
+                s.writing = None;
                 if result.is_err() {
+                    s.closed = true;
+                    s.queue.clear();
+                    s.bytes = 0;
                     break;
                 }
             }
@@ -160,33 +191,58 @@ impl Process {
                 format!("{reason}: {last}")
             });
         });
-        Ok(Self {
-            child,
-            input,
-            queued_bytes,
-        })
+        Ok(Self { child, outgoing })
     }
 
+    /// Queue `message`. False when it was not queued: the child is busy
+    /// (its queue is full), or gone. A busy child is left running, unless
+    /// it has stopped reading its input altogether.
     pub fn send(&self, message: &Value) -> bool {
+        self.enqueue(None, message)
+    }
+
+    /// Queue `message`, replacing a message with the same `key` that has not
+    /// been written yet, in its place. For messages that make earlier ones
+    /// obsolete (a document's full text); the order of other messages is
+    /// kept.
+    pub fn send_replacing(&self, key: &str, message: &Value) -> bool {
+        self.enqueue(Some(key), message)
+    }
+
+    fn enqueue(&self, key: Option<&str>, message: &Value) -> bool {
         let bytes = frame(message);
-        let size = bytes.len();
-        if !crate::budget::reserve(&self.queued_bytes, size, QUEUE_BYTES) {
-            self.terminate_overloaded();
+        let (state, wake) = &*self.outgoing;
+        let mut s = state.lock().unwrap();
+        if s.closed {
             return false;
         }
-        if self.input.try_send(bytes).is_err() {
-            self.queued_bytes.fetch_sub(size, Ordering::Relaxed);
-            self.terminate_overloaded();
+        let earlier = key.and_then(|key| {
+            s.queue
+                .iter()
+                .position(|(queued, _)| queued.as_deref() == Some(key))
+        });
+        let freed = earlier.map_or(0, |i| s.queue[i].1.len());
+        let fits = s.bytes - freed + bytes.len() <= QUEUE_BYTES
+            && (earlier.is_some() || s.queue.len() < QUEUE_MESSAGES);
+        if !fits {
+            if s.writing.is_some_and(|since| since.elapsed() >= STALLED) {
+                drop(s);
+                self.terminate_stalled();
+            }
             return false;
         }
+        s.bytes = s.bytes - freed + bytes.len();
+        match earlier {
+            Some(i) => s.queue[i].1 = bytes,
+            None => s.queue.push_back((key.map(str::to_owned), bytes)),
+        }
+        wake.notify_one();
         true
     }
 
-    fn terminate_overloaded(&self) {
+    fn terminate_stalled(&self) {
         #[cfg(unix)]
-        unsafe {
-            libc::kill(-(self.child.id() as i32), libc::SIGKILL);
-        }
+        crate::process::kill_group(self.child.id(), libc::SIGKILL);
     }
 
     /// Stop the process group: give it `grace` to exit, then force it.
@@ -203,12 +259,16 @@ impl Process {
 impl Drop for Process {
     fn drop(&mut self) {
         self.kill();
+        let (state, wake) = &*self.outgoing;
+        state.lock().unwrap().closed = true;
+        wake.notify_one();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
 
     #[test]
     fn frames_round_trip_and_tolerate_extra_headers() {
@@ -267,5 +327,46 @@ mod tests {
             !process.send(&message),
             "A blocked child accepted more than the byte budget"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_busy_child_keeps_running_and_replaced_messages_keep_their_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut process =
+            Process::spawn(&["sleep".into(), "60".into()], dir.path(), |_| true, |_| {}).unwrap();
+        // Larger than a pipe: the writer stays blocked writing it.
+        let big = serde_json::json!({"text": "q".repeat(15 * 1024 * 1024)});
+        assert!(process.send(&big));
+        // However slowly the writer thread is scheduled, wait until it has
+        // taken that message and is blocked writing it.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let state = process.outgoing.0.lock().unwrap();
+            if state.queue.is_empty() && state.writing.is_some() {
+                break;
+            }
+            drop(state);
+            assert!(Instant::now() < deadline, "the writer never started");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let text = |n: usize| serde_json::json!({"method": "didChange", "text": n});
+        assert!(process.send_replacing("doc", &text(1)));
+        assert!(process.send(&serde_json::json!({"method": "hover"})));
+        for n in 2..50 {
+            assert!(process.send_replacing("doc", &text(n)));
+        }
+        {
+            let state = process.outgoing.0.lock().unwrap();
+            let queued: Vec<Value> = state
+                .queue
+                .iter()
+                .map(|(_, bytes)| read_message(&mut io::Cursor::new(bytes)).unwrap().unwrap())
+                .collect();
+            assert_eq!(queued, [text(49), serde_json::json!({"method": "hover"})]);
+        }
+        // Over the budget: refused, but the child is not killed.
+        assert!(!process.send(&big));
+        assert!(process.child.try_wait().unwrap().is_none());
     }
 }

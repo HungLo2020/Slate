@@ -193,6 +193,8 @@ impl App {
         }
         let outcome = (|| -> Result<&str> {
             let text = result.map_err(anyhow::Error::msg)?;
+            // Buffers hold `\n` lines; saving restores the file's own style.
+            let text = crate::text_format::normalize_input(&text);
             let d = self
                 .documents
                 .get(&doc)

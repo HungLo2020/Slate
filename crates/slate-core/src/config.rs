@@ -4,12 +4,20 @@
 use serde::de::DeserializeOwned;
 use std::path::Path;
 
+/// Configuration files are small; project ones (`.slate/*.toml`) are read
+/// before the folder is trusted, so a FIFO or huge file must not stall or
+/// exhaust the editor.
+pub(crate) const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
 /// The parsed file, `Ok(None)` when it does not exist, or an error naming
-/// the file and the problem.
+/// the file and the problem. Only regular files up to 1 MiB are read.
 pub fn read<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, String> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
+    let text = match crate::fsio::read_regular(path, MAX_CONFIG_BYTES) {
+        Ok(bytes) => {
+            String::from_utf8(bytes).map_err(|_| format!("{}: not valid UTF-8", path.display()))?
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::Other => return Err(e.to_string()),
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
     toml::from_str(&text)
@@ -62,5 +70,19 @@ mod tests {
         let error = read::<File>(&path).unwrap_err();
         assert!(error.starts_with(&path.display().to_string()), "{error}");
         assert!(error.contains("invalid type"), "{error}");
+        std::fs::write(&path, vec![b'#'; MAX_CONFIG_BYTES as usize + 1]).unwrap();
+        assert!(read::<File>(&path).unwrap_err().contains("larger than"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_configuration_never_blocks_on_a_fifo() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let fifo = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let error = read::<File>(&path).unwrap_err();
+        assert!(error.contains("not a regular file"), "{error}");
     }
 }

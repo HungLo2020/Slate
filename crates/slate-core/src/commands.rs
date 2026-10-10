@@ -1131,6 +1131,22 @@ impl App {
         pane: u64,
         selection: Option<usize>,
     ) -> Vec<CommandInfo> {
+        self.catalog(query, pane, selection, None)
+    }
+    /// One action of the focused pane's catalog, without describing the
+    /// others.
+    pub fn command_info(&self, id: &str) -> Option<CommandInfo> {
+        self.catalog("", self.focus, None, Some(id))
+            .into_iter()
+            .next()
+    }
+    fn catalog(
+        &self,
+        query: &str,
+        pane: u64,
+        selection: Option<usize>,
+        only: Option<&str>,
+    ) -> Vec<CommandInfo> {
         let query = query.trim().to_lowercase();
         let view = self.layout.view(pane);
         let kind = match view {
@@ -1149,6 +1165,9 @@ impl App {
         let selected = self.git.entries.get(selection.unwrap_or(self.git.selected));
         let mut results = Vec::new();
         for &(id, name, description, argument, scope) in ACTIONS {
+            if only.is_some_and(|only| only != id) {
+                continue;
+            }
             let haystack = format!("{id} {name} {description}").to_lowercase();
             if !query.split_whitespace().all(|term| haystack.contains(term)) {
                 continue;
@@ -1285,6 +1304,9 @@ impl App {
             });
         }
         for tool in self.tool_catalog() {
+            if only.is_some_and(|only| only != tool.id) {
+                continue;
+            }
             let haystack = format!("{} {} {}", tool.id, tool.name, tool.description).to_lowercase();
             if query.split_whitespace().all(|term| haystack.contains(term)) {
                 results.push(tool);
@@ -1301,15 +1323,17 @@ impl App {
         results
     }
     pub(super) fn invoke_action(&mut self, id: &str, argument: &str) -> anyhow::Result<()> {
-        let command = self.resolve_action(id, argument)?;
+        let command = self.resolve_action(id, argument)?.confirming_discard();
         self.execute(command)
     }
     pub fn resolve_action(&self, id: &str, argument: &str) -> anyhow::Result<Command> {
         let action = self
-            .command_catalog("")
-            .into_iter()
-            .find(|c| c.id == id)
+            .command_info(id)
             .ok_or_else(|| anyhow::anyhow!("Unknown action: {id}"))?;
+        self.resolve_info(action, argument)
+    }
+    fn resolve_info(&self, action: CommandInfo, argument: &str) -> anyhow::Result<Command> {
+        let id = action.id.as_str();
         if !action.enabled {
             anyhow::bail!("{}", action.reason);
         }
@@ -1328,12 +1352,8 @@ impl App {
     /// Commands with supplied arguments retain the shared command-line syntax.
     pub fn resolve_command_input(&self, input: &str) -> anyhow::Result<Command> {
         let input = input.trim();
-        if self
-            .command_catalog("")
-            .iter()
-            .any(|action| action.id == input)
-        {
-            return self.resolve_action(input, "");
+        if let Some(action) = self.command_info(input) {
+            return self.resolve_info(action, "");
         }
         self.resolve_command_line(input).ok_or_else(|| {
             anyhow::anyhow!(
@@ -1344,6 +1364,17 @@ impl App {
 }
 
 impl Command {
+    /// Discarding commands picked, typed or bound in the shared input routes
+    /// ask first: the unforced form opens the unsaved-changes prompt when
+    /// there is something to lose, and only its acceptance discards. Frontends
+    /// with their own dialogs dispatch the forced command once confirmed.
+    pub(crate) fn confirming_discard(self) -> Self {
+        match self {
+            Command::Quit { force: true } => Command::Quit { force: false },
+            Command::CloseDocument { force: true } => Command::CloseDocument { force: false },
+            command => command,
+        }
+    }
     /// The shared catalog identity of a resolved command, when it has one.
     pub fn action_id(&self) -> Option<String> {
         let id = match self {

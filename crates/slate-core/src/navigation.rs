@@ -49,11 +49,19 @@ impl App {
         }
     }
 
-    /// The open document for a path, if any.
+    /// The open document for a path, if any. Document paths are already
+    /// resolved (opening and saving canonicalize them), so only the path
+    /// asked about is resolved, once, rather than every open document's on
+    /// each lookup (diagnostics and reference lists look up many paths).
     pub(crate) fn document_for(&self, path: &Path) -> Option<u64> {
+        let resolved = path.canonicalize().ok();
         self.documents
             .iter()
-            .find(|(_, d)| d.path.as_deref().is_some_and(|p| same_file(p, path)))
+            .find(|(_, d)| {
+                d.path
+                    .as_deref()
+                    .is_some_and(|p| p == path || resolved.as_deref() == Some(p))
+            })
             .map(|(id, _)| *id)
     }
 

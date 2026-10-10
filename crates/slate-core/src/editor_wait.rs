@@ -12,6 +12,12 @@ pub(crate) struct Waiting {
     opening: BTreeSet<u64>,
     documents: BTreeSet<u64>,
 }
+impl Waiting {
+    /// The caller is waiting for this document to be closed.
+    pub(crate) fn waits_for(&self, doc: u64) -> bool {
+        self.documents.contains(&doc)
+    }
+}
 impl App {
     pub(crate) fn queue_open(&mut self, path: PathBuf) -> Result<u64> {
         let path = if path.is_absolute() {

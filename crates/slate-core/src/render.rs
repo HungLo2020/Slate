@@ -198,25 +198,30 @@ impl App {
             handles,
             focus: self.focus,
             files: if known.is_some_and(|(files, _)| files == self.files_revision) {
-                vec![]
+                Default::default()
             } else {
-                self.files.clone()
+                let (revision, files) = &mut self.shared_files;
+                if *revision != self.files_revision {
+                    *revision = self.files_revision;
+                    *files = std::sync::Arc::new(self.files.clone());
+                }
+                files.clone()
             },
             git: if known.is_some_and(|(_, git)| git == self.git.revision) {
-                vec![]
+                Default::default()
             } else {
-                self.git.entries.clone()
+                let (revision, entries) = &mut self.shared_git;
+                if *revision != self.git.revision {
+                    *revision = self.git.revision;
+                    *entries = std::sync::Arc::new(self.git.entries.clone());
+                }
+                entries.clone()
             },
             browser: self.browser.to_string_lossy().into_owned(),
             search: self.search.clone(),
             status: self.visible_status(),
             dirty: self.dirty(),
             quit: self.quit,
-            clipboard: if graphical {
-                String::new()
-            } else {
-                self.clipboard.clone()
-            },
             layouts: self.presets.keys().cloned().collect(),
             prompt: self.prompt.clone(),
             location: self.location(),
@@ -228,11 +233,6 @@ impl App {
             background: self.colors.1.clone(),
             accent: self.colors.3.clone(),
             selection: self.colors.2.clone(),
-            commands: if graphical {
-                vec![]
-            } else {
-                self.command_catalog("")
-            },
             settings: self.preferences.clone(),
             profiles: self.preference_layers.names.clone(),
             setting_sources: self.preference_sources(),
@@ -293,25 +293,56 @@ impl App {
             overview_revision: self.overview_revision,
         }
     }
-    pub(crate) fn editor_signature(&self, id: u64) -> String {
+    /// A digest of everything an editor pane's screen is drawn from, taken
+    /// every frame, so it hashes the fields rather than serializing them.
+    pub(crate) fn editor_signature(&self, id: u64) -> u64 {
+        use std::hash::{Hash, Hasher};
         let v = &self.views[&id];
-        serde_json::to_string(&(
-            v,
-            // Further carets are not part of the saved view.
-            &v.extra,
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (
+            v.document,
+            v.cursor,
+            v.anchor,
+            v.top,
+            v.left,
+            v.rows,
+            v.cols,
+            v.manual_scroll,
+            v.top_row,
+            v.mark,
+            &v.folds,
+        )
+            .hash(&mut h);
+        v.extra.len().hash(&mut h);
+        for caret in &v.extra {
+            (caret.cursor, caret.anchor).hash(&mut h);
+        }
+        let preferences = self.preferences_for_document(v.document);
+        let d = &self.documents[&v.document];
+        // Diagnostics are found by path, so a Save As redraws them.
+        (&d.path, self.diff_inspections.contains_key(&v.document)).hash(&mut h);
+        (
             self.lsp_revision(),
             self.debug_marks(v.document),
-            self.documents[&v.document].generation,
+            d.generation,
             self.highlights.get(&v.document).map(|c| c.revision),
             &self.colors,
             &self.selection_foreground,
-            &self.search,
+            (
+                &self.search.query,
+                self.search.case_sensitive,
+                self.search.whole_word,
+                self.search.regex_mode,
+                self.search.selection_only,
+                self.search.scope,
+            ),
             self.preferences.line_numbers,
-            self.preferences_for_document(v.document).tab_width,
-            self.preferences_for_document(v.document).soft_wrap,
+            preferences.tab_width,
+            preferences.soft_wrap,
             self.preferences.show_whitespace,
-        ))
-        .unwrap()
+        )
+            .hash(&mut h);
+        h.finish()
     }
     pub(crate) fn cached_editor_screen(
         &mut self,
@@ -330,14 +361,10 @@ impl App {
         }
         let screen = std::sync::Arc::new(self.render_editor(id, rows, cols, false).0);
         self.screen_builds += 1;
-        self.render_cache.insert(
-            id,
-            (
-                self.editor_signature(id),
-                self.screen_builds,
-                screen.clone(),
-            ),
-        );
+        // Rendering may scroll the view; key the screen by the view it shows.
+        let key = self.editor_signature(id);
+        self.render_cache
+            .insert(id, (key, self.screen_builds, screen.clone()));
         screen
     }
     pub(crate) fn cached_terminal_screen(
@@ -345,7 +372,22 @@ impl App {
         id: u64,
         revision: u64,
     ) -> std::sync::Arc<Screen> {
-        let key = format!("terminal:{revision}:{:?}", self.terminal_colors);
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let colors = &self.terminal_colors;
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (
+                revision,
+                &colors.foreground,
+                &colors.background,
+                &colors.selection,
+                &colors.selection_foreground,
+                &colors.accent,
+                &colors.ansi,
+            )
+                .hash(&mut h);
+            h.finish()
+        };
         if let Some((prior, _, screen)) = self.render_cache.get(&id) {
             if *prior == key {
                 return screen.clone();

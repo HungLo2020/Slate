@@ -313,7 +313,7 @@ pub fn available(language: &str, errors: &mut Vec<String>) -> Vec<Snippet> {
 impl App {
     fn language_of(&self, doc: u64) -> String {
         let d = &self.documents[&doc];
-        crate::highlight::syntax_for(d.path.as_deref(), &d.line_text(0))
+        crate::highlight::syntax_of(d.path.as_deref(), d.rope())
             .name
             .clone()
     }

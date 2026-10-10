@@ -17,13 +17,22 @@ use unicode_width::UnicodeWidthStr;
 /// Documents are ropes: edits cost O(log n) regardless of size. The limit
 /// guards memory, not performance.
 pub const MAX_FILE_BYTES: usize = 1024 * 1024 * 1024;
+/// Undo history is trimmed, oldest first and whole undo steps at a time,
+/// beyond this many bytes, steps or revisions. The step being recorded is
+/// never trimmed: one larger than the budget becomes the only step kept.
+/// Revisions are capped too because each costs memory beyond its text and a
+/// single multi-caret step can hold thousands of them.
 const HISTORY_BUDGET: usize = 64 * 1024 * 1024;
+const HISTORY_STEPS: usize = 10_000;
+const HISTORY_REVISIONS: usize = 200_000;
 /// Changes kept for language servers between drains; beyond this they
 /// receive the whole document instead.
 const CHANGE_LIMIT: usize = 4096;
 /// Inserted text recorded for language servers before falling back to a
 /// full update.
 const CHANGE_BYTES: usize = 8 * 1024 * 1024;
+/// Recent splices kept for caches that follow edits (wrapped rows).
+const SPLICES: usize = 256;
 
 static VERSIONS: AtomicU64 = AtomicU64::new(1);
 fn new_version() -> u64 {
@@ -45,6 +54,11 @@ struct Revision {
     group: u64,
 }
 
+/// Whether a revision begins a new undo step after `previous`.
+fn starts_step(previous: Option<&Revision>, r: &Revision) -> bool {
+    r.group == 0 || previous.is_none_or(|p| p.group != r.group)
+}
+
 /// The leading revisions that undo or redo together.
 fn group_changes<'a>(
     revisions: impl Iterator<Item = &'a Revision>,
@@ -59,6 +73,17 @@ fn group_changes<'a>(
         }
     }
     changes
+}
+
+/// One replacement as caches see it: bytes `start..old_end` of the text
+/// before it became `new_len` bytes; line breaks removed and inserted.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Splice {
+    pub start: usize,
+    pub old_end: usize,
+    pub new_len: usize,
+    pub old_breaks: usize,
+    pub new_breaks: usize,
 }
 
 /// One edit, with positions in the text before it (lines and UTF-16
@@ -133,6 +158,9 @@ pub struct Document {
     pub generation: u64,
     #[serde(skip)]
     undo: std::collections::VecDeque<Revision>,
+    /// Undo steps in `undo` (a group of revisions counts once).
+    #[serde(skip)]
+    undo_steps: usize,
     #[serde(skip)]
     redo: Vec<Revision>,
     /// Edits since language servers last synchronized; `None` after overflow.
@@ -148,6 +176,12 @@ pub struct Document {
     /// language server, so their edits are not recorded.
     #[serde(skip)]
     quiet: bool,
+    /// Identifies the text: a new value whenever it changes in any way.
+    #[serde(skip, default = "new_version")]
+    serial: u64,
+    /// The latest splices, each with the serial it was applied to.
+    #[serde(skip)]
+    splices: std::collections::VecDeque<(u64, Splice)>,
 }
 
 impl Document {
@@ -216,7 +250,7 @@ impl Document {
             });
         self.replace(start, end, value, cursor)?;
         if merge && self.undo.len() >= 2 {
-            let tail = self.undo.pop_back().unwrap();
+            let tail = self.pop_undo().unwrap();
             let prior = self.undo.back_mut().unwrap();
             prior.inserted.push_str(&tail.inserted);
             prior.after = tail.after;
@@ -377,11 +411,42 @@ impl Document {
                 }
             }
         }
+        let splice = Splice {
+            start,
+            old_end: end,
+            new_len: value.len(),
+            old_breaks: self.text.byte_to_line(end) - self.text.byte_to_line(start),
+            new_breaks: value.bytes().filter(|b| *b == b'\n').count(),
+        };
+        if self.splices.len() >= SPLICES {
+            self.splices.pop_front();
+        }
+        self.splices.push_back((self.serial, splice));
+        self.serial = new_version();
         let first = self.text.byte_to_char(start);
         let last = self.text.byte_to_char(end);
         self.text.remove(first..last);
         self.text.insert(first, value);
         self.generation += 1;
+    }
+    /// The identity of the current text (see `splices_since`).
+    pub(crate) fn serial(&self) -> u64 {
+        self.serial
+    }
+    /// The splices that turned the text with `serial` into the current one,
+    /// in order; `None` when they are no longer known.
+    pub(crate) fn splices_since(&self, serial: u64) -> Option<impl Iterator<Item = &Splice>> {
+        let first = if serial == self.serial {
+            self.splices.len()
+        } else {
+            self.splices.iter().position(|(s, _)| *s == serial)?
+        };
+        Some(self.splices.range(first..).map(|(_, splice)| splice))
+    }
+    /// The text was replaced wholesale.
+    fn new_text_identity(&mut self) {
+        self.serial = new_version();
+        self.splices.clear();
     }
     /// Append to a read-only inspection document (task output, debugger
     /// console). Not undoable and never makes the document dirty.
@@ -435,11 +500,14 @@ impl Document {
             notice: None,
             generation: 0,
             undo: Default::default(),
+            undo_steps: 0,
             redo: vec![],
             changes: Some(Vec::new()),
             change_bytes: 0,
             quiet: false,
             line_edits: Some(Vec::new()),
+            serial: new_version(),
+            splices: Default::default(),
         }
     }
     /// After restoring from a checkpoint: content versions are not stored.
@@ -490,19 +558,31 @@ impl Document {
     }
     pub fn open_with_encoding(path: &Path, encoding: Option<&str>) -> Result<Self> {
         let path = path.canonicalize().context("Cannot resolve file")?;
-        let bytes = read_regular_bytes(&path)?;
-        let decoded = text_format::decode(&bytes, encoding)?;
+        let (bytes, stamp) = read_regular_bytes(&path)?;
+        let disk = Baseline::of(&bytes);
+        let decoded = text_format::decode_owned(bytes, encoding).map_err(|(error, _)| error)?;
+        Ok(Self::from_disk(path, disk, stamp, decoded))
+    }
+    /// A document for file contents already read and decoded.
+    fn from_disk(
+        path: PathBuf,
+        disk: Baseline,
+        stamp: FileStamp,
+        decoded: text_format::Decoded,
+    ) -> Self {
         let mut document = Self::scratch();
-        document.stamp = FileStamp::of(&path);
+        document.stamp = Some(stamp);
         document.file_read_only = !fsio::writable(&path);
+        // The decoded text is dropped once the rope holds it.
         document.text = Rope::from(decoded.text.as_str());
+        drop(decoded.text);
         document.saved = document.text.clone();
         document.format = decoded.format.clone();
         document.saved_format = decoded.format;
-        document.disk = Some(Baseline::of(&bytes));
+        document.disk = Some(disk);
         document.notice = decoded.notice;
         document.path = Some(path);
-        Ok(document)
+        document
     }
     pub fn dirty(&self) -> bool {
         !self.read_only
@@ -541,6 +621,18 @@ impl Document {
         Ok(())
     }
     pub fn replace(&mut self, start: usize, end: usize, value: &str, cursor: usize) -> Result<()> {
+        self.replace_in_group(start, end, value, cursor, 0)
+    }
+    /// `replace`, recording a revision that undoes with others sharing a
+    /// nonzero `group`.
+    fn replace_in_group(
+        &mut self,
+        start: usize,
+        end: usize,
+        value: &str,
+        cursor: usize,
+        group: u64,
+    ) -> Result<()> {
         self.locked()?;
         self.typing_at = None;
         if start > end
@@ -558,7 +650,8 @@ impl Document {
         }
         let version_before = self.version;
         self.version = new_version();
-        self.undo.push_back(Revision {
+        self.clear_redo();
+        let revision = Revision {
             start,
             removed: self.slice(start, end).into_owned(),
             inserted: value.into(),
@@ -566,28 +659,44 @@ impl Document {
             after: start + value.len(),
             version_before,
             version_after: self.version,
-            group: 0,
-        });
-        self.history_size = self.history_size.saturating_sub(
-            self.redo
-                .iter()
-                .map(|r| r.removed.len() + r.inserted.len())
-                .sum::<usize>(),
-        );
-        self.history_size += self
-            .undo
-            .back()
-            .map(|r| r.removed.len() + r.inserted.len())
-            .unwrap_or(0);
-        while self.undo.len() > 1
-            && (self.undo.len() > 10_000 || self.history_size > HISTORY_BUDGET)
-        {
-            let r = self.undo.pop_front().unwrap();
-            self.history_size -= r.removed.len() + r.inserted.len();
+            group,
+        };
+        self.history_size += revision.removed.len() + revision.inserted.len();
+        if starts_step(self.undo.back(), &revision) {
+            self.undo_steps += 1;
         }
-        self.redo.clear();
+        self.undo.push_back(revision);
+        // Trim whole steps from the front; the newest step is the one being
+        // recorded (possibly a group still growing) and always stays.
+        while self.undo_steps > 1
+            && (self.undo_steps > HISTORY_STEPS
+                || self.history_size > HISTORY_BUDGET
+                || self.undo.len() > HISTORY_REVISIONS)
+        {
+            let first = self.undo.pop_front().unwrap();
+            self.history_size -= first.removed.len() + first.inserted.len();
+            while first.group != 0 && self.undo.front().is_some_and(|r| r.group == first.group) {
+                let r = self.undo.pop_front().unwrap();
+                self.history_size -= r.removed.len() + r.inserted.len();
+            }
+            self.undo_steps -= 1;
+        }
         self.replace_text(start, end, value);
         Ok(())
+    }
+    fn clear_redo(&mut self) {
+        for r in self.redo.drain(..) {
+            self.history_size = self
+                .history_size
+                .saturating_sub(r.removed.len() + r.inserted.len());
+        }
+    }
+    fn pop_undo(&mut self) -> Option<Revision> {
+        let r = self.undo.pop_back()?;
+        if starts_step(self.undo.back(), &r) {
+            self.undo_steps -= 1;
+        }
+        Some(r)
     }
     /// Replace several non-overlapping ranges as one undoable edit. Ranges
     /// are in the coordinates of the text before any of them is applied.
@@ -630,22 +739,18 @@ impl Document {
         for &i in order.iter().rev() {
             let (start, end, text) = &edits[i];
             let version = self.version;
-            if let Err(e) = self.replace(*start, *end, text, cursor) {
+            if let Err(e) = self.replace_in_group(*start, *end, text, cursor, group) {
                 // Roll back what was applied (one undo: they share a group)
                 // so the document stays consistent.
                 if applied > 0 {
                     self.undo(cursor);
                 }
-                self.redo.clear();
+                self.clear_redo();
                 return Err(e);
             }
-            // `replace` records a revision whenever the text changed; the
-            // version tells, even when history trimmed its oldest entries.
+            // A revision is recorded whenever the text changed.
             if self.version != version {
                 applied += 1;
-                if let Some(last) = self.undo.back_mut() {
-                    last.group = group;
-                }
             }
         }
         Ok(placed)
@@ -669,7 +774,7 @@ impl Document {
         }
         self.typing_at = None;
         loop {
-            let mut r = self.undo.pop_back()?;
+            let mut r = self.pop_undo()?;
             self.replace_text(r.start, r.start + r.inserted.len(), &r.removed);
             self.version = r.version_before;
             r.after = cursor;
@@ -693,6 +798,9 @@ impl Document {
             r.before = cursor;
             let position = r.after.min(self.len());
             let group = r.group;
+            if starts_step(self.undo.back(), &r) {
+                self.undo_steps += 1;
+            }
             self.undo.push_back(r);
             if group == 0 || self.redo.last().is_none_or(|n| n.group != group) {
                 return Some(position);
@@ -739,6 +847,7 @@ impl Document {
     pub(crate) fn set_recovery_ropes(&mut self, text: Rope, saved: Rope) {
         self.text = text;
         self.saved = saved;
+        self.new_text_identity();
     }
     pub fn accept_save(&mut self, saved: Self) {
         self.unavailable = false;
@@ -763,10 +872,12 @@ impl Document {
     pub fn discard_changes(&mut self) {
         self.unavailable = false;
         self.text = self.saved.clone();
+        self.new_text_identity();
         self.version = self.saved_version;
         self.format = self.saved_format.clone();
         self.generation += 1;
         self.undo.clear();
+        self.undo_steps = 0;
         self.redo.clear();
         self.history_size = 0;
         self.typing_at = None;
@@ -838,7 +949,7 @@ impl Document {
                     "Save As refuses to overwrite an existing file",
                 ));
             }
-            Some(Baseline::of(&read_regular_bytes(&path)?))
+            Some(Baseline::of(&read_regular_bytes(&path)?.0))
         } else {
             None
         };
@@ -889,20 +1000,11 @@ impl Document {
 
 // ----- Rope helpers -----
 
-fn read_regular_bytes(path: &Path) -> Result<Vec<u8>> {
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // A replaced path must not block on a FIFO between stat and open.
-        options.custom_flags(libc::O_NONBLOCK);
-    }
-    let file = options.open(path)?;
-    let meta = file.metadata()?;
-    if !meta.is_file() {
-        bail!("{} is not a regular file", path.display());
-    }
+/// A regular file's contents (never blocking on a FIFO or reading a device)
+/// and the stamp of exactly the file read.
+fn read_regular_bytes(path: &Path) -> Result<(Vec<u8>, FileStamp)> {
+    // A replaced path must not block on a FIFO between stat and open.
+    let (file, meta) = crate::fsio::open_regular(path)?;
     if meta.len() > MAX_FILE_BYTES as u64 {
         bail!("Documents are limited to 1 GiB");
     }
@@ -914,7 +1016,7 @@ fn read_regular_bytes(path: &Path) -> Result<Vec<u8>> {
     if bytes.len() > MAX_FILE_BYTES {
         bail!("Documents are limited to 1 GiB");
     }
-    Ok(bytes)
+    Ok((bytes, FileStamp::of_metadata(&meta)))
 }
 
 /// Plain ASCII without tabs or carriage returns: one column per byte. Uses
@@ -1021,16 +1123,18 @@ pub struct FileStamp {
 }
 impl FileStamp {
     pub fn of(path: &Path) -> Option<Self> {
-        let meta = fs::metadata(path).ok()?;
+        Some(Self::of_metadata(&fs::metadata(path).ok()?))
+    }
+    fn of_metadata(meta: &fs::Metadata) -> Self {
         #[cfg(unix)]
-        let inode = std::os::unix::fs::MetadataExt::ino(&meta);
+        let inode = std::os::unix::fs::MetadataExt::ino(meta);
         #[cfg(not(unix))]
         let inode = 0;
-        Some(Self {
+        Self {
             len: meta.len(),
             modified: meta.modified().ok(),
             inode,
-        })
+        }
     }
 }
 
@@ -1079,14 +1183,24 @@ pub(crate) fn examine(
     if current == stamp {
         return None;
     }
-    let Ok(bytes) = fs::read(path) else {
+    // Read once, never blocking on a FIFO or reading past the size limit
+    // (the IO worker is shared), and decode those same bytes.
+    let Ok(path) = path.canonicalize() else {
         return Some(DiskChange::Unreadable);
     };
-    if baseline == Some(&Baseline::of(&bytes)) {
-        return Some(DiskChange::Touched(current));
+    let Ok((bytes, opened)) = read_regular_bytes(&path) else {
+        return Some(DiskChange::Unreadable);
+    };
+    let disk = Baseline::of(&bytes);
+    if baseline == Some(&disk) {
+        return Some(DiskChange::Touched(Some(opened)));
     }
-    match Document::open_with_encoding(path, Some(encoding)).or_else(|_| Document::open(path)) {
-        Ok(document) => Some(DiskChange::Changed(Box::new(document))),
+    let decoded = text_format::decode_owned(bytes, Some(encoding))
+        .or_else(|(_, bytes)| text_format::decode_owned(bytes, None));
+    match decoded {
+        Ok(decoded) => Some(DiskChange::Changed(Box::new(Document::from_disk(
+            path, disk, opened, decoded,
+        )))),
         Err(_) => Some(DiskChange::Unreadable),
     }
 }
@@ -1172,6 +1286,7 @@ pub fn display_width_with_tabs(text: &str, tab: usize) -> usize {
 }
 pub(crate) fn grapheme_width(g: &str, col: usize, tab: usize) -> usize {
     if g == "\t" {
+        let tab = tab.max(1);
         tab - col % tab
     } else if g == "\r" || g == "\r\n" {
         0
@@ -1216,6 +1331,101 @@ pub fn at_line_col_with_tabs(text: &str, row: usize, col: usize, tab: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text_format::LineEnding;
+
+    #[cfg(unix)]
+    #[test]
+    fn examining_a_fifo_or_oversized_file_returns_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        fs::write(&path, "abc").unwrap();
+        let d = Document::open(&path).unwrap();
+        let (_, baseline, stamp, encoding) = d.watch_entry().unwrap();
+        // The file is replaced by a FIFO nobody writes to.
+        fs::remove_file(&path).unwrap();
+        let fifo = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        let change = examine(&path, baseline.as_ref(), stamp, &encoding);
+        assert!(matches!(change, Some(DiskChange::Unreadable)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // A (sparse) file past the size limit is not read.
+        fs::remove_file(&path).unwrap();
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(MAX_FILE_BYTES as u64 + 1).unwrap();
+        let change = examine(&path, baseline.as_ref(), stamp, &encoding);
+        assert!(matches!(change, Some(DiskChange::Unreadable)));
+        // Real changes decode the bytes read, with the stamp of that file.
+        fs::write(&path, b"caf\xe9\r\n").unwrap();
+        let Some(DiskChange::Changed(fresh)) = examine(&path, baseline.as_ref(), stamp, &encoding)
+        else {
+            panic!("the change was not seen");
+        };
+        assert_eq!(fresh.text(), "café\n");
+        assert_eq!(fresh.format.encoding, "windows-1252");
+        assert_eq!(fresh.stamp, FileStamp::of(&path));
+        assert!(fresh.baseline_matches(b"caf\xe9\r\n"));
+    }
+
+    #[test]
+    fn decoding_reuses_the_buffer_and_keeps_formats() {
+        for (bytes, text, encoding, bom, ending) in [
+            (&b"plain\n"[..], "plain\n", "UTF-8", false, LineEnding::Lf),
+            (
+                b"\xEF\xBB\xBFa\r\nb\r\n",
+                "a\nb\n",
+                "UTF-8",
+                true,
+                LineEnding::Crlf,
+            ),
+            (
+                b"a\rb\r\xc3\xa9",
+                "a\nb\n\u{e9}",
+                "UTF-8",
+                false,
+                LineEnding::Cr,
+            ),
+            (
+                b"caf\xe9\r\n",
+                "caf\u{e9}\n",
+                "windows-1252",
+                false,
+                LineEnding::Crlf,
+            ),
+            (
+                b"\xFF\xFEa\0\r\0\n\0",
+                "a\n",
+                "UTF-16LE",
+                true,
+                LineEnding::Crlf,
+            ),
+        ] {
+            let decoded = text_format::decode_owned(bytes.to_vec(), None).unwrap();
+            assert_eq!(decoded.text, text);
+            assert_eq!(
+                (decoded.format.encoding.as_str(), decoded.format.bom),
+                (encoding, bom)
+            );
+            assert_eq!(decoded.format.line_ending, ending);
+        }
+        // A failure hands the bytes back unchanged, BOM included.
+        let bytes = b"\xEF\xBB\xBF\xff".to_vec();
+        let Err((_, back)) = text_format::decode_owned(bytes.clone(), None) else {
+            panic!("invalid UTF-8 after a BOM decoded");
+        };
+        assert_eq!(back, bytes);
+        let Err((_, back)) = text_format::decode_owned(b"\xff".to_vec(), Some("utf-8")) else {
+            panic!("invalid forced UTF-8 decoded");
+        };
+        assert_eq!(back, b"\xff");
+    }
+
+    #[test]
+    fn zero_tab_width_never_divides_by_zero() {
+        assert_eq!(grapheme_width("\t", 3, 0), 1);
+        assert_eq!(display_width_with_tabs("a\tb", 0), 3);
+        assert_eq!(column_offset("\tb", 1, 0), 1);
+    }
 
     #[test]
     fn grouped_edits_undo_together_even_with_full_history() {
@@ -1246,5 +1456,68 @@ mod tests {
             )
             .is_err());
         assert_eq!(d.text(), before);
+    }
+
+    #[test]
+    fn a_group_larger_than_the_history_budget_undoes_completely() {
+        let mut d = Document::from_text("ab".into()).unwrap();
+        d.replace(0, 0, "x", 0).unwrap();
+        let part = "y".repeat(HISTORY_BUDGET / 2 + 1);
+        d.replace_many(&[(1, 1, part.clone()), (2, 2, part)], 0)
+            .unwrap();
+        assert_eq!(d.undo_steps, 1, "older steps make room; the group stays");
+        d.undo(0);
+        assert_eq!(d.text(), "xab");
+        assert!(d.undo(0).is_none());
+        d.redo(0);
+        assert_eq!(d.len(), 3 + HISTORY_BUDGET + 2);
+    }
+
+    #[test]
+    fn history_limit_counts_undo_steps_not_revisions() {
+        let mut d = Document::from_text("a".repeat(HISTORY_STEPS + 1)).unwrap();
+        for _ in 0..5 {
+            d.replace(0, 0, "-", 0).unwrap();
+        }
+        let original = d.text();
+        // One caret per character: one step of more than 10,000 revisions.
+        let edits: Vec<_> = (5..d.len()).map(|i| (i, i + 1, "b".into())).collect();
+        d.replace_many(&edits, 0).unwrap();
+        d.undo(0);
+        assert_eq!(d.text(), original);
+        for _ in 0..5 {
+            d.undo(0).unwrap();
+        }
+        assert_eq!(d.text(), "a".repeat(HISTORY_STEPS + 1));
+        assert!(d.undo(0).is_none());
+        // Interleaved undo and redo keep the step count exact.
+        for _ in 0..6 {
+            d.redo(0).unwrap();
+        }
+        assert_eq!(d.undo_steps, 6);
+        assert!(d.text().ends_with(&"b".repeat(HISTORY_STEPS + 1)));
+        // Past the limit whole steps go, oldest first.
+        for i in 0..HISTORY_STEPS {
+            d.replace(i % 3, i % 3, "z", 0).unwrap();
+        }
+        assert_eq!(d.undo_steps, HISTORY_STEPS);
+        assert!(d.undo.iter().all(|r| r.group == 0));
+    }
+    #[test]
+    fn history_revisions_are_capped_a_whole_step_at_a_time() {
+        let mut d = Document::from_text("a".repeat(10_000)).unwrap();
+        let steps = HISTORY_REVISIONS / 10_000 + 5;
+        for step in 0..steps {
+            let value = if step % 2 == 0 { "b" } else { "a" };
+            let edits: Vec<_> = (0..d.len()).map(|i| (i, i + 1, value.into())).collect();
+            d.replace_many(&edits, 0).unwrap();
+        }
+        assert!(d.undo.len() <= HISTORY_REVISIONS);
+        assert_eq!(d.undo.len() % 10_000, 0, "steps are trimmed whole");
+        assert_eq!(d.undo_steps, d.undo.len() / 10_000);
+        // Every kept step still undoes completely.
+        while d.undo(0).is_some() {
+            assert!(d.text().chars().all(|c| c == 'a') || d.text().chars().all(|c| c == 'b'));
+        }
     }
 }

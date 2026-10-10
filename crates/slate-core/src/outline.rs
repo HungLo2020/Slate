@@ -41,16 +41,26 @@ fn kind_of(scope: &str) -> Option<&'static str> {
         .map(|(_, kind)| *kind)
 }
 
-/// Symbols in document order.
-pub fn symbols(rope: &Rope, path: Option<&Path>) -> Vec<Symbol> {
-    let first = rope.line(0).to_string();
-    let syntax = crate::highlight::syntax_for(path, &first);
+/// Symbols in document order; `None` once `cancelled` says so.
+pub fn symbols(
+    rope: &Rope,
+    path: Option<&Path>,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<Vec<Symbol>> {
+    let syntax = crate::highlight::syntax_of(path, rope);
     let syntaxes = crate::highlight::syntaxes();
     let mut state = ParseState::new(syntax);
     let mut stack = ScopeStack::new();
     let heading = Scope::new("markup.heading").ok();
     let mut out = Vec::new();
     for (line_number, line) in rope.lines().take(LINE_LIMIT).enumerate() {
+        if line_number % 256 == 0 && cancelled() {
+            return None;
+        }
+        // Like the highlighter, skip minified lines rather than parse them.
+        if line.len_bytes() > crate::highlight::LONG_LINE {
+            continue;
+        }
         let line = line.to_string();
         let Ok(ops) = state.parse_line(&line, syntaxes) else {
             break;
@@ -119,7 +129,7 @@ pub fn symbols(rope: &Rope, path: Option<&Path>) -> Vec<Symbol> {
             }
         }
     }
-    out
+    Some(out)
 }
 
 #[cfg(test)]
@@ -131,10 +141,12 @@ mod tests {
         let rust = Rope::from_str(
             "struct Point { x: i32 }\nimpl Point {\n    fn new() -> Self { todo!() }\n}\nfn main() {}\n",
         );
-        let found: Vec<(String, String, usize)> = symbols(&rust, Some(Path::new("a.rs")))
-            .into_iter()
-            .map(|s| (s.name, s.kind, s.line))
-            .collect();
+        let found: Vec<(String, String, usize)> =
+            symbols(&rust, Some(Path::new("a.rs")), &|| false)
+                .unwrap()
+                .into_iter()
+                .map(|s| (s.name, s.kind, s.line))
+                .collect();
         assert!(
             found.contains(&("Point".into(), "struct".into(), 0)),
             "{found:?}"
@@ -147,15 +159,31 @@ mod tests {
             .iter()
             .any(|(n, k, l)| n == "main" && k == "function" && *l == 4));
         let python = Rope::from_str("class A:\n    def run(self):\n        pass\n");
-        let found = symbols(&python, Some(Path::new("a.py")));
+        let found = symbols(&python, Some(Path::new("a.py")), &|| false).unwrap();
         assert_eq!(found[0].name, "A");
         assert_eq!(found[1].name, "run");
         let markdown = Rope::from_str("# Title\n\ntext\n## Part two\n");
-        let found = symbols(&markdown, Some(Path::new("a.md")));
+        let found = symbols(&markdown, Some(Path::new("a.md")), &|| false).unwrap();
         let names: Vec<_> = found.iter().map(|s| s.name.as_str()).collect();
         assert!(
             names.contains(&"Title") && names.contains(&"Part two"),
             "{names:?}"
         );
+    }
+
+    #[test]
+    fn long_lines_are_skipped_and_outlines_can_be_cancelled() {
+        let text = format!(
+            "fn a() {{}}\nconst X: &str = \"{}\";\nfn b() {{}}\n",
+            "x".repeat(crate::highlight::LONG_LINE)
+        );
+        let rope = Rope::from_str(&text);
+        let names: Vec<_> = symbols(&rope, Some(Path::new("a.rs")), &|| false)
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.name, s.line))
+            .collect();
+        assert_eq!(names, [("a".to_string(), 0), ("b".to_string(), 2)]);
+        assert!(symbols(&rope, Some(Path::new("a.rs")), &|| true).is_none());
     }
 }

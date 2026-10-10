@@ -137,17 +137,26 @@ fn os(bytes: &[u8]) -> OsString {
     String::from_utf8_lossy(bytes).into_owned().into()
 }
 
-/// Run git in the repository, killing it (and anything it started) after
-/// `timeout`. Only called for trusted repositories.
-pub fn run(context: &Context, args: &[OsString], timeout: Duration) -> Result<Output, String> {
+/// Git for the repository at `root`: never prompting, never taking the
+/// index lock for optional work, and blind to any repository a parent Git
+/// described in the environment (Slate as the commit editor), so `-C root`
+/// alone decides the repository.
+pub(crate) fn command(root: &Path) -> Command {
     let mut command = Command::new("git");
-    command
+    crate::process::scrub_repository_env(&mut command)
         .arg("-C")
-        .arg(&context.root)
-        .args(args)
+        .arg(root)
         .env("GIT_TERMINAL_PROMPT", "0")
         // Status must not take the index lock away from the user's own Git.
         .env("GIT_OPTIONAL_LOCKS", "0");
+    command
+}
+
+/// Run git in the repository, killing it (and anything it started) after
+/// `timeout`. Only called for trusted repositories.
+pub fn run(context: &Context, args: &[OsString], timeout: Duration) -> Result<Output, String> {
+    let mut command = command(&context.root);
+    command.args(args);
     let label = format!(
         "git {}",
         args.first()
@@ -660,6 +669,20 @@ mod tests {
         );
         assert!(result.unwrap_err().contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn git_ignores_a_parent_gits_repository_environment() {
+        // Set when Slate is Git's commit editor; `-C root` must decide.
+        let command = command(Path::new("/project"));
+        let envs: Vec<_> = command.get_envs().collect();
+        for name in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX"] {
+            assert!(
+                envs.contains(&(OsStr::new(name), None)),
+                "{name} is inherited"
+            );
+        }
+        assert!(envs.contains(&(OsStr::new("GIT_OPTIONAL_LOCKS"), Some(OsStr::new("0")))));
     }
 
     #[cfg(unix)]

@@ -340,8 +340,98 @@ fn replace_in_files_skips_changed_and_mixed_files_and_can_be_undone() {
         name: "undo-replace-in-files".into(),
         argument: String::new(),
     });
+    settle(&mut app, "undo", |a| a.status.starts_with("Restored"));
     assert!(app.status.starts_with("Restored 3 files"), "{}", app.status);
     assert!(fs::read_to_string(&util).unwrap().contains("fn greet("));
+}
+
+fn replace_all(app: &mut App, find: &str, with: &str) {
+    app.dispatch(Command::Action {
+        name: "search-in-files".into(),
+        argument: String::new(),
+    });
+    typed(app, find);
+    settle(app, "search", |a| !picker(a).busy);
+    app.dispatch(Command::Action {
+        name: "replace-in-files".into(),
+        argument: String::new(),
+    });
+    app.dispatch(Command::UpdatePrompt {
+        input: with.into(),
+        replacement: String::new(),
+        case_sensitive: false,
+        whole_word: false,
+    });
+    app.dispatch(Command::SubmitPrompt { all: false });
+    typed(app, "y");
+    settle(app, "replace", |a| a.status.starts_with("Replaced"));
+}
+fn undo_replace(app: &mut App) {
+    app.dispatch(Command::Action {
+        name: "undo-replace-in-files".into(),
+        argument: String::new(),
+    });
+    settle(app, "undo", |a| a.status.starts_with("Restored"));
+}
+
+#[test]
+fn a_file_that_stays_unwritable_does_not_block_older_undos() {
+    use std::os::unix::fs::PermissionsExt;
+    let (mut app, dir, _serial) = workspace();
+    let root = dir.path().join("project");
+    let (notes, util) = (root.join("notes.md"), root.join("src/util.rs"));
+    replace_all(&mut app, "greet", "hello");
+    replace_all(&mut app, "hello", "howdy");
+    fs::set_permissions(&notes, fs::Permissions::from_mode(0o444)).unwrap();
+    undo_replace(&mut app);
+    assert!(app.status.contains("undo again to retry"), "{}", app.status);
+    // The retry fails too; the backup is given up rather than kept on top.
+    undo_replace(&mut app);
+    assert!(app.status.contains("could not restore"), "{}", app.status);
+    assert!(!app.status.contains("undo again"), "{}", app.status);
+    undo_replace(&mut app);
+    assert!(fs::read_to_string(&util).unwrap().contains("fn greet("));
+    assert!(fs::read_to_string(&notes).unwrap().contains("howdy people"));
+    fs::set_permissions(&notes, fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+#[test]
+fn undo_replace_in_files_keeps_failed_backups_and_each_run() {
+    use std::os::unix::fs::PermissionsExt;
+    let (mut app, dir, _serial) = workspace();
+    let root = dir.path().join("project");
+    let (notes, util) = (root.join("notes.md"), root.join("src/util.rs"));
+    replace_all(&mut app, "greet", "hello");
+    replace_all(&mut app, "hello", "howdy");
+    assert!(fs::read_to_string(&notes).unwrap().contains("howdy people"));
+    // A file that cannot be written keeps its backup; the others restore.
+    fs::set_permissions(&notes, fs::Permissions::from_mode(0o444)).unwrap();
+    undo_replace(&mut app);
+    assert!(app.status.contains("could not restore"), "{}", app.status);
+    assert!(fs::read_to_string(&util).unwrap().contains("fn hello("));
+    assert!(fs::read_to_string(&notes).unwrap().contains("howdy people"));
+    // Undoing again retries it, keeping its permissions.
+    fs::set_permissions(&notes, fs::Permissions::from_mode(0o640)).unwrap();
+    undo_replace(&mut app);
+    assert!(app.status.starts_with("Restored 1 file"), "{}", app.status);
+    assert!(fs::read_to_string(&notes).unwrap().contains("hello people"));
+    assert_eq!(
+        fs::metadata(&notes).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    // The earlier run is still there to undo.
+    undo_replace(&mut app);
+    assert!(fs::read_to_string(&util).unwrap().contains("fn greet("));
+    assert!(fs::read_to_string(&notes).unwrap().contains("greet people"));
+    app.dispatch(Command::Action {
+        name: "undo-replace-in-files".into(),
+        argument: String::new(),
+    });
+    assert!(
+        app.status.contains("No replace-in-files to undo"),
+        "{}",
+        app.status
+    );
 }
 
 #[test]

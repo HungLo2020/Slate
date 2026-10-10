@@ -4,7 +4,7 @@
 use crate::cli::LaunchFile;
 use serde::{Deserialize, Serialize};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -43,15 +43,79 @@ pub fn can_share_window(launch: &crate::cli::Launch) -> bool {
         && !launch.ignore_rc
 }
 
+/// Only a folder no other user can enter may hold the socket: another user
+/// could otherwise bind it first, receive file paths and answer `--wait`.
+/// It must be a real folder (not a symlink) owned by this user with no group
+/// or other access.
 #[cfg(unix)]
-fn socket_path() -> PathBuf {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute() && p.is_dir())
-        .unwrap_or_else(std::env::temp_dir);
-    let uid = unsafe { libc::geteuid() };
-    base.join(format!("slate-gui-{uid}.sock"))
+fn private_dir(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    path.is_absolute()
+        && std::fs::symlink_metadata(path).is_ok_and(|meta| {
+            meta.file_type().is_dir()
+                && meta.uid() == unsafe { libc::geteuid() }
+                && meta.mode() & 0o077 == 0
+        })
 }
+/// `runtime` (XDG_RUNTIME_DIR) when private, else this user's own folder in
+/// `temp`, created private. `None` disables single-instance handover: a
+/// launch then simply opens its own window.
+#[cfg(unix)]
+fn socket_dir(runtime: Option<PathBuf>, temp: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    if let Some(runtime) = runtime.filter(|p| private_dir(p)) {
+        return Some(runtime);
+    }
+    let dir = temp.join(format!("slate-{}", unsafe { libc::geteuid() }));
+    // Never adopt an existing path without checking it: it may be another
+    // user's folder or symlink.
+    let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+    private_dir(&dir).then_some(dir)
+}
+#[cfg(unix)]
+fn socket_path() -> Option<PathBuf> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let uid = unsafe { libc::geteuid() };
+    socket_dir(runtime, &std::env::temp_dir()).map(|dir| dir.join(format!("slate-gui-{uid}.sock")))
+}
+/// The user ID of the process at the other end of a local socket.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_uid(stream: &std::os::unix::net::UnixStream) -> std::io::Result<u32> {
+    use std::os::fd::AsRawFd;
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(credentials.uid)
+}
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn peer_uid(stream: &std::os::unix::net::UnixStream) -> std::io::Result<u32> {
+    use std::os::fd::AsRawFd;
+    let (mut uid, mut gid) = (0, 0);
+    if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(uid)
+}
+/// Files and wait results are exchanged only with this user's processes.
+#[cfg(unix)]
+fn same_user(stream: &std::os::unix::net::UnixStream) -> bool {
+    peer_uid(stream).is_ok_and(|uid| uid == unsafe { libc::geteuid() })
+}
+/// The socket this process bound, by device and inode: release removes
+/// exactly that socket, never one that replaced it.
+#[cfg(unix)]
+static BOUND: Mutex<Option<(PathBuf, u64, u64)>> = Mutex::new(None);
 
 /// Send files to a running instance, returning immediately after acceptance.
 pub fn forward(files: &[LaunchFile]) -> bool {
@@ -64,8 +128,13 @@ pub fn forward_wait(files: &[LaunchFile]) -> anyhow::Result<bool> {
 #[cfg(unix)]
 fn forward_request(files: &[LaunchFile], wait: bool) -> anyhow::Result<bool> {
     use std::io::Write;
-    let mut stream = match std::os::unix::net::UnixStream::connect(socket_path()) {
-        Ok(stream) => stream,
+    let Some(path) = socket_path() else {
+        return Ok(false);
+    };
+    let mut stream = match std::os::unix::net::UnixStream::connect(path) {
+        Ok(stream) if same_user(&stream) => stream,
+        // Never hand paths to (or wait on) another user's process.
+        Ok(_) => return Ok(false),
         Err(error)
             if matches!(
                 error.kind(),
@@ -110,7 +179,7 @@ pub struct WaitTicket {
 }
 impl WaitTicket {
     #[cfg(unix)]
-    fn new(stream: std::os::unix::net::UnixStream) -> anyhow::Result<Self> {
+    pub(crate) fn new(stream: std::os::unix::net::UnixStream) -> anyhow::Result<Self> {
         stream.set_write_timeout(Some(std::time::Duration::from_millis(10)))?;
         anyhow::ensure!(
             crate::budget::reserve(&WAIT_COUNT, 1, 128),
@@ -263,7 +332,9 @@ pub fn start_waiting_gui(arguments: &[std::ffi::OsString]) -> anyhow::Result<()>
         let (client, server) = std::os::unix::net::UnixStream::pair()?;
         let fd = server.as_raw_fd();
         let mut command = Command::new(std::env::current_exe()?);
-        command
+        // The GUI outlives the Git that started it as the commit editor:
+        // never let it (or its terminals and tools) work on that repository.
+        crate::process::scrub_repository_env(&mut command)
             .args(arguments)
             .env(WAIT_FD, fd.to_string())
             .stdin(Stdio::null())
@@ -302,10 +373,15 @@ pub fn start_waiting_gui(arguments: &[std::ffi::OsString]) -> anyhow::Result<()>
 #[cfg(unix)]
 pub fn listen(notify: impl Fn() + Send + 'static) -> Option<Inbox> {
     use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
     use std::os::unix::net::{UnixListener, UnixStream};
-    let path = socket_path();
+    // Inside a private folder, so bound without a window for other users.
+    let path = socket_path()?;
     // A leftover socket from a crashed instance refuses connections.
-    if path.exists() && UnixStream::connect(&path).is_err() {
+    if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_socket())
+        && UnixStream::connect(&path)
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused)
+    {
         let _ = std::fs::remove_file(&path);
     }
     let listener = UnixListener::bind(&path).ok()?;
@@ -313,10 +389,15 @@ pub fn listen(notify: impl Fn() + Send + 'static) -> Option<Inbox> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
+    let bound = std::fs::symlink_metadata(&path).ok()?;
+    *BOUND.lock().unwrap() = Some((path, bound.dev(), bound.ino()));
     let inbox: Inbox = Default::default();
     let queue = inbox.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
+            if !same_user(&stream) {
+                continue;
+            }
             let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
             let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(500)));
             let mut line = String::new();
@@ -370,11 +451,15 @@ pub fn listen(_notify: impl Fn() + Send + 'static) -> Option<Inbox> {
     None
 }
 
-/// Remove the socket when the primary instance exits.
+/// Remove the socket when the primary instance exits, unless another
+/// instance has since replaced it.
 pub fn release() {
     #[cfg(unix)]
-    {
-        let _ = std::fs::remove_file(socket_path());
+    if let Some((path, dev, ino)) = BOUND.lock().unwrap().take() {
+        use std::os::unix::fs::MetadataExt;
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.dev() == dev && m.ino() == ino) {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -425,13 +510,13 @@ mod tests {
         let _serial = crate::paths::TEST_ENV
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let runtime = tempfile::tempdir().unwrap();
+        let runtime = private_tempdir();
         std::env::set_var("XDG_RUNTIME_DIR", runtime.path());
         let woke = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = woke.clone();
         let inbox = listen(move || flag.store(true, std::sync::atomic::Ordering::SeqCst)).unwrap();
         // A client that never sends a newline must not block later launches.
-        let stalled = std::os::unix::net::UnixStream::connect(socket_path()).unwrap();
+        let stalled = std::os::unix::net::UnixStream::connect(socket_path().unwrap()).unwrap();
         let file = LaunchFile {
             path: runtime.path().join("a.txt"),
             line: Some(3),
@@ -439,12 +524,96 @@ mod tests {
         };
         assert!(forward(std::slice::from_ref(&file)));
         drop(stalled);
-        let received = inbox.lock().unwrap();
-        assert_eq!(received.len(), 1);
-        assert_eq!(received[0].files[0].line, Some(3));
-        assert!(woke.load(std::sync::atomic::Ordering::SeqCst));
+        {
+            let received = inbox.lock().unwrap();
+            assert_eq!(received.len(), 1);
+            assert_eq!(received[0].files[0].line, Some(3));
+        }
+        // The listener wakes the event loop just after replying.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !woke.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Listener never notified"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         release();
         assert!(!forward(&[file]), "No instance after release");
+    }
+
+    fn private_tempdir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+    #[test]
+    fn the_socket_lives_only_in_a_private_folder() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let mode = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let runtime = private_tempdir();
+        let temp = tempfile::tempdir().unwrap();
+        let fallback = temp
+            .path()
+            .join(format!("slate-{}", unsafe { libc::geteuid() }));
+        assert_eq!(
+            socket_dir(Some(runtime.path().into()), temp.path()),
+            Some(runtime.path().into())
+        );
+        // A shared runtime folder (or a symlink to a private one) is not used;
+        // a private folder of our own in the temporary directory is.
+        mode(runtime.path(), 0o755);
+        assert_eq!(
+            socket_dir(Some(runtime.path().into()), temp.path()),
+            Some(fallback.clone())
+        );
+        mode(runtime.path(), 0o700);
+        let link = temp.path().join("link");
+        symlink(runtime.path(), &link).unwrap();
+        assert_eq!(socket_dir(Some(link), temp.path()), Some(fallback.clone()));
+        assert_eq!(
+            std::fs::metadata(&fallback).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(socket_dir(None, temp.path()), Some(fallback.clone()));
+        // A pre-existing folder that others can enter, or a planted symlink,
+        // disables handover rather than being adopted.
+        mode(&fallback, 0o733);
+        assert_eq!(socket_dir(None, temp.path()), None);
+        std::fs::remove_dir(&fallback).unwrap();
+        symlink(runtime.path(), &fallback).unwrap();
+        assert_eq!(socket_dir(None, temp.path()), None);
+        assert!(!private_dir(Path::new("relative")));
+    }
+
+    #[test]
+    fn peers_are_checked_and_release_spares_a_replacement_socket() {
+        let _serial = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert_eq!(peer_uid(&a).unwrap(), unsafe { libc::geteuid() });
+        assert!(same_user(&a) && same_user(&b));
+        let runtime = private_tempdir();
+        std::env::set_var("XDG_RUNTIME_DIR", runtime.path());
+        assert!(listen(|| {}).is_some());
+        let path = socket_path().unwrap();
+        // Another instance replaced the socket after this one bound it.
+        std::fs::remove_file(&path).unwrap();
+        let _other = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        release();
+        assert!(
+            path.exists(),
+            "Release must not remove another instance's socket"
+        );
+        // A stale socket (nobody listening) is replaced by the next instance.
+        drop(_other);
+        assert!(listen(|| {}).is_some());
+        release();
+        assert!(!path.exists());
     }
     fn fixture() -> (
         tempfile::TempDir,

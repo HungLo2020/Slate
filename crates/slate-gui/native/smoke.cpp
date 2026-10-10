@@ -5,6 +5,7 @@
 #include <QComboBox>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFontMetricsF>
 #include <QIcon>
 #include <QClipboard>
 #include <QDir>
@@ -18,6 +19,7 @@
 #include <QPointer>
 #include <QPushButton>
 #include <QQuickWindow>
+#include <QSet>
 #include <QSignalSpy>
 #include <QSignalBlocker>
 #include <QTest>
@@ -26,6 +28,8 @@
 #include <QMimeData>
 #include <QTextCharFormat>
 #include <QWheelEvent>
+#include <cmath>
+#include <cstdio>
 #include <functional>
 
 static QQuickItem *findItem(QQuickItem *item, const QString &name) {
@@ -485,7 +489,7 @@ static void startGitSmoke(Bridge *state, QQuickWindow *window) {
                               .arg(frame.value("status").toString())
                               .arg(frame.value("git_repository").toBool())
                               .arg(frame.value("git_restricted").toBool())
-                              .arg(frame.value("git").toList().size())
+                              .arg(state->gitEntries().size())
                               .arg(frame.value("git_error").toString()));
             return;
         }
@@ -516,7 +520,7 @@ static void startGitSmoke(Bridge *state, QQuickWindow *window) {
             *trust = 2;
             return;
         }
-        const auto entries = frame.value("git").toList();
+        const auto entries = state->gitEntries();
         auto browser = findItem(window->contentItem(), "browser_1");
         auto view = findItem(window->contentItem(), "gitView_1");
         switch (*step) {
@@ -913,7 +917,7 @@ static void startFeatureSmoke(Bridge *state, QQuickWindow *window) {
         case 7: {
             if (frame.value("git_busy").toBool())
                 return;
-            const auto entries = frame.value("git").toList();
+            const auto entries = state->gitEntries();
             int index = -1;
             for (int i = 0; i < entries.size(); ++i)
                 if (entries[i].toMap().value("path") == "new file.txt" &&
@@ -932,7 +936,7 @@ static void startFeatureSmoke(Bridge *state, QQuickWindow *window) {
         case 8: {
             if (frame.value("git_busy").toBool())
                 return;
-            const auto entries = frame.value("git").toList();
+            const auto entries = state->gitEntries();
             int index = -1;
             for (int i = 0; i < entries.size(); ++i)
                 if (entries[i].toMap().value("path") == "new file.txt" &&
@@ -1388,14 +1392,14 @@ static void startCommandSmoke(Bridge *state, QQuickWindow *window) {
             }
         } else if (scenario == 14) {
             if (trigger) {
-                if (state->frame().value("git_busy").toBool() || state->frame().value("git").toList().isEmpty()) return;
+                if (state->frame().value("git_busy").toBool() || state->gitEntries().isEmpty()) return;
                 state->send({{"action", "focus"}, {"pane", 1}}); state->refresh();
                 auto button = findItem(window->contentItem(), "paneActions_1");
                 if (!button || !button->isVisible()) { finish(false, "Git pane menu button missing"); return; }
                 QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
                     button->mapToScene(QPointF(button->width()/2, button->height()/2)).toPoint());
             } else {
-                const auto rows = state->frame().value("git").toList();
+                const auto rows = state->gitEntries();
                 const auto paneInfo = state->commandInfo("stage", 1);
                 auto stage = findMenuItem(window, "menuAction_stage");
                 auto unstage = findMenuItem(window, "menuAction_unstage");
@@ -1911,9 +1915,9 @@ static void startDesktopSmoke(Bridge *state, QQuickWindow *window) {
             QVariantMap terminal;
             for (const auto &value : frame.value("panes").toList())
                 if (value.toMap().value("kind") == "terminal") terminal = value.toMap();
-            const auto cells = state->surface(terminal.value("id").toInt()).value("screen").toMap().value("cells").toList();
-            if (cells.isEmpty() || cells.last().toList().isEmpty()) return;
-            const auto bg = cells.last().toList().last().toMap().value("bg").toString();
+            const auto lines = state->surface(terminal.value("id").toInt()).value("screen").toMap().value("lines").toList();
+            if (lines.isEmpty() || lines.last().toList().isEmpty()) return;
+            const auto bg = lines.last().toList().last().toMap().value("bg").toString();
             if (bg != themed.value("terminal_background").toString()) {
                 finish(false, "Terminal background " + bg + " ignores its theme " + themed.value("terminal_background").toString());
                 return;
@@ -2164,7 +2168,7 @@ static void startAuditSmoke(Bridge *state, QQuickWindow *window) {
         if (pane < 0) return false;
         state->send({{"action", "focus"}, {"pane", pane}});
         state->refresh();
-        const auto entries = state->frame().value("files").toList();
+        const auto entries = state->fileEntries();
         for (int i = 0; i < entries.size(); ++i) if (entries[i].toMap().value("path").toString() == path) {
             state->send({{"action", "click"}, {"pane", pane}, {"row", i}, {"col", 0}}); state->refresh(); return true;
         }
@@ -2178,7 +2182,7 @@ static void startAuditSmoke(Bridge *state, QQuickWindow *window) {
         case 1: if (!QFileInfo::exists(workspace + "/nested")) return; if (!select(workspace + "/nested")) return; invoke("toggle-folder"); invoke("new-file", "nested/inside.txt"); break;
         case 2: {
             if (!QFileInfo::exists(workspace + "/nested/inside.txt")) return;
-            bool child = false; for (const auto &row : state->frame().value("files").toList()) if (row.toMap().value("depth").toInt() == 1) child = true;
+            bool child = false; for (const auto &row : state->fileEntries()) if (row.toMap().value("depth").toInt() == 1) child = true;
             if (!child || !select(workspace + "/nested/inside.txt")) return;
             auto menu = findItem(window->contentItem(), "paneActions_1");
             if (!menu) { finish(false, "Explorer context menu missing"); return; }
@@ -2332,10 +2336,85 @@ static void startWaitSmoke(Bridge *state) {
     });
     timer->start(50);
 }
+// File names (tabs, menus, hints, status) are shown verbatim, never as markup.
+static void startMarkupSmoke(Bridge *state, QQuickWindow *window) {
+    const QString dir = qEnvironmentVariable("SLATE_GUI_SMOKE_DIR");
+    const QString name = QStringLiteral("<i>marked<i>.txt");
+    auto finish = [=](bool pass, const QString &detail) {
+        QFile report(dir + "/report.json");
+        report.open(QIODevice::WriteOnly);
+        report.write(QJsonDocument(QJsonObject{{"pass", pass}, {"detail", detail}}).toJson());
+        QGuiApplication::exit(pass ? 0 : 2);
+    };
+    state->send({{"action", "command"}, {"text", "open " + name}});
+    state->refresh();
+    auto timer = new QTimer(state);
+    auto ticks = new int(0);
+    QObject::connect(timer, &QTimer::timeout, state, [=]() {
+        if (++*ticks > 100) { timer->stop(); finish(false, "The file with a markup name did not open"); return; }
+        state->refresh();
+        bool open = false;
+        for (const auto &pane : state->frame().value("panes").toList())
+            for (const auto &tab : pane.toMap().value("tabs").toList())
+                open |= tab.toMap().value("title").toString() == name;
+        if (!open) return;
+        // Every text item showing the name, including the tab caption, its
+        // hint and menu entries that are not open, must be plain text.
+        int shown = 0;
+        QQuickItem *caption = nullptr;
+        QStringList texts;
+        // Delegates are not QObject children of the window; popups (hints,
+        // menus) are not visual children of their owners. Walk both trees.
+        QSet<QObject *> objects;
+        std::function<void(QObject *)> visit = [&](QObject *object) {
+            if (!object || objects.contains(object)) return;
+            objects.insert(object);
+            for (auto child : object->children()) visit(child);
+            if (auto item = qobject_cast<QQuickItem *>(object))
+                for (auto child : item->childItems()) visit(child);
+            if (object->metaObject()->indexOfProperty("contentItem") >= 0)
+                visit(object->property("contentItem").value<QObject *>());
+        };
+        visit(window);
+        visit(window->contentItem());
+        for (auto object : objects) {
+            if (!object->inherits("QQuickText") || !object->property("text").toString().contains(name)) continue;
+            ++shown;
+            texts.append(object->property("text").toString());
+            if (object->property("textFormat").toInt() != Qt::PlainText) {
+                timer->stop();
+                finish(false, QString("%1 \"%2\" may render markup").arg(object->metaObject()->className(), object->property("text").toString()));
+                return;
+            }
+            auto item = qobject_cast<QQuickItem *>(object);
+            if (item && item->isVisible() && object->property("text").toString() == name) caption = item;
+        }
+        if (shown < 2 || !caption) {
+            if (*ticks > 80) { timer->stop(); finish(false, QString("No visible tab caption among: %1").arg(texts.join(" | "))); }
+            return;
+        }
+        timer->stop();
+        // The caption is as wide as the literal name, tags included.
+        const QFontMetricsF metrics(caption->property("font").value<QFont>());
+        const qreal expected = metrics.horizontalAdvance(name), actual = caption->implicitWidth();
+        if (std::abs(actual - expected) > 3) {
+            finish(false, QString("Tab caption is %1 px wide; the literal name is %2 px").arg(actual).arg(expected));
+            return;
+        }
+        finish(true, QString("Markup in file names is shown literally in %1 text items").arg(shown));
+    });
+    timer->start(50);
+}
 void startSmoke(Bridge *state, QQuickWindow *window) {
+    // Signal tests terminate an idle running GUI from outside.
+    if (qEnvironmentVariable("SLATE_GUI_SMOKE_HOLD") == QLatin1String("event-loop")) {
+        std::fprintf(stderr, "Smoke startup: idle, unsaved=%s\n", state->frame().value("dirty").toBool() ? "yes" : "no");
+        return;
+    }
     if (qEnvironmentVariableIsSet("SLATE_GUI_WAIT_SMOKE")) { startWaitSmoke(state); return; }
     if (qEnvironmentVariableIsSet("SLATE_GUI_PRODUCTION_SMOKE") || qEnvironmentVariableIsSet("SLATE_GUI_GEOMETRY_SMOKE")) {startProductionSmoke(state,window);return;}
     if (!qEnvironmentVariableIsEmpty("SLATE_GUI_AUDIT_SMOKE")) { startAuditSmoke(state, window); return; }
+    if (!qEnvironmentVariableIsEmpty("SLATE_GUI_MARKUP_SMOKE")) { startMarkupSmoke(state, window); return; }
     if (QGuiApplication::desktopFileName() != "slate" ||
         QGuiApplication::windowIcon().pixmap(64, 64).isNull()) {
         qWarning("Application desktop identity or embedded SVG icon is missing");
@@ -2441,7 +2520,7 @@ void startSmoke(Bridge *state, QQuickWindow *window) {
         switch (*step) {
         case 0: {
             int fileIndex = -1;
-            const auto files = state->frame().value("files").toList();
+            const auto files = state->fileEntries();
             for (int i = 0; i < files.size(); ++i)
                 if (files[i].toMap().value("name") == "edit.txt") fileIndex = i;
             if (fileIndex < 0) return;
@@ -2564,7 +2643,7 @@ void startSmoke(Bridge *state, QQuickWindow *window) {
                 return;
             }
             int index = -1;
-            auto files = state->frame().value("files").toList();
+            auto files = state->fileEntries();
             for (int i = 0; i < files.size(); ++i)
                 if (files[i].toMap().value("name") == "second.txt")
                     index = i;

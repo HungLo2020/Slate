@@ -169,6 +169,8 @@ pub enum Reply {
     Outline(u64, Vec<crate::outline::Symbol>),
     /// Files rewritten by replace-in-files.
     Replaced(crate::picker::ReplaceReport),
+    /// Files undo-replace-in-files wrote back.
+    ReplaceUndone(crate::picker::RestoreReport),
     /// A formatter's output: (document, content version, text).
     Formatted(u64, u64, Result<String, String>),
     /// An external tool finished: (name, output mode, target, result).
@@ -416,11 +418,12 @@ fn spell(text: &str) -> Result<Vec<String>, String> {
         ("hunspell", &["-l"]),
         ("enchant-2", &["-l"]),
     ];
-    let (program, args) = checkers
+    // Run by absolute path: never a checker in the current folder.
+    let (program, path, args) = checkers
         .iter()
-        .find(|(program, _)| crate::fsio::which(program).is_some())
+        .find_map(|(program, args)| crate::fsio::which(program).map(|path| (program, path, args)))
         .ok_or("Install aspell, hunspell or enchant to check spelling")?;
-    let mut child = Command::new(program)
+    let mut child = crate::process::sanitize(&mut Command::new(path))
         .args(*args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
