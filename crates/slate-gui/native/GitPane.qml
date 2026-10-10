@@ -241,7 +241,8 @@ FocusScope {
             id: messageScroll
             Layout.fillWidth: true
             Layout.minimumWidth: 0
-            Layout.preferredHeight: Math.ceil(Math.max(66, metrics.height * 2 + 20))
+            // One line until the message needs more, up to six, then it scrolls.
+            Layout.preferredHeight: Math.ceil(Math.min(Math.max(message.implicitHeight, metrics.height + 2 * message.padding), metrics.height * 6 + 2 * message.padding))
             Layout.minimumHeight: Layout.preferredHeight
             Layout.maximumHeight: Layout.preferredHeight
             visible: view.repository && !view.compactHeight
@@ -271,7 +272,7 @@ FocusScope {
                 Accessible.description: "Press Ctrl+Enter to commit staged changes"
                 wrapMode: TextEdit.Wrap
                 selectByMouse: true
-                padding: 8
+                padding: 6
                 color: view.theme.textColor
                 selectionColor: view.theme.highlightColor
                 selectedTextColor: view.theme.highlightedTextColor

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.13 — 2026-10-10
+
+- Make the GUI menu bar and status bar fit one line of text instead of reserving full-size button height.
+- Size the Git commit message box to its text: one line when empty, growing to six lines before scrolling.
+- Name the system fixed-width font in the Settings font list, which showed it as a blank entry.
+
 ## 0.1.12 — 2026-10-10
 
 - Open folders consistently: Open Folder, Recent Projects, the palette and dropped folders all ask whether to use this window or a new one (or follow the new "Open folders in" setting). The current folder is shown instead of reopened, a folder open in another window is never opened twice without recovery, and new windows open offset from the one that started them.

@@ -423,11 +423,20 @@ ApplicationWindow {
         id: mainMenuBar
         objectName: "mainMenuBar"
         font: root.font
+        // The Basic style's menu items are at least 40 px tall; these fit
+        // their text instead.
         delegate: Basic.MenuBarItem {
+            id: menuBarItem
             objectName: "menu_" + text.replace("&", "")
             font: root.font
             leftPadding: 8
             rightPadding: 8
+            topPadding: 3
+            bottomPadding: 3
+            background: Rectangle {
+                implicitHeight: 0
+                color: menuBarItem.highlighted ? Theme.highlightColor : "transparent"
+            }
         }
         background: Rectangle {
             color: Theme.backgroundColor
@@ -1747,14 +1756,20 @@ ApplicationWindow {
         CommandMenuItem { actionId: "split-down"; commandPane: editorMenu.commandPane }
     }
     footer: Basic.ToolBar {
+        id: statusBar
         background: Rectangle {
             color: Theme.backgroundColor
         }
-        implicitHeight: statusRow.implicitHeight + 2 * Theme.smallSpacing
+        // One line of text: the bar's buttons are only as tall as that line.
+        readonly property int buttonHeight: Math.ceil(uiMetrics.height + 6)
+        implicitHeight: statusRow.implicitHeight + 4
         RowLayout {
             id: statusRow
             anchors.fill: parent
-            anchors.margins: Theme.smallSpacing
+            anchors.leftMargin: Theme.smallSpacing
+            anchors.rightMargin: 2
+            anchors.topMargin: 2
+            anchors.bottomMargin: 2
             Label {
                 id: statusLabel
                 objectName: "statusLabel"
@@ -1790,6 +1805,10 @@ ApplicationWindow {
                         {"id": "debug-stop", "text": "■", "tip": "Stop debugging"}
                     ]
                     delegate: ActionButton {
+                        compact: true
+                        implicitHeight: statusBar.buttonHeight
+                        topPadding: 0
+                        bottomPadding: 0
                         required property var modelData
                         objectName: "debug_" + modelData.id
                         text: modelData.text
@@ -1820,6 +1839,10 @@ ApplicationWindow {
                 elide: Text.ElideRight
             }
             ActionButton {
+                compact: true
+                implicitHeight: statusBar.buttonHeight
+                topPadding: 0
+                bottomPadding: 0
                 objectName: "problemCount"
                 readonly property var counts: root.frame.problems || [0, 0]
                 visible: counts[0] + counts[1] > 0
@@ -1829,6 +1852,10 @@ ApplicationWindow {
                 onClicked: root.invokeAction("problems")
             }
             ActionButton {
+                compact: true
+                implicitHeight: statusBar.buttonHeight
+                topPadding: 0
+                bottomPadding: 0
                 objectName: "restrictedMode"
                 visible: root.frame.trusted === false
                 text: "Restricted"
@@ -1852,6 +1879,10 @@ ApplicationWindow {
                 elide: Text.ElideMiddle
             }
             ActionButton {
+                compact: true
+                implicitHeight: statusBar.buttonHeight
+                topPadding: 0
+                bottomPadding: 0
                 text: "?"
                 onClicked: root.paletteWith("")
                 tip: root.frame.hints || "Keyboard shortcuts"
@@ -2571,10 +2602,12 @@ ApplicationWindow {
                         id: fontFamily
                         objectName: "settingsFontFamily"
                         Layout.preferredWidth: 220
-                        model: slate.fontFamilies
-                        currentIndex: Math.max(0, model.indexOf(root.settings.font_family || ""))
-                        displayText: currentIndex === 0 ? "System fixed-width font" : currentText
-                        onActivated: settingsDialog.configure("font-family", currentIndex === 0 ? "" : currentText)
+                        // The first family is "" (the desktop's fixed-width font);
+                        // the list names it, in the popup as well as when closed.
+                        readonly property var families: slate.fontFamilies
+                        model: ["System fixed-width font"].concat(families.slice(1))
+                        currentIndex: Math.max(0, families.indexOf(root.settings.font_family || ""))
+                        onActivated: settingsDialog.configure("font-family", currentIndex === 0 ? "" : families[currentIndex])
                     }
                     SpinBox {
                         objectName: "settingsFontSize"
