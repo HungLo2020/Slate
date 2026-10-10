@@ -301,11 +301,18 @@ is undoable. Reload Settings refreshes the cached files. Trimming is limited to
 10,000 affected lines per save; an unrepresentable encoding or oversized edit
 refuses the save without changing the buffer or file.
 
-GUI Open Folder creates another workspace window. TUI Open Folder switches the
-root, configuration, tools, Git, trust and recovery session, asking to save/discard
-unsaved buffers first. Recent Projects is available in the File menu and command
-palette. Window geometry is saved locally and clamped to available screens at
-startup. GUI Settings includes a shortcut editor for global/editor/terminal/debug
+Every way of opening a folder behaves the same: Open Folder, Recent Projects (File
+menu and command palette), `:open-folder`, and a folder opened as a file or dropped
+on the window from outside the workspace (folders inside it are shown in the file
+browser). The window's own folder is shown rather than opened again, and a folder
+already open in another Slate window is not opened twice. Otherwise the GUI asks
+whether to open it in this window or a new one; **Don't ask again**, or Settings →
+**Open folders in** (`open_folder_in = "ask" | "current" | "new"`), remembers the
+answer. Opening in this window, like TUI Open Folder, switches the root,
+configuration, tools, Git, trust and recovery session, asking to save/discard
+unsaved buffers first; its documents and terminals close. Window geometry is saved
+locally and clamped to available screens at startup; a window opened from another
+opens slightly offset rather than exactly over it. GUI Settings includes a shortcut editor for global/editor/terminal/debug
 scopes. `locking = true` / `--locking` enables advisory file-in-use warnings;
 these do not prevent editing and do not replace save-conflict detection.
 
@@ -430,12 +437,13 @@ Settings are saved automatically to `$XDG_CONFIG_HOME/slate/settings.toml`
 (normally `~/.config/slate/settings.toml`). The equivalent TOML fields are:
 
 ```toml
-file_startup = "editor-only"
+file_startup = "editor-only"     # the minimal and workspace profiles choose both
 directory_startup = "workspace"
 editor_theme = "dark"     # auto, dark, light
 terminal_theme = "editor" # editor (default), auto, dark, light
 files_theme = "editor"    # file browser: editor (default), auto (desktop), dark, light
 git_theme = "editor"      # Git pane: editor (default), auto (desktop), dark, light
+open_folder_in = "ask"    # GUI: ask, current (this window) or new (a new window)
 keymap = "default"        # or "nano"
 soft_wrap = false
 wrap_column = 80          # justify and hard wrap

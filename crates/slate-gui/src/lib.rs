@@ -86,9 +86,31 @@ struct GuiContext {
     git: u64,
     history: u64,
     global_keys: Option<BTreeMap<String, String>>,
+    /// The App session the caches above describe.
+    session: u64,
 }
 impl GuiContext {
+    /// Forget everything sent from a session replaced in place (opening a
+    /// folder in this window), so the next update describes the new one fully.
+    fn reset_if_replaced(&mut self) {
+        if self.session == self.app.session() {
+            return;
+        }
+        self.session = self.app.session();
+        self.revision = 0;
+        self.viewport.clear();
+        self.panes.clear();
+        self.editors.clear();
+        self.terminals.clear();
+        self.settings = None;
+        self.colors = None;
+        self.files = 0;
+        self.git = 0;
+        self.history = 0;
+        self.global_keys = None;
+    }
     fn new(app: App) -> Self {
+        let session = app.session();
         Self {
             app,
             revision: 0,
@@ -102,6 +124,7 @@ impl GuiContext {
             git: 0,
             history: 0,
             global_keys: None,
+            session,
         }
     }
 }
@@ -446,6 +469,7 @@ fn dispatch_gui(state: &mut GuiContext, request: serde_json::Value) -> String {
 }
 fn respond(state: &mut GuiContext, request: serde_json::Value) -> String {
     let action = request["action"].as_str().unwrap_or_default().to_owned();
+    state.reset_if_replaced();
     let app = &mut state.app;
     match action.as_str() {
         "file_dialog_context" => {
@@ -780,6 +804,54 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|e| e["name"] == ".."));
+        }
+    }
+    #[test]
+    fn opening_a_folder_in_this_window_sends_the_new_session_in_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("only-first.txt"), "1").unwrap();
+        std::fs::write(second.join("only-second.txt"), "2").unwrap();
+        let mut app = test_app(
+            &first,
+            Some(slate_core::preferences::StartupMode::Workspace),
+        )
+        .unwrap();
+        app.terminal_frontend = false;
+        app.refresh();
+        let mut state = GuiContext::new(app);
+        let update = serde_json::json!({"action":"update"});
+        settle(&mut state, &update);
+        request(
+            &mut state,
+            serde_json::json!({"action":"configure","name":"open-folder-in","value":"current"}),
+        );
+        request(
+            &mut state,
+            serde_json::json!({"action":"open_workspace","path":second}),
+        );
+        assert_eq!(state.app.root, second.canonicalize().unwrap());
+        // The replaced session's revisions may repeat the old ones: the next
+        // update must still describe it completely, never "unchanged".
+        let mut frame = request(&mut state, update.clone());
+        assert_ne!(frame["unchanged"], true);
+        assert!(frame["panes"].is_array());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let files = frame["files"].as_array().cloned().unwrap_or_default();
+            if files.iter().any(|e| e["name"] == "only-second.txt") {
+                assert!(!files.iter().any(|e| e["name"] == "only-first.txt"));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the new workspace's files never arrived"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            frame = request(&mut state, update.clone());
         }
     }
     #[test]

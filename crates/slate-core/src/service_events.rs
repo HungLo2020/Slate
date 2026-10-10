@@ -35,8 +35,16 @@ impl App {
                         if self.layout.view(pane).is_some() {
                             self.focus = pane;
                         }
-                        if let Err(e) = self.browse(path) {
-                            self.status = format!("Browse failed: {e:#}");
+                        // A folder inside the workspace is shown in the file
+                        // browser; any other folder opens as a workspace.
+                        let inside = path.canonicalize().is_ok_and(|p| p.starts_with(&self.root));
+                        let result = if inside {
+                            self.browse(path)
+                        } else {
+                            self.open_workspace(path)
+                        };
+                        if let Err(e) = result {
+                            self.status = format!("Open failed: {e:#}");
                         }
                     }
                 }

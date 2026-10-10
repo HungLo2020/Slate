@@ -364,7 +364,7 @@ impl App {
         }
     }
     /// Focus the pane showing the file browser, adding one if none does.
-    fn focus_file_browser(&mut self) -> Result<()> {
+    pub(crate) fn focus_file_browser(&mut self) -> Result<()> {
         if self.editor_only {
             self.expand_workspace()?;
         }

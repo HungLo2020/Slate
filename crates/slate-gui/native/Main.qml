@@ -2060,11 +2060,13 @@ ApplicationWindow {
         objectName: "choiceDialog"
         enter: Transition {}
         exit: Transition {}
-        readonly property var kinds: ["save-read-only", "save-elevated", "reload-changed", "file-changed", "quit", "trust", "confirm-replace", "trash-file", "discard-changes"]
+        readonly property var kinds: ["save-read-only", "save-elevated", "reload-changed", "file-changed", "quit", "trust", "confirm-replace", "trash-file", "discard-changes", "open-folder-where", "switch-workspace"]
         readonly property var prompt: root.frame.prompt || ({ "kind": "", "input": "" })
         readonly property var copy: ({
                 "save-read-only": ["Read-only file", "%1 is read-only. Overwrite it anyway?", "Overwrite", ""],
                 "trash-file": ["Move to Trash", "Move %1 to desktop Trash?", "Move to Trash", ""],
+                "open-folder-where": ["Open folder", "Open %1 in this window or in a new window? Opening it here replaces this window's documents and terminals.", "This Window", "New Window"],
+                "switch-workspace": ["Unsaved changes", "Save your changes before opening %1 in this window?", "Save All and Open", "Discard and Open"],
                 "discard-changes": prompt.replacement === "untracked" ? ["Discard changes", "Move the untracked file %1 to desktop Trash?", "Discard", ""] : ["Discard changes", "Discard the working changes to %1? This cannot be undone.", "Discard Changes", ""],
                 "save-elevated": ["Permission denied", "You do not have permission to write %1. Save it with administrator rights?", "Save as Administrator", ""],
                 "reload-changed": ["Reload from disk", "Reload %1 from disk and discard your unsaved changes?", "Reload", ""],
@@ -2080,6 +2082,7 @@ ApplicationWindow {
         closePolicy: Popup.CloseOnEscape
         onRejected: root.send({"action": "dismiss_prompt"})
         onClosed: Qt.callLater(root.focusPane)
+        onOpened: rememberPlace.checked = false
         contentItem: ColumnLayout {
             spacing: Theme.largeSpacing
             Label {
@@ -2088,6 +2091,14 @@ ApplicationWindow {
                 textFormat: Text.PlainText
                 wrapMode: Text.Wrap
                 text: choiceDialog.copy[1].replace("%1", choiceDialog.prompt.input)
+            }
+            // Where folders open can be remembered (Settings: Open folders in).
+            CheckBox {
+                id: rememberPlace
+                objectName: "choiceRemember"
+                visible: choiceDialog.prompt.kind === "open-folder-where"
+                text: "Don't ask again"
+                checked: false
             }
             Flow {
                 Layout.fillWidth: true
@@ -2098,6 +2109,8 @@ ApplicationWindow {
                     text: choiceDialog.copy[2]
                     highlighted: true
                     onClicked: {
+                        if (rememberPlace.visible && rememberPlace.checked)
+                            root.send({"action": "configure", "name": "open-folder-in", "value": "current"});
                         choiceDialog.close();
                         root.send({"action": "submit_prompt"});
                     }
@@ -2107,6 +2120,8 @@ ApplicationWindow {
                     visible: choiceDialog.copy[3].length > 0
                     text: choiceDialog.copy[3]
                     onClicked: {
+                        if (rememberPlace.visible && rememberPlace.checked)
+                            root.send({"action": "configure", "name": "open-folder-in", "value": "new"});
                         choiceDialog.close();
                         root.send({"action": "submit_prompt", "all": true});
                     }
@@ -2511,6 +2526,36 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     text: "Applies the next time Slate starts. F10 expands or collapses the current workspace."
                     wrapMode: Text.Wrap
+                }
+                Label {
+                    objectName: "settingsStartupProfile"
+                    Layout.fillWidth: true
+                    visible: root.settings.profile === "minimal" || root.settings.profile === "workspace"
+                    text: "The " + root.settings.profile + " profile chooses both startup modes. Changing one switches to the default profile."
+                    textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
+                    color: Theme.disabledTextColor
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    Label {
+                        text: "Open folders in"
+                        Layout.fillWidth: true
+                        Layout.minimumWidth: 0
+                        wrapMode: Text.Wrap
+                    }
+                    ComboBox {
+                        objectName: "settingsOpenFolderIn"
+                        textRole: "label"
+                        valueRole: "value"
+                        model: [
+                            { "value": "ask", "label": "Ask each time" },
+                            { "value": "current", "label": "This window" },
+                            { "value": "new", "label": "A new window" }
+                        ]
+                        currentIndex: Math.max(0, indexOfValue(root.settings.open_folder_in || "ask"))
+                        onActivated: settingsDialog.configure("open-folder-in", currentValue)
+                    }
                 }
                 Label {
                     text: "Editor"

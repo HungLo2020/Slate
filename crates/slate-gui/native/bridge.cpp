@@ -305,13 +305,25 @@ void Bridge::print() {
     connect(dialog, &QDialog::accepted, this, [printer, text]() { text->print(printer.get()); });
     dialog->open();
 }
+// Start another Slate window. It opens offset from this one (see
+// SLATE_GUI_CASCADE below) rather than exactly over it.
+static bool launchWindow(const QStringList &arguments, const QString &directory = {}) {
+    QProcess process;
+    process.setProgram(QCoreApplication::applicationFilePath());
+    process.setArguments(arguments);
+    if (!directory.isEmpty()) process.setWorkingDirectory(directory);
+    auto environment = QProcessEnvironment::systemEnvironment();
+    environment.insert("SLATE_GUI_CASCADE", "1");
+    process.setProcessEnvironment(environment);
+    return process.startDetached();
+}
 void Bridge::performRequests(const QVariantList &requests) {
     for (const auto &request : requests) {
         const auto name = request.toString();
         if (name.startsWith("open-workspace:")) {
             const auto log = qEnvironmentVariable("SLATE_GUI_NEW_WINDOW_LOG");
             if (!log.isEmpty()) { QFile file(log); if (file.open(QIODevice::Append)) file.write((name + "\n").toUtf8()); }
-            else if (!QProcess::startDetached(QCoreApplication::applicationFilePath(), {"--new-instance", name.mid(15)}))
+            else if (!launchWindow({"--new-instance", name.mid(15)}))
                 send({{"action","report_error"},{"message","Failed to open workspace window"}});
         } else if (name == "new-window") {
             const auto log = qEnvironmentVariable("SLATE_GUI_NEW_WINDOW_LOG");
@@ -321,8 +333,7 @@ void Bridge::performRequests(const QVariantList &requests) {
                 if (file.open(QIODevice::Append)) file.write("new-window\n");
                 continue;
             }
-            QProcess::startDetached(QCoreApplication::applicationFilePath(), {"--new-instance"},
-                                    m_frame.value("browser").toString());
+            launchWindow({"--new-instance"}, m_frame.value("browser").toString());
         } else if (name == "print") {
             QTimer::singleShot(0, this, &Bridge::print);
         } else if (name == "raise" && m_window) {
@@ -1519,6 +1530,10 @@ extern "C" int slate_qt_run(void *context, int argc, char **argv) {
     }
     auto window = qobject_cast<QQuickWindow *>(engine.rootObjects().first());
     state.setWindow(window);
+    // Set by the window that opened this one. Cleared so shells started
+    // here, and windows they start, do not inherit it.
+    const bool cascade = qEnvironmentVariableIsSet("SLATE_GUI_CASCADE");
+    qunsetenv("SLATE_GUI_CASCADE");
 #ifdef SLATE_SMOKE_TEST
     if (qEnvironmentVariableIsSet("SLATE_GUI_GEOMETRY_SMOKE"))
 #endif
@@ -1526,6 +1541,7 @@ extern "C" int slate_qt_run(void *context, int argc, char **argv) {
     // Keep normal geometry separately from maximized/fullscreen dimensions.
     auto geometrySettings = new QSettings(QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation) + "/slate/window.ini", QSettings::IniFormat, window);
     QRect saved = geometrySettings->value("geometry").toRect();
+    if (cascade && saved.isValid()) saved.translate(32, 32);
     QScreen *screen = QGuiApplication::screenAt(saved.center());
     if (!screen) screen = QGuiApplication::primaryScreen();
     if (screen && saved.isValid()) {

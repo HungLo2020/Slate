@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.12 — 2026-10-10
+
+- Open folders consistently: Open Folder, Recent Projects, the palette and dropped folders all ask whether to use this window or a new one (or follow the new "Open folders in" setting). The current folder is shown instead of reopened, a folder open in another window is never opened twice without recovery, and new windows open offset from the one that started them.
+- Choosing a startup mode in Settings now takes effect while the minimal or workspace profile is active: it switches to the default profile, keeping the profile's other startup choice, instead of silently snapping back.
+
 ## 0.1.11 — 2026-10-10
 
 - Theme the file browser and Git pane separately ("File browser theme", "Git pane theme"). Both use the editor's colours by default instead of the desktop's; they can follow the desktop (Qt) palette or use dark or light. Pane tabs, menus, hints and dialogs keep the desktop palette. Terminals now also use the editor's colours by default; their own dark palette remains a choice.

@@ -243,12 +243,16 @@ fn workspace_switch_cancel_and_gui_request_preserve_unsaved_documents() {
     assert!(a.pending_workspace.is_none());
     assert_eq!(a.root, root);
     assert_eq!(a.documents[&doc].text(), "keep me");
+    // The GUI asks where to open it; a new window leaves this one alone.
     a.terminal_frontend = false;
     a.open_workspace(dest.clone()).unwrap();
+    assert_eq!(a.prompt.as_ref().unwrap().kind, "open-folder-where");
+    a.submit_prompt(true).unwrap();
+    assert!(a.pending_workspace.is_none());
     assert_eq!(a.root, root);
     assert_eq!(
         a.frontend_requests.last().unwrap(),
-        &format!("open-workspace:{}", dest.display())
+        &format!("open-workspace:{}", dest.canonicalize().unwrap().display())
     );
     a.terminal_frontend = true;
     a.open_workspace(dest.clone()).unwrap();

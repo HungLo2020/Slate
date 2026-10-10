@@ -428,6 +428,26 @@ fn clean_store(dir: &Path) {
         }
     }
 }
+/// Whether another Slate process holds `root`'s workspace store, so the folder
+/// is open in another window. Never creates or keeps the lock.
+pub fn open_elsewhere(root: &Path) -> bool {
+    let hash = format!("{:x}", Sha256::digest(root.as_os_str().as_encoded_bytes()));
+    let path = crate::paths::state_dir()
+        .join("slate/workspaces")
+        .join(hash)
+        .join("lock");
+    let Ok(lock) = OpenOptions::new().read(true).write(true).open(&path) else {
+        return false;
+    };
+    match lock.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = fs2::FileExt::unlock(&lock);
+            false
+        }
+        Err(_) => true,
+    }
+}
+
 impl WorkspaceStore {
     pub fn acquire(root: &Path) -> Result<Self> {
         let state = crate::paths::state_dir();

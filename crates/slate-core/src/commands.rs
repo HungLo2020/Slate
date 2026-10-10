@@ -138,7 +138,7 @@ const ACTIONS: &[(&str, &str, &str, &str, &str)] = &[
     (
         "open-folder",
         "Open folder…",
-        "Browse a directory in the file pane",
+        "Open a folder as the workspace, in this window or a new one",
         "Path",
         "any",
     ),

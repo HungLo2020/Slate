@@ -1353,6 +1353,23 @@ static void startFileDialogSmoke(Bridge *state, QQuickWindow *window) {
             select(folder);
             break;
         case 12:
+            // Opening a folder asks where; choose a new window.
+            if (frame.value("prompt").toMap().value("kind") == "open-folder-where") {
+                QQuickItem *alternative = nullptr, *remember = nullptr;
+                for (auto candidate : window->contentItem()->findChildren<QQuickItem *>()) {
+                    if (!candidate->isVisible()) continue;
+                    if (candidate->objectName() == "choiceAlternative") alternative = candidate;
+                    if (candidate->objectName() == "choiceRemember") remember = candidate;
+                }
+                if (!alternative || !remember) return;
+                if (alternative->property("text") != "New Window") {
+                    finish(false, "Open folder question lacks a New Window choice");
+                    return;
+                }
+                QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                    alternative->mapToScene(QPointF(alternative->width() / 2, alternative->height() / 2)).toPoint());
+                return;
+            }
             if (!read(requests).contains(("open-workspace:" + folder).toUtf8())) return;
             if (frame.value("browser") != dir + "/workspace") { finish(false, "Opening a workspace changed the existing window root"); return; }
             if (state->send({{"action", "file_dialog_context"}}).value("path") != scratch) {

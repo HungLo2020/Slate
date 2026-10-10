@@ -2,6 +2,11 @@
 use crate::*;
 
 impl App {
+    /// Open a folder as a workspace. Every route (Open Folder, recent projects,
+    /// the palette, a folder dropped or opened as a file) comes here, so they
+    /// agree: this window's own folder is shown, one open in another window is
+    /// not opened twice, and otherwise the GUI asks (or follows
+    /// "open-folder-in") whether to use this window or a new one.
     pub(crate) fn open_workspace(&mut self, path: PathBuf) -> Result<()> {
         let path = if path.is_absolute() {
             path
@@ -12,13 +17,43 @@ impl App {
         if !path.is_dir() {
             bail!("Select a workspace folder");
         }
-        if !self.terminal_frontend {
-            self.frontend_requests
-                .push(format!("open-workspace:{}", path.display()));
-        } else if path == self.root {
+        if path == self.root {
             self.expand_workspace()?;
             self.browse(path)?;
-        } else if !self.saves.pending_save.is_empty() {
+            self.focus_file_browser()?;
+            self.status = "This folder is already open in this window".into();
+            return Ok(());
+        }
+        if workspace::open_elsewhere(&path) {
+            bail!("{} is already open in another Slate window", path.display());
+        }
+        let place = if self.terminal_frontend {
+            "current"
+        } else {
+            self.preferences.open_folder_in.as_str()
+        };
+        match place {
+            "new" => self.open_workspace_window(&path),
+            "current" => self.open_workspace_here(path)?,
+            _ => {
+                self.pending_workspace = Some(path.clone());
+                self.prompt = Some(search::Prompt {
+                    kind: "open-folder-where".into(),
+                    input: path.display().to_string(),
+                    ..Default::default()
+                });
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn open_workspace_window(&mut self, path: &Path) {
+        self.frontend_requests
+            .push(format!("open-workspace:{}", path.display()));
+        self.status = format!("Opening {} in a new window", path.display());
+    }
+    /// Replace this window's workspace, asking first about unsaved changes.
+    pub(crate) fn open_workspace_here(&mut self, path: PathBuf) -> Result<()> {
+        if !self.saves.pending_save.is_empty() {
             bail!("Wait for saves to finish before switching workspaces");
         } else if self.dirty() {
             self.pending_workspace = Some(path.clone());
@@ -46,6 +81,8 @@ impl App {
         next.terminal_frontend = self.terminal_frontend;
         next.elevation_mode = self.elevation_mode;
         next.inbox = self.inbox.clone();
+        // Frontends that cache the session's content start over.
+        next.session = self.session + 1;
         next.enable_workspace(true)?;
         self.flush_workspace()?;
         *self = next;
@@ -184,6 +221,7 @@ impl App {
         let mut app = Self {
             browser: root.clone(),
             pending_workspace: None,
+            session: 0,
             root: root.clone(),
             documents,
             views,

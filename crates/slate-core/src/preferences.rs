@@ -40,6 +40,9 @@ pub struct Preferences {
     /// editor's colours, `auto` the desktop's, or `dark`/`light`.
     pub files_theme: String,
     pub git_theme: String,
+    /// Where the GUI opens another folder: `ask` (the default), `current`
+    /// (this window) or `new` (a new window). The TUI has one window.
+    pub open_folder_in: String,
     pub file_startup: StartupMode,
     pub directory_startup: StartupMode,
     /// `default` or `nano`. Choosing a keymap replaces the key tables below.
@@ -292,6 +295,7 @@ impl Default for Preferences {
             terminal_theme: "editor".into(),
             files_theme: "editor".into(),
             git_theme: "editor".into(),
+            open_folder_in: "ask".into(),
             file_startup: StartupMode::EditorOnly,
             directory_startup: StartupMode::Workspace,
             keymap: "default".into(),
@@ -393,6 +397,11 @@ pub const SETTINGS: &[Setting] = &[
         kind: SettingKind::Choice(PANE_THEMES),
     },
     Setting {
+        name: "open-folder-in",
+        label: "Open folders in (GUI)",
+        kind: SettingKind::Choice(&["ask", "current", "new"]),
+    },
+    Setting {
         name: "keymap",
         label: "Keymap",
         kind: SettingKind::Choice(&["default", "nano"]),
@@ -487,6 +496,7 @@ impl Preferences {
             "terminal-theme" => self.terminal_theme.clone(),
             "files-theme" => self.files_theme.clone(),
             "git-theme" => self.git_theme.clone(),
+            "open-folder-in" => self.open_folder_in.clone(),
             "keymap" => self.keymap.clone(),
             "soft-wrap" => self.soft_wrap.to_string(),
             "wrap-column" => self.wrap_column.to_string(),
@@ -569,6 +579,9 @@ impl Preferences {
         }
         if !PANE_THEMES.contains(&self.git_theme.as_str()) {
             bail!("git_theme must be editor, auto, dark or light");
+        }
+        if !["ask", "current", "new"].contains(&self.open_folder_in.as_str()) {
+            bail!("open_folder_in must be ask, current or new");
         }
         if !["default", "nano"].contains(&self.keymap.as_str()) {
             bail!("keymap must be default or nano");
@@ -807,6 +820,7 @@ impl App {
                 bail!("Not saving over settings.toml until it is fixed: {e:#}");
             }
         }
+        let profile = self.preference_layers.base.profile.clone();
         if name == "profile" {
             return self.select_profile(value);
         }
@@ -833,8 +847,28 @@ impl App {
                 "terminal-theme" => settings.terminal_theme = value.into(),
                 "files-theme" => settings.files_theme = value.into(),
                 "git-theme" => settings.git_theme = value.into(),
-                "file-startup" => settings.file_startup = value.parse()?,
-                "directory-startup" => settings.directory_startup = value.parse()?,
+                "open-folder-in" => settings.open_folder_in = value.into(),
+                "file-startup" | "directory-startup" => {
+                    // The minimal and workspace profiles choose both startup
+                    // modes. Choosing one here leaves them for the default
+                    // profile, keeping the profile's choice for the other.
+                    let forced = match settings.profile.as_str() {
+                        "minimal" => Some(StartupMode::EditorOnly),
+                        "workspace" => Some(StartupMode::Workspace),
+                        _ => None,
+                    };
+                    if let Some(mode) = forced {
+                        settings.file_startup = mode;
+                        settings.directory_startup = mode;
+                        settings.profile = "default".into();
+                    }
+                    let mode = value.parse()?;
+                    if name == "file-startup" {
+                        settings.file_startup = mode;
+                    } else {
+                        settings.directory_startup = mode;
+                    }
+                }
                 "keymap" => {
                     let (global, editor, terminal) = keymap(value)?;
                     settings.keymap = value.into();
@@ -871,7 +905,13 @@ impl App {
             Ok(())
         })?;
         self.load_preferences();
-        self.status = format!("Set {name} to {value}");
+        self.status = if self.preference_layers.base.profile == profile {
+            format!("Set {name} to {value}")
+        } else {
+            format!(
+                "Set {name} to {value}; the {profile} profile chose startup, so the default profile is active"
+            )
+        };
         Ok(())
     }
     pub(super) fn apply_pane_colors(&mut self) {
@@ -1000,6 +1040,37 @@ mod tests {
         let migrated = Preferences::load().unwrap();
         assert_eq!(migrated.editor_theme, "light");
         assert_eq!(migrated.terminal_theme, "editor");
+    }
+
+    #[test]
+    fn choosing_a_startup_mode_leaves_a_profile_that_forces_it() {
+        let _env = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", dir.path().join("config"));
+        std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, "hello").unwrap();
+        let mut app = crate::App::new(&file).unwrap();
+        app.configure("profile", "workspace").unwrap();
+        assert_eq!(app.preferences.file_startup, StartupMode::Workspace);
+        // The choice takes effect instead of snapping back to the profile's.
+        app.configure("file-startup", "editor-only").unwrap();
+        assert_eq!(app.preferences.profile, "default");
+        assert_eq!(app.preferences.file_startup, StartupMode::EditorOnly);
+        // The profile's choice for the other mode is kept.
+        assert_eq!(app.preferences.directory_startup, StartupMode::Workspace);
+        assert!(app.status.contains("default profile"), "{}", app.status);
+        let saved = Preferences::load().unwrap();
+        assert_eq!(saved.profile, "default");
+        assert_eq!(saved.file_startup, StartupMode::EditorOnly);
+        assert_eq!(saved.directory_startup, StartupMode::Workspace);
+        // On the default profile, startup choices change nothing else.
+        app.configure("directory-startup", "editor-only").unwrap();
+        assert_eq!(app.preferences.profile, "default");
+        assert_eq!(app.preferences.directory_startup, StartupMode::EditorOnly);
+        assert_eq!(app.status, "Set directory-startup to editor-only");
     }
 
     #[test]

@@ -574,6 +574,8 @@ pub struct App {
     pub clipboard: String,
     browser: PathBuf,
     pending_workspace: Option<PathBuf>,
+    /// Counts in-place workspace switches, which replace the whole session.
+    session: u64,
     files: Vec<Entry>,
     expanded_folders: std::collections::BTreeSet<PathBuf>,
     pending_file: Option<PathBuf>,
@@ -734,6 +736,11 @@ impl App {
     }
     pub fn events(&self) -> events::Events {
         self.events.clone()
+    }
+    /// Changes when the workspace is replaced in place: frontends then drop
+    /// everything they cached from the previous session.
+    pub fn session(&self) -> u64 {
+        self.session
     }
     pub fn revision(&self) -> u64 {
         self.revision.wrapping_add(self.events.generation())
@@ -1111,6 +1118,18 @@ impl App {
             "confirm-replace" => {
                 self.prompt = None;
                 self.replace_in_files(&p.replacement)?;
+            }
+            "open-folder-where" => {
+                self.prompt = None;
+                let path = self
+                    .pending_workspace
+                    .take()
+                    .context("No workspace selected")?;
+                if all {
+                    self.open_workspace_window(&path);
+                } else {
+                    self.open_workspace_here(path)?;
+                }
             }
             "switch-workspace" => {
                 self.prompt = None;
@@ -1564,7 +1583,7 @@ impl App {
             Command::DismissPrompt => {
                 let kind = self.prompt.take().map(|p| p.kind).unwrap_or_default();
                 self.pending_close = None;
-                if kind == "switch-workspace" {
+                if matches!(kind.as_str(), "switch-workspace" | "open-folder-where") {
                     self.pending_workspace = None;
                 }
                 if matches!(
