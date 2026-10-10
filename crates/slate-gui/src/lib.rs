@@ -730,6 +730,13 @@ mod tests {
         let update = serde_json::json!({"action":"update"});
         settle(&mut state, &update);
         let initial = request(&mut state, snapshot.clone());
+        // Tree decorations: ignore state per row, and the root Git paths use.
+        assert!(initial["git_root"].is_string());
+        assert!(initial["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["ignored"].is_boolean()));
         assert!(!initial["files"]
             .as_array()
             .unwrap()

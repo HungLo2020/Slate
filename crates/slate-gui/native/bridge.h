@@ -7,6 +7,7 @@
 #include <QPointer>
 #include <QQuickImageProvider>
 #include <QTimer>
+#include <QUrl>
 #include <QObject>
 #include <QQuickPaintedItem>
 #include <QQuickWindow>
@@ -76,6 +77,8 @@ class Bridge : public QObject {
     Q_PROPERTY(QAbstractItemModel *files READ files CONSTANT)
     Q_PROPERTY(QAbstractItemModel *git READ git CONSTANT)
     Q_PROPERTY(QVariantList gitEntries READ gitEntries NOTIFY gitChanged)
+    // The browsed folder is below the workspace root (its listing starts with "..").
+    Q_PROPERTY(bool browserNested READ browserNested NOTIFY filesChanged)
     Q_PROPERTY(int cellWidth READ cellWidth NOTIFY fontChanged)
     Q_PROPERTY(int cellHeight READ cellHeight NOTIFY fontChanged)
     Q_PROPERTY(bool pathDialogOpen READ pathDialogOpen NOTIFY pathDialogOpenChanged)
@@ -94,6 +97,9 @@ class Bridge : public QObject {
     // converted to JavaScript whenever it changes.
     QVariantList gitEntries() const { return m_git.rows(); }
     QVariantList fileEntries() const { return m_files.rows(); }
+    Q_INVOKABLE QVariantMap fileEntry(int row) const {
+        return row >= 0 && row < m_files.rows().size() ? m_files.rows().at(row).toMap() : QVariantMap();
+    }
     const TerminalGrid *terminal(int pane) const {
         const auto found = m_terminals.constFind(pane);
         return found == m_terminals.cend() ? nullptr : &found.value();
@@ -108,6 +114,7 @@ class Bridge : public QObject {
     Q_INVOKABLE QVariantList commands(const QString &query);
     Q_INVOKABLE QVariantMap commandInfo(const QString &id, int pane = 0, int row = -1);
     Q_INVOKABLE QString localPath(const QUrl &url) const;
+    Q_INVOKABLE QUrl fileUrl(const QString &path) const { return QUrl::fromLocalFile(path); }
     Q_INVOKABLE bool hasIcon(const QString &name) const;
     // The complete native content of a pane (tests and accessibility tools).
     Q_INVOKABLE QVariantMap surface(int pane) const;
@@ -123,6 +130,9 @@ class Bridge : public QObject {
     void detachView(int id, CellView *view);
     Q_INVOKABLE void paneHeader(int height);
     Q_INVOKABLE void copyClipboard();
+    // Put plain text (such as a file path) on the desktop clipboard.
+    Q_INVOKABLE void copyText(const QString &text);
+    bool browserNested() const;
     Q_INVOKABLE void pasteClipboard();
     Q_INVOKABLE void exit();
     Q_INVOKABLE void key(int code, const QString &text, int modifiers, quint32 scanCode = 0);

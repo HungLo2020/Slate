@@ -108,7 +108,10 @@ all tabs replace the full tab row. The tab model changes only when titles or
 active tabs change, so editing does not recreate controls. Git views receive
 repository/selection metadata without editor or PTY screen payloads. File/Git
 lists reserve separate scrollbar
-gutters. Buttons own their measured background and caption to avoid native style
+gutters. Directory listings mark entries excluded by ignore rules rather than
+omitting them; the GUI tree dims them, colors names from Git status using the
+repository root the snapshot carries, and receives expand/collapse as row
+insertions and removals so delegates and scroll position survive. Buttons own their measured background and caption to avoid native style
 insets clipping controls or painting captions twice. Git controls wrap at narrow
 widths, and a compact commit dialog preserves list space in short panes. Toolbar
 actions collapse into the menu. Focus borders, active tab

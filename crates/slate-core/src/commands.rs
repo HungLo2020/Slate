@@ -115,6 +115,20 @@ const ACTIONS: &[(&str, &str, &str, &str, &str)] = &[
         "files",
     ),
     (
+        "collapse-all-folders",
+        "Collapse all folders",
+        "Collapse every expanded explorer folder",
+        "",
+        "files",
+    ),
+    (
+        "terminal-here",
+        "Open terminal here",
+        "Start a terminal in the selected folder, or the selected file's folder",
+        "",
+        "file-entry",
+    ),
+    (
         "open",
         "Open file…",
         "Open a file or browse a directory",

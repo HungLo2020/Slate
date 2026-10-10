@@ -122,13 +122,16 @@ pub(crate) fn listing(
         if depth > 16 || out.len() >= 100_000 {
             return Ok(());
         }
+        let visible = unignored_children(path);
         let mut rows: Vec<_> = fs::read_dir(path)?
             .take(100_000 - out.len())
             .filter_map(Result::ok)
             .map(|e| {
                 let directory = e.path().is_dir();
+                let name = e.file_name();
                 Entry {
-                    name: e.file_name().to_string_lossy().into_owned(),
+                    ignored: name == ".git" || visible.as_ref().is_some_and(|v| !v.contains(&name)),
+                    name: name.to_string_lossy().into_owned(),
                     path: e.path().to_string_lossy().into_owned(),
                     directory,
                     depth,
@@ -166,10 +169,36 @@ pub(crate) fn listing(
             directory: true,
             depth: 0,
             expanded: false,
+            ignored: false,
         });
     }
     children(root, workspace, 0, expanded, tree, &mut rows)?;
     Ok(rows)
+}
+
+/// The names in `folder` that ignore rules (`.gitignore`, `.ignore`, Git's
+/// exclude files, as project search reads them) keep; hidden files count as
+/// kept. `None` when the folder cannot be walked, so nothing is marked.
+fn unignored_children(folder: &Path) -> Option<std::collections::HashSet<std::ffi::OsString>> {
+    let mut kept = std::collections::HashSet::new();
+    let walk = ignore::WalkBuilder::new(folder)
+        .max_depth(Some(1))
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .ignore(true)
+        .parents(true)
+        .follow_links(false)
+        .require_git(false)
+        .build();
+    for entry in walk {
+        let entry = entry.ok()?;
+        if entry.depth() == 1 {
+            kept.insert(entry.file_name().to_os_string());
+        }
+    }
+    Some(kept)
 }
 
 impl App {
@@ -262,6 +291,31 @@ impl App {
                     }
                     self.refresh();
                 }
+            }
+            // The TUI browses one folder at a time; collapsing everything
+            // returns it to the workspace root.
+            "collapse-all-folders" if self.terminal_frontend => self.browse(self.root.clone())?,
+            "collapse-all-folders" => {
+                self.expanded_folders.clear();
+                self.refresh();
+            }
+            "terminal-here" => {
+                let path = if argument.is_empty() {
+                    selected()?
+                } else {
+                    PathBuf::from(argument)
+                };
+                let folder = if path.is_dir() {
+                    path
+                } else {
+                    path.parent()
+                        .context("Select a file or folder")?
+                        .to_path_buf()
+                };
+                let folder = workspace_directory(&folder, &self.root)?;
+                self.expand_workspace()?;
+                let id = self.new_terminal_in(&folder)?;
+                self.add_tab(crate::layout::View::Terminal(id));
             }
             _ => bail!("Unknown file action"),
         }
@@ -358,6 +412,27 @@ impl App {
 mod tests {
     use super::*;
 
+    #[test]
+    fn listing_marks_ignored_entries_without_hiding_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("target/debug")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join(".gitignore"), "target/\n*.log\n").unwrap();
+        fs::write(root.join("build.log"), "").unwrap();
+        fs::write(root.join(".env"), "").unwrap();
+        fs::write(root.join("src/main.rs"), "").unwrap();
+        fs::write(root.join("src/trace.log"), "").unwrap();
+        let rows = listing(&root, &root, &[root.join("src")], true).unwrap();
+        let ignored = |name: &str| rows.iter().find(|e| e.name == name).unwrap().ignored;
+        assert!(ignored(".git") && ignored("target") && ignored("build.log"));
+        assert!(ignored("trace.log"), "nested rows use their parents' rules");
+        // Hidden files are not ignored files.
+        assert!(!ignored(".env") && !ignored(".gitignore") && !ignored("src"));
+        assert!(!ignored("main.rs"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn tree_listing_does_not_follow_symlinks_outside_the_workspace() {
@@ -414,6 +489,7 @@ mod tests {
             directory: false,
             depth: 0,
             expanded: false,
+            ignored: false,
         }];
         let id = *app.documents.keys().next().unwrap();
         app.documents

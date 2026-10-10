@@ -218,6 +218,7 @@ impl App {
                 entries.clone()
             },
             browser: self.browser.to_string_lossy().into_owned(),
+            git_root: self.git.top.clone(),
             search: self.search.clone(),
             status: self.visible_status(),
             dirty: self.dirty(),

@@ -483,6 +483,8 @@ pub struct Snapshot {
     pub files: std::sync::Arc<Vec<Entry>>,
     pub git: std::sync::Arc<Vec<GitEntry>>,
     pub browser: String,
+    /// The repository top that `git` entry paths are relative to.
+    pub git_root: String,
     pub search: Search,
     pub status: String,
     pub dirty: bool,
@@ -2003,8 +2005,13 @@ impl App {
         self.refresh_git();
     }
     fn new_terminal(&mut self) -> Result<u64> {
+        self.new_terminal_in(&self.root.clone())
+    }
+    /// A terminal session starting in `folder` (the workspace root when it
+    /// is not a folder).
+    pub(crate) fn new_terminal_in(&mut self, folder: &Path) -> Result<u64> {
         let id = self.id();
-        let terminal = self.spawn_shell(&self.root.clone())?;
+        let terminal = self.spawn_shell(folder)?;
         self.terminals.insert(id, terminal);
         Ok(id)
     }
@@ -3052,6 +3059,8 @@ const ACTION_VERBS: &[&str] = &[
     "toggle-folder",
     "expand-folder",
     "collapse-folder",
+    "collapse-all-folders",
+    "terminal-here",
     "move-left",
     "move-right",
     "move-up",

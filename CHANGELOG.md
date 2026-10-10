@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.10 — 2026-10-10
+
+- Redesign the GUI file tree: theme file-type icons, indent guides, denser rows, focus-aware selection, Git status colors and folder markers, dimmed ignored entries, a folder header with up, new, collapse-all and refresh actions, an "Up to …" parent row, a useful empty state and path hints only for truncated names.
+- Expand and collapse GUI folders without rebuilding the list or losing its scroll position.
+- Add "Collapse all folders" and "Open terminal here" actions to both interfaces, and copy-path, relative-path and containing-folder entries to the GUI file menu.
+
 ## 0.1.9 — 2026-10-10
 
 - Fix crashes from rectangular selection over lines ending in non-ASCII text and from a zero `tab_width` in project settings.

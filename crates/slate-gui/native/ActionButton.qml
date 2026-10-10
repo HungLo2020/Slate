@@ -16,7 +16,11 @@ Basic.Button {
             "view-refresh": "↻",
             "view-more-symbolic": "⋮",
             "arrow-down": "▾",
-            "vcs-diff": "≠"
+            "vcs-diff": "≠",
+            "go-up": "↑",
+            "collapse-all": "⊟",
+            "document-new": "+",
+            "folder-new": "⊞"
         })[iconName] || "⋯"
     flat: false
     property bool compact: false

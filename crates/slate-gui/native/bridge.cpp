@@ -70,21 +70,40 @@ QPixmap IconProvider::requestPixmap(const QString &id, QSize *size, const QSize 
     return pixmap;
 }
 
+// Expanding or collapsing a folder inserts or removes one run of rows. Report
+// that run instead of resetting the model, so views keep their delegates and
+// scroll position and only the changed rows are rebuilt.
 void EntryModel::replace(const QVariantList &rows) {
     if (rows == m_rows)
         return;
-    if (rows.size() != m_rows.size()) {
-        beginResetModel();
-        m_rows = rows;
-        endResetModel();
-        return;
+    const qsizetype oldSize = m_rows.size(), newSize = rows.size();
+    qsizetype prefix = 0;
+    while (prefix < oldSize && prefix < newSize && m_rows[prefix] == rows[prefix])
+        ++prefix;
+    qsizetype suffix = 0;
+    while (suffix < oldSize - prefix && suffix < newSize - prefix &&
+           m_rows[oldSize - 1 - suffix] == rows[newSize - 1 - suffix])
+        ++suffix;
+    // The differing middle: rows present in both are updated in place, and
+    // the remainder is inserted or removed after them.
+    const qsizetype oldMiddle = oldSize - prefix - suffix, newMiddle = newSize - prefix - suffix;
+    const qsizetype common = qMin(oldMiddle, newMiddle);
+    for (qsizetype i = prefix; i < prefix + common; ++i)
+        m_rows[i] = rows[i];
+    if (common > 0)
+        emit dataChanged(index(int(prefix)), index(int(prefix + common - 1)));
+    const int first = int(prefix + common);
+    if (newMiddle > oldMiddle) {
+        beginInsertRows({}, first, int(first + newMiddle - oldMiddle - 1));
+        for (qsizetype i = first; i < prefix + newMiddle; ++i)
+            m_rows.insert(i, rows[i]);
+        endInsertRows();
+    } else if (oldMiddle > newMiddle) {
+        beginRemoveRows({}, first, int(first + oldMiddle - newMiddle - 1));
+        m_rows.remove(first, oldMiddle - newMiddle);
+        endRemoveRows();
     }
-    for (int i = 0; i < rows.size(); ++i) {
-        if (rows[i] != m_rows[i]) {
-            m_rows[i] = rows[i];
-            emit dataChanged(index(i), index(i));
-        }
-    }
+    Q_ASSERT(m_rows == rows);
 }
 QStringList Bridge::encodings() const {
     return {"UTF-8", "UTF-16LE", "UTF-16BE", "ISO-8859-1", "windows-1252", "ISO-8859-15", "ISO-8859-2",
@@ -545,6 +564,13 @@ void Bridge::refresh() {
     emit frameChanged();
     emit refreshFinished();
     if (frame.value("quit").toBool()) QCoreApplication::quit();
+}
+void Bridge::copyText(const QString &text) {
+    if (auto clipboard = QGuiApplication::clipboard())
+        clipboard->setText(text);
+}
+bool Bridge::browserNested() const {
+    return !m_files.rows().isEmpty() && m_files.rows().first().toMap().value("name") == QLatin1String("..");
 }
 void Bridge::copyClipboard() { send({{"action", "copy"}}); scheduleRefresh(); }
 void Bridge::pasteClipboard() { send({{"action", "paste"}}); scheduleRefresh(); }

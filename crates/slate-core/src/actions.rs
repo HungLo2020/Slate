@@ -891,8 +891,15 @@ impl App {
             }
             "insert-file" => self.insert_file(argument)?,
             "profile-save" | "profile-load" => self.profile_action(name, argument)?,
-            "new-file" | "new-folder" | "rename-file" | "trash-file" | "toggle-folder"
-            | "expand-folder" | "collapse-folder" => self.file_action(name, argument)?,
+            "new-file"
+            | "new-folder"
+            | "rename-file"
+            | "trash-file"
+            | "toggle-folder"
+            | "expand-folder"
+            | "collapse-folder"
+            | "collapse-all-folders"
+            | "terminal-here" => self.file_action(name, argument)?,
             "save-all" => self.save_all(false)?,
             "reload" => {
                 let (_, v) = self.editor_view()?;

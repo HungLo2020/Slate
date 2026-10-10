@@ -94,6 +94,9 @@ pub struct Entry {
     pub directory: bool,
     pub depth: usize,
     pub expanded: bool,
+    /// Excluded by `.gitignore`/`.ignore` rules, or Git's own folder.
+    /// Frontends may de-emphasize these rows; they are still listed.
+    pub ignored: bool,
 }
 pub use crate::git::{GitEntry, GitState};
 pub enum Job {

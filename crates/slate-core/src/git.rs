@@ -62,6 +62,9 @@ pub(crate) struct Panel {
     /// The repository is in a folder the user has not trusted, so Git (which
     /// can run programs named by repository configuration) does not run.
     pub restricted: bool,
+    /// The repository's top folder, which status paths are relative to;
+    /// empty outside a repository.
+    pub top: String,
 }
 impl Default for Panel {
     fn default() -> Self {
@@ -76,6 +79,7 @@ impl Default for Panel {
             status_running: false,
             status_again: false,
             restricted: false,
+            top: String::new(),
         }
     }
 }
@@ -581,6 +585,10 @@ impl App {
                 return;
             }
         };
+        let top = context.root.to_string_lossy();
+        if self.git.top != top {
+            self.git.top = top.into_owned();
+        }
         if !trusted {
             if !self.git.restricted {
                 self.git.entries.clear();
