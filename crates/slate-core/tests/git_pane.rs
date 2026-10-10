@@ -223,6 +223,8 @@ fn discarding_restores_files_and_reveal_selects_them_in_both_interfaces() {
         // Revealing showed the Files tab of the shared side pane.
         app.dispatch(Command::Focus { pane });
         app.dispatch(Command::AddView { kind: "git".into() });
+        // Revealing refreshed Git; discarding waits for running operations.
+        common::settle(&mut app, "idle Git", idle);
         app.dispatch(Command::Click {
             pane,
             row: working,

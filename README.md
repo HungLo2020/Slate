@@ -433,7 +433,9 @@ Settings are saved automatically to `$XDG_CONFIG_HOME/slate/settings.toml`
 file_startup = "editor-only"
 directory_startup = "workspace"
 editor_theme = "dark"     # auto, dark, light
-terminal_theme = "dark"   # auto, dark, light, editor
+terminal_theme = "editor" # editor (default), auto, dark, light
+files_theme = "editor"    # file browser: editor (default), auto (desktop), dark, light
+git_theme = "editor"      # Git pane: editor (default), auto (desktop), dark, light
 keymap = "default"        # or "nano"
 soft_wrap = false
 wrap_column = 80          # justify and hard wrap
@@ -446,8 +448,10 @@ complete_while_typing = true
 accept_completion_on_enter = true
 ```
 
-Editor and terminal themes are independent. Their dark defaults use charcoal
-backgrounds (`#1b1e26` and `#14171c`) while GUI menus and dialogs keep the desktop
+Editor and terminal themes are independent. The editor defaults to a dark
+charcoal background (`#1b1e26`); terminals, the file browser and the Git pane
+follow the editor's colors unless themed separately (the terminal's own `dark`
+palette is `#14171c`), while GUI menus, dialogs and pane tabs keep the desktop
 palette. `auto` follows the desktop palette in the GUI and uses a dark fallback
 in the TUI. Terminal `editor` follows the editor's colors, including selection.
 Terminal ANSI colors adapt to light/dark backgrounds; explicit application RGB
@@ -756,7 +760,9 @@ commands discard unsaved work. GUI window closure asks before discarding.
 `set` writes `$XDG_CONFIG_HOME/slate/settings.toml` (normally
 `~/.config/slate/settings.toml`). Supported options: `indent-width` (1–16),
 `insert-spaces`, `auto-indent`, `line-numbers` (booleans), `editor-theme`
-(`auto`, `dark`, `light`), `terminal-theme` (`auto`, `dark`, `light`, `editor`),
+(`auto`, `dark`, `light`), `terminal-theme` (`auto`, `dark`, `light`, `editor`), `files-theme` and
+`git-theme` (`editor`, `auto`, `dark`, `light`; the file browser and Git pane use
+the editor's colours unless set, and `auto` follows the desktop),
 `theme` (an alias for `editor-theme`), `keymap` (`default`, `nano`; choosing one replaces the
 key tables), `soft-wrap`, `wrap-column` (10–500), `hard-wrap`, `backup`,
 `file-recovery`, `tui-mouse`, `terminal-clipboard`, `complete-while-typing`

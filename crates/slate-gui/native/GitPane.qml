@@ -30,6 +30,8 @@ FocusScope {
     signal commitRequested(string message)
     property alias compactComposer: commitDialog
     required property bool committing
+    // The pane's colours (Settings: Git pane theme); popups keep the desktop's.
+    property var theme: Theme
     // The graph's state lives with the window, so recreated panes keep it.
     required property bool graphOpen
     required property real graphShare
@@ -142,6 +144,7 @@ FocusScope {
                 width: header.stacked ? header.width : Math.max(0, header.width - tools.width - 8)
                 spacing: 2
                 ActionButton {
+                    theme: view.theme
                     id: branchButton
                     objectName: "gitBranch_" + view.paneId
                     visible: view.repository
@@ -158,6 +161,7 @@ FocusScope {
                     onClicked: branchMenu.popup()
                 }
                 ActionButton {
+                    theme: view.theme
                     objectName: "gitSync_" + view.paneId
                     Layout.minimumWidth: implicitWidth
                     visible: view.repository && !!view.frame.git_upstream && (view.frame.git_ahead > 0 || view.frame.git_behind > 0)
@@ -170,6 +174,7 @@ FocusScope {
                     onClicked: syncMenu.popup()
                 }
                 Label {
+                    color: view.theme.textColor
                     visible: !view.repository
                     Layout.fillWidth: true
                     Layout.minimumWidth: 0
@@ -189,6 +194,7 @@ FocusScope {
                 y: header.stacked ? 0 : (header.height - height) / 2
                 spacing: 0
                 ActionButton {
+                    theme: view.theme
                     objectName: "gitStageAll_" + view.paneId
                     visible: view.repository
                     iconName: "list-add"
@@ -199,6 +205,7 @@ FocusScope {
                     onClicked: view.invokeAction("stage-all")
                 }
                 ActionButton {
+                    theme: view.theme
                     objectName: "gitUnstageAll_" + view.paneId
                     visible: view.repository
                     iconName: "list-remove"
@@ -209,6 +216,7 @@ FocusScope {
                     onClicked: view.invokeAction("unstage-all")
                 }
                 ActionButton {
+                    theme: view.theme
                     objectName: "gitRefresh_" + view.paneId
                     iconName: "view-refresh"
                     tip: "Refresh Git changes and history"
@@ -218,6 +226,7 @@ FocusScope {
                     onClicked: view.invokeAction("refresh")
                 }
                 ActionButton {
+                    theme: view.theme
                     objectName: "gitMore_" + view.paneId
                     visible: view.repository
                     iconName: "view-more-symbolic"
@@ -240,8 +249,8 @@ FocusScope {
             contentWidth: availableWidth
             background: Rectangle {
                 radius: 4
-                color: Theme.alternateBackgroundColor
-                border.color: message.activeFocus ? Theme.highlightColor : Qt.alpha(Theme.textColor, 0.25)
+                color: view.theme.alternateBackgroundColor
+                border.color: message.activeFocus ? view.theme.highlightColor : Qt.alpha(view.theme.textColor, 0.25)
                 border.width: message.activeFocus ? 2 : 1
             }
             Basic.TextArea {
@@ -258,13 +267,14 @@ FocusScope {
                         "pane": view.paneId
                     })
                 placeholderText: "Commit message"
+                placeholderTextColor: view.theme.disabledTextColor
                 Accessible.description: "Press Ctrl+Enter to commit staged changes"
                 wrapMode: TextEdit.Wrap
                 selectByMouse: true
                 padding: 8
-                color: Theme.textColor
-                selectionColor: Theme.highlightColor
-                selectedTextColor: Theme.highlightedTextColor
+                color: view.theme.textColor
+                selectionColor: view.theme.highlightColor
+                selectedTextColor: view.theme.highlightedTextColor
                 background: null
                 Keys.onPressed: function (event) {
                     if (view.frame.focus !== view.paneId)
@@ -280,6 +290,7 @@ FocusScope {
             }
         }
         ActionButton {
+            theme: view.theme
             id: commitButton
             objectName: "gitCommit_" + view.paneId
             Layout.fillWidth: true
@@ -310,7 +321,7 @@ FocusScope {
             wrapMode: Text.Wrap
             maximumLineCount: view.compactHeight ? 1 : 3
             elide: Text.ElideRight
-            color: Theme.negativeTextColor
+            color: view.theme.negativeTextColor
             HoverHandler {
                 id: noticeHover
             }
@@ -330,7 +341,7 @@ FocusScope {
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
                 height: 1
-                color: Qt.alpha(Theme.textColor, 0.1)
+                color: Qt.alpha(view.theme.textColor, 0.1)
             }
             Rectangle {
                 id: progress
@@ -338,7 +349,7 @@ FocusScope {
                 width: parent.width / 4
                 height: 2
                 radius: 1
-                color: Theme.highlightColor
+                color: view.theme.highlightColor
                 NumberAnimation on x {
                     running: progress.visible
                     from: -progress.width
@@ -426,11 +437,12 @@ FocusScope {
                             Label {
                                 text: sectionHeader.collapsed ? "▸" : "▾"
                                 textFormat: Text.PlainText
-                                color: Theme.disabledTextColor
+                                color: view.theme.disabledTextColor
                                 Layout.preferredWidth: view.iconSize
                                 horizontalAlignment: Text.AlignHCenter
                             }
                             Label {
+                                color: view.theme.textColor
                                 Layout.minimumWidth: 0
                                 text: sectionHeader.section
                                 textFormat: Text.PlainText
@@ -441,8 +453,9 @@ FocusScope {
                                 implicitWidth: Math.max(implicitHeight, countLabel.implicitWidth + 10)
                                 implicitHeight: countLabel.implicitHeight + 2
                                 radius: implicitHeight / 2
-                                color: Qt.alpha(Theme.textColor, 0.12)
+                                color: Qt.alpha(view.theme.textColor, 0.12)
                                 Label {
+                                    color: view.theme.textColor
                                     id: countLabel
                                     anchors.centerIn: parent
                                     text: view.groupCount(sectionHeader.section)
@@ -454,6 +467,7 @@ FocusScope {
                                 Layout.fillWidth: true
                             }
                             ActionButton {
+                                theme: view.theme
                                 objectName: "gitGroup_" + view.paneId + "_" + sectionHeader.section
                                 iconName: sectionHeader.section === "Staged" ? "list-remove" : "list-add"
                                 tip: sectionHeader.section === "Staged" ? "Unstage all staged changes" : "Stage all " + sectionHeader.section.toLowerCase() + " changes"
@@ -472,7 +486,7 @@ FocusScope {
                         readonly property bool collapsed: !!view.collapsedGroups[modelData.group]
                         readonly property string kind: view.changeKind(modelData)
                         readonly property bool strong: highlighted && view.paneFocused
-                        readonly property color foreground: strong ? Theme.highlightedTextColor : Theme.textColor
+                        readonly property color foreground: strong ? view.theme.highlightedTextColor : view.theme.textColor
                         // Narrow rows keep the name readable: actions appear only on
                         // hover there, and the rarer ones stay in the context menu.
                         readonly property bool roomy: width >= 240
@@ -518,7 +532,7 @@ FocusScope {
                                 text: entry.filename
                                 textFormat: Text.PlainText
                                 elide: Text.ElideMiddle
-                                color: entry.strong ? entry.foreground : Theme.statusColor(entry.kind)
+                                color: entry.strong ? entry.foreground : view.theme.statusColor(entry.kind)
                                 font.strikeout: entry.kind === "deleted"
                             }
                             Label {
@@ -535,7 +549,7 @@ FocusScope {
                                 horizontalAlignment: Text.AlignHCenter
                                 text: view.changeLetter(entry.modelData)
                                 textFormat: Text.PlainText
-                                color: entry.strong ? entry.foreground : Theme.statusColor(entry.kind)
+                                color: entry.strong ? entry.foreground : view.theme.statusColor(entry.kind)
                                 font.bold: true
                                 FontMetrics {
                                     id: letterMetrics
@@ -548,7 +562,7 @@ FocusScope {
                             width: parent.width - 4
                             height: parent.height
                             radius: 4
-                            color: entry.highlighted ? (view.paneFocused ? Theme.highlightColor : Qt.alpha(Theme.highlightColor, 0.28)) : entry.hovered ? Qt.alpha(Theme.textColor, 0.07) : "transparent"
+                            color: entry.highlighted ? (view.paneFocused ? view.theme.highlightColor : view.theme.softHighlightColor) : entry.hovered ? Qt.alpha(view.theme.textColor, 0.07) : "transparent"
                         }
                         // Row actions appear over the folder text on hover or
                         // selection, so resting rows stay quiet.
@@ -559,7 +573,7 @@ FocusScope {
                             anchors.verticalCenter: parent.verticalCenter
                             width: actionRow.implicitWidth + 6
                             height: actionRow.implicitHeight
-                            color: entry.background.color.a > 0.5 ? entry.background.color : Qt.tint(Theme.backgroundColor, entry.background.color)
+                            color: entry.background.color.a > 0.5 ? entry.background.color : Qt.tint(view.theme.backgroundColor, entry.background.color)
                             opacity: entry.showActions ? 1 : 0
                             HoverHandler {
                                 id: actionsHover
@@ -569,6 +583,7 @@ FocusScope {
                                 anchors.right: parent.right
                                 spacing: 0
                                 ActionButton {
+                                    theme: view.theme
                                     objectName: "gitOpen_" + view.paneId + "_" + entry.index
                                     foregroundColor: entry.foreground
                                     iconName: "document-open"
@@ -580,6 +595,7 @@ FocusScope {
                                     onClicked: view.invokeAction("git-open", "", entry.index)
                                 }
                                 ActionButton {
+                                    theme: view.theme
                                     objectName: "gitDiscard_" + view.paneId + "_" + entry.index
                                     foregroundColor: entry.foreground
                                     iconName: "edit-undo"
@@ -591,6 +607,7 @@ FocusScope {
                                     onClicked: view.invokeAction("discard-changes", "", entry.index)
                                 }
                                 ActionButton {
+                                    theme: view.theme
                                     objectName: "gitDiff_" + view.paneId + "_" + entry.index
                                     foregroundColor: entry.foreground
                                     iconName: "vcs-diff"
@@ -601,6 +618,7 @@ FocusScope {
                                     onClicked: entry.inspect()
                                 }
                                 ActionButton {
+                                    theme: view.theme
                                     objectName: "gitStage_" + view.paneId + "_" + entry.index
                                     foregroundColor: entry.foreground
                                     iconName: entry.modelData.staged ? "list-remove" : "list-add"
@@ -671,16 +689,17 @@ FocusScope {
                     anchors.centerIn: parent
                     width: Math.max(0, parent.width - 16)
                     visible: !!view.frame.git_restricted
-                    spacing: Theme.largeSpacing
+                    spacing: view.theme.largeSpacing
                     Label {
                         Layout.fillWidth: true
                         text: "Git is off in restricted mode: a repository's configuration can run programs."
                         textFormat: Text.PlainText
                         wrapMode: Text.Wrap
                         horizontalAlignment: Text.AlignHCenter
-                        color: Theme.disabledTextColor
+                        color: view.theme.disabledTextColor
                     }
                     ActionButton {
+                        theme: view.theme
                         objectName: "gitTrust_" + view.paneId
                         Layout.alignment: Qt.AlignHCenter
                         text: "Trust Folder…"
@@ -696,7 +715,7 @@ FocusScope {
                     textFormat: Text.PlainText
                     wrapMode: Text.Wrap
                     horizontalAlignment: Text.AlignHCenter
-                    color: Theme.disabledTextColor
+                    color: view.theme.disabledTextColor
                 }
             }
             // The commit graph, below the changes.
@@ -724,7 +743,7 @@ FocusScope {
                         Label {
                             text: body.graphExpanded ? "▾" : "▸"
                             textFormat: Text.PlainText
-                            color: Theme.disabledTextColor
+                            color: view.theme.disabledTextColor
                             Layout.preferredWidth: view.iconSize
                             horizontalAlignment: Text.AlignHCenter
                         }
@@ -735,7 +754,7 @@ FocusScope {
                             font.bold: true
                             font.capitalization: Font.AllUppercase
                             font.letterSpacing: 0.5
-                            color: Qt.alpha(Theme.textColor, 0.8)
+                            color: Qt.alpha(view.theme.textColor, 0.8)
                         }
                         Label {
                             Layout.fillWidth: true
@@ -744,7 +763,7 @@ FocusScope {
                             text: "HEAD · " + (view.frame.git_upstream || "")
                             textFormat: Text.PlainText
                             elide: Text.ElideRight
-                            color: Theme.disabledTextColor
+                            color: view.theme.disabledTextColor
                         }
                         Item {
                             Layout.fillWidth: !view.frame.git_upstream
@@ -799,7 +818,7 @@ FocusScope {
                         required property int index
                         objectName: "commit_" + view.paneId + "_" + index
                         readonly property bool strong: highlighted && view.paneFocused
-                        readonly property color foreground: strong ? Theme.highlightedTextColor : Theme.textColor
+                        readonly property color foreground: strong ? view.theme.highlightedTextColor : view.theme.textColor
                         width: graph.width
                         height: view.graphRowHeight
                         // Lanes run edge to edge, joining the rows above and below.
@@ -823,7 +842,7 @@ FocusScope {
                                 color: commitRow.modelData.color
                                 head: commitRow.modelData.head
                                 merge: commitRow.modelData.parents.length > 1
-                                background: commitRow.highlighted ? (view.paneFocused ? Theme.highlightColor : Qt.tint(Theme.backgroundColor, Qt.alpha(Theme.highlightColor, 0.28))) : Theme.backgroundColor
+                                background: commitRow.highlighted ? (view.paneFocused ? view.theme.highlightColor : Qt.tint(view.theme.backgroundColor, view.theme.softHighlightColor)) : view.theme.backgroundColor
                             }
                             Label {
                                 Layout.fillWidth: true
@@ -845,9 +864,9 @@ FocusScope {
                                     implicitWidth: refLabel.implicitWidth + 10
                                     implicitHeight: refLabel.implicitHeight + 2
                                     radius: implicitHeight / 2
-                                    color: current ? (commitRow.strong ? Qt.alpha(Theme.highlightedTextColor, 0.25) : Theme.highlightColor) : "transparent"
+                                    color: current ? (commitRow.strong ? Qt.alpha(view.theme.highlightedTextColor, 0.25) : view.theme.highlightColor) : "transparent"
                                     border.width: current ? 0 : 1
-                                    border.color: Qt.alpha(modelData.kind === "tag" ? Theme.positiveTextColor : commitRow.foreground, modelData.kind === "remote" ? 0.3 : 0.5)
+                                    border.color: Qt.alpha(modelData.kind === "tag" ? view.theme.positiveTextColor : commitRow.foreground, modelData.kind === "remote" ? 0.3 : 0.5)
                                     Label {
                                         id: refLabel
                                         anchors.centerIn: parent
@@ -856,7 +875,7 @@ FocusScope {
                                         textFormat: Text.PlainText
                                         elide: Text.ElideMiddle
                                         font.pixelSize: Math.max(9, Math.round(metrics.height * 0.66))
-                                        color: parent.current ? Theme.highlightedTextColor : commitRow.foreground
+                                        color: parent.current ? view.theme.highlightedTextColor : commitRow.foreground
                                         opacity: parent.modelData.kind === "remote" ? 0.75 : 1
                                     }
                                 }
@@ -882,7 +901,7 @@ FocusScope {
                             width: parent.width - 4
                             height: parent.height
                             radius: 4
-                            color: commitRow.highlighted ? (view.paneFocused ? Theme.highlightColor : Qt.alpha(Theme.highlightColor, 0.28)) : commitRow.hovered ? Qt.alpha(Theme.textColor, 0.07) : "transparent"
+                            color: commitRow.highlighted ? (view.paneFocused ? view.theme.highlightColor : view.theme.softHighlightColor) : commitRow.hovered ? Qt.alpha(view.theme.textColor, 0.07) : "transparent"
                         }
                         onHoveredChanged: {
                             if (hovered) {
@@ -930,6 +949,7 @@ FocusScope {
                         width: graph.width
                         height: view.frame.history_more ? moreButton.implicitHeight + 8 : 0
                         ActionButton {
+                            theme: view.theme
                             id: moreButton
                             objectName: "gitHistoryMore_" + view.paneId
                             visible: !!view.frame.history_more
@@ -950,7 +970,7 @@ FocusScope {
                         textFormat: Text.PlainText
                         wrapMode: Text.Wrap
                         horizontalAlignment: Text.AlignHCenter
-                        color: view.frame.history_error ? Theme.negativeTextColor : Theme.disabledTextColor
+                        color: view.frame.history_error ? view.theme.negativeTextColor : view.theme.disabledTextColor
                     }
                 }
             }
@@ -964,14 +984,14 @@ FocusScope {
                 width: parent.width
                 height: 6
                 radius: 2
-                color: !body.graphExpanded ? "transparent" : resize.pressed || resize.containsMouse ? Theme.highlightColor : Qt.alpha(Theme.textColor, 0.18)
+                color: !body.graphExpanded ? "transparent" : resize.pressed || resize.containsMouse ? view.theme.highlightColor : Qt.alpha(view.theme.textColor, 0.18)
                 Rectangle {
                     // At rest, collapsed: a plain divider.
                     visible: !body.graphExpanded
                     anchors.verticalCenter: parent.verticalCenter
                     width: parent.width
                     height: 1
-                    color: Qt.alpha(Theme.textColor, 0.1)
+                    color: Qt.alpha(view.theme.textColor, 0.1)
                 }
                 MouseArea {
                     id: resize

@@ -290,20 +290,32 @@ fn terminals_have_independent_themes_and_can_follow_the_editor() {
         Some(slate_core::preferences::StartupMode::Workspace),
     )
     .unwrap();
+    let terminal_background = |app: &mut App| {
+        let snapshot = app.snapshot(160, 40, 1, 1, 1, 3);
+        let terminal = snapshot
+            .panes
+            .iter()
+            .find(|p| p.kind == "terminal")
+            .unwrap();
+        let screen = terminal.screen.as_ref().unwrap();
+        let corner = screen.cells.last().unwrap().last().unwrap().bg.clone();
+        (corner, snapshot.background)
+    };
+    // By default terminals use the editor's colours.
+    let (terminal, editor) = terminal_background(&mut app);
+    assert_eq!(terminal, editor);
+    // A terminal theme of its own is independent of the editor's.
+    app.dispatch(Command::Configure {
+        name: "terminal-theme".into(),
+        value: "dark".into(),
+    });
     app.dispatch(Command::Configure {
         name: "theme".into(),
         value: "light".into(),
     });
-    let snapshot = app.snapshot(160, 40, 1, 1, 1, 3);
-    let terminal = snapshot
-        .panes
-        .iter()
-        .find(|p| p.kind == "terminal")
-        .unwrap();
-    let screen = terminal.screen.as_ref().unwrap();
-    let corner = screen.cells.last().unwrap().last().unwrap();
+    let (terminal, editor) = terminal_background(&mut app);
     assert_ne!(
-        corner.bg, snapshot.background,
+        terminal, editor,
         "Changing the editor theme leaves the terminal theme alone"
     );
     app.dispatch(Command::Configure {

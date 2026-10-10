@@ -62,6 +62,15 @@ ApplicationWindow {
             "focus": frame.focus
         };
     }
+    // The tool panes' colours (Settings: File browser / Git pane theme).
+    PaneTheme {
+        id: filesTheme
+        colors: root.frame.files_colors || null
+    }
+    PaneTheme {
+        id: gitTheme
+        colors: root.frame.git_colors || null
+    }
     // File browser decorations by absolute path: {kind, rank, folder}.
     // Folders carry their most severe descendant change.
     property var gitMarks: ({})
@@ -91,7 +100,7 @@ ApplicationWindow {
         return marks;
     }
     function gitMarkColor(mark) {
-        return Theme.statusColor(mark ? mark.kind : "");
+        return filesTheme.statusColor(mark ? mark.kind : "");
     }
     function gitMarkLetter(mark) {
         return mark ? ({"conflict": "!", "modified": "M", "deleted": "D", "added": "A", "untracked": "U"})[mark.kind] : "";
@@ -717,6 +726,8 @@ ApplicationWindow {
                 property var tabItems: []
                 property string tabKey: ""
                 readonly property bool isEditor: paneData.kind === "editor"
+                // File and Git panes have their own themes; others the desktop's.
+                readonly property var paneTheme: paneData.kind === "files" ? filesTheme : paneData.kind === "git" ? gitTheme : Theme
                 readonly property bool showMinimap: isEditor && !!root.settings.minimap && width > 360
                 function updateTabs() {
                     var next = paneData && paneData.tabs ? paneData.tabs : [];
@@ -915,6 +926,17 @@ ApplicationWindow {
                             paneMenu.popup();
                         }
                     }
+                }
+                // File and Git content sit on their pane theme; the tabs above
+                // keep the desktop palette like every other pane's.
+                Rectangle {
+                    objectName: "paneContent_" + panel.paneId
+                    visible: panel.paneData.kind === "files" || panel.paneData.kind === "git"
+                    x: panel.border.width
+                    y: root.paneHeaderHeight + 2
+                    width: Math.max(0, panel.width - 2 * panel.border.width)
+                    height: Math.max(0, panel.height - y - panel.border.width)
+                    color: panel.paneTheme.backgroundColor
                 }
                 CellView {
                     id: grid
@@ -1115,6 +1137,7 @@ ApplicationWindow {
                     paneId: panel.paneId
                     draft: root.gitCommitDraft
                     committing: root.gitCommitting
+                    theme: gitTheme
                     graphOpen: root.gitGraphOpen
                     graphShare: root.gitGraphShare
                     onGraphOpenEdited: function (open) {
@@ -1156,6 +1179,7 @@ ApplicationWindow {
                         anchors.rightMargin: 4
                         spacing: 2
                         ActionButton {
+                            theme: panel.paneTheme
                             objectName: "filesUp_" + panel.paneId
                             visible: slate.browserNested
                             iconName: "go-up"
@@ -1178,7 +1202,7 @@ ApplicationWindow {
                             font.bold: true
                             font.capitalization: Font.AllUppercase
                             font.letterSpacing: 0.5
-                            color: Qt.alpha(Theme.textColor, 0.8)
+                            color: Qt.alpha(panel.paneTheme.textColor, 0.8)
                             Accessible.name: "Folder " + filesHeader.folderPath
                             HoverHandler {
                                 id: folderHover
@@ -1190,6 +1214,7 @@ ApplicationWindow {
                             }
                         }
                         ActionButton {
+                            theme: panel.paneTheme
                             objectName: "filesNewFile_" + panel.paneId
                             visible: filesHeader.roomy
                             iconName: "document-new"
@@ -1199,6 +1224,7 @@ ApplicationWindow {
                             onClicked: root.invokeAction("new-file", "", panel.paneId)
                         }
                         ActionButton {
+                            theme: panel.paneTheme
                             objectName: "filesNewFolder_" + panel.paneId
                             visible: filesHeader.roomy
                             iconName: "folder-new"
@@ -1208,6 +1234,7 @@ ApplicationWindow {
                             onClicked: root.invokeAction("new-folder", "", panel.paneId)
                         }
                         ActionButton {
+                            theme: panel.paneTheme
                             objectName: "filesCollapse_" + panel.paneId
                             iconName: "collapse-all"
                             tip: "Collapse all folders"
@@ -1216,6 +1243,7 @@ ApplicationWindow {
                             onClicked: root.invokeAction("collapse-all-folders", "", panel.paneId)
                         }
                         ActionButton {
+                            theme: panel.paneTheme
                             objectName: "filesRefresh_" + panel.paneId
                             iconName: "view-refresh"
                             tip: "Refresh files and Git"
@@ -1229,7 +1257,7 @@ ApplicationWindow {
                         anchors.left: parent.left
                         anchors.right: parent.right
                         height: 1
-                        color: Qt.alpha(Theme.textColor, 0.1)
+                        color: Qt.alpha(panel.paneTheme.textColor, 0.1)
                     }
                 }
                 ListView {
@@ -1271,21 +1299,23 @@ ApplicationWindow {
                         anchors.centerIn: parent
                         width: Math.max(0, parent.width - 24)
                         visible: browser.count === 0
-                        spacing: Theme.largeSpacing
+                        spacing: panel.paneTheme.largeSpacing
                         Label {
                             Layout.fillWidth: true
                             textFormat: Text.PlainText
                             text: "This folder is empty"
                             wrapMode: Text.Wrap
                             horizontalAlignment: Text.AlignHCenter
-                            color: Theme.disabledTextColor
+                            color: panel.paneTheme.disabledTextColor
                         }
                         ActionButton {
+                            theme: panel.paneTheme
                             Layout.alignment: Qt.AlignHCenter
                             text: "New file…"
                             onClicked: root.invokeAction("new-file", "", panel.paneId)
                         }
                         ActionButton {
+                            theme: panel.paneTheme
                             Layout.alignment: Qt.AlignHCenter
                             text: "Open folder…"
                             onClicked: root.invokeAction("open-folder", "", panel.paneId)
@@ -1308,7 +1338,7 @@ ApplicationWindow {
                         readonly property int depth: modelData.depth || 0
                         readonly property var mark: root.gitMarks[modelData.path]
                         readonly property bool strong: highlighted && browser.paneFocused
-                        readonly property color foreground: strong ? Theme.highlightedTextColor : mark ? root.gitMarkColor(mark) : Theme.textColor
+                        readonly property color foreground: strong ? panel.paneTheme.highlightedTextColor : mark ? root.gitMarkColor(mark) : panel.paneTheme.textColor
                         function select() {
                             root.send({
                                 "action": "click",
@@ -1400,7 +1430,7 @@ ApplicationWindow {
                                 directory: fileDelegate.modelData.directory
                                 expanded: fileDelegate.modelData.expanded
                                 parentLink: fileDelegate.parentLink
-                                tint: fileDelegate.strong ? Theme.highlightedTextColor : Theme.textColor
+                                tint: fileDelegate.strong ? panel.paneTheme.highlightedTextColor : panel.paneTheme.textColor
                             }
                             Label {
                                 id: nameLabel
@@ -1442,7 +1472,7 @@ ApplicationWindow {
                                 anchors.bottomMargin: 1
                                 radius: 4
                                 // Full accent only while the tree has focus.
-                                color: fileDelegate.highlighted ? (browser.paneFocused ? Theme.highlightColor : Qt.alpha(Theme.highlightColor, 0.28)) : fileDelegate.hovered ? Qt.alpha(Theme.textColor, 0.07) : "transparent"
+                                color: fileDelegate.highlighted ? (browser.paneFocused ? panel.paneTheme.highlightColor : panel.paneTheme.softHighlightColor) : fileDelegate.hovered ? Qt.alpha(panel.paneTheme.textColor, 0.07) : "transparent"
                             }
                             // Indent guides through each ancestor's chevron.
                             Repeater {
@@ -1452,7 +1482,7 @@ ApplicationWindow {
                                     x: 6 + index * root.fileIndent + Math.floor(root.fileIndent / 2)
                                     width: 1
                                     height: fileDelegate.height
-                                    color: Qt.alpha(Theme.textColor, fileDelegate.strong ? 0 : 0.12)
+                                    color: Qt.alpha(panel.paneTheme.textColor, fileDelegate.strong ? 0 : 0.12)
                                 }
                             }
                         }
@@ -2597,6 +2627,35 @@ ApplicationWindow {
                         model: ["auto", "dark", "light", "editor"]
                         currentIndex: model.indexOf(root.settings.terminal_theme || "dark")
                         onActivated: settingsDialog.configure("terminal-theme", currentText)
+                    }
+                }
+                // The file browser and Git pane follow the editor unless chosen
+                // otherwise; "Desktop" uses the Qt colours of menus and dialogs.
+                Repeater {
+                    model: [
+                        { "label": "File browser theme", "setting": "files-theme", "field": "files_theme", "name": "filesThemeSetting" },
+                        { "label": "Git pane theme", "setting": "git-theme", "field": "git_theme", "name": "gitThemeSetting" }
+                    ]
+                    delegate: RowLayout {
+                        required property var modelData
+                        Label {
+                            textFormat: Text.PlainText
+                            text: modelData.label
+                            Layout.fillWidth: true
+                        }
+                        ComboBox {
+                            objectName: modelData.name
+                            textRole: "label"
+                            valueRole: "value"
+                            model: [
+                                { "value": "editor", "label": "Editor colours" },
+                                { "value": "auto", "label": "Desktop (Qt)" },
+                                { "value": "dark", "label": "Dark" },
+                                { "value": "light", "label": "Light" }
+                            ]
+                            currentIndex: Math.max(0, indexOfValue(root.settings[modelData.field] || "editor"))
+                            onActivated: settingsDialog.configure(modelData.setting, currentValue)
+                        }
                     }
                 }
                 RowLayout {

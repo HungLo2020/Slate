@@ -513,6 +513,9 @@ pub struct Snapshot {
     pub terminal_background: String,
     pub terminal_foreground: String,
     pub terminal_selection: String,
+    /// The file browser's and Git pane's colours ("files-theme", "git-theme").
+    pub files_colors: theme::PaneColors,
+    pub git_colors: theme::PaneColors,
     /// Selection background, so monochrome terminals can show reverse video.
     pub selection: String,
     pub settings: Preferences,
@@ -602,6 +605,9 @@ pub struct App {
     recovery: workspace::RecoveryState,
     colors: (String, String, String, String),
     terminal_colors: theme::Palette,
+    /// The file browser's and Git pane's palettes.
+    files_colors: theme::Palette,
+    git_colors: theme::Palette,
     system_colors: Option<(String, String, String, String, String)>,
     selection_foreground: String,
     events: events::Events,

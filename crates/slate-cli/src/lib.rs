@@ -1010,6 +1010,15 @@ fn clean(s: &str) -> String {
         .map(|c| if c.is_control() { '�' } else { c })
         .collect()
 }
+/// A file or Git pane's colours: its palette, or the terminal's own colours
+/// when it follows the desktop.
+fn tool_style(pane: &slate_core::theme::PaneColors, colors: ColorMode) -> Style {
+    if pane.desktop {
+        Style::default()
+    } else {
+        colors.style(&pane.foreground, &pane.background)
+    }
+}
 /// " ↑2 ↓1 origin/main" for a branch with an upstream.
 fn sync_summary(s: &Snapshot) -> String {
     if s.git_upstream.is_empty() {
@@ -1178,9 +1187,15 @@ fn render(
     for p in &s.panes {
         let area = Rect::new(p.rect.x, p.rect.y, p.rect.width, p.rect.height);
         let focus = p.id == s.focus;
+        // Tool panes have their own themes; "desktop" keeps the terminal's colours.
+        let pane_style = match p.kind.as_str() {
+            "files" => tool_style(&s.files_colors, colors),
+            "git" => tool_style(&s.git_colors, colors),
+            _ => base,
+        };
         let block = Block::default()
             .borders(Borders::ALL)
-            .style(base)
+            .style(pane_style)
             .title(if p.kind == "git" {
                 format!(
                     " Git: {}{} #{} ",

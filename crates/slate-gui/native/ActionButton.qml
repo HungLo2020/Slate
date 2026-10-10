@@ -7,9 +7,11 @@ import Slate.Native
 // paint its own caption, and its style insets can escape a tightly sized row.
 Basic.Button {
     id: control
+    // The colours to draw with: a tool pane passes its PaneTheme.
+    property var theme: Theme
     property string iconName: ""
     property string tip: ""
-    property color foregroundColor: Theme.textColor
+    property color foregroundColor: control.theme.textColor
     readonly property string fallbackGlyph: ({
             "list-add": "+",
             "list-remove": "−",
@@ -87,14 +89,14 @@ Basic.Button {
             verticalAlignment: Text.AlignVCenter
             // A disabled primary action keeps its accent (dimmed), so it still
             // reads as a button rather than as an empty field.
-            color: control.highlighted ? Theme.highlightedTextColor : !control.enabled ? Theme.disabledTextColor : control.down ? Theme.highlightedTextColor : control.foregroundColor
+            color: control.highlighted ? control.theme.highlightedTextColor : !control.enabled ? control.theme.disabledTextColor : control.down ? control.theme.highlightedTextColor : control.foregroundColor
         }
     }
     background: Rectangle {
         radius: 4
-        color: control.highlighted || control.down ? Theme.highlightColor : control.hovered ? Qt.tint(Theme.backgroundColor, Qt.alpha(Theme.highlightColor, 0.12)) : control.flat ? "transparent" : Theme.backgroundColor
+        color: control.highlighted || control.down ? control.theme.highlightColor : control.hovered ? Qt.tint(control.theme.backgroundColor, Qt.alpha(control.theme.highlightColor, 0.12)) : control.flat ? "transparent" : control.theme.backgroundColor
         border.width: control.visualFocus ? 2 : control.flat && !control.hovered ? 0 : 1
-        border.color: control.visualFocus || control.highlighted ? Theme.highlightColor : Qt.alpha(Theme.textColor, control.enabled ? 0.24 : 0.1)
+        border.color: control.visualFocus || control.highlighted ? control.theme.highlightColor : Qt.alpha(control.theme.textColor, control.enabled ? 0.24 : 0.1)
         opacity: control.enabled ? 1 : 0.6
     }
 }

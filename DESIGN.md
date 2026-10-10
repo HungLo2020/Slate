@@ -106,7 +106,9 @@ renderer. This provides basic accessible names/roles; complete platform screen
 reader integration is not claimed by the input-method tests.
 
 Editor and terminal content use independent shared-core palettes. Dark defaults
-are #1b1e26 for editors and #14171c for terminals; native GUI chrome follows Qt.
+are #1b1e26 for editors and #14171c for terminals, which follow the editor by
+default, as do the file browser and Git pane contents; native GUI chrome,
+including every pane's tabs, follows Qt.
 `editor_theme` chooses auto/dark/light, and `terminal_theme` additionally accepts
 editor to inherit its palette. Automatic palettes retain Qt's latest view/text/
 selection colors. The editor's background luminance chooses the syntax palette.

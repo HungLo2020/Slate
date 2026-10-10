@@ -248,6 +248,8 @@ impl App {
             terminal_background: self.terminal_colors.background.clone(),
             terminal_foreground: self.terminal_colors.foreground.clone(),
             terminal_selection: self.terminal_colors.selection.clone(),
+            files_colors: theme::PaneColors::new(&self.files_colors, &self.preferences.files_theme),
+            git_colors: theme::PaneColors::new(&self.git_colors, &self.preferences.git_theme),
             background: self.colors.1.clone(),
             accent: self.colors.3.clone(),
             selection: self.colors.2.clone(),

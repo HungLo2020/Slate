@@ -36,6 +36,10 @@ pub struct Preferences {
     /// Content themes are independent of desktop menus and dialogs.
     pub editor_theme: String,
     pub terminal_theme: String,
+    /// The file browser and Git panes: `editor` (their default) uses the
+    /// editor's colours, `auto` the desktop's, or `dark`/`light`.
+    pub files_theme: String,
+    pub git_theme: String,
     pub file_startup: StartupMode,
     pub directory_startup: StartupMode,
     /// `default` or `nano`. Choosing a keymap replaces the key tables below.
@@ -284,7 +288,10 @@ impl Default for Preferences {
             line_numbers: true,
             theme: "auto".into(),
             editor_theme: "dark".into(),
-            terminal_theme: "dark".into(),
+            // Terminals match the editor unless themed separately.
+            terminal_theme: "editor".into(),
+            files_theme: "editor".into(),
+            git_theme: "editor".into(),
             file_startup: StartupMode::EditorOnly,
             directory_startup: StartupMode::Workspace,
             keymap: "default".into(),
@@ -325,6 +332,10 @@ pub struct Setting {
     pub label: &'static str,
     pub kind: SettingKind,
 }
+/// Tool pane themes: the editor's colours (the default), the desktop's
+/// (`auto`), or a fixed palette.
+pub const PANE_THEMES: &[&str] = &["editor", "auto", "dark", "light"];
+
 pub const SETTINGS: &[Setting] = &[
     Setting {
         name: "profile",
@@ -370,6 +381,16 @@ pub const SETTINGS: &[Setting] = &[
         name: "terminal-theme",
         label: "Terminal theme",
         kind: SettingKind::Choice(&["auto", "dark", "light", "editor"]),
+    },
+    Setting {
+        name: "files-theme",
+        label: "File browser theme",
+        kind: SettingKind::Choice(PANE_THEMES),
+    },
+    Setting {
+        name: "git-theme",
+        label: "Git pane theme",
+        kind: SettingKind::Choice(PANE_THEMES),
     },
     Setting {
         name: "keymap",
@@ -464,6 +485,8 @@ impl Preferences {
             "line-numbers" => self.line_numbers.to_string(),
             "theme" | "editor-theme" => self.editor_theme.clone(),
             "terminal-theme" => self.terminal_theme.clone(),
+            "files-theme" => self.files_theme.clone(),
+            "git-theme" => self.git_theme.clone(),
             "keymap" => self.keymap.clone(),
             "soft-wrap" => self.soft_wrap.to_string(),
             "wrap-column" => self.wrap_column.to_string(),
@@ -540,6 +563,12 @@ impl Preferences {
         }
         if !["auto", "dark", "light", "editor"].contains(&self.terminal_theme.as_str()) {
             bail!("terminal_theme must be auto, dark, light or editor");
+        }
+        if !PANE_THEMES.contains(&self.files_theme.as_str()) {
+            bail!("files_theme must be editor, auto, dark or light");
+        }
+        if !PANE_THEMES.contains(&self.git_theme.as_str()) {
+            bail!("git_theme must be editor, auto, dark or light");
         }
         if !["default", "nano"].contains(&self.keymap.as_str()) {
             bail!("keymap must be default or nano");
@@ -802,6 +831,8 @@ impl App {
                     settings.editor_theme = value.into();
                 }
                 "terminal-theme" => settings.terminal_theme = value.into(),
+                "files-theme" => settings.files_theme = value.into(),
+                "git-theme" => settings.git_theme = value.into(),
                 "file-startup" => settings.file_startup = value.parse()?,
                 "directory-startup" => settings.directory_startup = value.parse()?,
                 "keymap" => {
@@ -861,6 +892,14 @@ impl App {
             "editor" => editor.clone(),
             _ => crate::theme::Palette::dark(true),
         };
+        let tool = |theme: &str| match theme {
+            "auto" => automatic(),
+            "light" => crate::theme::Palette::light(),
+            "dark" => crate::theme::Palette::dark(false),
+            _ => editor.clone(),
+        };
+        self.files_colors = tool(&self.preferences.files_theme);
+        self.git_colors = tool(&self.preferences.git_theme);
         self.colors = (
             editor.foreground,
             editor.background,
@@ -929,7 +968,7 @@ mod tests {
         let mut app = crate::App::new(&file).unwrap();
         let default = app.snapshot(100, 30, 0, 1, 1, 0);
         assert_eq!(default.background, "#1b1e26");
-        assert_eq!(default.terminal_background, "#14171c");
+        assert_eq!(default.terminal_background, "#1b1e26");
         app.dispatch(crate::Command::Theme {
             foreground: "#101010".into(),
             background: "#ffffff".into(),
@@ -960,7 +999,66 @@ mod tests {
         std::fs::write(Preferences::path(), "theme = \"light\"\n").unwrap();
         let migrated = Preferences::load().unwrap();
         assert_eq!(migrated.editor_theme, "light");
-        assert_eq!(migrated.terminal_theme, "dark");
+        assert_eq!(migrated.terminal_theme, "editor");
+    }
+
+    #[test]
+    fn tool_panes_follow_the_editor_unless_themed_separately() {
+        let _env = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", dir.path().join("config"));
+        std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, "hello").unwrap();
+        let mut app = crate::App::new(&file).unwrap();
+        // By default both use the editor's colours, not the desktop's.
+        let frame = app.snapshot(100, 30, 0, 1, 1, 0);
+        for pane in [&frame.files_colors, &frame.git_colors] {
+            assert_eq!(pane.background, frame.background);
+            assert_eq!(pane.foreground, frame.foreground);
+            assert_eq!(pane.selection, frame.selection);
+            assert!(!pane.desktop);
+        }
+        // Following the editor tracks its theme changes.
+        app.configure("editor-theme", "light").unwrap();
+        let frame = app.snapshot(100, 30, 0, 1, 1, 0);
+        assert_eq!(frame.files_colors.background, frame.background);
+        assert!(crate::theme::is_light(&frame.git_colors.background));
+        // Each pane is themed on its own; "auto" follows the desktop.
+        app.dispatch(crate::Command::Theme {
+            foreground: "#101010".into(),
+            background: "#f4f4f4".into(),
+            selection: "#abcdef".into(),
+            accent: "#123456".into(),
+            selection_foreground: "#010101".into(),
+        });
+        app.configure("files-theme", "auto").unwrap();
+        app.configure("git-theme", "dark").unwrap();
+        let frame = app.snapshot(100, 30, 0, 1, 1, 0);
+        assert!(frame.files_colors.desktop);
+        assert_eq!(frame.files_colors.background, "#f4f4f4");
+        assert!(!frame.git_colors.desktop);
+        assert_eq!(frame.git_colors.background, "#1b1e26");
+        assert_ne!(frame.background, frame.git_colors.background);
+        // The choices are saved and survive a reload.
+        let saved = Preferences::load().unwrap();
+        assert_eq!(
+            (saved.files_theme.as_str(), saved.git_theme.as_str()),
+            ("auto", "dark")
+        );
+        app.load_preferences();
+        assert_eq!(app.preferences.value("git-theme"), "dark");
+        assert!(app.configure("git-theme", "neon").is_err());
+        assert_eq!(app.preferences.value("git-theme"), "dark");
+        // Older settings files gain the editor default.
+        std::fs::write(Preferences::path(), "editor_theme = \"dark\"\n").unwrap();
+        let older = Preferences::load().unwrap();
+        assert_eq!(
+            (older.files_theme.as_str(), older.git_theme.as_str()),
+            ("editor", "editor")
+        );
     }
 
     #[test]

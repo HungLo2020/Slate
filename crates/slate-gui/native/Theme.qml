@@ -17,6 +17,10 @@ QtObject {
     readonly property color alternateBackgroundColor: active.alternateBase
     readonly property color highlightColor: active.highlight
     readonly property color highlightedTextColor: active.highlightedText
+    // The selection while a pane does not have focus, and the accent, named as
+    // PaneTheme names them so controls accept either.
+    readonly property color softHighlightColor: Qt.alpha(active.highlight, 0.28)
+    readonly property color accentColor: active.highlight
     readonly property color disabledTextColor: Qt.rgba(active.windowText.r, active.windowText.g, active.windowText.b, 0.55)
     readonly property color negativeTextColor: dark ? "#ed5a6a" : "#c0293b"
     readonly property color neutralTextColor: dark ? "#f6a14b" : "#b65c00"

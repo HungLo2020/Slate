@@ -1,7 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.1.11 — 2026-10-10
 
+- Theme the file browser and Git pane separately ("File browser theme", "Git pane theme"). Both use the editor's colours by default instead of the desktop's; they can follow the desktop (Qt) palette or use dark or light. Pane tabs, menus, hints and dialogs keep the desktop palette. Terminals now also use the editor's colours by default; their own dark palette remains a choice.
 - Add a commit graph below the Git pane's changes in both interfaces: HEAD and its upstream with coloured lanes, branch and tag badges, authors and ages, paged loading, commits opened read-only, and a draggable divider to resize the graph against the changes.
 - Redesign the GUI Git pane: one line per change with file icons and coloured status letters, hover row actions, collapsible groups with count badges, focus-aware selection, a non-shifting progress bar, a primary Commit button that stays recognisable when unavailable, and consistent menus.
 - Show the branch's upstream with ahead/behind counts; add fetch, fast-forward pull, push (setting an upstream on first push), branch switching and branch creation. Remote commands never wait on a password prompt.

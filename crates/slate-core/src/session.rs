@@ -236,6 +236,8 @@ impl App {
             ),
             system_colors: None,
             terminal_colors: theme::Palette::dark(true),
+            files_colors: theme::Palette::dark(false),
+            git_colors: theme::Palette::dark(false),
             file_mode,
             elevation_mode: ElevationMode::None,
             last_cut: None,

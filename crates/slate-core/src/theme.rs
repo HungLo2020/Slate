@@ -58,3 +58,30 @@ pub fn is_light(color: &str) -> bool {
     let color = u32::from_str_radix(color.trim_start_matches('#'), 16).unwrap_or(0);
     ((color >> 16) & 255) * 299 + ((color >> 8) & 255) * 587 + (color & 255) * 114 > 128_000
 }
+
+/// A tool pane's colours as frontends receive them. `desktop` panes follow
+/// the desktop's own palette where the frontend has one (the GUI's Qt
+/// palette, the terminal's default colours); the colours are the core's best
+/// equivalent otherwise.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct PaneColors {
+    pub foreground: String,
+    pub background: String,
+    pub selection: String,
+    pub selection_foreground: String,
+    pub accent: String,
+    pub desktop: bool,
+}
+
+impl PaneColors {
+    pub fn new(palette: &Palette, theme: &str) -> Self {
+        Self {
+            foreground: palette.foreground.clone(),
+            background: palette.background.clone(),
+            selection: palette.selection.clone(),
+            selection_foreground: palette.selection_foreground.clone(),
+            accent: palette.accent.clone(),
+            desktop: theme == "auto",
+        }
+    }
+}
