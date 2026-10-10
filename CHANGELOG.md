@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Add a commit graph below the Git pane's changes in both interfaces: HEAD and its upstream with coloured lanes, branch and tag badges, authors and ages, paged loading, commits opened read-only, and a draggable divider to resize the graph against the changes.
+- Redesign the GUI Git pane: one line per change with file icons and coloured status letters, hover row actions, collapsible groups with count badges, focus-aware selection, a non-shifting progress bar, a primary Commit button that stays recognisable when unavailable, and consistent menus.
+- Show the branch's upstream with ahead/behind counts; add fetch, fast-forward pull, push (setting an upstream on first push), branch switching and branch creation. Remote commands never wait on a password prompt.
+- Add "Discard changes" (with confirmation; untracked files go to Trash), "Open changed file" and "Reveal in file browser" to both interfaces.
+- Lighten pane tabs: the active tab is tinted and underlined rather than filled, and tool tabs fit side by side in narrow panes.
+- Fix the Git pane highlighting a different row than the selected one after rows were inserted or removed.
+
 ## 0.1.10 — 2026-10-10
 
 - Redesign the GUI file tree: theme file-type icons, indent guides, denser rows, focus-aware selection, Git status colors and folder markers, dimmed ignored entries, a folder header with up, new, collapse-all and refresh actions, an "Up to …" parent row, a useful empty state and path hints only for truncated names.

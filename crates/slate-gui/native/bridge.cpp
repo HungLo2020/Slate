@@ -23,6 +23,7 @@
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPainterPath>
 #include <QPalette>
 #include <QPrintDialog>
 #include <QPrinter>
@@ -519,9 +520,11 @@ void Bridge::refresh() {
     const auto surfaces = frame.take("surfaces").toList();
     // Rows are only sent when their revision changed. They go to the models,
     // never into the frame QML converts on every change.
-    const bool fileChange = frame.contains("files"), gitChange = frame.contains("git");
-    const auto files = frame.take("files").toList(), git = frame.take("git").toList();
-    for (const auto &key : {"settings", "global_shortcuts"})
+    const bool fileChange = frame.contains("files"), gitChange = frame.contains("git"),
+               historyChange = frame.contains("history");
+    const auto files = frame.take("files").toList(), git = frame.take("git").toList(),
+               history = frame.take("history").toList();
+    for (const auto &key : {"settings", "global_shortcuts", "git_branches"})
         if (!frame.contains(key)) frame.insert(key, m_frame.value(key));
     QVariantList panes, handles;
     for (const auto &p : frame.value("panes").toList()) {
@@ -561,6 +564,7 @@ void Bridge::refresh() {
     }
     if (fileChange) { m_files.replace(files); emit filesChanged(); }
     if (gitChange) { m_git.replace(git); emit gitChanged(); }
+    if (historyChange) { m_history.replace(history); emit historyChanged(); }
     emit frameChanged();
     emit refreshFinished();
     if (frame.value("quit").toBool()) QCoreApplication::quit();
@@ -1311,6 +1315,57 @@ QVariant CellView::inputMethodQuery(Qt::InputMethodQuery query) const {
 }
 
 // ---------------------------------------------------------------------------
+GraphLanes::GraphLanes(QQuickItem *parent) : QQuickPaintedItem(parent) {
+    setAntialiasing(true);
+    connect(this, &GraphLanes::changed, this, [this]() { update(); });
+}
+// The same order as slate_core::git_history::PALETTE.
+QColor GraphLanes::laneColor(int index) {
+    static const char *palette[] = {"#4c8bf5", "#e5a03b", "#3fb27f", "#d65db1",
+                                    "#ef6b5b", "#20b2c4", "#9b7be0", "#a3a33a"};
+    return QColor(palette[((index % 8) + 8) % 8]);
+}
+void GraphLanes::paint(QPainter *p) {
+    p->setRenderHint(QPainter::Antialiasing);
+    const qreal half = height() / 2;
+    auto x = [this](int lane) { return (lane + 0.5) * m_laneWidth; };
+    for (const auto &value : m_segments) {
+        const auto segment = value.toList();
+        if (segment.size() < 5) continue;
+        const QPointF from(x(segment[0].toInt()), segment[1].toInt() * half),
+            to(x(segment[2].toInt()), segment[3].toInt() * half);
+        QPen pen(laneColor(segment[4].toInt()), 1.6);
+        pen.setCapStyle(Qt::FlatCap);
+        p->setPen(pen);
+        if (qFuzzyCompare(from.x(), to.x())) {
+            p->drawLine(from, to);
+            continue;
+        }
+        // Leave and enter vertically, so lanes read as continuous lines.
+        const qreal middle = (from.y() + to.y()) / 2;
+        QPainterPath path(from);
+        path.cubicTo(QPointF(from.x(), middle), QPointF(to.x(), middle), to);
+        p->drawPath(path);
+    }
+    const QColor color = laneColor(m_color);
+    const QPointF centre(x(m_lane), half);
+    const qreal radius = qMin<qreal>(m_laneWidth * 0.26, 3.6);
+    if (m_head) {
+        // The checked-out commit is ringed.
+        p->setPen(QPen(color, 1.4));
+        p->setBrush(Qt::NoBrush);
+        p->drawEllipse(centre, radius + 2.6, radius + 2.6);
+    }
+    p->setPen(QPen(m_background.isValid() ? m_background : Qt::transparent, 1.5));
+    p->setBrush(color);
+    p->drawEllipse(centre, radius + 0.75, radius + 0.75);
+    if (m_merge) {
+        // A merge is drawn hollow.
+        p->setPen(Qt::NoPen);
+        p->setBrush(m_background.isValid() ? m_background : Qt::white);
+        p->drawEllipse(centre, radius * 0.5, radius * 0.5);
+    }
+}
 Minimap::Minimap(QQuickItem *parent) : QQuickPaintedItem(parent) {
     setAcceptedMouseButtons(Qt::LeftButton);
     setOpaquePainting(true);
@@ -1442,6 +1497,7 @@ extern "C" int slate_qt_run(void *context, int argc, char **argv) {
     bridge = &state;
     qmlRegisterType<CellView>("Slate.Native", 1, 0, "CellView");
     qmlRegisterType<Minimap>("Slate.Native", 1, 0, "Minimap");
+    qmlRegisterType<GraphLanes>("Slate.Native", 1, 0, "GraphLanes");
     qmlRegisterSingletonType(QUrl("qrc:/slate/Theme.qml"), "Slate.Native", 1, 0, "Theme");
     QQmlApplicationEngine engine;
     engine.addImageProvider("icon", new IconProvider);

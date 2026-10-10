@@ -384,6 +384,14 @@ static QString checkGitLayout(Bridge *state, QQuickWindow *window) {
     if (listRect.right() > scrollRect.left() ||
         scrollRect.right() > view->mapRectToScene(view->boundingRect()).right())
         return "Git scrollbar gutter overlaps rows or escapes pane";
+    // The commit graph sits below the changes, inside the pane.
+    if (auto graph = findItem(window->contentItem(), "gitGraph_1"); graph && graph->isVisible()) {
+        const auto graphRect = graph->mapRectToScene(graph->boundingRect());
+        const auto viewRect = view->mapRectToScene(view->boundingRect());
+        if (graphRect.top() < listRect.bottom() - 1 || graphRect.right() > viewRect.right() + 1 ||
+            graphRect.bottom() > viewRect.bottom() + 1)
+            return "Commit graph overlaps the changes or escapes the pane";
+    }
     for (const auto &name : {"gitRefresh_1", "gitCommit_1", "gitStageAll_1", "gitUnstageAll_1"}) {
         auto button = findItem(window->contentItem(), name);
         if (!button || !button->isVisible())
@@ -752,10 +760,81 @@ static void startGitSmoke(Bridge *state, QQuickWindow *window) {
                 finish(false, "An untrusted repository did not ask for trust");
                 return;
             }
+            break;
+        case 20: {
+            // The graph lists the new commit first, as HEAD, above the fixture.
+            const auto history = state->historyEntries();
+            if (history.size() < 2 ||
+                history.first().toMap().value("subject") != "GUI bulk commit")
+                return;
+            const auto top = history.first().toMap();
+            if (!top.value("head").toBool() || top.value("parents").toList().size() != 1 ||
+                history.last().toMap().value("subject") != "Initial fixture") {
+                finish(false, "Commit graph rows are wrong after committing");
+                return;
+            }
+            auto graph = findItem(window->contentItem(), "gitGraph_1");
+            auto row = findItem(window->contentItem(), "commit_1_0");
+            if (!graph || !graph->isVisible() || !row || !row->isVisible()) {
+                finish(false, "Commit graph or its first row is not shown");
+                return;
+            }
+            if (!check("git-graph"))
+                return;
+            // The divider above the graph resizes it like a pane divider: the
+            // graph follows the pointer, each side keeps its minimum, and a
+            // double-click restores the default share.
+            {
+                auto splitter = findItem(window->contentItem(), "gitGraphSplitter_1");
+                auto section = findItem(window->contentItem(), "gitGraphSection_1");
+                auto list = findItem(window->contentItem(), "browser_1");
+                if (!splitter || !section || !list || !splitter->isVisible()) {
+                    finish(false, "Graph divider missing");
+                    return;
+                }
+                const qreal before = section->height();
+                const auto start = splitter->mapToScene(QPointF(splitter->width() / 2, splitter->height() / 2)).toPoint();
+                QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, start);
+                for (int i = 1; i <= 8; ++i)
+                    QTest::mouseMove(window, start - QPoint(0, 10 * i));
+                QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, start - QPoint(0, 80));
+                const qreal grown = section->height();
+                if (grown < before + 70 || grown > before + 90) {
+                    finish(false, QString("Dragging the graph divider 80 px resized the graph by %1 px")
+                                      .arg(grown - before));
+                    return;
+                }
+                const auto top = splitter->mapToScene(QPointF(splitter->width() / 2, splitter->height() / 2)).toPoint();
+                QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, top);
+                QTest::mouseMove(window, QPoint(top.x(), 0));
+                QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, QPoint(top.x(), 0));
+                if (list->height() < view->property("rowHeight").toInt() || section->height() <= grown) {
+                    finish(false, "Dragging the graph divider past the top squeezed out the changes");
+                    return;
+                }
+                const auto handle = splitter->mapToScene(QPointF(splitter->width() / 2, splitter->height() / 2)).toPoint();
+                QTest::mouseDClick(window, Qt::LeftButton, Qt::NoModifier, handle);
+                if (qAbs(section->height() - before) > 1) {
+                    finish(false, "Double-clicking the graph divider did not restore its size");
+                    return;
+                }
+            }
+            if (!click("commit_1_0"))
+                return;
+            break;
+        }
+        case 21: {
+            bool shown = false;
+            for (const auto &value : frame.value("panes").toList())
+                for (const auto &tab : value.toMap().value("tabs").toList())
+                    shown |= tab.toMap().value("title").toString().endsWith(" · commit");
+            if (!shown)
+                return;
             finish(true, "Populated Git: trust prompt, normal/narrow/short/large fonts, separate scrollbar "
                          "gutter, row/section/bulk staging, compact composer, failed commit draft "
-                         "retention and successful retry");
+                         "retention, successful retry, commit graph and commit details");
             return;
+        }
         }
         ++*step;
     });

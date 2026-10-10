@@ -76,6 +76,8 @@ class Bridge : public QObject {
     Q_PROPERTY(QVariantList handleIds READ handleIds NOTIFY structureChanged)
     Q_PROPERTY(QAbstractItemModel *files READ files CONSTANT)
     Q_PROPERTY(QAbstractItemModel *git READ git CONSTANT)
+    // The commit graph's rows, which follow the Git changes in the pane.
+    Q_PROPERTY(QAbstractItemModel *history READ history CONSTANT)
     Q_PROPERTY(QVariantList gitEntries READ gitEntries NOTIFY gitChanged)
     // The browsed folder is below the workspace root (its listing starts with "..").
     Q_PROPERTY(bool browserNested READ browserNested NOTIFY filesChanged)
@@ -93,6 +95,8 @@ class Bridge : public QObject {
     QVariantList handleIds() const { return m_handleIds; }
     QAbstractItemModel *files() { return &m_files; }
     QAbstractItemModel *git() { return &m_git; }
+    QAbstractItemModel *history() { return &m_history; }
+    QVariantList historyEntries() const { return m_history.rows(); }
     // File and Git rows live in their models, not in the QML frame, which is
     // converted to JavaScript whenever it changes.
     QVariantList gitEntries() const { return m_git.rows(); }
@@ -151,11 +155,12 @@ class Bridge : public QObject {
     void structureChanged();
     void filesChanged();
     void gitChanged();
+    void historyChanged();
     void refreshFinished();
     void fontChanged();
 
   private:
-    EntryModel m_files, m_git;
+    EntryModel m_files, m_git, m_history;
     QPointer<QFileDialog> m_pathDialog;
     QPointer<QMessageBox> m_closeDialog;
     QPointer<QQuickWindow> m_window;
@@ -267,6 +272,35 @@ class CellView : public QQuickPaintedItem {
     void restartBlink();
     void notifyAccessibleCursor();
     QVariantMap m_accessibleContext;
+};
+
+// One row of the commit graph: the lane lines passing through it (each
+// [lane, height, lane, height, colour], heights 0 top, 1 middle, 2 bottom)
+// and the commit's node. Curves join lanes; colours follow the core palette.
+class GraphLanes : public QQuickPaintedItem {
+    Q_OBJECT
+    Q_PROPERTY(QVariantList segments MEMBER m_segments NOTIFY changed)
+    Q_PROPERTY(int lane MEMBER m_lane NOTIFY changed)
+    Q_PROPERTY(int color MEMBER m_color NOTIFY changed)
+    Q_PROPERTY(bool head MEMBER m_head NOTIFY changed)
+    Q_PROPERTY(bool merge MEMBER m_merge NOTIFY changed)
+    Q_PROPERTY(qreal laneWidth MEMBER m_laneWidth NOTIFY changed)
+    // Fills the node of a merge commit and rings the others, so nodes stay
+    // distinct where lines cross them.
+    Q_PROPERTY(QColor background MEMBER m_background NOTIFY changed)
+  public:
+    GraphLanes(QQuickItem *parent = nullptr);
+    void paint(QPainter *painter) override;
+    static QColor laneColor(int index);
+  signals:
+    void changed();
+
+  private:
+    QVariantList m_segments;
+    int m_lane = 0, m_color = 0;
+    bool m_head = false, m_merge = false;
+    qreal m_laneWidth = 14;
+    QColor m_background;
 };
 
 // The document overview beside an editor: one bar per (sampled) line, the

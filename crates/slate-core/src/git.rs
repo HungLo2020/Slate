@@ -39,10 +39,21 @@ impl GitEntry {
         std::iter::once(self.raw_path.clone()).chain(source)
     }
 }
+#[derive(Default)]
 pub struct GitState {
     pub entries: Vec<GitEntry>,
     pub branch: String,
     pub repository: bool,
+    /// The checked-out commit; empty before the first commit.
+    pub head: String,
+    /// The current branch's upstream (`origin/main`) and its commit, and how
+    /// far the branch is ahead of and behind it. Empty without an upstream.
+    pub upstream: String,
+    pub upstream_head: String,
+    pub ahead: usize,
+    pub behind: usize,
+    /// Local branches, most recently committed first.
+    pub branches: Vec<String>,
 }
 
 /// The Git pane's state.
@@ -65,6 +76,25 @@ pub(crate) struct Panel {
     /// The repository's top folder, which status paths are relative to;
     /// empty outside a repository.
     pub top: String,
+    pub head: String,
+    pub upstream: String,
+    pub upstream_head: String,
+    pub ahead: usize,
+    pub behind: usize,
+    pub branches: Vec<String>,
+    /// The commit graph, listed after `entries`: a `selected` index past the
+    /// last entry selects `history[selected - entries.len()]`.
+    pub history: Vec<crate::git_history::HistoryRow>,
+    pub history_revision: u64,
+    /// Commits requested; "load more" raises it a page at a time.
+    pub history_limit: usize,
+    pub history_running: bool,
+    pub history_again: bool,
+    /// The (HEAD, upstream) commits the history was read for, and whether a
+    /// refresh asked for it to be read again regardless.
+    pub history_key: (String, String),
+    pub history_stale: bool,
+    pub history_error: String,
 }
 impl Default for Panel {
     fn default() -> Self {
@@ -80,6 +110,20 @@ impl Default for Panel {
             status_again: false,
             restricted: false,
             top: String::new(),
+            head: String::new(),
+            upstream: String::new(),
+            upstream_head: String::new(),
+            ahead: 0,
+            behind: 0,
+            branches: Vec::new(),
+            history: Vec::new(),
+            history_revision: 1,
+            history_limit: crate::git_history::PAGE,
+            history_running: false,
+            history_again: false,
+            history_key: Default::default(),
+            history_stale: false,
+            history_error: String::new(),
         }
     }
 }
@@ -123,12 +167,37 @@ pub enum GitJob {
         untracked: bool,
     },
     Hunk(std::sync::Arc<crate::comparison::Preview>, usize),
+    /// Read up to `limit` commits of HEAD and its upstream for the graph.
+    History {
+        context: Context,
+        limit: usize,
+        head: String,
+    },
+    /// A commit's message, statistics and patch, for a read-only document.
+    Show {
+        context: Context,
+        hash: String,
+    },
+    /// Talk to the branch's remote. Never prompts for credentials.
+    Remote(Context, Remote),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Remote {
+    Fetch,
+    /// Fast-forward only: a pull never creates a merge or stops on conflicts.
+    Pull,
+    /// Push, setting an upstream on the only (or `origin`) remote when the
+    /// branch has none yet.
+    Push,
 }
 
 pub enum GitReply {
     Status(Result<GitState, String>),
     Operation(Result<String, String>),
     Preview(Result<crate::comparison::Preview, String>),
+    History(Result<Vec<crate::git_history::HistoryRow>, String>),
+    Show(String, Result<String, String>),
 }
 
 #[cfg(unix)]
@@ -161,12 +230,7 @@ pub(crate) fn command(root: &Path) -> Command {
 pub fn run(context: &Context, args: &[OsString], timeout: Duration) -> Result<Output, String> {
     let mut command = command(&context.root);
     command.args(args);
-    let label = format!(
-        "git {}",
-        args.first()
-            .map(|a| a.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    );
+    let label = format!("git {}", subcommand(args));
     crate::process::run(&mut command, None, timeout, &label)
 }
 
@@ -195,6 +259,180 @@ pub fn handle(job: GitJob) -> GitReply {
             GitReply::Operation(crate::comparison::apply_hunk(&preview, index))
         }
         GitJob::Run(context, args) => GitReply::Operation(operation(&context, args)),
+        GitJob::History {
+            context,
+            limit,
+            head,
+        } => GitReply::History(history(&context, limit, &head)),
+        GitJob::Show { context, hash } => {
+            let result = show(&context, &hash);
+            GitReply::Show(hash, result)
+        }
+        GitJob::Remote(context, remote) => GitReply::Operation(remote_operation(&context, remote)),
+    }
+}
+
+/// The successful, trimmed output of a read, or empty.
+fn read_text(context: &Context, list: &[&str]) -> String {
+    run(context, &args(list), READ_TIMEOUT)
+        .ok()
+        .filter(|r| r.status.success())
+        .map(|r| String::from_utf8_lossy(&r.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+fn history(
+    context: &Context,
+    limit: usize,
+    head: &str,
+) -> Result<Vec<crate::git_history::HistoryRow>, String> {
+    if head.is_empty() {
+        // Nothing is committed yet.
+        return Ok(Vec::new());
+    }
+    let mut list = args(&["log", "--topo-order", "--decorate=full", "--no-color"]);
+    list.push(crate::git_history::LOG_FORMAT.into());
+    list.push(format!("--max-count={}", limit.clamp(1, crate::git_history::MAX)).into());
+    list.push("HEAD".into());
+    if !read_text(context, &["rev-parse", "--verify", "-q", "@{upstream}"]).is_empty() {
+        list.push("@{upstream}".into());
+    }
+    list.push("--".into());
+    let result = run(context, &list, READ_TIMEOUT)?;
+    if !result.status.success() {
+        return Err(String::from_utf8_lossy(&result.stderr).trim().to_string());
+    }
+    Ok(crate::git_history::layout(
+        crate::git_history::parse_log(&result.stdout),
+        head,
+    ))
+}
+
+/// Hex object names only, so the argument can never be read as an option.
+pub(crate) fn valid_hash(hash: &str) -> bool {
+    (4..=64).contains(&hash.len()) && hash.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn show(context: &Context, hash: &str) -> Result<String, String> {
+    if !valid_hash(hash) {
+        return Err("Not a commit".into());
+    }
+    let mut list = args(&[
+        // File names as they are, not octal-escaped.
+        "-c",
+        "core.quotePath=false",
+        "show",
+        "--stat",
+        "--patch",
+        "--format=fuller",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+    ]);
+    list.push(hash.into());
+    list.push("--".into());
+    let result = run(context, &list, READ_TIMEOUT)?;
+    if !result.status.success() {
+        return Err(String::from_utf8_lossy(&result.stderr).trim().to_string());
+    }
+    let mut text = String::from_utf8_lossy(&result.stdout).into_owned();
+    if text.len() > 2 * 1024 * 1024 {
+        let mut end = 2 * 1024 * 1024;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("\n[Commit preview truncated at 2 MiB]\n");
+    }
+    Ok(text)
+}
+
+/// Run a command that may contact a remote. Git never prompts (see
+/// [`command`]); SSH is kept from prompting too, unless the user configured
+/// their own SSH command, because Slate's process group cannot read the
+/// terminal and a prompt would wait until the timeout.
+fn run_remote(context: &Context, list: &[OsString]) -> Result<Output, String> {
+    let mut command = command(&context.root);
+    let configured = std::env::var_os("GIT_SSH_COMMAND").is_some()
+        || std::env::var_os("GIT_SSH").is_some()
+        || !read_text(context, &["config", "--get", "core.sshCommand"]).is_empty();
+    if !configured {
+        command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    }
+    command.args(list);
+    let label = format!("git {}", subcommand(list));
+    crate::process::run(&mut command, None, WRITE_TIMEOUT, &label)
+}
+
+/// The Git subcommand in an argument list, past any `-c name=value` options.
+fn subcommand(list: &[OsString]) -> String {
+    let mut args = list.iter();
+    while let Some(arg) = args.next() {
+        if arg == "-c" {
+            args.next();
+            continue;
+        }
+        return arg.to_string_lossy().into_owned();
+    }
+    String::new()
+}
+
+fn remote_operation(context: &Context, remote: Remote) -> Result<String, String> {
+    let list = match remote {
+        Remote::Fetch => args(&["fetch"]),
+        Remote::Pull => args(&["pull", "--ff-only"]),
+        Remote::Push => {
+            let upstream = read_text(
+                context,
+                &[
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}",
+                ],
+            );
+            if upstream.is_empty() {
+                let remotes = read_text(context, &["remote"]);
+                let remotes: Vec<&str> = remotes.lines().collect();
+                let target = if remotes.contains(&"origin") {
+                    "origin"
+                } else if let [only] = remotes[..] {
+                    only
+                } else if remotes.is_empty() {
+                    return Err("This repository has no remote to push to".into());
+                } else {
+                    return Err("Choose a remote: set this branch's upstream first".into());
+                };
+                let mut list = args(&["push", "--set-upstream"]);
+                list.push(target.into());
+                list.push("HEAD".into());
+                list
+            } else {
+                args(&["push"])
+            }
+        }
+    };
+    let result = run_remote(context, &list)?;
+    // Fetch, pull and push report progress on standard error.
+    let output = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim().to_string();
+    if result.status.success() {
+        let message = output(&result.stdout);
+        Ok(if message.is_empty() {
+            match remote {
+                Remote::Fetch => "Fetched".into(),
+                Remote::Pull => "Pulled".into(),
+                Remote::Push => "Pushed".into(),
+            }
+        } else {
+            message
+        })
+    } else {
+        let error = output(&result.stderr);
+        Err(if error.is_empty() {
+            output(&result.stdout)
+        } else {
+            error
+        })
     }
 }
 
@@ -287,28 +525,70 @@ fn status(context: &Context) -> Result<GitState, String> {
     if !result.status.success() {
         let error = String::from_utf8_lossy(&result.stderr).trim().to_string();
         if error.contains("not a git repository") {
-            return Ok(GitState {
-                entries: vec![],
-                branch: String::new(),
-                repository: false,
-            });
+            return Ok(GitState::default());
         }
         return Err(error);
     }
-    let branch = run(
+    let symbolic = read_text(context, &["symbolic-ref", "--short", "HEAD"]);
+    let branch = if symbolic.is_empty() {
+        "Detached HEAD".into()
+    } else {
+        symbolic
+    };
+    let head = read_text(context, &["rev-parse", "--verify", "-q", "HEAD"]);
+    let refs = read_text(
         context,
-        &args(&["symbolic-ref", "--short", "HEAD"]),
-        READ_TIMEOUT,
-    )
-    .ok()
-    .filter(|r| r.status.success())
-    .map(|r| String::from_utf8_lossy(&r.stdout).trim().to_string())
-    .unwrap_or_else(|| "Detached HEAD".into());
-    Ok(GitState {
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--count=200",
+            "--format=%(HEAD)%00%(refname:short)%00%(upstream:short)%00%(upstream:track,nobracket)",
+            "refs/heads",
+        ],
+    );
+    let mut state = GitState {
         entries: parse_status(&result.stdout),
         branch,
         repository: true,
-    })
+        head,
+        ..GitState::default()
+    };
+    apply_branch_refs(&mut state, &refs);
+    if !state.upstream.is_empty() {
+        state.upstream_head = read_text(context, &["rev-parse", "--verify", "-q", "@{upstream}"]);
+    }
+    Ok(state)
+}
+
+/// Branch names, and the current branch's upstream and distance from it, from
+/// `for-each-ref --format=%(HEAD)%00%(refname:short)%00%(upstream:short)%00%(upstream:track,nobracket)`.
+pub(crate) fn apply_branch_refs(state: &mut GitState, output: &str) {
+    for line in output.lines() {
+        let fields: Vec<&str> = line.split('\0').collect();
+        let [current, name, upstream, track] = fields[..] else {
+            continue;
+        };
+        state.branches.push(name.to_string());
+        if current.trim() != "*" {
+            continue;
+        }
+        // "gone" means the upstream was deleted: there is nothing to sync with.
+        if track != "gone" {
+            state.upstream = upstream.to_string();
+        }
+        for part in track.split(", ") {
+            let count = |prefix: &str| {
+                part.strip_prefix(prefix)
+                    .and_then(|n| n.trim().parse().ok())
+            };
+            if let Some(n) = count("ahead ") {
+                state.ahead = n;
+            }
+            if let Some(n) = count("behind ") {
+                state.behind = n;
+            }
+        }
+    }
 }
 
 /// Parse `git status --porcelain=v1 -z` output.
@@ -381,7 +661,7 @@ pub(crate) fn raw_path(entries: &[GitEntry], display: &str) -> OsString {
 }
 
 use crate::{services::Job, App};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context as _, Result};
 
 fn os_args(list: &[&str]) -> Vec<OsString> {
     list.iter().map(OsString::from).collect()
@@ -477,27 +757,45 @@ impl App {
                 self.git.revision += 1;
                 self.git.branch = state.branch;
                 self.git.repository = state.repository;
+                // A selected commit stays selected as the change list above it
+                // grows or shrinks; a selected change is followed by its path.
+                let commit = self.selected_commit().map(|c| c.hash.clone());
                 let selection = self
                     .git
                     .entries
                     .get(self.git.selected)
                     .map(|e| (e.path.clone(), e.staged));
                 self.git.entries = state.entries;
-                if let Some((path, staged)) = selection {
-                    if let Some(index) = self
-                        .git
-                        .entries
-                        .iter()
-                        .position(|e| e.path == path && e.staged == staged)
-                        .or_else(|| self.git.entries.iter().position(|e| e.path == path))
-                    {
-                        self.git.selected = index;
+                if let Some(hash) = commit {
+                    let index = self.git.history.iter().position(|c| c.hash == hash);
+                    self.git.selected = self.git.entries.len() + index.unwrap_or(0);
+                } else {
+                    if let Some((path, staged)) = selection {
+                        if let Some(index) = self
+                            .git
+                            .entries
+                            .iter()
+                            .position(|e| e.path == path && e.staged == staged)
+                            .or_else(|| self.git.entries.iter().position(|e| e.path == path))
+                        {
+                            self.git.selected = index;
+                        }
                     }
+                    self.git.selected = self
+                        .git
+                        .selected
+                        .min(self.git.entries.len().saturating_sub(1));
                 }
-                self.git.selected = self
-                    .git
-                    .selected
-                    .min(self.git.entries.len().saturating_sub(1));
+                self.git.head = state.head;
+                self.git.upstream = state.upstream;
+                self.git.upstream_head = state.upstream_head;
+                self.git.ahead = state.ahead;
+                self.git.behind = state.behind;
+                self.git.branches = state.branches;
+                let key = (self.git.head.clone(), self.git.upstream_head.clone());
+                if key != self.git.history_key || self.git.history_stale {
+                    self.refresh_history();
+                }
             }
             Err(e) => {
                 self.git_status_finished();
@@ -579,6 +877,8 @@ impl App {
                     self.git = Panel {
                         jobs: self.git.jobs,
                         revision: self.git.revision + 1,
+                        // Revisions only grow, so frontends never keep a stale graph.
+                        history_revision: self.git.history_revision + 1,
                         ..Panel::default()
                     };
                 }
@@ -596,6 +896,7 @@ impl App {
                 self.git.selected = 0;
                 self.git.repository = true;
                 self.git.restricted = true;
+                self.clear_repository_details();
                 self.git.error = format!(
                     "Git is off until you trust {}: repository configuration can run programs.",
                     context.root.display()
@@ -642,6 +943,150 @@ impl App {
             }
             _ => self.status = "This folder is already trusted".into(),
         }
+    }
+    /// The Git pane's branch, remote and per-file actions.
+    pub(crate) fn git_pane_action(&mut self, name: &str, argument: &str) -> Result<()> {
+        match name {
+            "git-fetch" | "git-pull" | "git-push" => {
+                let (remote, doing) = match name {
+                    "git-fetch" => (Remote::Fetch, "Fetching"),
+                    "git-pull" => (Remote::Pull, "Pulling"),
+                    _ => (Remote::Push, "Pushing"),
+                };
+                let retry = crate::Command::Action {
+                    name: name.into(),
+                    argument: String::new(),
+                };
+                let Some(context) = self.git_ready(retry) else {
+                    return Ok(());
+                };
+                self.services
+                    .tx
+                    .send(Job::Git(GitJob::Remote(context, remote)))?;
+                self.git.error.clear();
+                self.git.jobs += 1;
+                self.status = format!("{doing}…");
+            }
+            "git-switch" | "git-branch" => {
+                let branch = argument.trim();
+                if branch.is_empty()
+                    || branch.starts_with('-')
+                    || branch.chars().any(|c| c.is_whitespace() || c.is_control())
+                {
+                    bail!("Not a branch name: {branch}");
+                }
+                let mut list = os_args(&["switch"]);
+                if name == "git-branch" {
+                    list.push("--create".into());
+                }
+                list.push(branch.into());
+                self.git_action(list)?;
+            }
+            "git-show" => self.show_commit(argument)?,
+            "git-history-more" => self.load_more_history()?,
+            "git-open" => {
+                let path = self.selected_change_path()?;
+                if !path.exists() {
+                    bail!("{} was deleted", path.display());
+                }
+                self.execute(crate::Command::Open { path })?;
+            }
+            "discard-changes" => {
+                let entry = self.discardable()?.clone();
+                let path = self.selected_change_path()?;
+                self.ensure_change_unedited(&path)?;
+                self.pending_file = Some(path);
+                self.prompt = Some(crate::search::Prompt {
+                    kind: "discard-changes".into(),
+                    input: entry.path.clone(),
+                    replacement: if entry.untracked {
+                        "untracked".into()
+                    } else {
+                        String::new()
+                    },
+                    field: 0,
+                    case_sensitive: false,
+                    whole_word: false,
+                });
+            }
+            "reveal-in-files" => {
+                let target = if !argument.trim().is_empty() {
+                    PathBuf::from(argument.trim())
+                } else if self.focused_kind() == "git" {
+                    self.selected_change_path()?
+                } else {
+                    self.active_editor()
+                        .and_then(|id| self.views.get(&id))
+                        .and_then(|v| self.documents[&v.document].path.clone())
+                        .ok_or_else(|| anyhow::anyhow!("Select a file to reveal"))?
+                };
+                self.reveal_in_files(&target)?;
+            }
+            _ => bail!("Unknown Git action: {name}"),
+        }
+        Ok(())
+    }
+    /// The selected change's file, in the working tree.
+    pub(crate) fn selected_change_path(&self) -> Result<PathBuf> {
+        let entry = self
+            .git
+            .entries
+            .get(self.git.selected)
+            .ok_or_else(|| anyhow::anyhow!("Select a changed file first"))?;
+        if self.git.top.is_empty() {
+            bail!("Git is not available here");
+        }
+        Ok(Path::new(&self.git.top).join(&entry.raw_path))
+    }
+    /// The selected change, when it is a working-tree change Git can undo.
+    fn discardable(&self) -> Result<&GitEntry> {
+        let entry = self
+            .git
+            .entries
+            .get(self.git.selected)
+            .ok_or_else(|| anyhow::anyhow!("Select a changed file first"))?;
+        if entry.staged {
+            bail!("Unstage the change first; only working changes are discarded");
+        }
+        if entry.group == "Conflicts" {
+            bail!("Resolve conflicts in the file; they cannot be discarded");
+        }
+        Ok(entry)
+    }
+    fn ensure_change_unedited(&self, path: &Path) -> Result<()> {
+        if self
+            .documents
+            .values()
+            .any(|doc| doc.path.as_deref() == Some(path) && doc.dirty())
+        {
+            bail!("Save or close the modified document before discarding its changes");
+        }
+        Ok(())
+    }
+    /// Discard the change the "discard-changes" prompt named: restore a
+    /// tracked file from the index, or move an untracked one to the Trash.
+    pub(crate) fn confirm_discard(&mut self) -> Result<()> {
+        let path = self.pending_file.take().context("No change selected")?;
+        let entry = self
+            .git
+            .entries
+            .iter()
+            .find(|e| !e.staged && Path::new(&self.git.top).join(&e.raw_path) == path)
+            .cloned()
+            .context("The change is no longer listed")?;
+        self.ensure_change_unedited(&path)?;
+        if entry.untracked {
+            self.services
+                .io
+                .send(crate::services::IoJob::FileOperation(
+                    crate::files::FileOperation::Trash(path),
+                ))?;
+            self.status = "Moving the untracked file to Trash…".into();
+            return Ok(());
+        }
+        let mut list = os_args(&["restore", "--worktree", "--"]);
+        list.extend(entry.staging_paths());
+        self.git_action(list)
     }
     pub(crate) fn git_action(&mut self, args: Vec<OsString>) -> Result<()> {
         let Some((context, true)) = self.git_context() else {
@@ -691,6 +1136,26 @@ mod tests {
             );
         }
         assert!(envs.contains(&(OsStr::new("GIT_OPTIONAL_LOCKS"), Some(OsStr::new("0")))));
+    }
+
+    #[test]
+    fn branch_refs_give_upstream_distance_and_names() {
+        let mut state = GitState::default();
+        apply_branch_refs(
+            &mut state,
+            " \0topic\0origin/topic\0behind 1\n*\0main\0origin/main\0ahead 2, behind 3\n \0old\0origin/old\0gone",
+        );
+        assert_eq!(state.branches, ["topic", "main", "old"]);
+        assert_eq!(state.upstream, "origin/main");
+        assert_eq!((state.ahead, state.behind), (2, 3));
+        // A deleted upstream leaves nothing to sync with.
+        let mut gone = GitState::default();
+        apply_branch_refs(&mut gone, "*\0old\0origin/old\0gone");
+        assert!(gone.upstream.is_empty() && gone.ahead == 0);
+        // Detached HEAD: no branch is current.
+        let mut detached = GitState::default();
+        apply_branch_refs(&mut detached, " \0main\0\0");
+        assert!(detached.upstream.is_empty() && detached.branches == ["main"]);
     }
 
     #[cfg(unix)]

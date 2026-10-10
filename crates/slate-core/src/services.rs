@@ -161,6 +161,9 @@ pub enum Reply {
     Git(Result<GitState, String>),
     GitOperation(Result<String, String>),
     GitPreview(Result<crate::comparison::Preview, String>),
+    GitHistory(Result<Vec<crate::git_history::HistoryRow>, String>),
+    /// A commit's hash and its `git show` text.
+    GitShow(String, Result<String, String>),
     Spelling(Result<Vec<String>, String>),
     Disk(Vec<(u64, crate::document::DiskChange)>),
     /// The workspace file index for a root.
@@ -220,13 +223,18 @@ pub struct JobSender {
     /// Status and diffs; a slow status never delays staging or commits.
     git_read: QueueSender<Job>,
     git_write: QueueSender<Job>,
+    /// The commit graph: a long `git log` never delays status reads.
+    git_history: QueueSender<Job>,
     files: QueueSender<Job>,
 }
 impl JobSender {
     pub fn send(&self, job: Job) -> Result<(), std::io::Error> {
         use crate::git::GitJob;
         match job {
-            Job::Git(GitJob::Run(..) | GitJob::Hunk(..)) => self.git_write.send(job),
+            Job::Git(GitJob::Run(..) | GitJob::Hunk(..) | GitJob::Remote(..)) => {
+                self.git_write.send(job)
+            }
+            Job::Git(GitJob::History { .. }) => self.git_history.send(job),
             Job::Git(_) => self.git_read.send(job),
             _ => self.files.send(job),
         }
@@ -245,10 +253,12 @@ impl Services {
     pub fn new(events: crate::events::Events) -> Self {
         let (git_read, read_jobs) = mpsc::sync_channel(64);
         let (git_write, write_jobs) = mpsc::sync_channel(64);
+        let (git_history, history_jobs) = mpsc::sync_channel(16);
         let (files, file_jobs) = mpsc::sync_channel(64);
         let tx = JobSender {
             git_read: QueueSender(git_read),
             git_write: QueueSender(git_write),
+            git_history: QueueSender(git_history),
             files: QueueSender(files),
         };
         let (sender, rx) = mpsc::sync_channel(256);
@@ -365,7 +375,7 @@ impl Services {
                 highlight_output.send(Reply::Highlighted(response)).is_ok()
             });
         });
-        for jobs in [read_jobs, write_jobs, file_jobs] {
+        for jobs in [read_jobs, write_jobs, history_jobs, file_jobs] {
             let output = output.clone();
             thread::spawn(move || {
                 while let Ok(job) = jobs.recv() {
@@ -380,6 +390,10 @@ impl Services {
                             crate::git::GitReply::Status(state) => Reply::Git(state),
                             crate::git::GitReply::Operation(result) => Reply::GitOperation(result),
                             crate::git::GitReply::Preview(result) => Reply::GitPreview(result),
+                            crate::git::GitReply::History(result) => Reply::GitHistory(result),
+                            crate::git::GitReply::Show(hash, result) => {
+                                Reply::GitShow(hash, result)
+                            }
                         },
                     };
                     if output.send(reply).is_err() {

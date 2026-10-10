@@ -77,13 +77,21 @@ impl App {
                     self.file_operation_done(operation, result)
                 }
                 Reply::Files(path, Ok(entries)) if path == self.browser => {
+                    self.browse_replies += 1;
                     if self.files != entries {
                         self.files_revision += 1;
                     }
                     self.files = entries;
                     self.selected = self.selected.min(self.files.len().saturating_sub(1));
+                    self.finish_reveal();
                 }
-                Reply::Files(_, Err(e)) => self.status = e,
+                Reply::Files(_, result) => {
+                    self.browse_replies += 1;
+                    if let Err(e) = result {
+                        self.status = e;
+                    }
+                    self.finish_reveal();
+                }
                 Reply::Git(state) => self.git_status(state),
                 Reply::GitOperation(result) => self.git_operation_done(result),
                 Reply::Index(root, files) => self.index_ready(root, files),
@@ -103,7 +111,8 @@ impl App {
                 Reply::Disk(changes) => self.disk_changes(changes),
                 Reply::GitPreview(Ok(preview)) => self.show_comparison(preview),
                 Reply::GitPreview(Err(error)) => self.git_operation_done(Err(error)),
-                _ => {}
+                Reply::GitHistory(result) => self.history_done(result),
+                Reply::GitShow(hash, result) => self.commit_shown(hash, result),
             }
         }
         self.offer_save_question();

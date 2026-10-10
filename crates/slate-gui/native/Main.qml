@@ -22,6 +22,9 @@ ApplicationWindow {
     property string gitCommitDraft: ""
     property string gitSubmittedMessage: ""
     property bool gitCommitting: false
+    // The Git pane's commit graph: shown, and its share of the pane.
+    property bool gitGraphOpen: true
+    property real gitGraphShare: 0.4
     readonly property var settings: frame.settings || ({})
     readonly property bool statusIsError: {
         var s = frame.status || "";
@@ -35,7 +38,7 @@ ApplicationWindow {
     function updateGitFrame() {
         // Row actions also depend on which panes show Git, so pane kinds count.
         var kinds = (frame.panes || []).map(function (p) { return p.id + ":" + p.kind; }).join(",");
-        var key = [frame.git_revision, frame.git_busy, frame.git_error, frame.git_branch, frame.git_repository, frame.git_restricted, frame.git_root, frame.focus, frame.editor_only, kinds].join("|");
+        var key = [frame.git_revision, frame.git_busy, frame.git_error, frame.git_branch, frame.git_repository, frame.git_restricted, frame.git_root, frame.git_upstream, frame.git_ahead, frame.git_behind, (frame.git_branches || []).join("\u0000"), frame.history_revision, frame.history_more, frame.history_error, frame.focus, frame.editor_only, kinds].join("|");
         if (key === gitKey)
             return;
         gitKey = key;
@@ -48,6 +51,13 @@ ApplicationWindow {
             "git_branch": frame.git_branch,
             "git_busy": frame.git_busy,
             "git_error": frame.git_error,
+            "git_root": frame.git_root,
+            "git_upstream": frame.git_upstream,
+            "git_ahead": frame.git_ahead || 0,
+            "git_behind": frame.git_behind || 0,
+            "git_branches": frame.git_branches || [],
+            "history_more": !!frame.history_more,
+            "history_error": frame.history_error || "",
             "git": slate.gitEntries,
             "focus": frame.focus
         };
@@ -81,9 +91,7 @@ ApplicationWindow {
         return marks;
     }
     function gitMarkColor(mark) {
-        if (!mark)
-            return Theme.textColor;
-        return mark.kind === "conflict" || mark.kind === "deleted" ? Theme.negativeTextColor : mark.kind === "modified" ? Theme.neutralTextColor : Theme.positiveTextColor;
+        return Theme.statusColor(mark ? mark.kind : "");
     }
     function gitMarkLetter(mark) {
         return mark ? ({"conflict": "!", "modified": "M", "deleted": "D", "added": "A", "untracked": "U"})[mark.kind] : "";
@@ -96,6 +104,8 @@ ApplicationWindow {
     }
     readonly property int paneHeaderHeight: Math.ceil(Math.max(40, uiMetrics.height + 20))
     readonly property int uiTabMinimum: Math.ceil(Math.max(122, uiMetrics.averageCharacterWidth * 10 + 52))
+    // Tool tabs (Files, Git) have no close button and short titles.
+    readonly property int toolTabMinimum: Math.ceil(Math.max(64, uiMetrics.averageCharacterWidth * 6 + 28))
     // File tree rows are denser than Git rows, which carry two lines and buttons.
     readonly property int fileRowHeight: Math.ceil(Math.max(24, uiMetrics.height + 8))
     readonly property int fileIndent: Math.ceil(Math.max(12, uiMetrics.height * 0.8))
@@ -250,24 +260,6 @@ ApplicationWindow {
             elide: Text.ElideMiddle
             verticalAlignment: Text.AlignVCenter
             color: plainItem.palette.windowText
-        }
-    }
-    // A menu entry handled by the window (clipboard, desktop), styled like
-    // catalog entries.
-    component EntryMenuItem: Basic.MenuItem {
-        id: entryItem
-        required property string caption
-        text: caption
-        height: visible ? implicitHeight : 0
-        font: root.font
-        contentItem: Text {
-            text: entryItem.caption
-            textFormat: Text.PlainText
-            font: entryItem.font
-            color: entryItem.highlighted ? Theme.highlightedTextColor : entryItem.enabled ? Theme.textColor : Theme.disabledTextColor
-        }
-        background: Rectangle {
-            color: entryItem.highlighted ? Theme.highlightColor : "transparent"
         }
     }
     // A label with the characters at `positions` bold and underlined.
@@ -776,7 +768,13 @@ ApplicationWindow {
                         Layout.minimumWidth: 0
                         Layout.fillHeight: true
                         readonly property var entries: panel.tabItems
-                        readonly property bool crowded: entries.length * root.uiTabMinimum > width
+                        readonly property real minimumWidth: {
+                            var total = Math.max(0, entries.length - 1) * 4;
+                            for (var i = 0; i < entries.length; i++)
+                                total += entries[i].close_id === null || entries[i].close_id === undefined ? root.toolTabMinimum : root.uiTabMinimum;
+                            return total;
+                        }
+                        readonly property bool crowded: minimumWidth > width
                         RowLayout {
                             anchors.fill: parent
                             spacing: 4
@@ -800,8 +798,29 @@ ApplicationWindow {
                                         rightPadding: tabClose.visible ? tabClose.width + 8 : leftPadding
                                         text: fileTab.modelData.title
                                         tip: fileTab.modelData.title
-                                        highlighted: fileTab.modelData.active
+                                        // The active tab is tinted and underlined in the
+                                        // accent, rather than filled with it.
+                                        flat: true
                                         font.bold: fileTab.modelData.active
+                                        foregroundColor: fileTab.modelData.active ? Theme.textColor : Qt.alpha(Theme.textColor, 0.75)
+                                        Accessible.name: fileTab.modelData.title + (fileTab.modelData.active ? ", active tab" : "")
+                                        background: Rectangle {
+                                            radius: 4
+                                            color: fileTab.modelData.active ? Qt.alpha(Theme.highlightColor, 0.16) : tabSelect.hovered ? Qt.alpha(Theme.textColor, 0.07) : "transparent"
+                                            border.width: tabSelect.visualFocus ? 2 : 0
+                                            border.color: Theme.highlightColor
+                                            Rectangle {
+                                                visible: fileTab.modelData.active
+                                                anchors.left: parent.left
+                                                anchors.right: parent.right
+                                                anchors.bottom: parent.bottom
+                                                anchors.leftMargin: 6
+                                                anchors.rightMargin: 6
+                                                height: 2
+                                                radius: 1
+                                                color: Theme.highlightColor
+                                            }
+                                        }
                                         onClicked: root.send({
                                             "action": "switch_tab",
                                             "pane": panel.paneId,
@@ -821,7 +840,7 @@ ApplicationWindow {
                                         width: Math.max(implicitWidth, implicitHeight)
                                         height: implicitHeight
                                         flat: true
-                                        foregroundColor: fileTab.modelData.active ? Theme.highlightedTextColor : Theme.textColor
+                                        foregroundColor: Theme.textColor
                                         background: Rectangle {
                                             radius: 4
                                             color: tabClose.down ? Qt.alpha(tabClose.foregroundColor, 0.24) : tabClose.hovered ? Qt.alpha(tabClose.foregroundColor, 0.12) : "transparent"
@@ -1096,6 +1115,14 @@ ApplicationWindow {
                     paneId: panel.paneId
                     draft: root.gitCommitDraft
                     committing: root.gitCommitting
+                    graphOpen: root.gitGraphOpen
+                    graphShare: root.gitGraphShare
+                    onGraphOpenEdited: function (open) {
+                        root.gitGraphOpen = open;
+                    }
+                    onGraphShareEdited: function (share) {
+                        root.gitGraphShare = share;
+                    }
                     onDraftEdited: function (text) {
                         root.gitCommitDraft = text;
                     }
@@ -1490,14 +1517,14 @@ ApplicationWindow {
                     CommandMenuItem { actionId: "rename-file"; commandPane: panel.paneId; visible: paneMenu.files }
                     CommandMenuItem { actionId: "trash-file"; commandPane: panel.paneId; visible: paneMenu.files }
                     MenuSeparator { visible: paneMenu.files; height: visible ? implicitHeight : 0 }
-                    EntryMenuItem {
+                    ActionMenuItem {
                         objectName: "menuAction_copy-path"
                         caption: "Copy path"
                         visible: paneMenu.files
                         enabled: paneMenu.entryPath.length > 0
                         onTriggered: slate.copyText(paneMenu.entryPath)
                     }
-                    EntryMenuItem {
+                    ActionMenuItem {
                         objectName: "menuAction_copy-relative-path"
                         caption: "Copy relative path"
                         visible: paneMenu.files
@@ -1510,7 +1537,7 @@ ApplicationWindow {
                             slate.copyText(top.length > 1 && path.indexOf(top) === 0 ? path.substring(top.length) : path.indexOf(browsed) === 0 ? path.substring(browsed.length) : path);
                         }
                     }
-                    EntryMenuItem {
+                    ActionMenuItem {
                         objectName: "menuAction_reveal"
                         caption: "Open containing folder"
                         visible: paneMenu.files
@@ -1839,7 +1866,9 @@ ApplicationWindow {
                 "new-folder": "Create folder",
                 "rename-file": "Rename file or folder",
                 "profile-save": "Save profile",
-                "profile-load": "Load profile"
+                "profile-load": "Load profile",
+                "git-switch": "Switch branch",
+                "git-branch": "Create branch"
             })[prompt.kind] || "Input"
         // Find and replace sit at the bottom without dimming the text, so
         // the matches stay visible; other prompts are centred.
@@ -1900,7 +1929,9 @@ ApplicationWindow {
                             "rename-symbol": "New name",
                             "project-replace": "Replacement text",
                             "debug-evaluate": "Expression, e.g. count * 2",
-                            "debug-program": "Path of the program to debug"
+                            "debug-program": "Path of the program to debug",
+                            "git-switch": "Branch name, e.g. main",
+                            "git-branch": "New branch name"
                         })[editPrompt.prompt.kind] || "Find text"
                     onTextEdited: editPrompt.update()
                     onAccepted: root.send({
@@ -1999,11 +2030,12 @@ ApplicationWindow {
         objectName: "choiceDialog"
         enter: Transition {}
         exit: Transition {}
-        readonly property var kinds: ["save-read-only", "save-elevated", "reload-changed", "file-changed", "quit", "trust", "confirm-replace", "trash-file"]
+        readonly property var kinds: ["save-read-only", "save-elevated", "reload-changed", "file-changed", "quit", "trust", "confirm-replace", "trash-file", "discard-changes"]
         readonly property var prompt: root.frame.prompt || ({ "kind": "", "input": "" })
         readonly property var copy: ({
                 "save-read-only": ["Read-only file", "%1 is read-only. Overwrite it anyway?", "Overwrite", ""],
                 "trash-file": ["Move to Trash", "Move %1 to desktop Trash?", "Move to Trash", ""],
+                "discard-changes": prompt.replacement === "untracked" ? ["Discard changes", "Move the untracked file %1 to desktop Trash?", "Discard", ""] : ["Discard changes", "Discard the working changes to %1? This cannot be undone.", "Discard Changes", ""],
                 "save-elevated": ["Permission denied", "You do not have permission to write %1. Save it with administrator rights?", "Save as Administrator", ""],
                 "reload-changed": ["Reload from disk", "Reload %1 from disk and discard your unsaved changes?", "Reload", ""],
                 "file-changed": ["File changed on disk", "%1 changed on disk while you have unsaved changes.", "Reload from Disk", "Keep My Version"],

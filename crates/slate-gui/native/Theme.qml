@@ -23,4 +23,21 @@ QtObject {
     readonly property color positiveTextColor: dark ? "#3dd68c" : "#1e7f4c"
     readonly property int smallSpacing: 4
     readonly property int largeSpacing: 8
+    // Git change kinds, shared by the file tree and the Git pane: additions
+    // green, edits and renames amber, deletions and conflicts red.
+    function statusColor(kind) {
+        switch (kind) {
+        case "added":
+        case "untracked":
+            return positiveTextColor;
+        case "deleted":
+        case "conflict":
+            return negativeTextColor;
+        case "modified":
+        case "renamed":
+            return neutralTextColor;
+        default:
+            return textColor;
+        }
+    }
 }

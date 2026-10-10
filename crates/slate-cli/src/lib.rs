@@ -280,6 +280,7 @@ const CHOICE_PROMPTS: &[&str] = &[
     "close-tab",
     "switch-workspace",
     "trash-file",
+    "discard-changes",
     "quit",
     "save-read-only",
     "save-elevated",
@@ -874,7 +875,7 @@ pub fn run(mut app: App) -> Result<()> {
                                         let len = if pane.kind == "files" {
                                             snapshot.files.len()
                                         } else {
-                                            snapshot.git.len()
+                                            snapshot.git.len() + snapshot.history.len()
                                         };
                                         let height = pane.rect.height.saturating_sub(3) as usize;
                                         let top = pane
@@ -1009,6 +1010,73 @@ fn clean(s: &str) -> String {
         .map(|c| if c.is_control() { '�' } else { c })
         .collect()
 }
+/// " ↑2 ↓1 origin/main" for a branch with an upstream.
+fn sync_summary(s: &Snapshot) -> String {
+    if s.git_upstream.is_empty() {
+        return String::new();
+    }
+    let mut text = String::new();
+    if s.git_ahead > 0 {
+        text.push_str(&format!(" ↑{}", s.git_ahead));
+    }
+    if s.git_behind > 0 {
+        text.push_str(&format!(" ↓{}", s.git_behind));
+    }
+    format!("{text} → {}", clean(&s.git_upstream))
+}
+/// "5m", "3h", "2d", "4mo", "1y": how long ago `time` was.
+fn age(time: i64, now: i64) -> String {
+    let seconds = (now - time).max(0);
+    match seconds {
+        0..60 => "now".into(),
+        60..3_600 => format!("{}m", seconds / 60),
+        3_600..86_400 => format!("{}h", seconds / 3_600),
+        86_400..2_592_000 => format!("{}d", seconds / 86_400),
+        2_592_000..31_536_000 => format!("{}mo", seconds / 2_592_000),
+        _ => format!("{}y", seconds / 31_536_000),
+    }
+}
+/// A commit row: its lanes in their graph colours, then hash, subject,
+/// references, author and age.
+fn commit_item(
+    commit: &slate_core::git_history::HistoryRow,
+    colors: ColorMode,
+    now: i64,
+) -> ListItem<'static> {
+    const LANES: usize = 6;
+    let mut spans: Vec<Span> = slate_core::git_history::glyphs(commit, LANES)
+        .into_iter()
+        .map(|(glyph, color)| {
+            let style = match color {
+                Some(index) if colors != ColorMode::None => Style::default().fg(colors.color(
+                    slate_core::git_history::PALETTE
+                        [index as usize % slate_core::git_history::PALETTE.len()],
+                )),
+                _ => Style::default(),
+            };
+            Span::styled(glyph.to_string(), style)
+        })
+        .collect();
+    let dim = if colors == ColorMode::None {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    spans.push(Span::styled(format!(" {} ", commit.short), dim));
+    spans.push(Span::raw(clean(&commit.subject)));
+    if !commit.refs.is_empty() {
+        let names: Vec<String> = commit.refs.iter().map(|r| clean(&r.name)).collect();
+        spans.push(Span::styled(
+            format!(" ({})", names.join(", ")),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::styled(
+        format!(" · {}, {}", clean(&commit.author), age(commit.time, now)),
+        dim,
+    ));
+    ListItem::new(Line::from(spans))
+}
 /// Text, title and height of each prompt kind.
 fn prompt_view(
     prompt: &slate_core::search::Prompt,
@@ -1017,6 +1085,8 @@ fn prompt_view(
     let input = clean(&prompt.input);
     match prompt.kind.as_str() {
         "trash-file" => (format!("Move {input} to desktop Trash?\nY: move to Trash · N / Escape: cancel"), "Move to Trash", 5),
+        "discard-changes" if prompt.replacement == "untracked" => (format!("Move the untracked file {input} to desktop Trash?\nY: discard · N / Escape: cancel"), "Discard changes", 5),
+        "discard-changes" => (format!("Discard the working changes to {input}? This cannot be undone.\nY: discard · N / Escape: cancel"), "Discard changes", 5),
         "close-tab" => (
             format!("Save changes to {input} before closing?\nS: save and close · D: discard and close\nEscape / Enter: cancel"),
             "Unsaved changes",
@@ -1088,6 +1158,8 @@ fn prompt_view(
                 "debug-program" => "Program to debug",
                 "goto" => "Go to line",
                 "find" => "Find",
+                "git-switch" => "Switch to branch",
+                "git-branch" => "Create and switch to branch",
                 _ => "Input",
             },
             6,
@@ -1111,12 +1183,13 @@ fn render(
             .style(base)
             .title(if p.kind == "git" {
                 format!(
-                    " Git: {} #{} ",
+                    " Git: {}{} #{} ",
                     if s.git_repository {
                         &s.git_branch
                     } else {
                         "No repository"
                     },
+                    sync_summary(s),
                     p.id
                 )
             } else {
@@ -1172,7 +1245,7 @@ fn render(
             let total = if p.kind == "files" {
                 s.files.len()
             } else {
-                s.git.len()
+                s.git.len() + s.history.len()
             };
             let (rows, selected) = list_window(total, p.selected, content.height as usize);
             let items: Vec<ListItem> = if p.kind == "files" {
@@ -1187,12 +1260,17 @@ fn render(
                     })
                     .collect()
             } else {
-                s.git[rows]
-                    .iter()
-                    .map(|e| {
+                // Changes, then the commit graph.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs() as i64);
+                rows.map(|row| match s.git.get(row) {
+                    Some(e) => {
                         ListItem::new(clean(&format!("[{}] {} {}", e.group, e.status, e.path)))
-                    })
-                    .collect()
+                    }
+                    None => commit_item(&s.history[row - s.git.len()], colors, now),
+                })
+                .collect()
             };
             let mut state = ListState::default().with_selected(Some(selected));
             frame.render_stateful_widget(

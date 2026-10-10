@@ -586,6 +586,76 @@ const ACTIONS: &[(&str, &str, &str, &str, &str)] = &[
         "repository",
     ),
     (
+        "git-fetch",
+        "Fetch",
+        "Download new commits from the branch's remote",
+        "",
+        "git-ready",
+    ),
+    (
+        "git-pull",
+        "Pull",
+        "Fast-forward the branch to its upstream",
+        "",
+        "git-ready",
+    ),
+    (
+        "git-push",
+        "Push",
+        "Upload the branch's commits, setting its upstream when it has none",
+        "",
+        "git-ready",
+    ),
+    (
+        "git-switch",
+        "Switch branch…",
+        "Check out another branch",
+        "Branch name",
+        "git-ready",
+    ),
+    (
+        "git-branch",
+        "Create branch…",
+        "Create a branch at the current commit and switch to it",
+        "New branch name",
+        "git-ready",
+    ),
+    (
+        "git-open",
+        "Open changed file",
+        "Open the selected change's file",
+        "",
+        "git-file",
+    ),
+    (
+        "discard-changes",
+        "Discard changes…",
+        "Undo the selected file's working changes; untracked files go to Trash",
+        "",
+        "git-working",
+    ),
+    (
+        "reveal-in-files",
+        "Reveal in file browser",
+        "Select the file in the file browser",
+        "",
+        "reveal",
+    ),
+    (
+        "git-show",
+        "Show commit",
+        "Open the selected commit's message and changes read-only",
+        "",
+        "history",
+    ),
+    (
+        "git-history-more",
+        "Load more commits",
+        "Read another page of commit history",
+        "",
+        "history-more",
+    ),
+    (
         "toggle-soft-wrap",
         "Toggle soft wrap",
         "Wrap long lines at the window edge",
@@ -1177,6 +1247,7 @@ impl App {
             _ => None,
         };
         let selected = self.git.entries.get(selection.unwrap_or(self.git.selected));
+        let git_ready = self.git.repository && !self.git.restricted && self.git.jobs == 0;
         let mut results = Vec::new();
         for &(id, name, description, argument, scope) in ACTIONS {
             if only.is_some_and(|only| only != id) {
@@ -1213,6 +1284,19 @@ impl App {
                 "diff-working" => self.can_stage_diff_hunk(false),
                 "diff-staged" => self.can_stage_diff_hunk(true),
                 "files" => kind == "files",
+                "git-ready" => git_ready,
+                "git-file" => kind == "git" && selected.is_some(),
+                "git-working" => {
+                    kind == "git"
+                        && self.git.jobs == 0
+                        && selected.is_some_and(|e| !e.staged && e.group != "Conflicts")
+                }
+                "reveal" => {
+                    (kind == "git" && selected.is_some())
+                        || editor.is_some_and(|d| d.path.is_some() && d.label.is_none())
+                }
+                "history" => !self.git.history.is_empty(),
+                "history-more" => self.history_has_more(),
                 "file-entry" => {
                     kind == "files"
                         && self
@@ -1304,6 +1388,16 @@ impl App {
                     "running" => "The program is not running",
                     "tasks" => "No task is running",
                     "untrusted" => "The workspace is already trusted",
+                    "files" => "Focus the file browser",
+                    "file-entry" => "Select a file or folder in the file browser",
+                    "git-ready" => "Open a trusted Git repository; wait for running operations",
+                    "git-file" => "Select a changed file in the Git pane",
+                    "git-working" => {
+                        "Select an unstaged, non-conflicted change; wait for running operations"
+                    }
+                    "reveal" => "Select a changed file, or focus a document that has a file",
+                    "history" => "No commits are listed",
+                    "history-more" => "All commits are shown",
                     _ => "Focus an editor or terminal",
                 }
             };

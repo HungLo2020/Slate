@@ -84,6 +84,7 @@ struct GuiContext {
     colors: Option<(String, String)>,
     files: u64,
     git: u64,
+    history: u64,
     global_keys: Option<BTreeMap<String, String>>,
 }
 impl GuiContext {
@@ -99,6 +100,7 @@ impl GuiContext {
             colors: None,
             files: 0,
             git: 0,
+            history: 0,
             global_keys: None,
         }
     }
@@ -533,12 +535,14 @@ fn respond(state: &mut GuiContext, request: serde_json::Value) -> String {
                     number("minimum_width", 160),
                     header.saturating_add(cell.1.saturating_mul(3)),
                 ),
-                patch.then_some((state.files, state.git)),
+                patch.then_some((state.files, state.git, state.history)),
             );
             let files_changed = state.files != snapshot.files_revision;
             let git_changed = state.git != snapshot.git_revision;
+            let history_changed = state.history != snapshot.history_revision;
             state.files = snapshot.files_revision;
             state.git = snapshot.git_revision;
+            state.history = snapshot.history_revision;
             let colors = (snapshot.foreground.clone(), snapshot.background.clone());
             let same_colors = state.colors.as_ref() == Some(&colors);
             state.colors = Some(colors);
@@ -663,6 +667,11 @@ fn respond(state: &mut GuiContext, request: serde_json::Value) -> String {
             }
             if patch && !git_changed {
                 frame.remove("git");
+                // Branches change with repository state; the bridge keeps them.
+                frame.remove("git_branches");
+            }
+            if patch && !history_changed {
+                frame.remove("history");
             }
             if patch && frame.get("settings") == state.settings.as_ref() {
                 frame.remove("settings");

@@ -21,6 +21,7 @@ mod folding;
 pub mod format;
 pub mod fsio;
 pub mod git;
+pub mod git_history;
 mod highlight;
 mod history;
 pub mod ide;
@@ -482,6 +483,19 @@ pub struct Snapshot {
     /// it. Empty in a graphical snapshot that already has this revision.
     pub files: std::sync::Arc<Vec<Entry>>,
     pub git: std::sync::Arc<Vec<GitEntry>>,
+    /// The commit graph, listed after `git` in the Git pane. Like `files`,
+    /// empty in a graphical snapshot that already has this revision.
+    pub history: std::sync::Arc<Vec<git_history::HistoryRow>>,
+    pub history_revision: u64,
+    /// More commits can be read ("git-history-more").
+    pub history_more: bool,
+    pub history_error: String,
+    /// The branch's upstream and how far ahead of and behind it the branch is.
+    pub git_upstream: String,
+    pub git_ahead: usize,
+    pub git_behind: usize,
+    /// Local branches, most recently committed first.
+    pub git_branches: Vec<String>,
     pub browser: String,
     /// The repository top that `git` entry paths are relative to.
     pub git_root: String,
@@ -560,6 +574,13 @@ pub struct App {
     files: Vec<Entry>,
     expanded_folders: std::collections::BTreeSet<PathBuf>,
     pending_file: Option<PathBuf>,
+    /// An entry to select once the browser lists it, and the listing reply
+    /// (counted from `browse_replies`) that should contain it.
+    pending_reveal: Option<(PathBuf, u64)>,
+    /// Directory listings requested from, and answered by, the file worker,
+    /// which answers in order.
+    browse_requests: u64,
+    browse_replies: u64,
     pending_path_dialog: Option<(String, Option<u64>)>,
     /// The Git pane: entries, branch and running jobs.
     git: git::Panel,
@@ -589,6 +610,7 @@ pub struct App {
     /// The file and Git listings last handed to snapshots, by revision.
     shared_files: (u64, std::sync::Arc<Vec<Entry>>),
     shared_git: (u64, std::sync::Arc<Vec<GitEntry>>),
+    shared_history: (u64, std::sync::Arc<Vec<git_history::HistoryRow>>),
     /// Pane screens by view: (signature, build number, screen).
     render_cache: BTreeMap<u64, (u64, u64, std::sync::Arc<Screen>)>,
     pub screen_builds: u64,
@@ -1005,6 +1027,8 @@ impl App {
             "rename-file",
             "profile-save",
             "profile-load",
+            "git-switch",
+            "git-branch",
         ]
         .contains(&kind.as_str())
         {
@@ -1074,6 +1098,10 @@ impl App {
                 self.prompt = None;
                 self.confirm_trash()?;
             }
+            "discard-changes" => {
+                self.prompt = None;
+                self.confirm_discard()?;
+            }
             "confirm-replace" => {
                 self.prompt = None;
                 self.replace_in_files(&p.replacement)?;
@@ -1113,7 +1141,7 @@ impl App {
                 }
             }
             "open" | "open-folder" | "save-as" | "commit" | "layout-save" | "layout-load"
-            | "move-pane" | "settings" => {
+            | "move-pane" | "settings" | "git-switch" | "git-branch" => {
                 if p.input.trim().is_empty() {
                     bail!("Enter {}", p.kind);
                 }
@@ -1281,9 +1309,7 @@ impl App {
                 v.cursor = cursor;
             }
             Some(View::Files) => self.selected = row.min(self.files.len().saturating_sub(1)),
-            Some(View::Git) => {
-                self.git.selected = row.min(self.git.entries.len().saturating_sub(1))
-            }
+            Some(View::Git) => self.git.selected = row.min(self.git_rows().saturating_sub(1)),
             Some(View::Terminal(id)) => {
                 self.terminals.get_mut(&id).unwrap().select(row, col, shift)
             }
@@ -1535,7 +1561,10 @@ impl App {
                 if kind == "switch-workspace" {
                     self.pending_workspace = None;
                 }
-                if matches!(kind.as_str(), "rename-file" | "trash-file") {
+                if matches!(
+                    kind.as_str(),
+                    "rename-file" | "trash-file" | "discard-changes"
+                ) {
                     self.pending_file = None;
                 }
                 if matches!(
@@ -1935,7 +1964,11 @@ impl App {
                 self.add_tab(v);
                 self.refresh_git();
             }
-            Command::Refresh => self.refresh(),
+            Command::Refresh => {
+                // A refresh also rereads the graph, whose refs may have moved.
+                self.git.history_stale = true;
+                self.refresh();
+            }
             cmd @ (Command::GitStage { .. }
             | Command::GitUnstage { .. }
             | Command::GitStageAll
@@ -1993,15 +2026,23 @@ impl App {
             self.expanded_folders.iter().cloned().collect(),
             !self.terminal_frontend,
         ))?;
+        self.browse_requests += 1;
         Ok(())
     }
     pub fn refresh(&mut self) {
-        let _ = self.services.tx.send(Job::Browse(
-            self.browser.clone(),
-            self.root.clone(),
-            self.expanded_folders.iter().cloned().collect(),
-            !self.terminal_frontend,
-        ));
+        if self
+            .services
+            .tx
+            .send(Job::Browse(
+                self.browser.clone(),
+                self.root.clone(),
+                self.expanded_folders.iter().cloned().collect(),
+                !self.terminal_frontend,
+            ))
+            .is_ok()
+        {
+            self.browse_requests += 1;
+        }
         self.refresh_git();
     }
     fn new_terminal(&mut self) -> Result<u64> {
@@ -2442,8 +2483,9 @@ impl App {
         };
         let cancel = k.key == "Escape" || letter == "c";
         match kind.as_str() {
-            "trash-file" => {
-                if letter == "y" || letter == "d" {
+            // Discarding opens on D in the Git pane: a repeated D must not confirm it.
+            "trash-file" | "discard-changes" => {
+                if letter == "y" || (letter == "d" && kind == "trash-file") {
                     self.execute(Command::SubmitPrompt { all: false })?;
                 } else if cancel || letter == "n" || k.key == "Enter" {
                     self.execute(Command::DismissPrompt)?;
@@ -2628,6 +2670,18 @@ impl App {
                     self.invoke_action("refresh", "")?;
                     return Ok(());
                 }
+                "d" => {
+                    self.invoke_action("discard-changes", "")?;
+                    return Ok(());
+                }
+                "o" => {
+                    self.invoke_action("git-open", "")?;
+                    return Ok(());
+                }
+                "f" => {
+                    self.invoke_action("git-fetch", "")?;
+                    return Ok(());
+                }
                 _ => {}
             }
         }
@@ -2642,7 +2696,7 @@ impl App {
             Some(View::Files) | Some(View::Git) => {
                 let git = matches!(self.focused(), Some(View::Git));
                 let length = if git {
-                    self.git.entries.len()
+                    self.git_rows()
                 } else {
                     self.files.len()
                 };
@@ -2662,6 +2716,9 @@ impl App {
                         if git {
                             if self.git.entries.get(*selected).is_some() {
                                 return self.invoke_action("diff", "");
+                            }
+                            if self.selected_commit().is_some() {
+                                return self.invoke_action("git-show", "");
                             }
                         } else if let Some(e) = self.files.get(*selected) {
                             return self.execute(Command::Open {
@@ -3061,6 +3118,16 @@ const ACTION_VERBS: &[&str] = &[
     "collapse-folder",
     "collapse-all-folders",
     "terminal-here",
+    "git-fetch",
+    "git-pull",
+    "git-push",
+    "git-switch",
+    "git-branch",
+    "git-open",
+    "discard-changes",
+    "reveal-in-files",
+    "git-show",
+    "git-history-more",
     "move-left",
     "move-right",
     "move-up",
@@ -3354,7 +3421,10 @@ impl App {
             hints.push(format!("{key} quit"));
         }
         if kind == "git" {
-            hints.push("Enter diff · S stage · U unstage · C commit · R refresh".into());
+            hints.push(
+                "Enter diff/commit · S stage · U unstage · D discard · O open · C commit · F fetch · R refresh"
+                    .into(),
+            );
         }
         if kind == "terminal" {
             hints.push("Shift-drag selects · Shift-wheel scrollback".into());

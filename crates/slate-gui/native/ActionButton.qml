@@ -20,7 +20,10 @@ Basic.Button {
             "go-up": "↑",
             "collapse-all": "⊟",
             "document-new": "+",
-            "folder-new": "⊞"
+            "folder-new": "⊞",
+            "git-branch": "⎇",
+            "document-open": "↗",
+            "edit-undo": "↶"
         })[iconName] || "⋯"
     flat: false
     property bool compact: false
@@ -82,7 +85,9 @@ Basic.Button {
             elide: Text.ElideMiddle
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
-            color: !control.enabled ? Theme.disabledTextColor : control.highlighted || control.down ? Theme.highlightedTextColor : control.foregroundColor
+            // A disabled primary action keeps its accent (dimmed), so it still
+            // reads as a button rather than as an empty field.
+            color: control.highlighted ? Theme.highlightedTextColor : !control.enabled ? Theme.disabledTextColor : control.down ? Theme.highlightedTextColor : control.foregroundColor
         }
     }
     background: Rectangle {

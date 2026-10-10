@@ -50,6 +50,16 @@ remain available with a leading colon. Open, Save As, commit and layout actions
 use shared argument prompts; GUI settings offers direct persistent controls.
 
 Git status is parsed using NUL-delimited records, retaining rename source paths.
+The same read records HEAD, the branch's upstream with ahead/behind counts, and
+local branches. The commit graph is read on its own worker only when HEAD or the
+upstream commit changes (or on Refresh): `git log --topo-order` for HEAD and its
+upstream, then a lane layout in the core that gives every row its node and the
+line segments crossing it. Frontends draw those segments (curves in the GUI,
+box-drawing characters in the TUI) without recomputing the graph. The pane lists
+changes, then commits, under one selection: a selected commit stays selected as
+changes above it come and go. Remote commands never prompt; SSH runs in batch mode
+unless the user configured an SSH command. Discarding restores tracked files from
+the index and moves untracked files to the desktop Trash.
 Index and worktree changes are separate selectable entries, with groups for
 staged, unstaged, untracked and conflicts. Staging a working rename and
 unstaging an index rename include both names; restaging edits to an index rename

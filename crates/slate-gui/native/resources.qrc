@@ -5,6 +5,7 @@
         <file>ActionButton.qml</file>
         <file>Hint.qml</file>
         <file>FileIcon.qml</file>
+        <file>ActionMenuItem.qml</file>
         <file>GitPane.qml</file>
         <file>Theme.qml</file>
     </qresource>

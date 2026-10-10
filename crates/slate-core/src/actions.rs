@@ -900,6 +900,10 @@ impl App {
             | "collapse-folder"
             | "collapse-all-folders"
             | "terminal-here" => self.file_action(name, argument)?,
+            "git-fetch" | "git-pull" | "git-push" | "git-switch" | "git-branch" | "git-open"
+            | "discard-changes" | "reveal-in-files" | "git-show" | "git-history-more" => {
+                self.git_pane_action(name, argument)?
+            }
             "save-all" => self.save_all(false)?,
             "reload" => {
                 let (_, v) = self.editor_view()?;

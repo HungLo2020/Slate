@@ -43,7 +43,7 @@ impl App {
         cell: (u16, u16),
         header: u16,
         minimum: (u16, u16),
-        known: Option<(u64, u64)>,
+        known: Option<(u64, u64, u64)>,
     ) -> Snapshot {
         self.snapshot_presentation(area, gap, cell, header, minimum, known, true)
     }
@@ -55,7 +55,7 @@ impl App {
         cell: (u16, u16),
         header: u16,
         minimum: (u16, u16),
-        known: Option<(u64, u64)>,
+        known: Option<(u64, u64, u64)>,
         graphical: bool,
     ) -> Snapshot {
         let Rect { width, height, .. } = area;
@@ -197,7 +197,7 @@ impl App {
             panes,
             handles,
             focus: self.focus,
-            files: if known.is_some_and(|(files, _)| files == self.files_revision) {
+            files: if known.is_some_and(|(files, _, _)| files == self.files_revision) {
                 Default::default()
             } else {
                 let (revision, files) = &mut self.shared_files;
@@ -207,7 +207,7 @@ impl App {
                 }
                 files.clone()
             },
-            git: if known.is_some_and(|(_, git)| git == self.git.revision) {
+            git: if known.is_some_and(|(_, git, _)| git == self.git.revision) {
                 Default::default()
             } else {
                 let (revision, entries) = &mut self.shared_git;
@@ -217,6 +217,23 @@ impl App {
                 }
                 entries.clone()
             },
+            history: if known.is_some_and(|(_, _, history)| history == self.git.history_revision) {
+                Default::default()
+            } else {
+                let (revision, rows) = &mut self.shared_history;
+                if *revision != self.git.history_revision {
+                    *revision = self.git.history_revision;
+                    *rows = std::sync::Arc::new(self.git.history.clone());
+                }
+                rows.clone()
+            },
+            history_revision: self.git.history_revision,
+            history_more: self.history_has_more(),
+            history_error: self.git.history_error.clone(),
+            git_upstream: self.git.upstream.clone(),
+            git_ahead: self.git.ahead,
+            git_behind: self.git.behind,
+            git_branches: self.git.branches.clone(),
             browser: self.browser.to_string_lossy().into_owned(),
             git_root: self.git.top.clone(),
             search: self.search.clone(),

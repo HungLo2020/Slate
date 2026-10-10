@@ -576,8 +576,9 @@ slate`; subsequent releases arrive through normal APT updates.
   a pane leaves sessions running; closing a terminal tab or `terminate-terminal`
   explicitly stops that session.
 - Git branch/status, staged/unstaged/untracked groups, direct stage/unstage,
-  read-only diffs and untracked previews, bulk/section staging, and a commit
-  message composer. Directory listing and Git commands have separate workers. File opens/saves have their own worker;
+  read-only diffs and untracked previews, bulk/section staging, a commit
+  message composer, a commit graph, discard, branch switching and fetch, pull
+  and push. Directory listing and Git commands have separate workers. File opens/saves have their own worker;
   saving a snapshot leaves edits made during the save dirty. Git operations use
   the repository root, including when opening a subfolder.
 - Atomic saves preserve permissions, owner/group, extended attributes, hard
@@ -651,15 +652,33 @@ and Refresh reloads changes made outside Slate. **Stage all** and **Unstage all*
 operate on the workspace subtree when its repository is larger; section +/−
 controls operate on that group. Commits include all staged repository changes,
 including changes staged outside the workspace.
-Unstaging preserves working files. The GUI shows section counts, file names and
-parent folders, and reserves a gutter for the scrollbar beside the row actions.
+Unstaging preserves working files. The GUI shows one line per change (icon, name,
+folder and a coloured status letter), collapsible groups with counts, and row
+actions on hover: open, discard, inspect and stage. It reserves a gutter for the
+scrollbar beside the row actions. **Discard changes…** asks first; it restores a
+tracked file from the index and moves an untracked file to the desktop Trash.
+Right-click a change to open it, copy its path or reveal it in the file browser.
+
+The header shows the branch, how far it is ahead of and behind its upstream
+(↑/↓), and actions to stage or unstage everything, refresh, fetch, pull, push,
+switch branch and create a branch. Pull only fast-forwards. Push sets an upstream
+on `origin` (or the only remote) the first time. Remote commands never prompt:
+SSH runs in batch mode unless you configured your own SSH command, so use an SSH
+agent or a credential helper.
+
+Below the changes, the **Graph** lists the history of HEAD and its upstream with
+coloured lanes, branch and tag badges, authors and ages, 200 commits at a time
+(**Load more commits** continues). Click a commit to open its message, statistics
+and patch read-only; drag the divider to resize the graph, or collapse it.
 
 Type a message in the GUI composer and click **Commit**, or press **Ctrl+Enter**.
 Commit operates on staged files. Short panes open a compact message dialog.
 The draft survives pane/layout changes and failed commits; successful commits
 clear it. Hover file controls for explanations, or right-click a file for actions.
-In the TUI Git pane, S stages, U unstages, C opens the commit form, R refreshes,
-and Enter inspects the selected change.
+In the TUI Git pane, S stages, U unstages, D discards, O opens the file, C opens
+the commit form, F fetches, R refreshes, and Enter inspects the selected change.
+The commit graph follows the changes, drawn with box-drawing lanes; Enter on a
+commit opens it read-only. The pane title shows ↑/↓ counts for the upstream.
 
 Settings provides file/directory startup defaults, theme, indentation, spaces/tabs,
 auto-indent and line-number controls in both frontends. GUI Settings also offers
@@ -879,7 +898,8 @@ KDE dialogs, X11/Wayland accessibility, Orca discovery, and the minimum Rust 1.8
 compiler check. Automated accessibility checks exercise document ranges, cursor
 and selection; speech output still needs manual listening.
 The populated Git workflow checks normal/narrow/short panes and large fonts,
-scrollbar/action separation, bulk and section staging, and commit hook failures.
+scrollbar/action separation, bulk and section staging, commit hook failures,
+the commit graph after committing, and opening a commit.
 Set `SLATE_GUI_ARTIFACT_DIR` to retain its screenshots and report.
 Release performance checks measure actual input handlers and rendered frames at
 normal, 1080p and 4K sizes, plus cursor/selection layout retention, scrolling,

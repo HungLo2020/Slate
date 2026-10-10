@@ -321,6 +321,66 @@ impl App {
         }
         Ok(())
     }
+    /// Show `target` (a workspace path) selected in a file browser: the GUI
+    /// tree expands its folders; the TUI browses its folder.
+    pub(crate) fn reveal_in_files(&mut self, target: &Path) -> Result<()> {
+        let target = target
+            .canonicalize()
+            .with_context(|| format!("{} no longer exists", target.display()))?;
+        if !target.starts_with(&self.root) || target == self.root {
+            bail!("Only entries inside the workspace can be revealed");
+        }
+        self.focus_file_browser()?;
+        let folder = target.parent().context("Nothing to reveal")?.to_path_buf();
+        if self.terminal_frontend {
+            self.browse(folder)?;
+        } else {
+            if !target.starts_with(&self.browser) {
+                self.browse(self.root.clone())?;
+            }
+            for ancestor in folder.ancestors() {
+                if !ancestor.starts_with(&self.browser) || ancestor == self.browser {
+                    break;
+                }
+                self.expanded_folders.insert(ancestor.to_path_buf());
+            }
+            self.refresh();
+        }
+        // The listing just requested is the one to search.
+        self.pending_reveal = Some((target, self.browse_requests));
+        Ok(())
+    }
+    pub(crate) fn finish_reveal(&mut self) {
+        let Some((target, reply)) = self.pending_reveal.take() else {
+            return;
+        };
+        if self.browse_replies < reply {
+            self.pending_reveal = Some((target, reply));
+            return;
+        }
+        match self.files.iter().position(|e| Path::new(&e.path) == target) {
+            Some(index) => self.selected = index,
+            None => self.status = format!("{} is not listed", target.display()),
+        }
+    }
+    /// Focus the pane showing the file browser, adding one if none does.
+    fn focus_file_browser(&mut self) -> Result<()> {
+        if self.editor_only {
+            self.expand_workspace()?;
+        }
+        for pane in self.layout.panes() {
+            if let Some((tabs, active)) = self.layout.pane_mut(pane) {
+                if let Some(index) = tabs.iter().position(|v| *v == crate::layout::View::Files) {
+                    *active = index;
+                    self.focus = pane;
+                    return Ok(());
+                }
+            }
+        }
+        self.execute(Command::AddView {
+            kind: "files".into(),
+        })
+    }
     pub(crate) fn confirm_trash(&mut self) -> Result<()> {
         let source = self.pending_file.take().context("No entry selected")?;
         self.ensure_entry_idle(&source)?;
