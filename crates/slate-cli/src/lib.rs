@@ -1519,7 +1519,7 @@ impl Widget for Grid<'_> {
                 if c.underline {
                     modifiers |= Modifier::UNDERLINED;
                 }
-                let mut style = self.colors.style(&c.fg, &c.bg).add_modifier(modifiers);
+                let mut style = self.colors.cell_style(c.fg, c.bg).add_modifier(modifiers);
                 if self.colors == ColorMode::None && c.bg == self.selection {
                     style = style.add_modifier(Modifier::REVERSED);
                 }

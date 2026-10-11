@@ -78,9 +78,10 @@ struct GuiContext {
     revision: u64,
     viewport: String,
     panes: BTreeMap<u64, u64>,
-    editors: BTreeMap<u64, EditorText>,
+    editors: BTreeMap<u64, Arc<EditorText>>,
     terminals: BTreeMap<u64, Arc<slate_core::terminal::Screen>>,
-    settings: Option<serde_json::Value>,
+    /// The slower-changing frame groups (see `STABLE`) as last sent.
+    stable: serde_json::Map<String, serde_json::Value>,
     colors: Option<(String, String)>,
     files: u64,
     git: u64,
@@ -102,7 +103,7 @@ impl GuiContext {
         self.panes.clear();
         self.editors.clear();
         self.terminals.clear();
-        self.settings = None;
+        self.stable.clear();
         self.colors = None;
         self.files = 0;
         self.git = 0;
@@ -118,7 +119,7 @@ impl GuiContext {
             panes: BTreeMap::new(),
             editors: BTreeMap::new(),
             terminals: BTreeMap::new(),
-            settings: None,
+            stable: serde_json::Map::new(),
             colors: None,
             files: 0,
             git: 0,
@@ -165,7 +166,7 @@ struct TerminalPatch {
     cursor: Option<(u16, u16)>,
     /// `(foreground, background, bold | italic << 1 | underline << 2)`,
     /// indexed by the runs of this patch.
-    styles: Vec<(String, String, u8)>,
+    styles: Vec<(slate_core::terminal::Rgb, slate_core::terminal::Rgb, u8)>,
     lines: Vec<TerminalRow>,
 }
 impl TerminalPatch {
@@ -188,7 +189,7 @@ impl TerminalPatch {
         {
             Some(index) => index,
             None => {
-                self.styles.push((cell.fg.clone(), cell.bg.clone(), flags));
+                self.styles.push((cell.fg, cell.bg, flags));
                 self.styles.len() - 1
             }
         }
@@ -226,7 +227,7 @@ impl TerminalPatch {
                 let text = if cell.continuation {
                     String::new()
                 } else {
-                    cell.text.clone()
+                    cell.text.to_string()
                 };
                 runs.push((style, columns, text));
                 col += columns;
@@ -235,11 +236,32 @@ impl TerminalPatch {
         self.lines.push(TerminalRow { row, runs });
     }
 }
+/// Frame fields that change only with settings, recent lists, profiles or
+/// colours, not with typing or terminal output.
+const STABLE: [&str; 9] = [
+    "settings",
+    "recent",
+    "recent_projects",
+    "layouts",
+    "profiles",
+    "setting_sources",
+    "project_search_policy",
+    "files_colors",
+    "git_colors",
+];
 #[derive(Serialize)]
 struct GuiUpdate {
     #[serde(flatten)]
     frame: serde_json::Map<String, serde_json::Value>,
     surfaces: Vec<SurfacePatch>,
+    // Lists are written straight from the core's shared copies, never built
+    // into the temporary JSON tree, and only when they changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    files: Option<Arc<Vec<slate_core::Entry>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git: Option<Arc<Vec<slate_core::GitEntry>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    history: Option<Arc<Vec<slate_core::git_history::HistoryRow>>>,
 }
 /// Run the graphical interface. `qt_arguments` are Qt's own options
 /// (-platform, -style, -reverse…), which Qt consumes.
@@ -578,6 +600,11 @@ fn respond(state: &mut GuiContext, request: serde_json::Value) -> String {
                 panes.insert(pane.id, pane.revision);
                 if let Some(mut text) = pane.text.take() {
                     let prior = patch.then(|| state.editors.get(&pane.id)).flatten();
+                    // The core returns the same text for an unchanged view.
+                    if prior.is_some_and(|p| Arc::ptr_eq(p, &text)) && state.viewport == viewport {
+                        editors.insert(pane.id, text);
+                        continue;
+                    }
                     // While highlighting catches up, unchanged document lines
                     // keep their previous styles. Do not flash/re-layout the whole
                     // viewport in default colors on every edit.
@@ -585,8 +612,9 @@ fn respond(state: &mut GuiContext, request: serde_json::Value) -> String {
                         if let Some(old) =
                             prior.filter(|p| p.document == text.document && p.left == text.left)
                         {
-                            for (row, line) in text.lines.iter_mut().enumerate() {
-                                if let Some(previous) = (text.top + row)
+                            let merged = Arc::make_mut(&mut text);
+                            for (row, line) in merged.lines.iter_mut().enumerate() {
+                                if let Some(previous) = (merged.top + row)
                                     .checked_sub(old.top)
                                     .and_then(|r| old.lines.get(r))
                                 {
@@ -667,13 +695,18 @@ fn respond(state: &mut GuiContext, request: serde_json::Value) -> String {
             state.viewport = viewport;
             // Only small metadata enters this temporary JSON value. Bulk surfaces
             // serialize directly and never become part of the QML frame.
-            let mut frame = serde_json::to_value(snapshot)
-                .unwrap()
-                .as_object()
-                .unwrap()
-                .clone();
+            let files = (!patch || files_changed).then(|| std::mem::take(&mut snapshot.files));
+            let git = (!patch || git_changed).then(|| std::mem::take(&mut snapshot.git));
+            let history = (!patch || history_changed).then(|| std::mem::take(&mut snapshot.history));
+            let serde_json::Value::Object(mut frame) = serde_json::to_value(snapshot).unwrap()
+            else {
+                unreachable!("a snapshot serializes to an object")
+            };
             frame.remove("clipboard");
             frame.remove("commands");
+            for key in ["files", "git", "history"] {
+                frame.remove(key);
+            }
             if !patch || state.global_keys.as_ref() != Some(&app.preferences.global_keys) {
                 frame.insert(
                     "global_shortcuts".into(),
@@ -686,23 +719,31 @@ fn respond(state: &mut GuiContext, request: serde_json::Value) -> String {
             if !requests.is_empty() {
                 frame.insert("requests".into(), requests.into());
             }
-            if patch && !files_changed {
-                frame.remove("files");
-            }
             if patch && !git_changed {
-                frame.remove("git");
                 // Branches change with repository state; the bridge keeps them.
                 frame.remove("git_branches");
             }
-            if patch && !history_changed {
-                frame.remove("history");
+            // Groups that rarely change are sent only when they do; the
+            // bridge keeps the last value of each.
+            for key in STABLE {
+                match frame.get(key) {
+                    Some(value) if patch && state.stable.get(key) == Some(value) => {
+                        frame.remove(key);
+                    }
+                    Some(value) => {
+                        state.stable.insert(key.into(), value.clone());
+                    }
+                    None => {}
+                }
             }
-            if patch && frame.get("settings") == state.settings.as_ref() {
-                frame.remove("settings");
-            } else {
-                state.settings = frame.get("settings").cloned();
-            }
-            serde_json::to_string(&GuiUpdate { frame, surfaces }).unwrap()
+            serde_json::to_string(&GuiUpdate {
+                frame,
+                surfaces,
+                files,
+                git,
+                history,
+            })
+            .unwrap()
         }
         _ => dispatch_gui(state, request),
     }
@@ -853,6 +894,101 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
             frame = request(&mut state, update.clone());
         }
+    }
+    #[test]
+    fn slower_changing_groups_are_sent_only_when_they_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("edit.txt");
+        std::fs::write(&file, "hello\n").unwrap();
+        let mut app =
+            test_app(&file, Some(slate_core::preferences::StartupMode::Workspace)).unwrap();
+        app.terminal_frontend = false;
+        let mut state = GuiContext::new(app);
+        let update = serde_json::json!({"action":"update", "width":1280, "height":720});
+        let first = request(&mut state, update.clone());
+        for key in STABLE {
+            assert!(first.get(key).is_some(), "the first frame describes {key}");
+        }
+        settle(&mut state, &update);
+        request(
+            &mut state,
+            serde_json::json!({"action":"paste","text":"typed "}),
+        );
+        let typed = request(&mut state, update.clone());
+        assert_ne!(typed["unchanged"], true);
+        for key in STABLE {
+            assert!(typed.get(key).is_none(), "typing resent {key}");
+        }
+        request(
+            &mut state,
+            serde_json::json!({"action":"configure","name":"font-size","value":"13"}),
+        );
+        let configured = request(&mut state, update.clone());
+        assert_eq!(configured["settings"]["font_size"], 13);
+    }
+    #[test]
+    fn unchanged_editors_are_not_rendered_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("edit.txt");
+        std::fs::write(&file, "hello\n").unwrap();
+        let mut app =
+            test_app(&file, Some(slate_core::preferences::StartupMode::Workspace)).unwrap();
+        app.terminal_frontend = false;
+        let editor = app
+            .layout
+            .panes()
+            .into_iter()
+            .find(|p| {
+                matches!(
+                    app.layout.view(*p),
+                    Some(slate_core::layout::View::Editor(_))
+                )
+            })
+            .unwrap();
+        let other = app
+            .layout
+            .panes()
+            .into_iter()
+            .find(|p| *p != editor)
+            .unwrap();
+        let mut state = GuiContext::new(app);
+        let update = serde_json::json!({"action":"update", "width":1280, "height":720});
+        settle(&mut state, &update);
+        let builds = |state: &mut GuiContext| {
+            request(state, serde_json::json!({"action":"diagnostics"}))["screen_builds"]
+                .as_u64()
+                .unwrap()
+        };
+        let before = builds(&mut state);
+        // Focus moves elsewhere: the frame changes, the editor does not.
+        request(
+            &mut state,
+            serde_json::json!({"action":"focus","pane":other}),
+        );
+        let frame = request(&mut state, update.clone());
+        assert_ne!(frame["unchanged"], true);
+        assert!(frame["surfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["kind"] != "editor"));
+        assert_eq!(builds(&mut state), before, "the editor was rendered again");
+        // An edit renders it again and sends the change.
+        request(
+            &mut state,
+            serde_json::json!({"action":"focus","pane":editor}),
+        );
+        request(
+            &mut state,
+            serde_json::json!({"action":"paste","text":"more "}),
+        );
+        let frame = request(&mut state, update.clone());
+        assert!(builds(&mut state) > before);
+        assert!(frame["surfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["kind"] == "editor"));
     }
     #[test]
     fn idle_and_component_updates_do_not_transport_unchanged_grids() {

@@ -74,7 +74,10 @@ QPixmap IconProvider::requestPixmap(const QString &id, QSize *size, const QSize 
 // Expanding or collapsing a folder inserts or removes one run of rows. Report
 // that run instead of resetting the model, so views keep their delegates and
 // scroll position and only the changed rows are rebuilt.
-void EntryModel::replace(const QVariantList &rows) {
+void EntryModel::replace(const QJsonArray &array) {
+    QList<QJsonObject> rows;
+    rows.reserve(array.size());
+    for (const auto &value : array) rows.append(value.toObject());
     if (rows == m_rows)
         return;
     const qsizetype oldSize = m_rows.size(), newSize = rows.size();
@@ -187,7 +190,14 @@ void Bridge::updateFont(const QVariantMap &settings) {
         m_variants[i] = font;
         m_variants[i].setBold(i & 1);
         m_variants[i].setItalic(i & 2);
+        // Glyph runs need the variant's real face; a synthesized bold or
+        // italic would lose its styling, so those keep QPainter text.
+        m_raw[i] = QRawFont::fromFont(m_variants[i]);
+        m_rawExact[i] = m_raw[i].isValid() &&
+                        (!(i & 1) || m_raw[i].weight() >= QFont::DemiBold) &&
+                        (!(i & 2) || m_raw[i].style() != QFont::StyleNormal);
     }
+    ++m_fontGeneration;
     const QFontMetricsF metrics(font);
     m_cellWidth = int(std::ceil(metrics.horizontalAdvance('M')));
     m_cellHeight = int(std::ceil(metrics.height()));
@@ -354,7 +364,8 @@ void Bridge::tick() {
 }
 QVariantMap Bridge::diagnostics() const {
     return {{"updates", m_updates}, {"last_update_bytes", m_lastBytes},
-            {"clipboard_reads", m_clipboardReads}, {"catalog_requests", m_catalogRequests}};
+            {"clipboard_reads", m_clipboardReads}, {"catalog_requests", m_catalogRequests},
+            {"input_context_requests", m_inputContextRequests}};
 }
 void Bridge::attachView(int id, CellView *view) {
     m_views.insert(id, view);
@@ -366,21 +377,27 @@ void Bridge::attachView(int id, CellView *view) {
 void Bridge::detachView(int id, CellView *view) {
     if (m_views.value(id) == view) m_views.remove(id);
 }
-QVariantMap Bridge::send(const QVariantMap &command) {
+QVariantMap Bridge::send(const QVariantMap &command, QJsonObject *lists) {
     const auto action = command.value("action").toString();
     if (action == "catalog") ++m_catalogRequests;
+    if (action == "input_context") ++m_inputContextRequests;
     if (!action.startsWith("accessible_") && action != "catalog" && action != "input_context" && action != "file_dialog_context" &&
         action != "diagnostics" && action != "update" && action != "snapshot" && action != "overview" &&
-        action != "document_text")
+        action != "document_text") {
         m_catalogs.clear();
-    auto exchange = [this](const QVariantMap &request) {
+        ++m_inputGeneration;
+    }
+    auto exchange = [this, lists](const QVariantMap &request) {
         const auto bytes = QJsonDocument(QJsonObject::fromVariantMap(request)).toJson(QJsonDocument::Compact);
         char *raw = slate_request(m_context, bytes.constData());
         const QByteArray response(raw);
         if (request.value("action") == "update") m_lastBytes = response.size();
-        const auto result = QJsonDocument::fromJson(response).object().toVariantMap();
+        auto object = QJsonDocument::fromJson(response).object();
         slate_response_free(raw);
-        return result;
+        if (lists)
+            for (const auto key : {"files", "git", "history"})
+                if (object.contains(QLatin1String(key))) lists->insert(QLatin1String(key), object.take(QLatin1String(key)));
+        return object.toVariantMap();
     };
     auto result = exchange(command);
     if (result.value("clipboard_request").toBool()) {
@@ -522,21 +539,34 @@ void Bridge::refresh() {
     if (m_refreshing) { scheduleRefresh(); return; }
     QScopedValueRollback<bool> refreshing(m_refreshing, true);
     m_refreshTimer.stop();
+    QJsonObject lists;
     auto frame = send({{"action", "update"}, {"width", m_width}, {"height", m_height},
                        {"cell_width", m_cellWidth}, {"cell_height", m_cellHeight},
-                       {"header_height", m_headerHeight}, {"minimum_width", qMax(160, m_headerHeight * 4)}});
+                       {"header_height", m_headerHeight}, {"minimum_width", qMax(160, m_headerHeight * 4)}},
+                      &lists);
     m_lastRefresh.start();
     if (frame.value("unchanged").toBool()) { emit refreshFinished(); return; }
     ++m_updates;
     const auto surfaces = frame.take("surfaces").toList();
     // Rows are only sent when their revision changed. They go to the models,
     // never into the frame QML converts on every change.
-    const bool fileChange = frame.contains("files"), gitChange = frame.contains("git"),
-               historyChange = frame.contains("history");
-    const auto files = frame.take("files").toList(), git = frame.take("git").toList(),
-               history = frame.take("history").toList();
-    for (const auto &key : {"settings", "global_shortcuts", "git_branches"})
-        if (!frame.contains(key)) frame.insert(key, m_frame.value(key));
+    const bool fileChange = lists.contains("files"), gitChange = lists.contains("git"),
+               historyChange = lists.contains("history");
+    const auto files = lists.value("files").toArray(), git = lists.value("git").toArray(),
+               history = lists.value("history").toArray();
+    // Groups that rarely change leave the frame: QML converts the frame on
+    // every update, and every binding reading it re-evaluates. Each group is
+    // kept here until a later update carries a new value.
+    bool stableChange = false;
+    for (const auto &key : {"settings", "global_shortcuts", "git_branches", "recent", "recent_projects", "layouts",
+                            "profiles", "setting_sources", "project_search_policy", "files_colors", "git_colors"}) {
+        if (!frame.contains(key)) continue;
+        const auto value = frame.take(key);
+        if (m_stable.value(key) != value) {
+            m_stable.insert(key, value);
+            stableChange = true;
+        }
+    }
     QVariantList panes, handles;
     for (const auto &p : frame.value("panes").toList()) {
         const auto pane = p.toMap();
@@ -558,13 +588,23 @@ void Bridge::refresh() {
     m_frame = frame;
     m_paneIds = panes;
     m_handleIds = handles;
-    updateFont(frame.value("settings").toMap());
+    updateFont(m_stable.value("settings").toMap());
     // Store before delegates are created, so a restored/recreated view can
     // immediately attach to complete native content even on a metadata-only frame.
     for (const auto &entry : surfaces) {
         auto patch = entry.toMap();
         const int id = patch.value("id").toInt();
-        if (patch.contains("screen")) patchTerminal(m_terminals[id], patch.take("screen").toMap());
+        if (patch.contains("screen")) {
+            auto &grid = m_terminals[id];
+            const auto screen = patch.take("screen").toMap();
+            const bool resized = grid.rows != screen.value("rows").toInt() || grid.cols != screen.value("cols").toInt();
+            patchTerminal(grid, screen);
+            // The view repaints only the rows that changed.
+            QVariantList rows;
+            for (const auto &line : screen.value("lines").toList()) rows.append(line.toMap().value("row"));
+            patch.insert("dirty_rows", rows);
+            patch.insert("resized", resized);
+        }
         m_surfaces.insert(id, patchSurface(m_surfaces.value(id), patch));
         if (auto view = m_views.value(id)) view->applySurface(patch);
     }
@@ -576,6 +616,7 @@ void Bridge::refresh() {
     if (fileChange) { m_files.replace(files); emit filesChanged(); }
     if (gitChange) { m_git.replace(git); emit gitChanged(); }
     if (historyChange) { m_history.replace(history); emit historyChanged(); }
+    if (stableChange) emit stableChanged();
     emit frameChanged();
     emit refreshFinished();
     if (frame.value("quit").toBool()) QCoreApplication::quit();
@@ -585,7 +626,7 @@ void Bridge::copyText(const QString &text) {
         clipboard->setText(text);
 }
 bool Bridge::browserNested() const {
-    return !m_files.rows().isEmpty() && m_files.rows().first().toMap().value("name") == QLatin1String("..");
+    return m_files.size() > 0 && m_files.row(0).value("name") == QLatin1String("..");
 }
 void Bridge::copyClipboard() { send({{"action", "copy"}}); scheduleRefresh(); }
 void Bridge::pasteClipboard() { send({{"action", "paste"}}); scheduleRefresh(); }
@@ -715,6 +756,7 @@ void CellView::setPaneId(int id) {
     if (m_paneId == id) return;
     if (bridge) bridge->detachView(m_paneId, this);
     m_paneId = id;
+    m_inputContextAt = ~0ull;
     if (bridge) bridge->attachView(id, this);
     emit paneIdChanged();
 }
@@ -746,7 +788,15 @@ void CellView::focusOutEvent(QFocusEvent *event) {
 void CellView::setPane(const QVariantMap &pane) {
     if (m_pane == pane) return;
     const bool kindChanged = m_pane.value("kind") != pane.value("kind");
+    // A terminal's revision changes with its output, which arrives as row
+    // patches (see applySurface); only other changes repaint the whole view.
+    auto drawn = [](QVariantMap map) { map.remove("revision"); return map; };
+    const bool repaint = drawn(m_pane) != drawn(pane);
+    const bool inputChanged = kindChanged || m_pane.value("editor") != pane.value("editor") ||
+                              m_pane.value("read_only") != pane.value("read_only");
     m_pane = pane;
+    // Background edits (reloads, language-server changes) arrive this way.
+    if (inputChanged) m_inputContextAt = ~0ull;
     if (kindChanged && pane.value("kind") != "editor") {
         m_lines.clear(); m_columns.clear(); m_lineData.clear(); m_overlays.clear();
         m_layoutPreedit.clear(); m_preeditPosition.clear();
@@ -762,9 +812,11 @@ void CellView::setPane(const QVariantMap &pane) {
         m_requestedLines = 0;
         m_lastTop = top;
     }
-    if (hasActiveFocus() && QGuiApplication::inputMethod()) QGuiApplication::inputMethod()->update(Qt::ImQueryAll);
+    // Input methods re-read the editor only when what they see changed.
+    if (inputChanged && hasActiveFocus() && QGuiApplication::inputMethod())
+        QGuiApplication::inputMethod()->update(Qt::ImQueryAll);
     emit paneChanged();
-    update();
+    if (repaint) update();
 }
 void CellView::notifyAccessibleCursor() {
     if (!QAccessible::isActive() || !isEditor()) return;
@@ -788,7 +840,18 @@ void CellView::applySurface(const QVariantMap &patch) {
     const auto previousCursor = m_cursor;
     m_cursor = patch.value("cursor").toList();
     if (patch.value("kind") == "terminal") {
-        update(); // The bridge holds the grid.
+        // The bridge holds the grid: repaint the changed rows and the cursor.
+        const int ch = bridge ? bridge->cellHeight() : 1;
+        auto row = [&](int index) { update(QRect(0, 1 + index * ch, int(std::ceil(width())), ch + 1)); };
+        if (patch.value("resized").toBool() || !bridge) {
+            update();
+        } else {
+            for (const auto &index : patch.value("dirty_rows").toList()) row(index.toInt());
+            if (previousCursor != m_cursor) {
+                if (previousCursor.size() == 2) row(previousCursor[0].toInt());
+                if (m_cursor.size() == 2) row(m_cursor[0].toInt());
+            }
+        }
         return;
     }
     const int count = patch.value("line_count").toInt();
@@ -930,7 +993,7 @@ void CellView::paint(QPainter *p) {
     if (!bridge)
         return;
     const bool editor = m_pane.value("kind") == "editor";
-    const QColor background(bridge->frame().value(editor ? "background" : "terminal_background").toString());
+    const QColor background(bridge->qmlFrame().value(editor ? "background" : "terminal_background").toString());
     p->fillRect(boundingRect(), background);
     const int cw = bridge->cellWidth(), ch = bridge->cellHeight();
     const qreal offset = editor ? m_scrollPixels : 0;
@@ -957,12 +1020,38 @@ void CellView::paint(QPainter *p) {
             if (line.bottom() < clip.top()) continue;
             for (const auto &run : grid->lines[row]) {
                 const QRect rect(1 + run.column * cw, 1 + row * ch, run.columns * cw, ch);
-                p->fillRect(rect, run.background);
+                // The view was filled with the default background above.
+                if (run.background != background) p->fillRect(rect, run.background);
                 if (run.text.isEmpty() || run.text.trimmed().isEmpty()) continue;
+                p->setPen(run.foreground);
+                if (run.perColumn) {
+                    // Shape each run once per font: glyphs at their cell
+                    // boundaries, drawn in one call (monospace alignment
+                    // without a text layout per character).
+                    if (run.glyphsFont != bridge->fontGeneration()) {
+                        run.glyphsFont = bridge->fontGeneration();
+                        run.glyphs = QGlyphRun();
+                        if (const auto raw = bridge->rawFont(run.bold, run.italic)) {
+                            const auto indexes = raw->glyphIndexesForString(run.text);
+                            if (indexes.size() == run.text.size() && !indexes.contains(0)) {
+                                QList<QPointF> positions;
+                                positions.reserve(indexes.size());
+                                for (int i = 0; i < indexes.size(); ++i) positions.append(QPointF(i * cw, 0));
+                                run.glyphs.setRawFont(*raw);
+                                run.glyphs.setGlyphIndexes(indexes);
+                                run.glyphs.setPositions(positions);
+                                run.glyphs.setUnderline(run.underline);
+                            }
+                        }
+                    }
+                    if (!run.glyphs.glyphIndexes().isEmpty()) {
+                        p->drawGlyphRun(QPointF(rect.x(), rect.y() + ascent), run.glyphs);
+                        continue;
+                    }
+                }
                 QFont font = bridge->font(run.bold, run.italic);
                 font.setUnderline(run.underline);
                 p->setFont(font);
-                p->setPen(run.foreground);
                 if (run.perColumn) {
                     // Monospace: place each glyph on its cell boundary.
                     for (int i = 0; i < run.text.size(); ++i)
@@ -977,11 +1066,11 @@ void CellView::paint(QPainter *p) {
     const auto cursor = m_cursor;
     if (cursor.size() == 2 && m_pane.value("focused").toBool() && (m_cursorShown || !hasActiveFocus())) {
         const int row = cursor[0].toInt(), col = cursor[1].toInt();
-        p->setPen(QColor(bridge->frame().value("accent").toString()));
+        p->setPen(QColor(bridge->qmlFrame().value("accent").toString()));
         if (editor) {
             const qreal x = 1 + cursorX(row, col);
             const qreal y = 1 + row * ch - offset;
-            p->fillRect(QRectF(x, y, 2, ch), QColor(bridge->frame().value("accent").toString()));
+            p->fillRect(QRectF(x, y, 2, ch), QColor(bridge->qmlFrame().value("accent").toString()));
         } else {
             p->drawRect(1 + col * cw, 1 + row * ch, cw - 1, ch - 1);
         }
@@ -1290,6 +1379,14 @@ void CellView::inputMethodEvent(QInputMethodEvent *e) {
     update();
     e->accept();
 }
+QVariantMap CellView::inputContext() const {
+    if (m_inputContextAt != bridge->inputGeneration()) {
+        m_inputContext =
+            bridge->send({{"action", "input_context"}, {"pane", m_paneId}}).value("editor").toMap();
+        m_inputContextAt = bridge->inputGeneration();
+    }
+    return m_inputContext;
+}
 QVariant CellView::inputMethodQuery(Qt::InputMethodQuery query) const {
     if (!bridge)
         return {};
@@ -1297,9 +1394,8 @@ QVariant CellView::inputMethodQuery(Qt::InputMethodQuery query) const {
     // observe the current document even before the next presentation update.
     const bool textQuery = query == Qt::ImSurroundingText || query == Qt::ImCursorPosition ||
                            query == Qt::ImAnchorPosition || query == Qt::ImCurrentSelection;
-    const auto editor = textQuery && m_pane.value("kind") == "editor"
-        ? bridge->send({{"action", "input_context"}, {"pane", m_paneId}}).value("editor").toMap()
-        : m_pane.value("editor").toMap();
+    const auto editor = textQuery && m_pane.value("kind") == "editor" ? inputContext()
+                                                                       : m_pane.value("editor").toMap();
     if (query == Qt::ImEnabled)
         return !m_pane.value("read_only").toBool();
     if (query == Qt::ImSurroundingText)

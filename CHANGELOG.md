@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.14 — 2026-10-10
+
+- Render GUI editor panes again only when their content changes, not on every terminal, Git or worker update; and build file and Git views only in panes that show them.
+- Make screen cells compact (colours as numbers, glyphs inline), shrinking every terminal and editor screen and removing three allocations per cell.
+- Match brackets by walking the text once instead of looking up each character; repaint only changed terminal rows, drawing them as cached glyph runs.
+- Send settings, recent lists, profiles and colours to the GUI only when they change, and stop re-querying the input method on every frame.
+- Keep one copy of file, Git and history lists from the core to Qt (shared in Rust, serialized directly, compact rows in Qt), and stop resending an unchanged Git status.
+- Merge directory listings requested while one is being read (several per save before), and retry one the busy queue refused instead of dropping it.
+- Bound memory: a scrollback budget shared by all terminals, highlight spans kept only near what is shown, parser state dropped for closed documents, and selections that freeze only the visible terminal rows.
+
 ## 0.1.13 — 2026-10-10
 
 - Make the GUI menu bar and status bar fit one line of text instead of reserving full-size button height.

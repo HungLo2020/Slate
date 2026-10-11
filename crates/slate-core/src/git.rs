@@ -58,7 +58,7 @@ pub struct GitState {
 
 /// The Git pane's state.
 pub(crate) struct Panel {
-    pub entries: Vec<GitEntry>,
+    pub entries: std::sync::Arc<Vec<GitEntry>>,
     pub selected: usize,
     pub branch: String,
     pub repository: bool,
@@ -84,7 +84,7 @@ pub(crate) struct Panel {
     pub branches: Vec<String>,
     /// The commit graph, listed after `entries`: a `selected` index past the
     /// last entry selects `history[selected - entries.len()]`.
-    pub history: Vec<crate::git_history::HistoryRow>,
+    pub history: std::sync::Arc<Vec<crate::git_history::HistoryRow>>,
     pub history_revision: u64,
     /// Commits requested; "load more" raises it a page at a time.
     pub history_limit: usize,
@@ -99,7 +99,7 @@ pub(crate) struct Panel {
 impl Default for Panel {
     fn default() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: Default::default(),
             selected: 0,
             branch: String::new(),
             repository: false,
@@ -116,7 +116,7 @@ impl Default for Panel {
             ahead: 0,
             behind: 0,
             branches: Vec::new(),
-            history: Vec::new(),
+            history: Default::default(),
             history_revision: 1,
             history_limit: crate::git_history::PAGE,
             history_running: false,
@@ -754,7 +754,19 @@ impl App {
         match state {
             Ok(state) => {
                 self.git_status_finished();
-                self.git.revision += 1;
+                // Status is read after every save and operation; frontends
+                // receive the list again only when something in it changed.
+                let changed = *self.git.entries != state.entries
+                    || self.git.branch != state.branch
+                    || self.git.repository != state.repository
+                    || self.git.head != state.head
+                    || self.git.upstream != state.upstream
+                    || self.git.upstream_head != state.upstream_head
+                    || (self.git.ahead, self.git.behind) != (state.ahead, state.behind)
+                    || self.git.branches != state.branches;
+                if changed {
+                    self.git.revision += 1;
+                }
                 self.git.branch = state.branch;
                 self.git.repository = state.repository;
                 // A selected commit stays selected as the change list above it
@@ -765,7 +777,9 @@ impl App {
                     .entries
                     .get(self.git.selected)
                     .map(|e| (e.path.clone(), e.staged));
-                self.git.entries = state.entries;
+                if changed {
+                    self.git.entries = std::sync::Arc::new(state.entries);
+                }
                 if let Some(hash) = commit {
                     let index = self.git.history.iter().position(|c| c.hash == hash);
                     self.git.selected = self.git.entries.len() + index.unwrap_or(0);
@@ -891,7 +905,7 @@ impl App {
         }
         if !trusted {
             if !self.git.restricted {
-                self.git.entries.clear();
+                self.git.entries = Default::default();
                 self.git.branch.clear();
                 self.git.selected = 0;
                 self.git.repository = true;

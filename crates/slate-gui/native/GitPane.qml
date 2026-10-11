@@ -119,12 +119,14 @@ FocusScope {
     readonly property int graphRowHeight: Math.ceil(Math.max(24, metrics.height + 8))
     readonly property int sectionHeight: Math.ceil(Math.max(view.compactHeight ? 26 : 30, metrics.height + 10))
     readonly property int iconSize: Math.max(14, Math.min(rowHeight - 10, Math.ceil(metrics.height)))
-    // Collapsed change groups, by name.
+    // Collapsed change groups, by name. The window keeps them, so they
+    // survive this view being rebuilt when its pane switches views.
     property var collapsedGroups: ({})
+    signal collapsedGroupsEdited(var groups)
     function toggleGroup(group) {
         var next = Object.assign({}, collapsedGroups);
         next[group] = !next[group];
-        collapsedGroups = next;
+        collapsedGroupsEdited(next);
     }
     ColumnLayout {
         anchors.fill: parent
@@ -413,6 +415,8 @@ FocusScope {
                         view.bridge.key(event.key, event.text, event.modifiers);
                         event.accepted = true;
                     }
+                    // A rebuilt view shows the selection, as a kept one would.
+                    Component.onCompleted: if (view.changesSelected > 0) positionViewAtIndex(view.changesSelected, ListView.Contain)
                     Connections {
                         target: view
                         function onChangesSelectedChanged() {
@@ -800,6 +804,7 @@ FocusScope {
                         view.bridge.key(event.key, event.text, event.modifiers);
                         event.accepted = true;
                     }
+                    Component.onCompleted: if (view.commitSelected > 0) positionViewAtIndex(view.commitSelected, ListView.Contain)
                     Connections {
                         target: view
                         function onCommitSelectedChanged() {

@@ -242,8 +242,9 @@ Portable PTYs run real shells; vt100 maintains the screen and scrollback. Input
 uses the application's cursor mode, modifiers and bracketed paste settings.
 Mouse presses/releases, button motion, all-motion and wheel events use the
 application's requested legacy, UTF-8 or SGR encoding. Shift bypasses application
-mouse capture for local selection and scrollback. Selection freezes a cloned VT
-viewport while output continues, providing stable copying of wrapped/wide text.
+mouse capture for local selection and scrollback. Selection freezes a copy of the
+visible VT rows (not the scrollback) while output continues, providing stable
+copying of wrapped/wide text.
 Typing, paste, scroll and resize release the frozen selection.
 
 GUI copy/paste uses the system clipboard; TUI copy uses OSC 52 and paste accepts

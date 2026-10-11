@@ -129,6 +129,8 @@ pub fn worker(
         while let Ok(more) = requests.try_recv() {
             queue.push(more);
         }
+        // Closed documents leave `latest`; forget their parser states.
+        prune_states(&mut states, &latest);
         let mut newest: HashMap<u64, Request> = HashMap::new();
         for request in queue {
             match newest.get_mut(&request.doc) {
@@ -150,6 +152,11 @@ pub fn worker(
             }
         }
     }
+}
+
+fn prune_states(states: &mut HashMap<u64, DocState>, latest: &Mutex<HashMap<u64, u64>>) {
+    let latest = latest.lock().unwrap();
+    states.retain(|doc, _| latest.contains_key(doc));
 }
 
 fn line_text(rope: &Rope, line: usize) -> std::borrow::Cow<'_, str> {
@@ -308,6 +315,11 @@ pub fn highlight_text(text: &str, path: Option<&Path>, light: bool) -> Vec<Vec<S
 
 /// Watermarks kept before stale lines are marked one by one.
 const WATERMARKS: usize = 64;
+/// Lines whose spans are kept before distant ones are dropped, and how far
+/// from a view lines keep theirs. Dropped spans are recomputed from the
+/// worker's checkpoints when their lines are shown again.
+const SPAN_BUDGET: usize = 20_000;
+const SPAN_KEEP: usize = 2_000;
 
 /// The core's per-document line cache: spans and whether they are current.
 #[derive(Default)]
@@ -328,6 +340,9 @@ pub struct LineCache {
     /// Both strictly increase, so the first entry after a line's epoch is
     /// the lowest watermark it has to respect.
     stale_from: Vec<(u64, usize)>,
+    /// Lines stored since spans were last counted: an upper bound on how
+    /// many lines hold spans beyond that count.
+    stored: usize,
 }
 impl LineCache {
     pub fn new(lines: usize, light: bool) -> Self {
@@ -339,7 +354,38 @@ impl LineCache {
             dirty_from: 0,
             epoch: 0,
             stale_from: vec![],
+            stored: 0,
         }
+    }
+    /// Lines holding spans (stale or current).
+    #[cfg(test)]
+    pub fn retained(&self) -> usize {
+        self.lines.iter().filter(|line| line.is_some()).count()
+    }
+    /// Once more than `SPAN_BUDGET` lines may hold spans, drop the spans of
+    /// lines further than `SPAN_KEEP` from every range in view. Scrolling
+    /// through a long file then keeps memory proportional to the view.
+    pub fn evict_far(&mut self, ranges: &[(usize, usize)]) {
+        if self.stored <= SPAN_BUDGET {
+            return;
+        }
+        let near = |line: usize| {
+            ranges.iter().any(|&(first, last)| {
+                line + SPAN_KEEP >= first && line < last.saturating_add(SPAN_KEEP)
+            })
+        };
+        let mut kept = 0;
+        for (line, entry) in self.lines.iter_mut().enumerate() {
+            if entry.is_some() {
+                if near(line) {
+                    kept += 1;
+                } else {
+                    *entry = None;
+                }
+            }
+        }
+        self.stored = kept;
+        self.revision += 1;
     }
     pub fn line_count(&self) -> usize {
         self.lines.len()
@@ -428,6 +474,7 @@ impl LineCache {
             }
             if let Some(entry) = self.lines.get_mut(line) {
                 *entry = Some((spans, fresh.then_some(self.epoch)));
+                self.stored += 1;
             }
         }
         if fresh {
@@ -497,6 +544,7 @@ impl App {
             if cache.light != light || cache.line_count() != lines {
                 *cache = LineCache::new(lines, light);
             }
+            cache.evict_far(&ranges);
             // Each range from its first line without current spans.
             let ranges: Vec<_> = ranges
                 .into_iter()
@@ -566,6 +614,67 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spans() -> LineSpans {
+        Arc::new(vec![Span {
+            start: 0,
+            end: 1,
+            fg: 0,
+            bold: false,
+            italic: false,
+        }])
+    }
+
+    #[test]
+    fn scrolling_keeps_spans_only_near_the_view() {
+        let mut cache = LineCache::new(100_000, false);
+        // Scroll from the top to the bottom, highlighting a screenful at a time.
+        for first in (0..100_000).step_by(100) {
+            cache.evict_far(&[(first, first + 100)]);
+            cache.apply(1, 1, first, vec![spans(); 100]);
+        }
+        let view = (99_900, 100_000);
+        cache.evict_far(&[view]);
+        assert!(
+            cache.retained() <= SPAN_BUDGET + 100,
+            "{}",
+            cache.retained()
+        );
+        assert!(cache.current(view.0, view.1), "the view keeps its spans");
+        assert!(
+            cache.spans(99_900 - SPAN_KEEP + 1).is_some(),
+            "nearby lines are kept"
+        );
+        assert!(cache.spans(10).is_none(), "distant lines are dropped");
+        assert_eq!(
+            cache.first_missing(0, 100),
+            Some(0),
+            "dropped lines are highlighted again"
+        );
+        // Under the budget nothing is dropped.
+        let mut small = LineCache::new(1_000, false);
+        small.apply(1, 1, 0, vec![spans(); 1_000]);
+        small.evict_far(&[(0, 10)]);
+        assert_eq!(small.retained(), 1_000);
+    }
+
+    #[test]
+    fn closed_documents_lose_their_parser_states() {
+        let mut states = HashMap::new();
+        for doc in [1, 2] {
+            states.insert(
+                doc,
+                DocState {
+                    syntax: String::new(),
+                    light: false,
+                    checkpoints: vec![],
+                },
+            );
+        }
+        let latest = Mutex::new(HashMap::from([(2, 7)]));
+        prune_states(&mut states, &latest);
+        assert_eq!(states.keys().copied().collect::<Vec<_>>(), [2]);
+    }
 
     #[test]
     fn extended_grammars_cover_common_project_files() {

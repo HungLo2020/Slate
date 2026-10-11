@@ -336,7 +336,7 @@ impl App {
         git.history_key = Default::default();
         git.history_stale = false;
         if !git.history.is_empty() || !git.history_error.is_empty() {
-            git.history.clear();
+            git.history = Default::default();
             git.history_error.clear();
             git.history_revision += 1;
         }
@@ -367,8 +367,8 @@ impl App {
         match result {
             Ok(rows) => {
                 let commit = self.selected_commit().map(|c| c.hash.clone());
-                if rows != self.git.history || !self.git.history_error.is_empty() {
-                    self.git.history = rows;
+                if *self.git.history != rows || !self.git.history_error.is_empty() {
+                    self.git.history = std::sync::Arc::new(rows);
                     self.git.history_error.clear();
                     self.git.history_revision += 1;
                 }

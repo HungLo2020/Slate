@@ -51,7 +51,11 @@ impl ColorMode {
         Self::Ansi256
     }
     pub fn color(self, hex: &str) -> Color {
-        let value = u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0);
+        self.rgb(slate_core::terminal::Rgb::parse(hex))
+    }
+    /// A screen cell's colour, already parsed by the core.
+    pub fn rgb(self, rgb: slate_core::terminal::Rgb) -> Color {
+        let value = rgb.0;
         let (r, g, b) = ((value >> 16) as u8, (value >> 8) as u8, value as u8);
         match self {
             Self::TrueColor => Color::Rgb(r, g, b),
@@ -70,6 +74,12 @@ impl ColorMode {
                     })
             }),
         }
+    }
+    pub fn cell_style(self, fg: slate_core::terminal::Rgb, bg: slate_core::terminal::Rgb) -> Style {
+        if self == Self::None {
+            return Style::default();
+        }
+        Style::default().fg(self.rgb(fg)).bg(self.rgb(bg))
     }
     pub fn style(self, fg: &str, bg: &str) -> Style {
         if self == Self::None {

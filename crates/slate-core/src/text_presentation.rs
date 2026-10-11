@@ -1,13 +1,16 @@
 //! Compact editor presentation. Terminal cell grids remain a separate frontend projection.
-use crate::{terminal::Cell, App};
+use crate::{
+    terminal::{Cell, Rgb},
+    App,
+};
 use serde::Serialize;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct TextSpan {
     pub start: usize,
     pub length: usize,
-    pub fg: String,
-    pub bg: String,
+    pub fg: Rgb,
+    pub bg: Rgb,
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
@@ -17,8 +20,8 @@ impl TextSpan {
         Self {
             start,
             length,
-            fg: cell.fg.clone(),
-            bg: cell.bg.clone(),
+            fg: cell.fg,
+            bg: cell.bg,
             bold: cell.bold,
             italic: cell.italic,
             underline: cell.underline,

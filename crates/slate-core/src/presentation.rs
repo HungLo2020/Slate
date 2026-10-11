@@ -29,12 +29,21 @@ impl App {
         Ok(())
     }
 
+    /// Scrollback for a new terminal: the setting, within what the other
+    /// terminals leave of the shared budget, and never below the minimum.
+    pub(crate) fn scrollback_for_new_terminal(&self) -> usize {
+        use crate::terminal::{MIN_SCROLLBACK, SCROLLBACK_BUDGET};
+        let wanted = self.preferences.terminal_scrollback;
+        let budget = SCROLLBACK_BUDGET.max(wanted);
+        let used: usize = self.terminals.values().map(|t| t.scrollback_lines()).sum();
+        wanted.min(budget.saturating_sub(used).max(MIN_SCROLLBACK))
+    }
     /// Start a shell in `cwd` (or the workspace root when it is gone) with
-    /// the configured scrollback, wired to wake the event loop.
+    /// its share of the scrollback budget, wired to wake the event loop.
     pub(super) fn spawn_shell(&self, cwd: &std::path::Path) -> Result<TerminalSession> {
         let cwd = if cwd.is_dir() { cwd } else { &self.root };
         let mut session =
-            TerminalSession::spawn_with(cwd, None, 24, 80, self.preferences.terminal_scrollback)?;
+            TerminalSession::spawn_with(cwd, None, 24, 80, self.scrollback_for_new_terminal())?;
         session.set_events(self.events.clone());
         Ok(session)
     }

@@ -913,7 +913,7 @@ fn highlighting_is_shared_and_refreshes_after_editing() {
             .cells
             .iter()
             .flatten()
-            .map(|c| c.fg.as_str())
+            .map(|c| c.fg)
             .collect::<std::collections::BTreeSet<_>>();
         if colors.len() > 2 {
             assert!(

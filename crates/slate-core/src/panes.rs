@@ -97,6 +97,9 @@ impl App {
         self.diff_inspections.remove(&doc);
         self.highlights.remove(&doc);
         self.highlight_pending.remove(&doc);
+        // The highlight worker drops its parser state for documents it no
+        // longer has a request generation for.
+        self.services.highlight_latest.lock().unwrap().remove(&doc);
         self.wrap_cache.lock().unwrap().forget(doc);
         self.overview_cache.remove(&doc);
         self.overview_pending.remove(&doc);

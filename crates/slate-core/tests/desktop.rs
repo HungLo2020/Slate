@@ -298,7 +298,7 @@ fn terminals_have_independent_themes_and_can_follow_the_editor() {
             .find(|p| p.kind == "terminal")
             .unwrap();
         let screen = terminal.screen.as_ref().unwrap();
-        let corner = screen.cells.last().unwrap().last().unwrap().bg.clone();
+        let corner = screen.cells.last().unwrap().last().unwrap().bg;
         (corner, snapshot.background)
     };
     // By default terminals use the editor's colours.

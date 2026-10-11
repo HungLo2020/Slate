@@ -350,6 +350,35 @@ impl App {
         self.pending_reveal = Some((target, self.browse_requests));
         Ok(())
     }
+    /// Ask for the browser's listing. A save, a file operation or several
+    /// expanded folders in a row need only the newest state, so this never
+    /// queues more than one listing behind the one being read.
+    pub(crate) fn request_listing(&mut self) {
+        self.browse_requests += 1;
+        self.send_listing();
+    }
+    /// Send the newest requested listing when none is being read. Also called
+    /// as events are processed, so a request the busy queue refused is retried.
+    pub(crate) fn send_listing(&mut self) {
+        if self.browse_sent.is_some() || self.browse_replies >= self.browse_requests {
+            return;
+        }
+        let job = crate::services::Job::Browse(
+            self.browser.clone(),
+            self.root.clone(),
+            self.expanded_folders.iter().cloned().collect(),
+            !self.terminal_frontend,
+        );
+        if self.services.tx.send(job).is_ok() {
+            self.browse_sent = Some(self.browse_requests);
+        }
+    }
+    /// A listing arrived: everything requested before it was sent is answered.
+    pub(crate) fn listing_answered(&mut self) {
+        if let Some(sent) = self.browse_sent.take() {
+            self.browse_replies = self.browse_replies.max(sent);
+        }
+    }
     pub(crate) fn finish_reveal(&mut self) {
         let Some((target, reply)) = self.pending_reveal.take() else {
             return;
@@ -473,6 +502,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn listing_requests_coalesce_into_one_follow_up() {
+        let _serial = crate::paths::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", dir.path().join("config"));
+        std::env::set_var("XDG_STATE_HOME", dir.path().join("state"));
+        let root = dir.path().join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(&root).unwrap();
+        let in_flight = app.browse_sent;
+        assert!(
+            in_flight.is_some(),
+            "the session asks for its first listing"
+        );
+        // Saves and file operations each ask again; none queue behind it.
+        fs::write(root.join("late.txt"), "").unwrap();
+        for _ in 0..50 {
+            app.refresh();
+        }
+        assert_eq!(app.browse_sent, in_flight, "no second listing was queued");
+        let wanted = app.browse_requests;
+        for _ in 0..500 {
+            app.process_events();
+            if app.browse_replies >= wanted {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            app.browse_replies >= wanted,
+            "the follow-up listing was read"
+        );
+        assert!(
+            app.files.iter().any(|e| e.name == "late.txt"),
+            "it saw the newest state"
+        );
+        assert!(app.browse_sent.is_none());
+    }
+
+    #[test]
     fn listing_marks_ignored_entries_without_hiding_them() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
@@ -543,14 +613,14 @@ mod tests {
         let path = dir.path().join("source.txt");
         fs::write(&path, "data").unwrap();
         let mut app = App::new(&path).unwrap();
-        app.files = vec![Entry {
+        app.files = std::sync::Arc::new(vec![Entry {
             name: "source.txt".into(),
             path: path.to_string_lossy().into_owned(),
             directory: false,
             depth: 0,
             expanded: false,
             ignored: false,
-        }];
+        }]);
         let id = *app.documents.keys().next().unwrap();
         app.documents
             .get_mut(&id)

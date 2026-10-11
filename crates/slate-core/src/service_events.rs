@@ -85,20 +85,22 @@ impl App {
                     self.file_operation_done(operation, result)
                 }
                 Reply::Files(path, Ok(entries)) if path == self.browser => {
-                    self.browse_replies += 1;
-                    if self.files != entries {
+                    self.listing_answered();
+                    if *self.files != entries {
                         self.files_revision += 1;
+                        self.files = std::sync::Arc::new(entries);
                     }
-                    self.files = entries;
                     self.selected = self.selected.min(self.files.len().saturating_sub(1));
                     self.finish_reveal();
+                    self.send_listing();
                 }
                 Reply::Files(_, result) => {
-                    self.browse_replies += 1;
+                    self.listing_answered();
                     if let Err(e) = result {
                         self.status = e;
                     }
                     self.finish_reveal();
+                    self.send_listing();
                 }
                 Reply::Git(state) => self.git_status(state),
                 Reply::GitOperation(result) => self.git_operation_done(result),

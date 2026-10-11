@@ -203,7 +203,7 @@ fn selections_wrap_in_brackets_and_matching_brackets_are_found() {
     let frame = app.snapshot(100, 30, 0, 1, 1, 0);
     let cells = &frame.panes[0].screen.as_ref().unwrap().cells[0];
     let gutter = cells.iter().position(|c| c.text == "c").unwrap();
-    let background = cells[0].bg.clone();
+    let background = cells[0].bg;
     assert_ne!(cells[gutter + 4].bg, background, "opening bracket");
     assert_ne!(cells[gutter + 12].bg, background, "closing bracket");
     assert_eq!(cells[gutter + 6].bg, background);

@@ -11,11 +11,140 @@ use std::{
     thread,
 };
 
+/// A colour, 0xRRGGBB. Frontends receive it as `"#rrggbb"`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Rgb(pub u32);
+impl Rgb {
+    pub const fn new(r: u8, g: u8, b: u8) -> Self {
+        Self((r as u32) << 16 | (g as u32) << 8 | b as u32)
+    }
+    /// `#rrggbb` (or `rrggbb`); anything else is black.
+    pub fn parse(hex: &str) -> Self {
+        Self(u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0) & 0xff_ffff)
+    }
+    pub fn hex(self) -> String {
+        format!("#{:06x}", self.0)
+    }
+    pub fn rgb(self) -> (u8, u8, u8) {
+        ((self.0 >> 16) as u8, (self.0 >> 8) as u8, self.0 as u8)
+    }
+}
+impl From<&str> for Rgb {
+    fn from(hex: &str) -> Self {
+        Self::parse(hex)
+    }
+}
+impl From<&String> for Rgb {
+    fn from(hex: &String) -> Self {
+        Self::parse(hex)
+    }
+}
+/// A colour equals the `#rrggbb` text naming it.
+impl PartialEq<str> for Rgb {
+    fn eq(&self, other: &str) -> bool {
+        other.len() == 7 && other.starts_with('#') && *self == Rgb::parse(other)
+    }
+}
+impl PartialEq<&str> for Rgb {
+    fn eq(&self, other: &&str) -> bool {
+        *self == **other
+    }
+}
+impl PartialEq<String> for Rgb {
+    fn eq(&self, other: &String) -> bool {
+        *self == **other
+    }
+}
+impl Serialize for Rgb {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut text = [b'#'; 7];
+        for (i, byte) in text[1..].iter_mut().enumerate() {
+            *byte = DIGITS[(self.0 >> (20 - 4 * i) & 15) as usize];
+        }
+        serializer.serialize_str(std::str::from_utf8(&text).unwrap())
+    }
+}
+
+/// A cell's grapheme. Almost every one fits inline, so screens do not
+/// allocate per cell; longer clusters (some emoji sequences) use the heap.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct Glyph(GlyphRepr);
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum GlyphRepr {
+    Inline(u8, [u8; Glyph::INLINE]),
+    Heap(Box<str>),
+}
+impl Glyph {
+    const INLINE: usize = 22;
+    pub fn as_str(&self) -> &str {
+        match &self.0 {
+            // Only ever filled from a whole `str` of this length.
+            GlyphRepr::Inline(len, bytes) => std::str::from_utf8(&bytes[..*len as usize]).unwrap(),
+            GlyphRepr::Heap(text) => text,
+        }
+    }
+}
+impl Default for Glyph {
+    fn default() -> Self {
+        Self(GlyphRepr::Inline(0, [0; Self::INLINE]))
+    }
+}
+impl From<&str> for Glyph {
+    fn from(text: &str) -> Self {
+        if text.len() <= Self::INLINE {
+            let mut bytes = [0; Self::INLINE];
+            bytes[..text.len()].copy_from_slice(text.as_bytes());
+            Self(GlyphRepr::Inline(text.len() as u8, bytes))
+        } else {
+            Self(GlyphRepr::Heap(text.into()))
+        }
+    }
+}
+impl From<String> for Glyph {
+    fn from(text: String) -> Self {
+        Self::from(text.as_str())
+    }
+}
+impl From<char> for Glyph {
+    fn from(c: char) -> Self {
+        Self::from(c.encode_utf8(&mut [0; 4]) as &str)
+    }
+}
+impl std::ops::Deref for Glyph {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+impl std::fmt::Debug for Glyph {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_str().fmt(f)
+    }
+}
+impl PartialEq<str> for Glyph {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+impl PartialEq<&str> for Glyph {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+impl Serialize for Glyph {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// One screen cell: about 40 bytes, with no heap allocation for ordinary
+/// text (screens are rebuilt for every changed frame).
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct Cell {
-    pub text: String,
-    pub fg: String,
-    pub bg: String,
+    pub text: Glyph,
+    pub fg: Rgb,
+    pub bg: Rgb,
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
@@ -23,11 +152,11 @@ pub struct Cell {
     pub continuation: bool,
 }
 impl Cell {
-    pub fn text(text: impl Into<String>) -> Self {
+    pub fn text(text: impl Into<Glyph>) -> Self {
         Self {
             text: text.into(),
-            fg: "#d8dee9".into(),
-            bg: "#20242c".into(),
+            fg: Rgb(0xd8dee9),
+            bg: Rgb(0x20242c),
             bold: false,
             italic: false,
             underline: false,
@@ -55,6 +184,11 @@ pub struct Pointer<'a> {
 }
 /// Default lines of history kept per terminal.
 pub const DEFAULT_SCROLLBACK: usize = 5000;
+/// Scrollback lines all of a window's terminals keep together (or the
+/// per-terminal setting, when larger), and the least a new terminal gets.
+/// A busy 200-column terminal holds about 6 KB per line.
+pub const SCROLLBACK_BUDGET: usize = 20_000;
+pub const MIN_SCROLLBACK: usize = 500;
 
 /// Side effects of terminal output that are not drawn on the screen. The
 /// parser calls these while processing output, so replies to queries see
@@ -139,6 +273,7 @@ pub struct TerminalSession {
     initial_cwd: PathBuf,
     selection: Option<((u16, u16), (u16, u16))>,
     selection_screen: Option<vt100::Screen>,
+    scrollback: usize,
 }
 impl TerminalSession {
     pub fn spawn(cwd: &Path, command: Option<&str>, rows: u16, cols: u16) -> Result<Self> {
@@ -232,7 +367,12 @@ impl TerminalSession {
             initial_cwd: cwd.to_path_buf(),
             selection: None,
             selection_screen: None,
+            scrollback,
         })
+    }
+    /// Scrollback lines this terminal keeps.
+    pub fn scrollback_lines(&self) -> usize {
+        self.scrollback
     }
     /// The title set by the running program (OSC 0/2), if any.
     pub fn program_title(&self) -> Option<String> {
@@ -356,6 +496,8 @@ impl TerminalSession {
             .clone()
             .unwrap_or_else(|| self.initial_cwd.clone())
     }
+    /// Start or extend a selection. The screen is frozen while selecting so
+    /// output does not move the text under the pointer.
     pub fn select(&mut self, row: usize, col: usize, extend: bool) {
         self.changed();
         let position = (
@@ -364,7 +506,7 @@ impl TerminalSession {
         );
         if !extend || self.selection.is_none() {
             self.selection = Some((position, position));
-            self.selection_screen = Some(self.parser.lock().unwrap().screen().clone());
+            self.selection_screen = Some(visible_copy(self.parser.lock().unwrap().screen()));
         } else if let Some((anchor, _)) = self.selection {
             self.selection = Some((anchor, position));
         }
@@ -470,6 +612,7 @@ impl TerminalSession {
         ))
     }
     pub fn screen_with_palette(&self, palette: &crate::theme::Palette) -> Screen {
+        let palette = &TerminalPalette::from(palette);
         let p = self.parser.lock().unwrap();
         let s = self.selection_screen.as_ref().unwrap_or_else(|| p.screen());
         let (rows, cols) = s.size();
@@ -478,26 +621,20 @@ impl TerminalSession {
             let mut line = Vec::with_capacity(cols as usize);
             for col in 0..cols {
                 let c = s.cell(row, col).unwrap();
-                let mut fg = match c.fgcolor() {
-                    vt100::Color::Default => palette.foreground.clone(),
-                    other => color(other, false, palette),
-                };
-                let mut bg = match c.bgcolor() {
-                    vt100::Color::Default => palette.background.clone(),
-                    other => color(other, true, palette),
-                };
+                let mut fg = color(c.fgcolor(), false, palette);
+                let mut bg = color(c.bgcolor(), true, palette);
                 if c.inverse() {
                     std::mem::swap(&mut fg, &mut bg);
                 }
                 if let Some((a, b)) = self.selection {
                     let (start, end) = if a <= b { (a, b) } else { (b, a) };
                     if (row, col) >= start && (row, col) < end {
-                        bg = palette.selection.clone();
-                        fg = palette.selection_foreground.clone();
+                        bg = palette.selection;
+                        fg = palette.selection_foreground;
                     }
                 }
                 line.push(Cell {
-                    text: c.contents().to_string(),
+                    text: Glyph::from(c.contents()),
                     fg,
                     bg,
                     bold: c.bold(),
@@ -534,31 +671,51 @@ impl Drop for TerminalSession {
         let _ = self.child.wait();
     }
 }
-fn color(c: vt100::Color, background: bool, palette: &crate::theme::Palette) -> String {
+fn color(c: vt100::Color, background: bool, palette: &TerminalPalette) -> Rgb {
     match c {
-        vt100::Color::Default => if background {
-            &palette.background
-        } else {
-            &palette.foreground
+        vt100::Color::Default => {
+            if background {
+                palette.background
+            } else {
+                palette.foreground
+            }
         }
-        .clone(),
-        vt100::Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+        vt100::Color::Rgb(r, g, b) => Rgb::new(r, g, b),
         vt100::Color::Idx(i) => {
             if i < 16 {
-                return palette.ansi[i as usize].clone();
+                return palette.ansi[i as usize];
             }
             if i >= 232 {
                 let v = 8 + (i - 232) * 10;
-                return format!("#{v:02x}{v:02x}{v:02x}");
+                return Rgb::new(v, v, v);
             }
             let i = i - 16;
             let levels = [0, 95, 135, 175, 215, 255];
-            format!(
-                "#{:02x}{:02x}{:02x}",
+            Rgb::new(
                 levels[(i / 36) as usize],
                 levels[((i / 6) % 6) as usize],
-                levels[(i % 6) as usize]
+                levels[(i % 6) as usize],
             )
+        }
+    }
+}
+
+/// A theme palette parsed once per screen, not once per cell.
+struct TerminalPalette {
+    foreground: Rgb,
+    background: Rgb,
+    selection: Rgb,
+    selection_foreground: Rgb,
+    ansi: [Rgb; 16],
+}
+impl From<&crate::theme::Palette> for TerminalPalette {
+    fn from(palette: &crate::theme::Palette) -> Self {
+        Self {
+            foreground: Rgb::parse(&palette.foreground),
+            background: Rgb::parse(&palette.background),
+            selection: Rgb::parse(&palette.selection),
+            selection_foreground: Rgb::parse(&palette.selection_foreground),
+            ansi: std::array::from_fn(|i| Rgb::parse(&palette.ansi[i])),
         }
     }
 }
@@ -636,14 +793,108 @@ fn decode_base64(data: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// The rows `screen` shows (scrolled back or not), with their colours,
+/// attributes and line wrapping, and none of its scrollback: a selection
+/// only covers visible rows, and scrollback can hold millions of cells.
+pub(crate) fn visible_copy(screen: &vt100::Screen) -> vt100::Screen {
+    let (rows, cols) = screen.size();
+    let mut parser = vt100::Parser::new(rows, cols, 0);
+    parser.process(&screen.contents_formatted());
+    parser.screen().clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn compact_colours_and_glyphs_keep_their_text_form() {
+        for hex in ["#000000", "#d8dee9", "#ffffff", "#0a0b0c"] {
+            let rgb = Rgb::parse(hex);
+            assert_eq!(serde_json::to_value(rgb).unwrap(), hex);
+            assert_eq!(rgb.hex(), hex);
+            assert_eq!(rgb, hex);
+        }
+        assert_eq!(Rgb::new(18, 52, 86), "#123456");
+        assert_ne!(Rgb::new(18, 52, 86), "#123457");
+        for text in ["", " ", "a", "猫", "👩‍💻", "e\u{301}", "👨‍👩‍👧‍👦👨‍👩‍👧‍👦"]
+        {
+            let glyph = Glyph::from(text);
+            assert_eq!(glyph.as_str(), text);
+            assert_eq!(&*glyph, text);
+            assert_eq!(serde_json::to_value(&glyph).unwrap(), text);
+            assert_eq!(glyph.clone(), Glyph::from(text.to_string()));
+        }
+        assert_eq!(Glyph::from('x'), "x");
+        // Ordinary cells need no heap allocation for their text or colours.
+        assert!(
+            std::mem::size_of::<Cell>() <= 40,
+            "{}",
+            std::mem::size_of::<Cell>()
+        );
+    }
+
+    #[test]
+    fn a_frozen_selection_screen_matches_the_visible_rows_exactly() {
+        let mut parser = vt100::Parser::new(5, 12, 100);
+        for line in 0..20 {
+            parser.process(format!("line {line}\r\n").as_bytes());
+        }
+        parser.process(
+            b"\x1b[1;31mred\x1b[0m \x1b[4;38;5;120mu\x1b[0m \x1b[3;48;2;10;20;30mrgb\x1b[0m\r\n",
+        );
+        parser.process("\x1b[7mwide 猫猫\x1b[0m wraps across rows\r\n".as_bytes());
+        for scrollback in [0, 3] {
+            parser.screen_mut().set_scrollback(scrollback);
+            let live = parser.screen();
+            let frozen = visible_copy(live);
+            assert_eq!(frozen.size(), live.size());
+            assert_eq!(frozen.scrollback(), 0);
+            let (rows, cols) = live.size();
+            for row in 0..rows {
+                for col in 0..cols {
+                    let (a, b) = (live.cell(row, col).unwrap(), frozen.cell(row, col).unwrap());
+                    assert_eq!(
+                        (
+                            a.contents(),
+                            a.fgcolor(),
+                            a.bgcolor(),
+                            a.bold(),
+                            a.italic(),
+                            a.underline(),
+                            a.inverse(),
+                            a.is_wide(),
+                            a.is_wide_continuation()
+                        ),
+                        (
+                            b.contents(),
+                            b.fgcolor(),
+                            b.bgcolor(),
+                            b.bold(),
+                            b.italic(),
+                            b.underline(),
+                            b.inverse(),
+                            b.is_wide(),
+                            b.is_wide_continuation()
+                        ),
+                        "scrollback {scrollback}, cell {row},{col}"
+                    );
+                }
+            }
+            for (a, b, c, d) in [(0, 0, 4, 12), (1, 3, 3, 2), (2, 0, 2, 5), (3, 4, 4, 9)] {
+                assert_eq!(
+                    frozen.contents_between(a, b, c, d),
+                    live.contents_between(a, b, c, d),
+                    "scrollback {scrollback}: selection {a},{b}..{c},{d}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn terminal_palettes_change_ansi_but_preserve_application_rgb() {
-        let dark = crate::theme::Palette::dark(true);
-        let light = crate::theme::Palette::light();
+        let dark = TerminalPalette::from(&crate::theme::Palette::dark(true));
+        let light = TerminalPalette::from(&crate::theme::Palette::light());
         assert_ne!(
             color(vt100::Color::Idx(1), false, &dark),
             color(vt100::Color::Idx(1), false, &light)

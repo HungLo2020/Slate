@@ -30,7 +30,7 @@ struct PerformanceRun {
     qint64 started = 0;
     int keys = 0;
     qulonglong dispatchedUpdate = 0;
-    qulonglong beforeLayouts = 0, beforeUpdates = 0, beforeClipboard = 0, maximumBytes = 0;
+    qulonglong beforeLayouts = 0, beforeUpdates = 0, beforeClipboard = 0, beforeInputContexts = 0, maximumBytes = 0;
 };
 void startPerformanceSmoke(Bridge *state, QQuickWindow *window) {
     const auto dir = qEnvironmentVariable("SLATE_GUI_SMOKE_DIR");
@@ -67,6 +67,7 @@ void startPerformanceSmoke(Bridge *state, QQuickWindow *window) {
         const auto diagnostics = state->diagnostics();
         run->beforeUpdates = diagnostics.value("updates").toULongLong();
         run->beforeClipboard = diagnostics.value("clipboard_reads").toULongLong();
+        run->beforeInputContexts = diagnostics.value("input_context_requests").toULongLong();
         run->maximumBytes = 0;
         const bool typing = mode == "typing" || mode == "syntax" || mode == "burst" || mode == "busy";
         auto send = [=](int index) {
@@ -91,6 +92,7 @@ void startPerformanceSmoke(Bridge *state, QQuickWindow *window) {
             const auto diag = state->diagnostics();
             const auto updates = diag.value("updates").toULongLong()-run->beforeUpdates;
             const auto clipboardReads = diag.value("clipboard_reads").toULongLong()-run->beforeClipboard;
+            const auto inputContexts = diag.value("input_context_requests").toULongLong()-run->beforeInputContexts;
             const auto layouts = grid->layoutBuilds()-run->beforeLayouts;
             const double medianFrame = percentile(run->frames, .5), p95Frame = percentile(run->frames, .95);
             const double medianDispatch = percentile(run->dispatches, .5), p95Dispatch = percentile(run->dispatches, .95);
@@ -104,13 +106,16 @@ void startPerformanceSmoke(Bridge *state, QQuickWindow *window) {
             else if ((mode == "cursor" || mode == "selection") && layouts != 0) error = "Cursor/selection changes rebuilt text layouts";
             else if (mode == "syntax" && layouts > qulonglong(run->keys * 2 + 4)) error = "Highlighting invalidated unchanged text layouts";
             else if (mode == "burst" && updates > 10) error = "Burst inputs were not coalesced";
+            // Input methods share one context per state change, whatever they query.
+            else if (inputContexts > qulonglong(run->keys + 4)) error = "Input-method queries repeated synchronous context requests";
             QJsonObject report{{"pass", error.isEmpty()}, {"detail", error.isEmpty() ? "Responsive input, compact native row updates and retained layouts" : error},
                                {"mode", mode}, {"width", window->width()}, {"height", window->height()},
                                {"keys", run->keys}, {"frames", run->frames.size()},
                                {"median_dispatch_ms", medianDispatch}, {"p95_dispatch_ms", p95Dispatch},
                                {"median_frame_ms", medianFrame}, {"p95_frame_ms", p95Frame},
                                {"layout_builds", qint64(layouts)}, {"updates", qint64(updates)},
-                               {"max_update_bytes", qint64(run->maximumBytes)}, {"clipboard_reads", qint64(clipboardReads)}};
+                               {"max_update_bytes", qint64(run->maximumBytes)}, {"clipboard_reads", qint64(clipboardReads)},
+                               {"input_context_requests", qint64(inputContexts)}};
             QFile output(dir + "/report.json"); output.open(QIODevice::WriteOnly);
             output.write(QJsonDocument(report).toJson());
             QGuiApplication::exit(error.isEmpty() ? 0 : 2);

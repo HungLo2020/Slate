@@ -933,3 +933,40 @@ fn salvage_keeps_unsaved_buffers_before_clean_references() {
     assert_eq!(salvaged.documents.len(), crate::workspace::MAX_DOCUMENTS);
     assert_eq!(salvaged.documents[&last].text(), "unsaved work");
 }
+
+#[test]
+fn terminals_share_a_scrollback_budget() {
+    use crate::terminal::{DEFAULT_SCROLLBACK, MIN_SCROLLBACK, SCROLLBACK_BUDGET};
+    let (dir, _guard) = setup();
+    let root = dir.path().join("workspace");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut a = app(&root);
+    a.terminals.clear();
+    let mut given = vec![];
+    for _ in 0..8 {
+        let id = a.new_terminal_in(&root).unwrap();
+        given.push(a.terminals[&id].scrollback_lines());
+    }
+    // The first terminals get the setting; later ones share what is left,
+    // and none falls below the minimum.
+    assert_eq!(given[..4], [DEFAULT_SCROLLBACK; 4]);
+    assert!(given.iter().all(|&n| n >= MIN_SCROLLBACK));
+    let total: usize = given.iter().sum();
+    assert!(total <= SCROLLBACK_BUDGET + MIN_SCROLLBACK * 4, "{given:?}");
+    // Closed terminals return their share.
+    a.terminals.clear();
+    let id = a.new_terminal_in(&root).unwrap();
+    assert_eq!(a.terminals[&id].scrollback_lines(), DEFAULT_SCROLLBACK);
+    // A setting above the budget is honoured for one terminal.
+    a.terminals.clear();
+    a.preferences.terminal_scrollback = 50_000;
+    let first = a.new_terminal_in(&root).unwrap();
+    let second = a.new_terminal_in(&root).unwrap();
+    assert_eq!(a.terminals[&first].scrollback_lines(), 50_000);
+    assert_eq!(a.terminals[&second].scrollback_lines(), MIN_SCROLLBACK);
+    // No scrollback stays none.
+    a.terminals.clear();
+    a.preferences.terminal_scrollback = 0;
+    let none = a.new_terminal_in(&root).unwrap();
+    assert_eq!(a.terminals[&none].scrollback_lines(), 0);
+}

@@ -227,6 +227,13 @@ static QString checkLayout(Bridge *state, QQuickWindow *window) {
     for (const auto &entry : panes) {
         const auto pane = entry.toMap();
         const auto id = pane.value("id").toString();
+        // Panes build only the content of the view they show.
+        const auto kind = pane.value("kind").toString();
+        // (The Git view's change list is also named browser_<id>.)
+        if ((kind != "git" && findItem(window->contentItem(), "gitView_" + id)) ||
+            (kind != "files" && findItem(window->contentItem(), "filesHeader_" + id)) ||
+            (kind != "files" && kind != "git" && findItem(window->contentItem(), "browser_" + id)))
+            return "A pane built the content of a view it does not show";
         auto tabs = findItem(window->contentItem(), "tabs_" + id);
         auto button = findItem(window->contentItem(), "paneActions_" + id);
         auto chrome = findItem(window->contentItem(), "paneHeader_" + id);

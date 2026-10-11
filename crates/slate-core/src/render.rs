@@ -2,6 +2,7 @@
 //! (text, selections, carets, search matches, diagnostics, folds and
 //! debugger marks).
 use super::*;
+use crate::terminal::Rgb;
 
 impl App {
     pub fn snapshot(
@@ -63,6 +64,7 @@ impl App {
         self.process_events();
         self.render_cache
             .retain(|id, _| self.views.contains_key(id) || self.terminals.contains_key(id));
+        self.text_cache.retain(|id, _| self.views.contains_key(id));
         let cw = cell_width.max(1);
         let ch = cell_height.max(1);
         let required = self.layout.minimum_size(gap, minimum);
@@ -141,7 +143,7 @@ impl App {
             let (kind, screen, selected) = match view {
                 View::Editor(view) => {
                     if graphical {
-                        text = Some(self.editor_text(view, rows, cols));
+                        text = Some(self.cached_editor_text(view, rows, cols));
                         ("editor", None, 0)
                     } else {
                         let screen = self.cached_editor_screen(view, rows, cols);
@@ -183,7 +185,7 @@ impl App {
                     _ => false,
                 },
                 editor: match view {
-                    View::Editor(v) => Some(self.editor_presentation(v)),
+                    View::Editor(v) => Some(self.editor_metadata(v)),
                     _ => None,
                 },
                 screen,
@@ -200,32 +202,17 @@ impl App {
             files: if known.is_some_and(|(files, _, _)| files == self.files_revision) {
                 Default::default()
             } else {
-                let (revision, files) = &mut self.shared_files;
-                if *revision != self.files_revision {
-                    *revision = self.files_revision;
-                    *files = std::sync::Arc::new(self.files.clone());
-                }
-                files.clone()
+                self.files.clone()
             },
             git: if known.is_some_and(|(_, git, _)| git == self.git.revision) {
                 Default::default()
             } else {
-                let (revision, entries) = &mut self.shared_git;
-                if *revision != self.git.revision {
-                    *revision = self.git.revision;
-                    *entries = std::sync::Arc::new(self.git.entries.clone());
-                }
-                entries.clone()
+                self.git.entries.clone()
             },
             history: if known.is_some_and(|(_, _, history)| history == self.git.history_revision) {
                 Default::default()
             } else {
-                let (revision, rows) = &mut self.shared_history;
-                if *revision != self.git.history_revision {
-                    *revision = self.git.history_revision;
-                    *rows = std::sync::Arc::new(self.git.history.clone());
-                }
-                rows.clone()
+                self.git.history.clone()
             },
             history_revision: self.git.history_revision,
             history_more: self.history_has_more(),
@@ -285,6 +272,20 @@ impl App {
                 Some(self.editor_presentation(*id))
             }
             _ => None,
+        }
+    }
+    pub(crate) fn editor_metadata(&self, id: u64) -> EditorMetadata {
+        let v = &self.views[&id];
+        let doc = &self.documents[&v.document];
+        EditorMetadata {
+            cursor: v.cursor,
+            anchor: v.anchor.unwrap_or(v.cursor),
+            line_count: doc.line_count(),
+            top: v.top,
+            left: v.left,
+            document: v.document,
+            generation: doc.generation,
+            overview_revision: self.overview_revision,
         }
     }
     pub(crate) fn editor_presentation(&self, id: u64) -> EditorPresentation {
@@ -387,6 +388,31 @@ impl App {
             .insert(id, (key, self.screen_builds, screen.clone()));
         screen
     }
+    /// The graphical text of an editor view, rendered again only when its
+    /// signature changes: terminal output, worker replies and other panes'
+    /// edits leave unchanged editors untouched.
+    pub(crate) fn cached_editor_text(
+        &mut self,
+        id: u64,
+        rows: u16,
+        cols: u16,
+    ) -> std::sync::Arc<text_presentation::EditorText> {
+        let v = self.views.get_mut(&id).unwrap();
+        v.rows = rows;
+        v.cols = cols;
+        let key = self.editor_signature(id);
+        if let Some((prior, text)) = self.text_cache.get(&id) {
+            if *prior == key {
+                return text.clone();
+            }
+        }
+        let text = std::sync::Arc::new(self.editor_text(id, rows, cols));
+        self.screen_builds += 1;
+        // Rendering may scroll the view; key the text by the view it shows.
+        let key = self.editor_signature(id);
+        self.text_cache.insert(id, (key, text.clone()));
+        text
+    }
     pub(crate) fn cached_terminal_screen(
         &mut self,
         id: u64,
@@ -458,7 +484,15 @@ impl App {
         let render_rows = rows as usize + usize::from(graphical);
         let visible = self.visible_rows(id, render_rows);
         let show_whitespace = self.preferences.show_whitespace;
-        let whitespace_color = desktop::blend(&self.colors.0, &self.colors.1, 0.6);
+        let whitespace_color = Rgb::parse(&desktop::blend(&self.colors.0, &self.colors.1, 0.6));
+        // The theme's colours, parsed once rather than cloned per cell.
+        let (text_fg, text_bg, selection_bg, accent) = (
+            Rgb::parse(&self.colors.0),
+            Rgb::parse(&self.colors.1),
+            Rgb::parse(&self.colors.2),
+            Rgb::parse(&self.colors.3),
+        );
+        let selection_fg = Rgb::parse(&self.selection_foreground);
         // Fold state is computed before borrowing the view for drawing.
         let folded: Vec<bool> = visible
             .iter()
@@ -492,24 +526,23 @@ impl App {
         let brackets = (selection.is_none() && v.extra.is_empty())
             .then(|| smart::matching_bracket(document.rope(), v.cursor))
             .flatten();
-        let bracket_bg = desktop::blend(&self.colors.3, &self.colors.1, 0.35);
+        let bracket_bg = Rgb::parse(&desktop::blend(&self.colors.3, &self.colors.1, 0.35));
         // Language-server and task diagnostics: underlined ranges in the
         // severity colour and a mark in the gutter.
         let (breakpoints, paused_line) = self.debug_marks(doc_id);
-        let paused_bg = desktop::blend(&self.colors.3, &self.colors.1, 0.18);
+        let paused_bg = Rgb::parse(&desktop::blend(&self.colors.3, &self.colors.1, 0.18));
         let problems = self.diagnostic_spans(doc_id);
         let problem_lines = self.diagnostic_lines(doc_id);
         let light = self.light_theme();
-        let severity_color = |severity: u8| -> String {
-            match (severity, light) {
-                (1, false) => "#ef6b73",
-                (1, true) => "#c4242e",
-                (2, false) => "#e5c07b",
-                (2, true) => "#9a6700",
-                (_, false) => "#7fb2e5",
-                (_, true) => "#2264a8",
-            }
-            .into()
+        let severity_color = |severity: u8| -> Rgb {
+            Rgb(match (severity, light) {
+                (1, false) => 0xef6b73,
+                (1, true) => 0xc4242e,
+                (2, false) => 0xe5c07b,
+                (2, true) => 0x9a6700,
+                (_, false) => 0x7fb2e5,
+                (_, true) => 0x2264a8,
+            })
         };
         // Spans are sorted by start and may nest; the running maximum of
         // their ends bounds how far back an enclosing span can begin.
@@ -534,11 +567,10 @@ impl App {
             }
             best
         };
-        let caret_fg = self.colors.1.clone();
-        let accent = self.colors.3.clone();
+        let caret_fg = text_bg;
         let mut blank = Cell::text(" ");
-        blank.fg = self.colors.0.clone();
-        blank.bg = self.colors.1.clone();
+        blank.fg = text_fg;
+        blank.bg = text_bg;
         let mut cells = if graphical {
             vec![vec![]; render_rows]
         } else {
@@ -568,16 +600,16 @@ impl App {
                     " ".repeat(gutter)
                 };
                 for (x, c) in number.chars().take(gutter).enumerate() {
-                    cells[y][x] = Cell::text(c.to_string());
-                    cells[y][x].fg = self.colors.0.clone();
-                    cells[y][x].bg = self.colors.1.clone();
+                    cells[y][x] = Cell::text(c);
+                    cells[y][x].fg = text_fg;
+                    cells[y][x].bg = text_bg;
                 }
                 // One mark per line: paused here, breakpoint, fold, problem.
                 if row.start == 0 && gutter >= 2 {
                     let mark = &mut cells[y][gutter - 2];
                     if paused_line == Some(*line) {
                         mark.text = "▶".into();
-                        mark.fg = self.colors.3.clone();
+                        mark.fg = accent;
                     } else if breakpoints.contains(line) {
                         // A diamond, so breakpoints never look like errors.
                         mark.text = "◆".into();
@@ -588,7 +620,7 @@ impl App {
                     } else if !folded[y] && foldable[y] {
                         // Click to fold.
                         mark.text = "▾".into();
-                        mark.fg = whitespace_color.clone();
+                        mark.fg = whitespace_color;
                     }
                 }
             }
@@ -651,25 +683,25 @@ impl App {
                                 .map(|c| if c.is_control() { '\u{fffd}' } else { c })
                                 .collect()
                         });
-                        c.fg = self.colors.0.clone();
-                        c.bg = self.colors.1.clone();
+                        c.fg = text_fg;
+                        c.bg = text_bg;
                         let absolute = line_start_byte + i;
                         while token_index < spans.len() && (spans[token_index].end as usize) <= i {
                             token_index += 1;
                         }
                         if let Some(span) = spans.get(token_index).filter(|t| t.start as usize <= i)
                         {
-                            c.fg = format!("#{:06x}", span.fg);
+                            c.fg = Rgb(span.fg);
                             c.bold = span.bold;
                             c.italic = span.italic;
                         }
                         if self.diff_inspections.contains_key(&doc_id) {
                             let prefix = line_slice.chars().next();
                             if prefix == Some('+') {
-                                c.fg = "#268b47".into();
+                                c.fg = Rgb(0x268b47);
                             }
                             if prefix == Some('-') {
-                                c.fg = "#d14b4b".into();
+                                c.fg = Rgb(0xd14b4b);
                             }
                         }
                         while match_index < ranges.len() && ranges[match_index].1 <= i {
@@ -685,7 +717,7 @@ impl App {
                                 _ => " ",
                             }
                             .into();
-                            c.fg = whitespace_color.clone();
+                            c.fg = whitespace_color;
                         }
                         c.wide = width == 2 && g != "\t" && offset == 0;
                         c.continuation = width == 2 && g != "\t" && offset == 1;
@@ -700,7 +732,7 @@ impl App {
                             && brackets.is_some_and(|(a, b)| absolute == a || absolute == b);
                         let position = column - origin + gutter;
                         if paused_line == Some(*line) {
-                            c.bg = paused_bg.clone();
+                            c.bg = paused_bg;
                         }
                         if !problems.is_empty() {
                             if let Some(severity) = problem_at(absolute) {
@@ -709,15 +741,11 @@ impl App {
                             }
                         }
                         let style = if caret {
-                            Some((accent.clone(), caret_fg.clone(), false))
+                            Some((accent, caret_fg, false))
                         } else if matched || selected {
-                            Some((
-                                self.colors.2.clone(),
-                                self.selection_foreground.clone(),
-                                matched,
-                            ))
+                            Some((selection_bg, selection_fg, matched))
                         } else if bracket {
-                            Some((bracket_bg.clone(), c.fg.clone(), false))
+                            Some((bracket_bg, c.fg, false))
                         } else {
                             None
                         };
@@ -770,15 +798,15 @@ impl App {
                         && extra_carets.binary_search(&(end_of_text - 1)).is_ok());
                 if at_end && (!wrapping || row.end == line_slice.len_bytes()) {
                     let mut c = Cell::text(" ");
-                    c.bg = accent.clone();
-                    c.fg = caret_fg.clone();
+                    c.bg = accent;
+                    c.fg = caret_fg;
                     trailing.push(c);
                 }
                 if folded[y] {
                     for glyph in [" ", "⋯"] {
                         let mut c = Cell::text(glyph);
-                        c.fg = accent.clone();
-                        c.bg = self.colors.1.clone();
+                        c.fg = accent;
+                        c.bg = text_bg;
                         trailing.push(c);
                     }
                 }
@@ -792,11 +820,11 @@ impl App {
                     if cells[y].len() <= position {
                         cells[y].resize_with(position + 1, || Cell::text(" "));
                     }
-                    if c.bg != self.colors.1 {
+                    if c.bg != text_bg {
                         decorations[y].push(text_presentation::TextSpan::cell(position, 1, &c));
                         cells[y][position] = Cell::text(" ");
-                        cells[y][position].fg = self.colors.0.clone();
-                        cells[y][position].bg = self.colors.1.clone();
+                        cells[y][position].fg = text_fg;
+                        cells[y][position].bg = text_bg;
                         continue;
                     }
                 }

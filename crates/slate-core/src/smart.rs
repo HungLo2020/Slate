@@ -195,16 +195,15 @@ pub fn dedent_closer(rope: &Rope, caret: usize, c: char) -> Option<Typed> {
 /// The nearest unmatched `open` before `offset`.
 fn unmatched_opener(rope: &Rope, offset: usize, open: char, close: char) -> Option<usize> {
     let mut depth = 0usize;
-    let mut index = rope.byte_to_char(offset);
-    let stop = index.saturating_sub(MATCH_LIMIT);
-    while index > stop {
-        index -= 1;
-        let ch = rope.char(index);
+    let start = rope.byte_to_char(offset);
+    // One iterator walk: indexing the rope per character costs a tree descent.
+    let before = rope.chars_at(start).reversed();
+    for (step, ch) in before.take(MATCH_LIMIT).enumerate() {
         if ch == close {
             depth += 1;
         } else if ch == open {
             if depth == 0 {
-                return Some(rope.char_to_byte(index));
+                return Some(rope.char_to_byte(start - step - 1));
             }
             depth -= 1;
         }
@@ -223,9 +222,8 @@ pub fn matching_bracket(rope: &Rope, offset: usize) -> Option<(usize, usize)> {
         if let Some(close) = closer(c).filter(|_| !is_quote(c)) {
             let mut depth = 0usize;
             let first = rope.byte_to_char(at) + 1;
-            let last = rope.len_chars().min(first + MATCH_LIMIT);
-            for index in first..last {
-                let ch = rope.char(index);
+            for (step, ch) in rope.chars_at(first).take(MATCH_LIMIT).enumerate() {
+                let index = first + step;
                 if ch == c {
                     depth += 1;
                 } else if ch == close {
@@ -342,6 +340,79 @@ mod tests {
         assert!(
             dedent_closer(&rope, 9, '}').is_none(),
             "not on an indented line"
+        );
+    }
+
+    #[test]
+    fn bracket_matching_agrees_with_a_reference_at_every_offset() {
+        // The straightforward per-character scan the iterator walk replaces.
+        fn reference(text: &str, offset: usize) -> Option<(usize, usize)> {
+            let chars: Vec<(usize, char)> = text.char_indices().collect();
+            let at = chars.iter().position(|(b, _)| *b == offset);
+            let candidates = [
+                at.map(|i| chars[i]),
+                chars.iter().rev().find(|(b, _)| *b < offset).copied(),
+            ];
+            for (byte, c) in candidates.into_iter().flatten() {
+                let i = chars.iter().position(|(b, _)| *b == byte).unwrap();
+                if let Some(close) = closer(c).filter(|_| !is_quote(c)) {
+                    let mut depth = 0;
+                    for &(b, ch) in chars[i + 1..].iter().take(MATCH_LIMIT) {
+                        if ch == c {
+                            depth += 1;
+                        } else if ch == close {
+                            if depth == 0 {
+                                return Some((byte, b));
+                            }
+                            depth -= 1;
+                        }
+                    }
+                    return None;
+                }
+                if let Some(open) = opener(c) {
+                    let mut depth = 0;
+                    for &(b, ch) in chars[..i].iter().rev().take(MATCH_LIMIT) {
+                        if ch == c {
+                            depth += 1;
+                        } else if ch == open {
+                            if depth == 0 {
+                                return Some((b, byte));
+                            }
+                            depth -= 1;
+                        }
+                    }
+                    return None;
+                }
+            }
+            None
+        }
+        for text in [
+            "fn é(a: [u8; 2]) { (x, {y}) }",
+            "((é))]",
+            "[ü{ö(ä)ö}ü] )(",
+            "{ unclosed ( [ ] ",
+            "猫(犬[鳥]犬)猫}",
+        ] {
+            let rope = Rope::from_str(text);
+            for (offset, _) in text.char_indices().chain([(text.len(), ' ')]) {
+                assert_eq!(
+                    matching_bracket(&rope, offset),
+                    reference(text, offset),
+                    "{text:?} at {offset}"
+                );
+            }
+        }
+        // The scan still stops after MATCH_LIMIT characters in both directions.
+        let far = format!("({})", "x".repeat(MATCH_LIMIT));
+        let rope = Rope::from_str(&far);
+        assert_eq!(matching_bracket(&rope, 0), None);
+        assert_eq!(matching_bracket(&rope, far.len()), None);
+        let near = format!("({})", "x".repeat(MATCH_LIMIT - 1));
+        let rope = Rope::from_str(&near);
+        assert_eq!(matching_bracket(&rope, 0), Some((0, near.len() - 1)));
+        assert_eq!(
+            matching_bracket(&rope, near.len()),
+            Some((0, near.len() - 1))
         );
     }
 

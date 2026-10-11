@@ -422,7 +422,9 @@ clipboard (OSC 52) only with the **Terminal programs may set the clipboard**
 setting (`terminal_clipboard`), since anything printed to a terminal (a `cat`
 of a downloaded file, say) could otherwise replace what you copied. Pasted text
 has control characters removed. The **Terminal scrollback lines** setting
-controls history.
+controls each terminal's history. All of a window's terminals share a budget of
+20,000 lines (or the setting, when larger): a new terminal gets what the others
+leave, and never less than 500 lines.
 
 ## Startup and settings
 

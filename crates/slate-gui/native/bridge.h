@@ -1,8 +1,12 @@
 #pragma once
 #include <QAbstractListModel>
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QColor>
 #include <QElapsedTimer>
 #include <QFont>
+#include <QGlyphRun>
+#include <QRawFont>
 #include <QHash>
 #include <QPointer>
 #include <QQuickImageProvider>
@@ -24,23 +28,35 @@ class EntryModel : public QAbstractListModel {
     int rowCount(const QModelIndex &parent = QModelIndex()) const override {
         return parent.isValid() ? 0 : m_rows.size();
     }
+    // Rows stay compact JSON objects; delegates (visible rows only) get
+    // them as maps when they ask.
     QVariant data(const QModelIndex &index, int role) const override {
         if (!index.isValid() || index.row() >= m_rows.size())
             return {};
         if (role == Qt::UserRole + 1)
-            return m_rows.at(index.row());
+            return m_rows.at(index.row()).toVariantMap();
         if (role == Qt::UserRole + 2)
-            return m_rows.at(index.row()).toMap().value("group");
+            return m_rows.at(index.row()).value("group").toString();
         return {};
     }
     QHash<int, QByteArray> roleNames() const override {
         return {{Qt::UserRole + 1, "modelData"}, {Qt::UserRole + 2, "group"}};
     }
-    void replace(const QVariantList &rows);
-    const QVariantList &rows() const { return m_rows; }
+    void replace(const QJsonArray &rows);
+    // Every row as maps: for tests and the occasional whole-list reader.
+    QVariantList rows() const {
+        QVariantList list;
+        list.reserve(m_rows.size());
+        for (const auto &row : m_rows) list.append(row.toVariantMap());
+        return list;
+    }
+    QVariantMap row(int index) const {
+        return index >= 0 && index < m_rows.size() ? m_rows.at(index).toVariantMap() : QVariantMap();
+    }
+    int size() const { return m_rows.size(); }
 
   private:
-    QVariantList m_rows;
+    QList<QJsonObject> m_rows;
 };
 
 // A terminal row is drawn as runs of equally styled cells: plain ASCII runs
@@ -52,6 +68,10 @@ struct TerminalRun {
     QColor foreground, background;
     bool bold = false, italic = false, underline = false;
     bool perColumn = false;
+    // Shaped once for the font generation it was built with: glyphs placed
+    // on their cell boundaries, so a row draws in a few calls.
+    mutable QGlyphRun glyphs;
+    mutable int glyphsFont = -1;
 };
 struct TerminalGrid {
     int rows = 0, cols = 0;
@@ -71,7 +91,10 @@ class QFileDialog;
 class QMessageBox;
 class Bridge : public QObject {
     Q_OBJECT
-    Q_PROPERTY(QVariantMap frame READ frame NOTIFY frameChanged)
+    // The per-update frame QML binds to, without the slower-changing groups
+    // in `stable`, which notifies only when one of them changes.
+    Q_PROPERTY(QVariantMap frame READ qmlFrame NOTIFY frameChanged)
+    Q_PROPERTY(QVariantMap stable READ stable NOTIFY stableChanged)
     Q_PROPERTY(QVariantList paneIds READ paneIds NOTIFY structureChanged)
     Q_PROPERTY(QVariantList handleIds READ handleIds NOTIFY structureChanged)
     Q_PROPERTY(QAbstractItemModel *files READ files CONSTANT)
@@ -90,7 +113,14 @@ class Bridge : public QObject {
   public:
     Bridge(void *context, QObject *parent = nullptr);
     ~Bridge() override;
-    QVariantMap frame() const { return m_frame; }
+    // The whole frame, stable groups included (tests and occasional callers).
+    QVariantMap frame() const {
+        auto merged = m_frame;
+        for (auto it = m_stable.cbegin(); it != m_stable.cend(); ++it) merged.insert(it.key(), it.value());
+        return merged;
+    }
+    const QVariantMap &qmlFrame() const { return m_frame; }
+    const QVariantMap &stable() const { return m_stable; }
     QVariantList paneIds() const { return m_paneIds; }
     QVariantList handleIds() const { return m_handleIds; }
     QAbstractItemModel *files() { return &m_files; }
@@ -102,7 +132,7 @@ class Bridge : public QObject {
     QVariantList gitEntries() const { return m_git.rows(); }
     QVariantList fileEntries() const { return m_files.rows(); }
     Q_INVOKABLE QVariantMap fileEntry(int row) const {
-        return row >= 0 && row < m_files.rows().size() ? m_files.rows().at(row).toMap() : QVariantMap();
+        return m_files.row(row);
     }
     const TerminalGrid *terminal(int pane) const {
         const auto found = m_terminals.constFind(pane);
@@ -112,9 +142,19 @@ class Bridge : public QObject {
     int cellHeight() const { return m_cellHeight; }
     const QFont &font() const { return m_font; }
     const QFont &font(bool bold, bool italic) const { return m_variants[(bold ? 1 : 0) + (italic ? 2 : 0)]; }
+    // The variant's own face, when it has a true bold/italic (synthesized
+    // styles are drawn with QPainter text instead), for glyph runs.
+    const QRawFont *rawFont(bool bold, bool italic) const {
+        const int i = (bold ? 1 : 0) + (italic ? 2 : 0);
+        return m_rawExact[i] ? &m_raw[i] : nullptr;
+    }
+    int fontGeneration() const { return m_fontGeneration; }
     QStringList encodings() const;
     QStringList fontFamilies() const;
-    Q_INVOKABLE QVariantMap send(const QVariantMap &command);
+    Q_INVOKABLE QVariantMap send(const QVariantMap &command) { return send(command, nullptr); }
+    // As send(), moving the files/git/history lists of the reply into `lists`
+    // as JSON instead of converting them with the rest.
+    QVariantMap send(const QVariantMap &command, QJsonObject *lists);
     Q_INVOKABLE QVariantList commands(const QString &query);
     Q_INVOKABLE QVariantMap commandInfo(const QString &id, int pane = 0, int row = -1);
     Q_INVOKABLE QString localPath(const QUrl &url) const;
@@ -130,6 +170,7 @@ class Bridge : public QObject {
     Q_INVOKABLE void scheduleRefresh();
     void tick();
     Q_INVOKABLE QVariantMap diagnostics() const;
+    qulonglong inputGeneration() const { return m_inputGeneration; }
     void attachView(int id, CellView *view);
     void detachView(int id, CellView *view);
     Q_INVOKABLE void paneHeader(int height);
@@ -156,6 +197,7 @@ class Bridge : public QObject {
     void filesChanged();
     void gitChanged();
     void historyChanged();
+    void stableChanged();
     void refreshFinished();
     void fontChanged();
 
@@ -170,9 +212,13 @@ class Bridge : public QObject {
     QHash<int, CellView *> m_views;
     QHash<int, QVariantMap> m_surfaces;
     QHash<int, TerminalGrid> m_terminals;
-    qulonglong m_updates = 0, m_lastBytes = 0, m_clipboardReads = 0, m_catalogRequests = 0;
+    qulonglong m_updates = 0, m_lastBytes = 0, m_clipboardReads = 0, m_catalogRequests = 0,
+               m_inputContextRequests = 0;
+    // Counts requests that can change state; read-only queries leave it.
+    qulonglong m_inputGeneration = 0;
     void *m_context;
     QVariantMap m_frame;
+    QVariantMap m_stable;
     QVariantMap m_theme;
     QHash<QString, QVariantList> m_catalogs;
     QHash<QString, QVariantList> m_rowCatalogs;
@@ -182,6 +228,9 @@ class Bridge : public QObject {
     int m_width = 1280, m_height = 700;
     QFont m_font;
     QFont m_variants[4];
+    QRawFont m_raw[4];
+    bool m_rawExact[4] = {false, false, false, false};
+    int m_fontGeneration = 0;
     int m_cellWidth = 9, m_cellHeight = 18;
     QString m_fontKey;
     // The desktop clipboard, read when it changes rather than during a paste:
@@ -206,6 +255,9 @@ class CellView : public QQuickPaintedItem {
     qreal scrollPixels() const { return m_scrollPixels; }
     void applySurface(const QVariantMap &patch);
     QVariantMap pane() const { return m_pane; }
+    // The editor's input context, fetched once per state change however
+    // many queries an input method makes.
+    QVariantMap inputContext() const;
     void setPane(const QVariantMap &pane);
     void paint(QPainter *painter) override;
     QVariant inputMethodQuery(Qt::InputMethodQuery query) const override;
@@ -239,6 +291,8 @@ class CellView : public QQuickPaintedItem {
   private:
     int m_paneId = 0;
     QVariantMap m_pane;
+    mutable QVariantMap m_inputContext;
+    mutable qulonglong m_inputContextAt = ~0ull;
     QVariantList m_cursor;
     QVector<QVariantMap> m_lineData;
     QVector<QVariantList> m_overlays;

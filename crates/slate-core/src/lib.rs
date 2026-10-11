@@ -72,7 +72,9 @@ use layout::{Axis, Handle, Node, Rect, View};
 use preferences::{Preferences, StartupMode};
 use search::{Prompt, Search};
 use serde::{Deserialize, Serialize};
-use services::{Entry, GitEntry, Job, Reply, Services};
+/// Rows of the file browser and Git pane, as snapshots carry them.
+pub use services::{Entry, GitEntry};
+use services::{Reply, Services};
 use std::time::{Duration, Instant};
 use std::{
     collections::BTreeMap,
@@ -457,9 +459,28 @@ pub struct PaneSnapshot {
     pub rows: u16,
     pub cols: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<text_presentation::EditorText>,
-    pub editor: Option<EditorPresentation>,
+    /// Shared with the core's render cache: unchanged views return the same
+    /// text, so a frontend can compare pointers before content.
+    pub text: Option<std::sync::Arc<text_presentation::EditorText>>,
+    pub editor: Option<EditorMetadata>,
 }
+/// What a frame says about an editor pane: where it is scrolled and which
+/// document state it shows. Text for input methods comes from
+/// `editor_input_context`, only when they ask.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct EditorMetadata {
+    /// Byte offsets: equal when nothing is selected.
+    pub cursor: usize,
+    pub anchor: usize,
+    pub line_count: usize,
+    pub top: usize,
+    /// Horizontal scroll position in display columns.
+    pub left: usize,
+    pub document: u64,
+    pub generation: u64,
+    pub overview_revision: u64,
+}
+/// An editor's text around the cursor for input methods, in UTF-16 units.
 #[derive(Serialize)]
 pub struct EditorPresentation {
     pub surrounding: String,
@@ -576,15 +597,18 @@ pub struct App {
     pending_workspace: Option<PathBuf>,
     /// Counts in-place workspace switches, which replace the whole session.
     session: u64,
-    files: Vec<Entry>,
+    /// Shared with snapshots, which then copy nothing (lists reach 100,000 rows).
+    files: std::sync::Arc<Vec<Entry>>,
     expanded_folders: std::collections::BTreeSet<PathBuf>,
     pending_file: Option<PathBuf>,
-    /// An entry to select once the browser lists it, and the listing reply
-    /// (counted from `browse_replies`) that should contain it.
+    /// An entry to select once the browser lists it, and the listing
+    /// request (see `browse_requests`) that should contain it.
     pending_reveal: Option<(PathBuf, u64)>,
-    /// Directory listings requested from, and answered by, the file worker,
-    /// which answers in order.
+    /// Directory listings: the newest request, the request the listing in
+    /// flight answers, and the newest request answered. One listing runs at
+    /// a time; requests made meanwhile become a single follow-up.
     browse_requests: u64,
+    browse_sent: Option<u64>,
     browse_replies: u64,
     pending_path_dialog: Option<(String, Option<u64>)>,
     /// The Git pane: entries, branch and running jobs.
@@ -616,11 +640,10 @@ pub struct App {
     revision: u64,
     files_revision: u64,
     /// The file and Git listings last handed to snapshots, by revision.
-    shared_files: (u64, std::sync::Arc<Vec<Entry>>),
-    shared_git: (u64, std::sync::Arc<Vec<GitEntry>>),
-    shared_history: (u64, std::sync::Arc<Vec<git_history::HistoryRow>>),
     /// Pane screens by view: (signature, build number, screen).
     render_cache: BTreeMap<u64, (u64, u64, std::sync::Arc<Screen>)>,
+    /// The graphical editor text per view, keyed like `render_cache`.
+    text_cache: BTreeMap<u64, (u64, std::sync::Arc<text_presentation::EditorText>)>,
     pub screen_builds: u64,
     typing: bool,
     /// Launched with files (or standard input) rather than a directory.
@@ -760,6 +783,8 @@ impl App {
         self.watch_files();
         self.update_file_locks();
         self.record_diagnostic_status();
+        // A listing the busy file queue refused is sent once it has room.
+        self.send_listing();
         if self.pending_workspace.is_some()
             && !self.dirty()
             && self.saves.pending_save.is_empty()
@@ -2043,31 +2068,13 @@ impl App {
             self.browser.join(path)
         };
         let path = files::workspace_directory(&path, &self.root)?;
-        self.browser = path.clone();
+        self.browser = path;
         self.selected = 0;
-        self.services.tx.send(Job::Browse(
-            path,
-            self.root.clone(),
-            self.expanded_folders.iter().cloned().collect(),
-            !self.terminal_frontend,
-        ))?;
-        self.browse_requests += 1;
+        self.request_listing();
         Ok(())
     }
     pub fn refresh(&mut self) {
-        if self
-            .services
-            .tx
-            .send(Job::Browse(
-                self.browser.clone(),
-                self.root.clone(),
-                self.expanded_folders.iter().cloned().collect(),
-                !self.terminal_frontend,
-            ))
-            .is_ok()
-        {
-            self.browse_requests += 1;
-        }
+        self.request_listing();
         self.refresh_git();
     }
     fn new_terminal(&mut self) -> Result<u64> {
