@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.15 — 2026-10-11
+
+- Keep every TUI tab reachable in narrow panes: crowded tab bars number their tabs and shorten titles (the active tab's longest), then scroll a window of tabs around the active one with clickable ‹ and › instead of hiding all but the active tab.
+- Switch to the previous tab with Shift+F7, and switch tabs from a focused terminal with Ctrl+PageDown / Ctrl+PageUp; the terminal hint bar names the tab keys when the pane has more than one tab.
+
 ## 0.1.14 — 2026-10-10
 
 - Render GUI editor panes again only when their content changes, not on every terminal, Git or worker update; and build file and Git views only in panes that show them.

@@ -109,7 +109,7 @@ pub const DEBUG_KEYS: &[(&str, &str)] = &[
 ];
 
 /// Bumped whenever a keymap gains default bindings.
-pub const KEYS_REVISION: u32 = 3;
+pub const KEYS_REVISION: u32 = 4;
 
 fn keys(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
     entries
@@ -122,10 +122,13 @@ const TERMINAL_KEYS: &[(&str, &str)] = &[
     ("Ctrl+Shift+v", "paste"),
     ("Alt+c", "copy"),
     ("Alt+v", "paste"),
+    ("Ctrl+pagedown", "next-tab"),
+    ("Ctrl+pageup", "previous-tab"),
 ];
 const COMMON_GLOBAL_KEYS: &[(&str, &str)] = &[
     ("f6", "next-pane"),
     ("f7", "next-tab"),
+    ("Shift+f7", "previous-tab"),
     ("f8", "terminal"),
     ("f9", "split-right"),
     ("Shift+f9", "split-down"),

@@ -244,33 +244,154 @@ struct TabRegion {
     index: usize,
     x: u16,
     width: u16,
+    label: String,
     close: Option<u16>,
 }
-fn tab_regions(tabs: &[slate_core::Tab], width: u16) -> Vec<TabRegion> {
-    let widths: Vec<usize> = tabs
-        .iter()
-        .map(|tab| {
-            Span::raw(clean(&tab.title)).width() + 2 + if tab.close_id.is_some() { 3 } else { 0 }
-        })
-        .collect();
-    let crowded = widths.iter().sum::<usize>() > width as usize;
-    let mut x = 0u16;
-    let mut regions = Vec::new();
-    for (index, tab) in tabs.iter().enumerate() {
-        if crowded && !tab.active {
-            continue;
-        }
-        let size = widths[index].min(width.saturating_sub(x) as usize) as u16;
-        if size == 0 {
+/// Cut `text` to `columns` display columns, ending in … when shortened.
+fn truncate_columns(text: &str, columns: usize) -> String {
+    if Span::raw(text).width() <= columns {
+        return text.into();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = Span::raw(c.encode_utf8(&mut [0; 4]).to_string()).width();
+        if used + w + 1 > columns {
             break;
+        }
+        out.push(c);
+        used += w;
+    }
+    if columns > 0 {
+        out.push('…');
+    }
+    out
+}
+/// Shortest title kept before a crowded tab bar falls back to numbers alone.
+const MIN_TAB_TITLE: usize = 3;
+fn tab_regions(tabs: &[slate_core::Tab], width: u16) -> Vec<TabRegion> {
+    let width = width as usize;
+    let titles: Vec<String> = tabs.iter().map(|tab| clean(&tab.title)).collect();
+    let columns = |text: &str| Span::raw(text).width();
+    let full: usize = titles
+        .iter()
+        .zip(tabs)
+        .map(|(title, tab)| columns(title) + 2 + if tab.close_id.is_some() { 3 } else { 0 })
+        .sum();
+    let mut regions = Vec::new();
+    let mut x = 0;
+    let mut place = |index: usize, mut label: String, close: bool, regions: &mut Vec<TabRegion>| {
+        let room = width.saturating_sub(x);
+        while columns(&label) > room {
+            label.pop();
+        }
+        let close = close && columns(&label) + 3 <= room;
+        let size = columns(&label) + if close { 3 } else { 0 };
+        if size == 0 {
+            return;
         }
         regions.push(TabRegion {
             index,
-            x,
-            width: size,
-            close: (tab.close_id.is_some() && size >= 3).then(|| x + size - 3),
+            x: x as u16,
+            width: size as u16,
+            label,
+            close: close.then(|| (x + size - 3) as u16),
         });
         x += size;
+    };
+    if full <= width {
+        for (index, title) in titles.iter().enumerate() {
+            place(
+                index,
+                format!(" {title} "),
+                tabs[index].close_id.is_some(),
+                &mut regions,
+            );
+        }
+        return regions;
+    }
+    // Crowded: number every tab so shortened titles stay distinguishable,
+    // and keep a close button on the active tab only.
+    let Some(active) = tabs.iter().position(|tab| tab.active) else {
+        return regions;
+    };
+    let close = if tabs[active].close_id.is_some() {
+        3
+    } else {
+        0
+    };
+    let label = |index: usize, cap: usize| {
+        if cap == 0 {
+            format!(" {} ", index + 1)
+        } else {
+            format!(" {}:{} ", index + 1, truncate_columns(&titles[index], cap))
+        }
+    };
+    // Columns for tabs lo..=hi, with `cap` title columns on the active tab
+    // and `others` on the rest, plus ‹ and › for any hidden tabs.
+    let span = |lo: usize, hi: usize, cap: usize, others: usize| {
+        (lo..=hi)
+            .map(|i| columns(&label(i, if i == active { cap } else { others })))
+            .sum::<usize>()
+            + close
+            + usize::from(lo > 0)
+            + usize::from(hi + 1 < tabs.len())
+    };
+    let last = tabs.len() - 1;
+    let title = columns(&titles[active]);
+    let caps = |longest: usize| (MIN_TAB_TITLE.min(longest).max(1)..=longest).rev();
+    // The active tab keeps its whole title while the others shrink, first
+    // to shortened titles, then to numbers; only then is it shortened too.
+    let longest = (0..tabs.len())
+        .filter(|&i| i != active)
+        .map(|i| columns(&titles[i]))
+        .max()
+        .unwrap_or(0);
+    let (cap, others) =
+        if let Some(others) = caps(longest).find(|&others| span(0, last, title, others) <= width) {
+            (title, others)
+        } else {
+            let cap = caps(title)
+                .chain([0])
+                .find(|&cap| span(0, last, cap, 0) <= width)
+                .unwrap_or(0);
+            (cap, 0)
+        };
+    // When even numbers do not fit, show a window of tabs around the active
+    // one, with ‹ and › standing for (and selecting) the hidden neighbours.
+    let (mut lo, mut hi) = (active, active);
+    loop {
+        let grown = (lo, hi);
+        if hi < last && span(lo, hi + 1, cap, others) <= width {
+            hi += 1;
+        }
+        if lo > 0 && span(lo - 1, hi, cap, others) <= width {
+            lo -= 1;
+        }
+        if (lo, hi) == grown {
+            break;
+        }
+    }
+    // Spare columns in a window lengthen the active tab's title.
+    let cap = caps(title)
+        .find(|&longer| longer > cap && span(lo, hi, longer, others) <= width)
+        .unwrap_or(cap);
+    // Too narrow even for the arrows: the active tab alone.
+    let arrows = span(lo, hi, cap, others) <= width;
+    if arrows && lo > 0 {
+        place(lo - 1, "‹".into(), false, &mut regions);
+    }
+    for index in lo..=hi {
+        let cap = if index == active { cap } else { others };
+        place(
+            index,
+            label(index, cap),
+            index == active && close > 0,
+            &mut regions,
+        );
+    }
+    if arrows && hi < last {
+        place(hi + 1, "›".into(), false, &mut regions);
     }
     regions
 }
@@ -1219,7 +1340,7 @@ fn render(
                     .width
                     .saturating_sub(if region.close.is_some() { 3 } else { 0 });
             frame.render_widget(
-                Paragraph::new(format!(" {} ", clean(&tab.title))).style(colors.tab(tab.active)),
+                Paragraph::new(region.label).style(colors.tab(tab.active)),
                 Rect::new(area.x + 1 + region.x, area.y + 1, label_width, 1),
             );
             if let Some(close) = region.close {
@@ -1535,6 +1656,103 @@ impl Widget for Grid<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tabs(titles: &[&str], active: usize) -> Vec<slate_core::Tab> {
+        titles
+            .iter()
+            .enumerate()
+            .map(|(i, title)| slate_core::Tab {
+                title: title.to_string(),
+                active: i == active,
+                editor_id: None,
+                close_id: Some(i as u64),
+            })
+            .collect()
+    }
+    fn bar(tabs: &[slate_core::Tab], width: u16) -> String {
+        let regions = tab_regions(tabs, width);
+        let mut line = String::new();
+        for region in &regions {
+            assert_eq!(region.x as usize, Span::raw(line.as_str()).width());
+            line += &region.label;
+            if region.close.is_some() {
+                line += "[x]";
+            }
+            assert_eq!(
+                Span::raw(line.as_str()).width(),
+                (region.x + region.width) as usize
+            );
+        }
+        assert!(Span::raw(line.as_str()).width() <= width as usize, "{line}");
+        line
+    }
+
+    #[test]
+    fn crowded_tab_bars_shrink_titles_and_keep_every_tab_reachable() {
+        let names = ["Terminal 1", "Terminal 2", "Terminal 3"];
+        // Room for everything: full titles, each with a close button.
+        assert_eq!(
+            bar(&tabs(&names, 1), 60),
+            " Terminal 1 [x] Terminal 2 [x] Terminal 3 [x]"
+        );
+        // A side pane: numbered tabs; the active one keeps its whole title
+        // while the others shorten, then show numbers alone.
+        assert_eq!(
+            bar(&tabs(&names, 1), 38),
+            " 1:Termi…  2:Terminal 2 [x] 3:Termi… "
+        );
+        assert_eq!(bar(&tabs(&names, 0), 24), " 1:Terminal 1 [x] 2  3 ");
+        // Then the active title shortens too.
+        assert_eq!(bar(&tabs(&names, 1), 20), " 1  2:Termin… [x] 3 ");
+        // Numbers only, then a window around the active tab with ‹ and ›.
+        assert_eq!(bar(&tabs(&names, 2), 14), " 1  2  3 [x]");
+        assert_eq!(bar(&tabs(&names, 0), 10), " 1 [x] 2 ›");
+        assert_eq!(bar(&tabs(&names, 0), 3), " 1 ");
+        let many: Vec<String> = (1..=12).map(|n| format!("Terminal {n}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert_eq!(bar(&tabs(&many, 6), 20), "‹ 5  6  7 [x] 8  9 ›");
+        let regions = tab_regions(&tabs(&many, 6), 20);
+        // The arrows select the nearest hidden tab on their side.
+        assert_eq!(regions[0].index + 1, regions[1].index);
+        assert_eq!(
+            regions[regions.len() - 1].index,
+            regions[regions.len() - 2].index + 1
+        );
+        assert!(regions.iter().any(|r| r.index == 6 && r.close.is_some()));
+        // Every tab stays reachable from the first and the last.
+        assert_eq!(bar(&tabs(&many, 0), 20), " 1 [x] 2  3  4  5 ›");
+        assert_eq!(bar(&tabs(&many, 11), 20), "‹ 9  10  11  12 [x]");
+        assert_eq!(bar(&tabs(&many, 6), 12), "‹ 7 [x] 8 ›");
+        assert_eq!(
+            bar(&tabs(&many, 6), 60),
+            " 1  2  3  4  5  6  7:Terminal 7 [x] 8  9  10  11  12 "
+        );
+        // Wide characters are cut whole; short titles show in full.
+        assert_eq!(
+            bar(&tabs(&["sh", "猫猫猫猫猫猫.txt", "vim"], 1), 22),
+            " 1  2:猫猫猫猫… [x] 3 "
+        );
+        assert_eq!(
+            bar(&tabs(&["sh", "猫猫猫猫猫猫.txt", "vim"], 0), 22),
+            " 1:sh [x] 2  3 "
+        );
+        // At every width the active tab is drawn and the layout fits.
+        let wide = ["sh", "猫猫猫猫猫猫.txt", "vim"];
+        for width in 1..70 {
+            for (titles, active) in [
+                (&many[..], 0),
+                (&many[..], 5),
+                (&many[..], 11),
+                (&wide[..], 2),
+            ] {
+                bar(&tabs(titles, active), width);
+                let regions = tab_regions(&tabs(titles, active), width);
+                assert!(regions
+                    .iter()
+                    .any(|r| r.index == active && !r.label.starts_with(['‹', '›'])));
+            }
+        }
+    }
 
     #[test]
     fn worker_panics_are_recorded_and_only_the_interface_restores_the_terminal() {

@@ -70,8 +70,8 @@ Options:
 Files that do not exist are created when first saved. +LINE[,COLUMN] or
 +LINE:COLUMN positions the cursor in the file that follows it.
 
-Keys: F1 / Ctrl-Shift-P commands · F6 next pane · F7 next tab · F8 terminal
-F9 split right · Shift-F9 split below · F10 expand/collapse workspace
+Keys: F1 / Ctrl-Shift-P commands · F6 next pane · F7 / Shift-F7 next / previous tab
+F8 terminal · F9 split right · Shift-F9 split below · F10 expand/collapse workspace
 Editor: Ctrl-S save, Ctrl-Z undo, Ctrl-Y redo, Ctrl-F find, Ctrl-H replace,
 Ctrl-G go to line, Ctrl-Q quit. A nano-compatible keymap is available in
 Settings (keymap = \"nano\").";

@@ -3459,6 +3459,23 @@ impl App {
             );
         }
         if kind == "terminal" {
+            // Shells keep most chords, so name the global keys that switch tabs.
+            let global = |verb: &str| {
+                self.preferences
+                    .global_keys
+                    .iter()
+                    .find(|(_, v)| v.as_str() == verb)
+                    .map(|(key, _)| key.clone())
+            };
+            if self.layout.tabs(self.focus).is_some_and(|t| t.len() > 1) {
+                if let (Some(next), Some(previous)) = (global("next-tab"), global("previous-tab")) {
+                    hints.push(format!(
+                        "{}/{} tabs",
+                        commands::display_chord(&next),
+                        commands::display_chord(&previous)
+                    ));
+                }
+            }
             hints.push("Shift-drag selects · Shift-wheel scrollback".into());
         }
         hints.join(" · ")

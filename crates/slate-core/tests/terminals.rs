@@ -193,3 +193,66 @@ fn stalled_pty_rejects_pastes_without_blocking_editor_or_shutdown() {
     drop(app);
     assert!(started.elapsed() < Duration::from_secs(5));
 }
+
+#[test]
+fn terminal_tabs_switch_both_ways_without_leaving_the_terminal() {
+    let (dir, _serial) = isolated();
+    let mut app = App::new_with_startup(dir.path(), Some(StartupMode::Workspace)).unwrap();
+    for _ in 0..3 {
+        app.dispatch(Command::NewTerminal);
+    }
+    let pane = app.focus;
+    let count = app.layout.tabs(pane).unwrap().len();
+    assert!(count >= 3);
+    let active = |app: &App| {
+        let view = app.layout.view(pane).unwrap();
+        app.layout
+            .tabs(pane)
+            .unwrap()
+            .iter()
+            .position(|v| v == view)
+            .unwrap()
+    };
+    let start = active(&app);
+    assert!(matches!(app.layout.view(pane), Some(View::Terminal(_))));
+    let press = |app: &mut App, key: &str, ctrl: bool, shift: bool| {
+        app.dispatch(Command::Key {
+            key: slate_core::Key {
+                key: key.into(),
+                ctrl,
+                shift,
+                ..Default::default()
+            },
+        });
+        assert_eq!(app.focus, pane);
+        active(app)
+    };
+    // From a focused terminal: back and forward with Shift+F7 / F7 and
+    // Ctrl+PageUp / Ctrl+PageDown, none of which reach the shell.
+    let back = (start + count - 1) % count;
+    assert_eq!(press(&mut app, "F7", false, true), back);
+    assert_eq!(press(&mut app, "F7", false, false), start);
+    assert_eq!(
+        press(&mut app, "PageDown", true, false),
+        (start + 1) % count
+    );
+    assert_eq!(press(&mut app, "PageUp", true, false), start);
+    assert_eq!(press(&mut app, "PageUp", true, false), back);
+}
+
+#[test]
+fn the_hint_bar_names_the_tab_keys_when_a_terminal_pane_has_tabs() {
+    let (dir, _serial) = isolated();
+    let mut app = App::new_with_startup(dir.path(), Some(StartupMode::Workspace)).unwrap();
+    app.dispatch(Command::NewTerminal);
+    let pane = app.focus;
+    let hints = |app: &mut App| app.snapshot(160, 40, 1, 1, 1, 3).hints;
+    let tabs = app.layout.tabs(pane).unwrap().len();
+    assert_eq!(hints(&mut app).contains("F7/Shift+F7 tabs"), tabs > 1);
+    app.dispatch(Command::NewTerminal);
+    assert!(
+        hints(&mut app).contains("F7/Shift+F7 tabs"),
+        "{}",
+        hints(&mut app)
+    );
+}

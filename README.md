@@ -24,8 +24,11 @@ keep running. **Ctrl+W** closes the active editor tab in either frontend. Closin
 a shared document's tab leaves its other views intact; closing its last view
 asks before discarding unsaved changes. Cancel to save first. In the TUI, press
 **D** to discard or **Escape / Enter** to cancel. Closing the final editor tab
-leaves an empty editor. On narrow tab bars, use the GUI's tab menu or **F7** in
-the TUI to select hidden tabs.
+leaves an empty editor. On narrow tab bars, use the GUI's tab menu to select
+hidden tabs. The TUI numbers crowded tabs and shortens their titles, then shows
+a window of tabs around the active one with **‹** / **›** for the rest; **F7** /
+**Shift+F7** (or **Ctrl+PageDown** / **Ctrl+PageUp**, also in terminals) switch
+to the next / previous tab.
 
 The GUI uses Qt's native file dialogs for **Open File**, **Open Folder**, and
 **Save As**. On Plasma, the desktop's Qt platform integration (`plasma-integration`
@@ -613,7 +616,8 @@ slate`; subsequent releases arrive through normal APT updates.
 | --- | --- |
 | F1 or Ctrl+Shift+P | Command palette |
 | F6 | Next pane; also escapes input captured by a terminal program |
-| F7 | Next tab/view in the current pane |
+| F7 / Shift+F7 | Next / previous tab in the current pane, terminals included |
+| Ctrl+PageDown / Ctrl+PageUp | Next / previous tab (editors and terminals) |
 | F8 | New terminal in the current pane |
 | F9 / Shift+F9 | Split right / below |
 | F10 | Expand / collapse workspace |
