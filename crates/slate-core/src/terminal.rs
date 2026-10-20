@@ -511,6 +511,9 @@ impl TerminalSession {
             self.selection = Some((anchor, position));
         }
     }
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some_and(|(anchor, end)| anchor != end)
+    }
     pub fn selection_text(&self) -> String {
         match (&self.selection_screen, self.selection) {
             (Some(screen), Some((a, b))) => {

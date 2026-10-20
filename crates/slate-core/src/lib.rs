@@ -593,6 +593,8 @@ pub struct App {
     pub status: String,
     pub quit: bool,
     pub clipboard: String,
+    /// A permitted terminal-program copy awaiting the graphical clipboard.
+    frontend_clipboard: Option<String>,
     browser: PathBuf,
     pending_workspace: Option<PathBuf>,
     /// Counts in-place workspace switches, which replace the whole session.
@@ -1859,6 +1861,10 @@ impl App {
             }
             Command::Copy | Command::Cut => {
                 if let Some(View::Terminal(id)) = self.focused() {
+                    anyhow::ensure!(
+                        self.terminals[&id].has_selection(),
+                        "Select terminal text first; hold Shift while dragging to select outside the running program"
+                    );
                     self.clipboard = self.terminals[&id].selection_text();
                 }
                 if let Some(id) = self

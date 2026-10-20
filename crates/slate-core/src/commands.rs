@@ -1322,6 +1322,10 @@ impl App {
                     }
                 }
             }
+            if matches!(id, "copy" | "cut") && kind == "terminal" {
+                enabled &= matches!(view, Some(crate::layout::View::Terminal(id))
+                    if self.terminals.get(id).is_some_and(|terminal| terminal.has_selection()));
+            }
             if matches!(id, "quit" | "discard-quit" | "save" | "save-as") {
                 enabled &= self.saves.pending_save.is_empty();
             }
@@ -1359,6 +1363,8 @@ impl App {
                 .unwrap_or_default();
             let reason = if enabled {
                 ""
+            } else if matches!(id, "copy" | "cut") && kind == "terminal" {
+                "Select terminal text first; hold Shift while dragging to select outside the running program"
             } else if matches!(id, "quit" | "discard-quit" | "save" | "save-as")
                 && !self.saves.pending_save.is_empty()
             {

@@ -68,7 +68,7 @@ with tempfile.TemporaryDirectory(prefix='slate-gui-offscreen-', dir=fixture_pare
     (root/'runtime').mkdir(mode=0o700)
     platform = os.environ.get('SLATE_GUI_PLATFORM', 'offscreen')
     environment = {**os.environ, 'SLATE_GUI_SMOKE_DIR':temporary,
-                   'QT_QPA_PLATFORM':platform, 'QT_QUICK_BACKEND':'software', 'SHELL':'/bin/sh',
+                   'QT_QPA_PLATFORM':platform, 'QT_QUICK_BACKEND':'software', 'SHELL':os.environ.get('SLATE_GUI_TEST_SHELL', '/bin/sh'),
                    'XDG_CONFIG_HOME':str(root/'config'), 'XDG_STATE_HOME':str(root/'state'), 'XDG_DATA_HOME':str(root/'data'),
                    'XDG_RUNTIME_DIR':str(root/'runtime')}
     if platform.startswith('wayland'):

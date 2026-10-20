@@ -233,6 +233,7 @@ impl App {
             status: String::new(),
             quit: false,
             clipboard: String::new(),
+            frontend_clipboard: None,
             files: Default::default(),
             expanded_folders: Default::default(),
             pending_file: None,

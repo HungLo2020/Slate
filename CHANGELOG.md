@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.16 — 2026-10-20
+
+- Put a terminal program's copy (OSC 52) on the desktop clipboard immediately, again only with **Terminal programs may set the clipboard** allowed, instead of leaving it until the next explicit copy. The clipboard event is consumed once, so it is not repeated in later frames or restored from a saved one.
+- Refuse Copy and Cut in a GUI terminal with no selection, so the shortcut and the pane menu no longer replace the desktop clipboard with stale text and the reason explains that Shift+drag selects while a program owns the mouse.
+- Check the GUI's terminal clipboard end to end from a separate Qt client, including the pane menu, an alternate screen and a program's own copy (`scripts/gui-clipboard-smoke.py`).
+
 ## 0.1.15 — 2026-10-11
 
 - Keep every TUI tab reachable in narrow panes: crowded tab bars number their tabs and shorten titles (the active tab's longest), then scroll a window of tabs around the active one with clickable ‹ and › instead of hiding all but the active tab.

@@ -407,7 +407,8 @@ QVariantMap Bridge::send(const QVariantMap &command, QJsonObject *lists) {
         result = exchange(retry);
     }
     if (result.contains("clipboard")) {
-        m_clipboard = result.value("clipboard").toString();
+        // Consume this event before an update becomes persistent QML state.
+        m_clipboard = result.take("clipboard").toString();
         QGuiApplication::clipboard()->setText(m_clipboard);
     }
     if (result.contains("command_revision") && result.value("command_revision") != m_catalogRevision) {

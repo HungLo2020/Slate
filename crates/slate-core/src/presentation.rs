@@ -61,6 +61,9 @@ impl App {
                 // A program (perhaps over ssh) may only replace the clipboard
                 // when the user allows it.
                 if self.preferences.terminal_clipboard {
+                    if !self.terminal_frontend {
+                        self.frontend_clipboard = Some(text.clone());
+                    }
                     self.clipboard = text;
                 } else {
                     self.status = "A terminal program tried to copy to the clipboard · allow it with the Terminal clipboard setting".into();

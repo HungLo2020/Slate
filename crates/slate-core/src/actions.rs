@@ -437,6 +437,10 @@ impl App {
     pub fn take_frontend_requests(&mut self) -> Vec<String> {
         std::mem::take(&mut self.frontend_requests)
     }
+    /// An authorized terminal-program clipboard write, delivered once.
+    pub fn take_frontend_clipboard(&mut self) -> Option<String> {
+        self.frontend_clipboard.take()
+    }
     /// A privileged save the terminal frontend should perform now.
     pub fn take_elevation(&mut self) -> Option<Elevation> {
         self.saves.elevation.take()

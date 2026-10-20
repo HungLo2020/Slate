@@ -476,6 +476,8 @@ fn dispatch_gui(state: &mut GuiContext, request: serde_json::Value) -> String {
             response["requests"] = requests.into();
         }
         if id.as_deref().is_some_and(|id| id == "copy" || id == "cut") {
+            // An explicit copy supersedes an earlier program clipboard write.
+            app.take_frontend_clipboard();
             response["clipboard"] = app.clipboard.clone().into();
         }
         Ok(response)
@@ -703,6 +705,11 @@ fn respond(state: &mut GuiContext, request: serde_json::Value) -> String {
                 unreachable!("a snapshot serializes to an object")
             };
             frame.remove("clipboard");
+            // Snapshots omit the persistent clipboard; only an authorized new
+            // program write crosses the bridge, including repeated/empty text.
+            if let Some(text) = app.take_frontend_clipboard() {
+                frame.insert("clipboard".into(), text.into());
+            }
             frame.remove("commands");
             for key in ["files", "git", "history"] {
                 frame.remove(key);
@@ -1248,6 +1255,189 @@ mod tests {
                 "The GUI skipped the final terminal output notification"
             );
             std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    #[test]
+    fn copying_without_a_terminal_selection_does_not_overwrite_the_desktop_clipboard() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = GuiContext::new(
+            test_app(
+                dir.path(),
+                Some(slate_core::preferences::StartupMode::Workspace),
+            )
+            .unwrap(),
+        );
+        state.app.preferences = Default::default();
+        request(&mut state, serde_json::json!({"action":"focus","pane":3}));
+        // A mouse-reporting program owns its own highlights and may have
+        // already copied natively. Slate's internal clipboard can be stale.
+        state.app.clipboard = "stale internal clipboard".into();
+        for command in [
+            serde_json::json!({"action":"key","key":"c","ctrl":true,"shift":true}),
+            serde_json::json!({"action":"invoke_action","id":"copy","argument":""}),
+            serde_json::json!({"action":"copy"}),
+            serde_json::json!({"action":"cut"}),
+        ] {
+            let response = request(&mut state, command);
+            assert!(
+                response.get("clipboard").is_none(),
+                "Unexpected desktop write: {response}"
+            );
+            assert_eq!(state.app.clipboard, "stale internal clipboard");
+        }
+    }
+    #[test]
+    fn permitted_terminal_clipboard_updates_reach_the_gui_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(
+            dir.path(),
+            Some(slate_core::preferences::StartupMode::Workspace),
+        )
+        .unwrap();
+        app.terminal_frontend = false;
+        let mut state = GuiContext::new(app);
+        let update = serde_json::json!({"action":"update","width":1360,"height":820});
+        settle(&mut state, &update);
+        request(&mut state, serde_json::json!({"action":"focus","pane":3}));
+        for (permitted, encoded, text) in [
+            (false, "aGVsbG8=", "hello"),
+            (true, "aGVsbG8=", "hello"),
+            (true, "aGVsbG8=", "hello"),
+            (true, "", ""),
+        ] {
+            state.app.preferences.terminal_clipboard = permitted;
+            request(
+                &mut state,
+                serde_json::json!({"action":"paste","text":format!(
+                    "printf '\\033]52;c;{encoded}\\007'"
+                )}),
+            );
+            request(
+                &mut state,
+                serde_json::json!({"action":"key","key":"Enter"}),
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let response = request(&mut state, update.clone());
+                if permitted {
+                    if response.get("clipboard").is_some() {
+                        assert_eq!(response["clipboard"], text, "{response}");
+                        assert_eq!(state.app.clipboard, text);
+                        break;
+                    }
+                } else {
+                    assert!(
+                        response.get("clipboard").is_none(),
+                        "Unapproved terminal copy: {response}"
+                    );
+                    if state.app.status.contains("tried to copy") {
+                        break;
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "Timed out waiting for OSC 52"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            for _ in 0..3 {
+                assert!(request(&mut state, update.clone())
+                    .get("clipboard")
+                    .is_none());
+            }
+        }
+    }
+    #[test]
+    fn terminal_copy_routes_return_selected_text_including_alternate_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = GuiContext::new(
+            test_app(
+                dir.path(),
+                Some(slate_core::preferences::StartupMode::Workspace),
+            )
+            .unwrap(),
+        );
+        state.app.preferences = Default::default();
+        let update = serde_json::json!({"action":"update","width":1360,"height":820});
+        settle(&mut state, &update);
+        let pane = state
+            .app
+            .layout
+            .panes()
+            .into_iter()
+            .find(|pane| {
+                matches!(
+                    state.app.layout.view(*pane),
+                    Some(slate_core::layout::View::Terminal(_))
+                )
+            })
+            .unwrap();
+        request(
+            &mut state,
+            serde_json::json!({"action":"focus","pane":pane}),
+        );
+        let terminal = match state.app.layout.view(pane).unwrap() {
+            slate_core::layout::View::Terminal(id) => *id,
+            _ => unreachable!(),
+        };
+        for alternate in [false, true] {
+            let enter = if alternate {
+                "\\033[?1049h\\033[?1000h"
+            } else {
+                ""
+            };
+            request(
+                &mut state,
+                serde_json::json!({"action":"paste","text":format!(
+                    "printf '{enter}\\033[2J\\033[Hcopy %s' '猫 text'"
+                )}),
+            );
+            request(
+                &mut state,
+                serde_json::json!({"action":"key","key":"Enter"}),
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                request(&mut state, update.clone());
+                let screen = state.app.terminals[&terminal].screen();
+                let first: String = screen.cells[0]
+                    .iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect();
+                if first.starts_with("copy 猫 text") {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "terminal output: {first}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            for command in [
+                serde_json::json!({"action":"key","key":"c","ctrl":true,"shift":true}),
+                serde_json::json!({"action":"invoke_action","id":"copy","argument":""}),
+            ] {
+                request(
+                    &mut state,
+                    serde_json::json!({"action":"pointer","pane":pane,"row":0,"col":0,"kind":"press","button":0,"shift":alternate}),
+                );
+                request(
+                    &mut state,
+                    serde_json::json!({"action":"pointer","pane":pane,"row":0,"col":12,"kind":"drag","button":0,"shift":alternate}),
+                );
+                assert_eq!(
+                    state.app.terminals[&terminal].selection_text(),
+                    "copy 猫 text"
+                );
+                let response = request(&mut state, command);
+                assert_eq!(response["clipboard"], "copy 猫 text", "{response}");
+                // Copy must preserve the selection, including after another frame.
+                request(&mut state, update.clone());
+                assert_eq!(
+                    state.app.terminals[&terminal].selection_text(),
+                    "copy 猫 text"
+                );
+            }
         }
     }
     #[test]

@@ -17,6 +17,7 @@
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QPointer>
+#include <QProcess>
 #include <QPushButton>
 #include <QQuickWindow>
 #include <QSet>
@@ -2569,6 +2570,7 @@ void startSmoke(Bridge *state, QQuickWindow *window) {
     auto step = new int(0);
     auto ticks = new int(0);
     auto traceStep = new int(-1);
+    auto clipboardProbe = new QProcess(state);
     auto finish = [=](bool pass, const QString &detail) {
         QFile report(dir + "/report.json");
         report.open(QIODevice::WriteOnly);
@@ -2578,6 +2580,22 @@ void startSmoke(Bridge *state, QQuickWindow *window) {
         window->grabWindow().save(dir + "/gui.png");
         timer->stop();
         QGuiApplication::exit(pass ? 0 : 2);
+    };
+    auto externalClipboard = [=](const QString &expected) {
+        if (clipboardProbe->program().isEmpty()) {
+            clipboardProbe->start("python3", {qEnvironmentVariable("SLATE_GUI_CLIPBOARD_PROBE"), "--read"});
+            return false;
+        }
+        if (clipboardProbe->state() != QProcess::NotRunning) return false;
+        const auto text = clipboardProbe->readAllStandardOutput();
+        if (clipboardProbe->exitCode() != 0 || text != expected.toUtf8()) {
+            finish(false, QString("External terminal clipboard mismatch: expected %1, got %2; %3")
+                .arg(expected, QString::fromUtf8(text), QString::fromUtf8(clipboardProbe->readAllStandardError())));
+            return false;
+        }
+        clipboardProbe->setProgram({});
+        window->requestActivate();
+        return true;
     };
     if (!qEnvironmentVariableIsEmpty("SLATE_GUI_CAPTION_SMOKE")) {
         QTimer::singleShot(500, state, [=]() {
@@ -2852,6 +2870,9 @@ void startSmoke(Bridge *state, QQuickWindow *window) {
                 finish(false, "Terminal selection did not copy to system clipboard");
                 return;
             }
+            if (!qEnvironmentVariableIsEmpty("SLATE_GUI_CLIPBOARD_PROBE")) {
+                if (!externalClipboard("GUI_COPY_TEXT")) return;
+            }
             QGuiApplication::clipboard()->setText("printf 'PASTE_OK' > paste.txt");
             key(Qt::Key_V, Qt::ControlModifier | Qt::ShiftModifier);
             key(Qt::Key_Return);
@@ -2859,10 +2880,70 @@ void startSmoke(Bridge *state, QQuickWindow *window) {
         case 20:
             if (read(dir + "/workspace/paste.txt") != "PASTE_OK")
                 return;
+            if (!qEnvironmentVariableIsEmpty("SLATE_GUI_CLIPBOARD_PROBE")) {
+                state->send({{"action", "paste"}, {"text", "printf '\\033[2J\\033[HGUI_MENU_TEXT\\n'"}});
+                key(Qt::Key_Return);
+                break;
+            }
             finish(true,
                    "Three panes, file browsing, edit/save, undo/redo, splits/layouts, find/replace "
                    "dialogs, go-to-line, settings, PTY selection/system clipboard/paste");
             return;
+        case 21: {
+            const auto id = frame.value("focus").toString();
+            const auto terminal = state->terminal(id.toInt());
+            QString first;
+            if (terminal && !terminal->lines.isEmpty())
+                for (const auto &run : terminal->lines.first()) first += run.text;
+            if (!first.startsWith("GUI_MENU_TEXT")) return;
+            auto grid = findItem(window->contentItem(), "cells_" + id);
+            auto button = findItem(window->contentItem(), "paneActions_" + id);
+            if (!grid || !button) { finish(false, "Terminal pane controls missing"); return; }
+            const auto start = grid->mapToScene(QPointF(2, 2)).toPoint();
+            const auto end = grid->mapToScene(QPointF(2 + 13 * state->cellWidth(), 2)).toPoint();
+            QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, start);
+            QTest::mouseMove(window, end);
+            QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, end);
+            QGuiApplication::clipboard()->setText("menu copy sentinel");
+            QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                button->mapToScene(QPointF(button->width()/2, button->height()/2)).toPoint());
+            break;
+        }
+        case 22: {
+            auto copy = findMenuItem(window, "menuAction_copy");
+            if (!copy || !copy->isVisible() || !copy->isEnabled()) return;
+            QTest::mouseClick(copy->window(), Qt::LeftButton, Qt::NoModifier,
+                copy->mapToScene(QPointF(copy->width()/2, copy->height()/2)).toPoint());
+            break;
+        }
+        case 23:
+            if (!externalClipboard("GUI_MENU_TEXT")) return;
+            state->send({{"action", "configure"}, {"name", "terminal-clipboard"}, {"value", "true"}});
+            // Model a fullscreen program owning its highlight and clipboard.
+            state->send({{"action", "paste"}, {"text", "printf '\\033[?1000h\\033[2J\\033[H\\033[7mAPP_SELECTION\\033[0m\\033]52;c;T1NDX0NPUFlfVEVYVA==\\007'"}});
+            state->send({{"action", "key"}, {"key", "Enter"}});
+            break;
+        case 24: {
+            if (QGuiApplication::clipboard()->text() != "OSC_COPY_TEXT") return;
+            if (!externalClipboard("OSC_COPY_TEXT")) return;
+            const auto id = frame.value("focus").toString();
+            auto grid = findItem(window->contentItem(), "cells_" + id);
+            auto button = findItem(window->contentItem(), "paneActions_" + id);
+            if (!grid || !button) { finish(false, "Terminal pane controls missing"); return; }
+            grid->forceActiveFocus();
+            key(Qt::Key_C, Qt::ControlModifier | Qt::ShiftModifier);
+            QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                button->mapToScene(QPointF(button->width()/2, button->height()/2)).toPoint());
+            break;
+        }
+        case 25: {
+            auto copy = findMenuItem(window, "menuAction_copy");
+            if (!copy || !copy->isVisible()) return;
+            if (copy->isEnabled()) { finish(false, "Copy enabled without a terminal selection"); return; }
+            if (!externalClipboard("OSC_COPY_TEXT")) return;
+            finish(true, "External Wayland clipboard: shortcut, pane menu, OSC 52, paste and preservation of program-owned copies");
+            return;
+        }
         }
         ++*step;
     });
