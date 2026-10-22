@@ -5,6 +5,7 @@
 - Add a saved **Preferred GUI diff viewer** setting for unified or side-by-side Git comparisons.
 - Link vertical, horizontal and smooth scrolling between comparison panes; close both halves together and restore the previous layout while preserving other files opened in those panes.
 - Preview PNG, JPEG, SVG and other supported images in the GUI, with zoom, fit, panning, live reload and an editable SVG source view.
+- Keep horizontal scrollbars available when narrow panes or settings hide the minimap.
 - Cover image previews, paired diff scrolling, comparison cleanup and session recovery with core and GUI regression tests.
 
 ## 0.1.16 — 2026-10-20

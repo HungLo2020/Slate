@@ -1548,8 +1548,10 @@ Minimap::Minimap(QQuickItem *parent) : QQuickPaintedItem(parent) {
 void Minimap::setEditor(const QVariantMap &editor) {
     if (editor == m_editor) return;
     m_editor = editor;
-    // Fetch the outline only when the document (or its content) changes.
-    if (bridge && isVisible() && (editor.value("document") != m_document || editor.value("generation") != m_generation || editor.value("overview_revision") != m_overviewRevision)) {
+    // Unwrapped editors need the width for their horizontal scrollbar even
+    // when a narrow pane (or the user's setting) hides the minimap.
+    // Fetch only when the document or its content changes.
+    if (bridge && editor.contains("document") && (isVisible() || !editor.value("soft_wrap").toBool()) && (editor.value("document") != m_document || editor.value("generation") != m_generation || editor.value("overview_revision") != m_overviewRevision)) {
         m_document = editor.value("document");
         m_generation = editor.value("generation");
         m_overviewRevision = editor.value("overview_revision");

@@ -67,7 +67,7 @@ with tempfile.TemporaryDirectory(prefix='slate-gui-offscreen-', dir=fixture_pare
     if diff_smoke:
         (root/'config/slate').mkdir(parents=True, exist_ok=True)
         (root/'config/slate/trusted-folders').write_text(f'{workspace.resolve()}\n')
-        (root/'config/slate/settings.toml').write_text('gui_diff_viewer = \"side-by-side\"\nsoft_wrap = true\n')
+        (root/'config/slate/settings.toml').write_text('gui_diff_viewer = \"side-by-side\"\nsoft_wrap = true\nminimap = false\n')
     if command_smoke:
         (root/'config/slate').mkdir(parents=True, exist_ok=True)
         (root/'config/slate/settings.toml').write_text(
