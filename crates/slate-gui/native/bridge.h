@@ -8,6 +8,7 @@
 #include <QGlyphRun>
 #include <QRawFont>
 #include <QHash>
+#include <QMutex>
 #include <QPointer>
 #include <QQuickImageProvider>
 #include <QTimer>
@@ -87,6 +88,22 @@ class IconProvider : public QQuickImageProvider {
 };
 
 class CellView;
+// Decode user images on Qt Quick's image-loading thread, with bounded output.
+class PreviewProvider : public QQuickImageProvider {
+  public:
+    PreviewProvider() : QQuickImageProvider(QQuickImageProvider::Image, QQuickImageProvider::ForceAsynchronousImageLoading) {}
+    QImage requestImage(const QString &id, QSize *size, const QSize &requested) override;
+    QSize originalSize(const QString &id) const {
+        QMutexLocker lock(&m_mutex);
+        return m_sizes.value(id);
+    }
+    static QString imageId(const QString &path, qulonglong generation) {
+        return QString::fromLatin1(path.toUtf8().toBase64(QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals)) + "?" + QString::number(generation);
+    }
+  private:
+    mutable QMutex m_mutex;
+    QHash<QString, QSize> m_sizes;
+};
 class QFileDialog;
 class QMessageBox;
 class Bridge : public QObject {
@@ -159,6 +176,14 @@ class Bridge : public QObject {
     Q_INVOKABLE QVariantMap commandInfo(const QString &id, int pane = 0, int row = -1);
     Q_INVOKABLE QString localPath(const QUrl &url) const;
     Q_INVOKABLE QUrl fileUrl(const QString &path) const { return QUrl::fromLocalFile(path); }
+    Q_INVOKABLE QString imageSource(const QString &path, qulonglong generation) const {
+        return QStringLiteral("image://preview/") + PreviewProvider::imageId(path, generation);
+    }
+    Q_INVOKABLE QVariantMap imageSize(const QString &path, qulonglong generation) const {
+        const QSize size = m_previews ? m_previews->originalSize(PreviewProvider::imageId(path, generation)) : QSize();
+        return {{"width", size.width()}, {"height", size.height()}};
+    }
+    void setPreviewProvider(PreviewProvider *provider) { m_previews = provider; }
     Q_INVOKABLE bool hasIcon(const QString &name) const;
     // The complete native content of a pane (tests and accessibility tools).
     Q_INVOKABLE QVariantMap surface(int pane) const;
@@ -173,6 +198,7 @@ class Bridge : public QObject {
     qulonglong inputGeneration() const { return m_inputGeneration; }
     void attachView(int id, CellView *view);
     void detachView(int id, CellView *view);
+    void linkComparisonScroll(CellView *source, int lines);
     Q_INVOKABLE void paneHeader(int height);
     Q_INVOKABLE void copyClipboard();
     // Put plain text (such as a file path) on the desktop clipboard.
@@ -203,6 +229,7 @@ class Bridge : public QObject {
 
   private:
     EntryModel m_files, m_git, m_history;
+    PreviewProvider *m_previews = nullptr;
     QPointer<QFileDialog> m_pathDialog;
     QPointer<QMessageBox> m_closeDialog;
     QPointer<QQuickWindow> m_window;
@@ -253,6 +280,7 @@ class CellView : public QQuickPaintedItem {
     void setPaneId(int id);
     qulonglong layoutBuilds() const { return m_layoutBuilds; }
     qreal scrollPixels() const { return m_scrollPixels; }
+    void setLinkedScroll(qreal pixels, int lines);
     void applySurface(const QVariantMap &patch);
     QVariantMap pane() const { return m_pane; }
     // The editor's input context, fetched once per state change however

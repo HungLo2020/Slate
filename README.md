@@ -105,7 +105,21 @@ BOM, and legacy 8-bit files (opened as windows-1252, or any encoding through
 are reported and saved with their dominant ending. **Set encoding** and **Set line
 endings** change how a document is saved. Pasted text and text from other
 programs is normalized, so stray carriage returns never reach the file. Binary
-files (containing NUL bytes) are refused.
+files (containing NUL bytes) are refused by the text editor.
+
+The GUI opens PNG, JPEG, SVG, GIF, BMP and other recognized image files in
+read-only image tabs. Additional formats such as WebP and TIFF need the
+corresponding Qt image-format plugins; SVG needs the Qt SVG plugin (included
+in the Debian package dependencies). Use **Fit**, **100%**, **+ / −**, or
+**Ctrl+wheel** to zoom, and drag or use the scrollbars to pan. The toolbar shows
+pixel dimensions, zoom and file size; a checkerboard shows transparency.
+**Open as Text** opens SVG source in a separate editable tab; **View → Preview
+Saved Image** returns to the preview without discarding unsaved source edits.
+Image tabs follow external file changes and are restored with their workspace,
+including zoom and pan. Loading is asynchronous, limited to 64 MiB files and
+100-megapixel images, with decoded previews bounded to 4096 pixels per side.
+Animated formats currently show their first frame. Terminal mode keeps its
+text-only behavior.
 
 Saving keeps file metadata: permissions, owner and group (when running as root),
 extended attributes and ACLs, and hard links. Files in directories you cannot
@@ -289,7 +303,13 @@ and `$$` for a literal dollar. Selection scope retains the initially selected
 region as matches move the caret. Up/Down recalls prompt history; enable
 `history_log = true` or `--historylog` to retain it across sessions.
 
-The Git pane offers unified and **Side-by-side diff** views. **Stage hunk** and
+The Git pane offers unified and **Side-by-side diff** views. In Settings,
+**Preferred GUI diff viewer** chooses which view opens when inspecting changes
+in the GUI. The choice is saved; unified is the default and terminal diffs stay
+unified. The pane menu's **Side-by-side diff** command remains available for an
+individual comparison. Split comparisons link horizontal and vertical scrolling;
+closing either half closes the comparison and restores the previous pane layout.
+Files opened in a comparison pane are preserved. **Stage hunk** and
 **Unstage hunk** use the hunk under the cursor and refuse stale previews. New/deleted,
 renamed, binary or truncated previews require whole-file staging. Conflicted
 working documents offer **Conflict: accept ours/theirs/both** at the caret; these
@@ -449,6 +469,7 @@ terminal_theme = "editor" # editor (default), auto, dark, light
 files_theme = "editor"    # file browser: editor (default), auto (desktop), dark, light
 git_theme = "editor"      # Git pane: editor (default), auto (desktop), dark, light
 open_folder_in = "ask"    # GUI: ask, current (this window) or new (a new window)
+gui_diff_viewer = "unified" # GUI: unified or side-by-side
 keymap = "default"        # or "nano"
 soft_wrap = false
 wrap_column = 80          # justify and hard wrap
@@ -777,6 +798,7 @@ commands discard unsaved work. GUI window closure asks before discarding.
 (`auto`, `dark`, `light`), `terminal-theme` (`auto`, `dark`, `light`, `editor`), `files-theme` and
 `git-theme` (`editor`, `auto`, `dark`, `light`; the file browser and Git pane use
 the editor's colours unless set, and `auto` follows the desktop),
+`gui-diff-viewer` (`unified`, `side-by-side`; the preferred GUI diff view),
 `theme` (an alias for `editor-theme`), `keymap` (`default`, `nano`; choosing one replaces the
 key tables), `soft-wrap`, `wrap-column` (10–500), `hard-wrap`, `backup`,
 `file-recovery`, `tui-mouse`, `terminal-clipboard`, `complete-while-typing`

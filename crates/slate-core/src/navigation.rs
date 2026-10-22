@@ -58,9 +58,10 @@ impl App {
         self.documents
             .iter()
             .find(|(_, d)| {
-                d.path
-                    .as_deref()
-                    .is_some_and(|p| p == path || resolved.as_deref() == Some(p))
+                d.image.is_none()
+                    && d.path
+                        .as_deref()
+                        .is_some_and(|p| p == path || resolved.as_deref() == Some(p))
             })
             .map(|(id, _)| *id)
     }
@@ -133,9 +134,9 @@ impl App {
         }
         self.pending_positions
             .insert(location.path.clone(), (location.line, location.column));
-        self.execute(crate::Command::Open {
-            path: location.path,
-        })
+        // A text location (search, diagnostics, definitions) must open source,
+        // including SVG files that normally open as a GUI image preview.
+        self.queue_open_as(location.path, false).map(|_| ())
     }
 
     /// Return to the position before the last jump (`forward` = redo).

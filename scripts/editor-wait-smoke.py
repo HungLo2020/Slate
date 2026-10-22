@@ -132,6 +132,16 @@ for fresh in (True, False):
             command('close_document', force=False)
             survivor.communicate(timeout=5)
             assert survivor.returncode == 0
+            # Image tabs have the same per-document wait/close lifecycle.
+            image = root / 'waited.svg'
+            image.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="32" height="24"/>')
+            image_waiter = launch('--wait', str(image))
+            until(lambda s: s.get('document', {}).get('title', '').startswith(image.name), 'Waited image did not open')
+            waiting(image_waiter)
+            assert any(p.get('kind') == 'image' for p in state().get('frame', {}).get('panes', [])), state()
+            command('close_document', force=False)
+            image_waiter.communicate(timeout=5)
+            assert image_waiter.returncode == 0
             # A failed open must return a failure rather than hang or report success.
             binary_file = root / 'binary.dat'
             binary_file.write_bytes(b'bad\x00data')

@@ -85,6 +85,143 @@ fn idle(app: &mut App) -> bool {
 }
 
 #[test]
+fn gui_diff_preference_persists_and_selects_the_viewer_only_in_the_gui() {
+    let (dir, _serial) = isolated();
+    let root = repository(dir.path());
+    commit(&root, "a.txt", "original\n", "First");
+    fs::write(root.join("a.txt"), "staged\n").unwrap();
+    git(&root, &["add", "a.txt"]);
+    fs::write(root.join("a.txt"), "working\n").unwrap();
+    fs::write(root.join("new.txt"), "untracked\n").unwrap();
+
+    assert_eq!(
+        slate_core::preferences::Preferences::load()
+            .unwrap()
+            .gui_diff_viewer,
+        "unified"
+    );
+    for (terminal, preference) in [
+        (false, "unified"),
+        (false, "side-by-side"),
+        (true, "side-by-side"),
+        (false, "unified"),
+    ] {
+        let mut app = open(&root, terminal);
+        app.dispatch(Command::Configure {
+            name: "gui-diff-viewer".into(),
+            value: preference.into(),
+        });
+        assert_eq!(app.preferences.gui_diff_viewer, preference);
+        assert_eq!(
+            slate_core::preferences::Preferences::load()
+                .unwrap()
+                .gui_diff_viewer,
+            preference
+        );
+        drop(app);
+        // A fresh application reads the persisted choice.
+        let mut app = open(&root, terminal);
+        assert_eq!(app.preferences.gui_diff_viewer, preference);
+        common::settle(&mut app, "staged, working and untracked changes", |a| {
+            frame(a).git.len() == 3 && idle(a)
+        });
+        for (staged, path, before, after) in [
+            (true, "a.txt", "original", "staged"),
+            (false, "a.txt", "staged", "working"),
+            (false, "new.txt", "", "untracked"),
+        ] {
+            let row = frame(&mut app)
+                .git
+                .iter()
+                .position(|e| e.path == path && e.staged == staged)
+                .unwrap();
+            let pane = git_pane(&mut app).id;
+            app.dispatch(Command::Click {
+                pane,
+                row,
+                col: 0,
+                shift: false,
+            });
+            let existing = app.documents.len();
+            action(&mut app, "diff", "");
+            common::settle(&mut app, "preferred diff viewer", |a| {
+                a.documents.len() > existing && idle(a)
+            });
+            let split = !terminal && preference == "side-by-side";
+            let suffix = format!(" · {path}");
+            let docs: Vec<_> = app
+                .documents
+                .values()
+                .filter(|d| d.label.as_ref().is_some_and(|l| l.ends_with(&suffix)))
+                .collect();
+            // a.txt has separate staged and working previews.
+            let title = if split {
+                if staged {
+                    "HEAD → index"
+                } else {
+                    "index → working copy"
+                }
+            } else if staged {
+                "Staged diff"
+            } else {
+                "Working diff"
+            };
+            let docs: Vec<_> = docs
+                .into_iter()
+                .filter(|d| d.label.as_ref().unwrap().contains(title))
+                .collect();
+            assert_eq!(docs.len(), if split { 2 } else { 1 });
+            assert!(docs.iter().all(|d| d.read_only));
+            if split {
+                let left = docs
+                    .iter()
+                    .find(|d| d.label.as_ref().unwrap().starts_with("Before"))
+                    .unwrap();
+                let right = docs
+                    .iter()
+                    .find(|d| d.label.as_ref().unwrap().starts_with("After"))
+                    .unwrap();
+                assert!(left.text().contains(before));
+                assert!(right.text().contains(after));
+                let visible: Vec<_> = frame(&mut app)
+                    .panes
+                    .into_iter()
+                    .filter(|p| p.kind == "editor")
+                    .collect();
+                assert!(visible.len() >= 2);
+            } else {
+                assert!(docs[0].text().contains(before));
+                assert!(docs[0].text().contains(after));
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_gui_diff_preference_keeps_the_saved_choice() {
+    let (dir, _serial) = isolated();
+    let root = repository(dir.path());
+    let mut app = open(&root, false);
+    app.dispatch(Command::Configure {
+        name: "gui-diff-viewer".into(),
+        value: "side-by-side".into(),
+    });
+    let path = slate_core::preferences::Preferences::path();
+    let saved = fs::read(&path).unwrap();
+    app.dispatch(Command::Configure {
+        name: "gui-diff-viewer".into(),
+        value: "invalid".into(),
+    });
+    assert!(
+        app.status.contains("gui_diff_viewer must be"),
+        "{}",
+        app.status
+    );
+    assert_eq!(app.preferences.gui_diff_viewer, "side-by-side");
+    assert_eq!(fs::read(path).unwrap(), saved);
+}
+
+#[test]
 fn the_graph_follows_the_changes_and_opens_commits() {
     let (dir, _serial) = isolated();
     let root = repository(dir.path());
@@ -331,4 +468,275 @@ fn branches_switch_and_sync_with_a_remote_without_prompting() {
     // Without an argument, switching asks for the branch.
     action(&mut app, "git-switch", "");
     assert_eq!(app.prompt.as_ref().unwrap().kind, "git-switch");
+}
+
+fn split_diff(app: &mut App) -> Vec<slate_core::PaneSnapshot> {
+    common::settle(app, "Git ready for comparison", |a| {
+        !frame(a).git.is_empty() && idle(a)
+    });
+    let pane = git_pane(app).id;
+    app.dispatch(Command::Focus { pane });
+    common::settle(app, "focused Git ready", idle);
+    let count = app.documents.len();
+    action(app, "diff-side-by-side", "");
+    common::settle(app, "split comparison", |a| {
+        a.documents.len() == count + 2 && idle(a)
+    });
+    frame(app)
+        .panes
+        .into_iter()
+        .filter(|p| {
+            p.editor
+                .as_ref()
+                .is_some_and(|e| app.documents[&e.document].label.is_some())
+        })
+        .collect()
+}
+
+#[test]
+fn split_comparisons_restore_layout_and_link_both_scroll_axes() {
+    let (dir, _serial) = isolated();
+    let root = repository(dir.path());
+    let before: String = (0..180)
+        .map(|i| format!("old {i} {}\n", "x".repeat(400)))
+        .collect();
+    let after: String = (0..180).map(|i| format!("new {i}\n")).collect();
+    commit(&root, "a.txt", &before, "First");
+    fs::write(root.join("a.txt"), after).unwrap();
+    let mut app = open(&root, false);
+    common::settle(&mut app, "working diff", |a| {
+        frame(a).git.len() == 1 && idle(a)
+    });
+    app.dispatch(Command::Configure {
+        name: "soft-wrap".into(),
+        value: "true".into(),
+    });
+    let original = serde_json::to_value(&app.layout).unwrap();
+    let original_focus = app.focus;
+    let original_docs = app.documents.len();
+    for close_left in [false, true, false] {
+        let panes = split_diff(&mut app);
+        assert_eq!(panes.len(), 2);
+        assert_eq!(app.layout.panes().len(), 4);
+        assert!(panes.iter().all(|p| !p.editor.as_ref().unwrap().soft_wrap));
+        let left = panes[0].id;
+        let right = panes[1].id;
+        // Wheel, vertical scrollbar and horizontal scrolling all work from
+        // either side, even when only the opposite side contains long lines.
+        for (pane, line, column) in [(left, 40, 60), (right, 80, 35)] {
+            app.dispatch(Command::ScrollTo { pane, line });
+            app.dispatch(Command::ScrollColumns {
+                pane,
+                delta: column,
+            });
+            let pair: Vec<_> = frame(&mut app)
+                .panes
+                .into_iter()
+                .filter(|p| p.id == left || p.id == right)
+                .collect();
+            let a = pair[0].editor.as_ref().unwrap();
+            let b = pair[1].editor.as_ref().unwrap();
+            assert_eq!(a.top, line);
+            assert_eq!((a.top, a.left), (b.top, b.left));
+            assert!(a.left > 0);
+        }
+        app.dispatch(Command::Scroll {
+            pane: right,
+            delta: -7,
+        });
+        let pair = frame(&mut app);
+        let a = pair
+            .panes
+            .iter()
+            .find(|p| p.id == left)
+            .unwrap()
+            .editor
+            .as_ref()
+            .unwrap();
+        let b = pair
+            .panes
+            .iter()
+            .find(|p| p.id == right)
+            .unwrap()
+            .editor
+            .as_ref()
+            .unwrap();
+        assert_eq!(a.top, 87);
+        assert_eq!(a.top, b.top);
+        // Navigation from the right pane must synchronize the left pane in
+        // this frame, although the left pane is rendered first.
+        app.dispatch(Command::Focus { pane: right });
+        app.dispatch(Command::Key {
+            key: Key {
+                key: "End".into(),
+                ctrl: true,
+                ..Default::default()
+            },
+        });
+        let pair = frame(&mut app);
+        let a = pair
+            .panes
+            .iter()
+            .find(|p| p.id == left)
+            .unwrap()
+            .editor
+            .as_ref()
+            .unwrap();
+        let b = pair
+            .panes
+            .iter()
+            .find(|p| p.id == right)
+            .unwrap()
+            .editor
+            .as_ref()
+            .unwrap();
+        assert_eq!((a.top, a.left), (b.top, b.left));
+        assert!(a.top > 87);
+        let pane = if close_left { left } else { right };
+        let slate_core::layout::View::Editor(view) = app.layout.view(pane).unwrap() else {
+            panic!("editor")
+        };
+        app.dispatch(Command::CloseTab {
+            pane,
+            view: *view,
+            force: false,
+        });
+        assert_eq!(serde_json::to_value(&app.layout).unwrap(), original);
+        assert_eq!(app.focus, original_focus);
+        assert_eq!(app.documents.len(), original_docs);
+    }
+}
+
+#[test]
+fn nested_comparisons_close_in_either_order_and_keep_new_files() {
+    let (dir, _serial) = isolated();
+    let root = repository(dir.path());
+    commit(&root, "a.txt", "old\n", "First");
+    fs::write(root.join("a.txt"), "new\n").unwrap();
+    let mut app = open(&root, false);
+    common::settle(&mut app, "working diff", |a| {
+        frame(a).git.len() == 1 && idle(a)
+    });
+    let original = serde_json::to_value(&app.layout).unwrap();
+    for oldest_first in [true, false] {
+        let first = split_diff(&mut app);
+        let first_view = app.layout.view(first[0].id).unwrap().clone();
+        let second = split_diff(&mut app);
+        let second_view = app
+            .layout
+            .view(
+                second
+                    .iter()
+                    .max_by_key(|p| p.editor.as_ref().unwrap().document)
+                    .unwrap()
+                    .id,
+            )
+            .unwrap()
+            .clone();
+        let mut close = |view: &slate_core::layout::View| {
+            let pane = app
+                .layout
+                .panes()
+                .into_iter()
+                .find(|p| app.layout.tabs(*p).unwrap().contains(view))
+                .unwrap();
+            let slate_core::layout::View::Editor(view) = view else {
+                panic!("editor")
+            };
+            app.dispatch(Command::CloseTab {
+                pane,
+                view: *view,
+                force: false,
+            });
+        };
+        if oldest_first {
+            close(&first_view);
+            close(&second_view);
+        } else {
+            close(&second_view);
+            close(&first_view);
+        }
+        assert_eq!(serde_json::to_value(&app.layout).unwrap(), original);
+    }
+    let panes = split_diff(&mut app);
+    let temporary = panes.last().unwrap().id;
+    app.dispatch(Command::Focus { pane: temporary });
+    app.dispatch(Command::Open {
+        path: root.join("a.txt"),
+    });
+    common::settle(&mut app, "file opened in comparison pane", |a| {
+        a.layout.view(temporary).is_some_and(|v| match v {
+            slate_core::layout::View::Editor(id) => {
+                a.documents[&a.views[id].document].path.as_deref()
+                    == Some(root.join("a.txt").as_path())
+            }
+            _ => false,
+        })
+    });
+    let slate_core::layout::View::Editor(file_view) = app.layout.view(temporary).unwrap() else {
+        panic!("file editor")
+    };
+    let doc = app.views[file_view].document;
+    let other = panes[0].id;
+    app.dispatch(Command::Focus { pane: other });
+    app.dispatch(Command::ClosePane);
+    assert!(app.layout.tabs(temporary).is_some());
+    assert!(app.documents.contains_key(&doc));
+    assert!(app
+        .documents
+        .values()
+        .any(|d| d.path.as_deref() == Some(root.join("a.txt").as_path())));
+    assert!(!app.documents.values().any(|d| d
+        .label
+        .as_ref()
+        .is_some_and(|l| l.starts_with("Before") || l.starts_with("After"))));
+}
+
+#[test]
+fn temporary_diff_splits_are_not_recovered_and_failed_opens_are_atomic() {
+    let (dir, _serial) = isolated();
+    let root = repository(dir.path());
+    commit(&root, "a.txt", "old\n", "First");
+    fs::write(root.join("a.txt"), "new\n").unwrap();
+    let mut app = open(&root, false);
+    common::settle(&mut app, "working diff", |a| {
+        frame(a).git.len() == 1 && idle(a)
+    });
+    app.enable_workspace(false).unwrap();
+    let original = serde_json::to_value(&app.layout).unwrap();
+    split_diff(&mut app);
+    app.flush_workspace().unwrap();
+    drop(app);
+    let mut app = open(&root, false);
+    app.enable_workspace(true).unwrap();
+    assert_eq!(serde_json::to_value(&app.layout).unwrap(), original);
+    assert!(!app.documents.values().any(|d| d.label.is_some()));
+    common::settle(&mut app, "working diff", |a| {
+        frame(a).git.len() == 1 && idle(a)
+    });
+    let pane = common::editor_pane(&app);
+    // Saturate the editor branch to the supported nesting limit.
+    for id in 10000..10020 {
+        if app.layout.depth_of(pane).unwrap() >= slate_core::layout::MAX_DEPTH {
+            break;
+        }
+        app.layout.split(
+            pane,
+            slate_core::layout::Axis::Horizontal,
+            id * 2,
+            id * 2 + 1,
+            slate_core::layout::View::Files,
+        );
+    }
+    let git = git_pane(&mut app).id;
+    app.dispatch(Command::Focus { pane: git });
+    let original = serde_json::to_value(&app.layout).unwrap();
+    let docs = app.documents.len();
+    let views = app.views.len();
+    action(&mut app, "diff-side-by-side", "");
+    common::settle(&mut app, "rejected saturated comparison", idle);
+    assert!(app.status.contains("Not enough room"), "{}", app.status);
+    assert_eq!(serde_json::to_value(&app.layout).unwrap(), original);
+    assert_eq!(app.documents.len(), docs);
+    assert_eq!(app.views.len(), views);
 }

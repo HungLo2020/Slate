@@ -728,13 +728,27 @@ impl App {
                     .entries
                     .iter()
                     .any(|e| e.path == path && e.untracked);
-                self.services.tx.send(Job::Git(GitJob::Diff {
-                    context,
-                    path: raw_path(&self.git.entries, &path),
-                    display: path,
-                    staged,
-                    untracked,
-                }))?;
+                let path_raw = raw_path(&self.git.entries, &path);
+                let job = if !self.terminal_frontend
+                    && self.preferences.gui_diff_viewer == "side-by-side"
+                {
+                    GitJob::Comparison {
+                        context,
+                        path: path_raw,
+                        display: path,
+                        staged,
+                        untracked,
+                    }
+                } else {
+                    GitJob::Diff {
+                        context,
+                        path: path_raw,
+                        display: path,
+                        staged,
+                        untracked,
+                    }
+                };
+                self.services.tx.send(Job::Git(job))?;
                 self.git.jobs += 1;
                 self.git.error.clear();
                 self.status = "Loading Git diff…".into();

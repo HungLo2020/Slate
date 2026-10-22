@@ -84,6 +84,29 @@ impl App {
         } else {
             self.layout.arrange_constrained(area, gap, minimum)
         };
+        // Position the focused comparison before rendering either side, so
+        // keyboard navigation updates both panes in the same frame.
+        if let Some(View::Editor(id)) = self.layout.view(self.focus).cloned() {
+            if self.is_split_diff(self.views[&id].document) {
+                if let Some(p) = placements.iter().find(|p| p.id == self.focus) {
+                    let rows = p
+                        .rect
+                        .height
+                        .saturating_sub(header)
+                        .checked_div(ch)
+                        .unwrap_or(1)
+                        .max(1);
+                    let cols = p
+                        .rect
+                        .width
+                        .saturating_sub(2)
+                        .checked_div(cw)
+                        .unwrap_or(1)
+                        .max(1);
+                    self.position_editor(id, rows, cols);
+                }
+            }
+        }
         let mut panes = vec![];
         for placement in placements {
             let id = placement.id;
@@ -142,7 +165,30 @@ impl App {
             let mut text = None;
             let (kind, screen, selected) = match view {
                 View::Editor(view) => {
-                    if graphical {
+                    if self.documents[&self.views[&view].document].image.is_some() {
+                        if graphical || !self.terminal_frontend {
+                            ("image", None, 0)
+                        } else {
+                            let mut cells =
+                                vec![vec![terminal::Cell::text(" "); cols as usize]; rows as usize];
+                            for (cell, ch) in cells[0]
+                                .iter_mut()
+                                .zip("Image preview: open this file with slate-gui.".chars())
+                            {
+                                *cell = terminal::Cell::text(ch.to_string());
+                            }
+                            (
+                                "editor",
+                                Some(std::sync::Arc::new(Screen {
+                                    cells,
+                                    cursor: None,
+                                    rows,
+                                    cols,
+                                })),
+                                0,
+                            )
+                        }
+                    } else if graphical {
                         text = Some(self.cached_editor_text(view, rows, cols));
                         ("editor", None, 0)
                     } else {
@@ -163,6 +209,26 @@ impl App {
                 View::Git => ("git", None, self.git.selected),
             };
             panes.push(PaneSnapshot {
+                image: match view {
+                    View::Editor(v) => {
+                        let view = &self.views[&v];
+                        let doc = &self.documents[&view.document];
+                        doc.image.as_ref().map(|image| images::ImagePresentation {
+                            document: view.document,
+                            path: doc
+                                .path
+                                .as_ref()
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                            bytes: image.bytes,
+                            generation: doc.generation,
+                            viewport: view.image_viewport.clone(),
+                            source_available: doc.path.as_deref().is_some_and(images::svg),
+                            unavailable: doc.unavailable_flag(),
+                        })
+                    }
+                    _ => None,
+                },
                 id,
                 rect: r,
                 kind: kind.into(),
@@ -185,7 +251,9 @@ impl App {
                     _ => false,
                 },
                 editor: match view {
-                    View::Editor(v) => Some(self.editor_metadata(v)),
+                    View::Editor(v) if self.documents[&self.views[&v].document].image.is_none() => {
+                        Some(self.editor_metadata(v))
+                    }
                     _ => None,
                 },
                 screen,
@@ -286,6 +354,8 @@ impl App {
             document: v.document,
             generation: doc.generation,
             overview_revision: self.overview_revision,
+            soft_wrap: self.preferences_for_document(v.document).soft_wrap,
+            comparison_partner: self.comparison_partner(v.document),
         }
     }
     pub(crate) fn editor_presentation(&self, id: u64) -> EditorPresentation {
@@ -446,16 +516,10 @@ impl App {
             .insert(id, (key, self.screen_builds, screen.clone()));
         screen
     }
-    pub(crate) fn render_editor(
-        &mut self,
-        id: u64,
-        rows: u16,
-        cols: u16,
-        graphical: bool,
-    ) -> (Screen, Vec<Vec<text_presentation::TextSpan>>) {
-        let options = self.preferences_for_document(self.views[&id].document);
-        let tab = options.tab_width;
-        let wrapping = options.soft_wrap;
+    fn position_editor(&mut self, id: u64, rows: u16, cols: u16) -> (usize, usize, usize) {
+        let wrapping = self
+            .preferences_for_document(self.views[&id].document)
+            .soft_wrap;
         {
             let v = self.views.get_mut(&id).unwrap();
             v.rows = rows;
@@ -480,6 +544,25 @@ impl App {
         } else {
             self.views.get_mut(&id).unwrap().left = 0;
         }
+        if !self.views[&id].manual_scroll {
+            self.sync_comparison_scroll(id, false, true);
+        }
+        (cursor_line, cursor_row, cursor_col)
+    }
+    pub(crate) fn render_editor(
+        &mut self,
+        id: u64,
+        rows: u16,
+        cols: u16,
+        graphical: bool,
+    ) -> (Screen, Vec<Vec<text_presentation::TextSpan>>) {
+        let options = self.preferences_for_document(self.views[&id].document);
+        let tab = options.tab_width;
+        let wrapping = options.soft_wrap;
+        let (cursor_line, cursor_row, cursor_col) = self.position_editor(id, rows, cols);
+        let doc_id = self.views[&id].document;
+        let gutter = self.gutter_width(doc_id, cols);
+        let usable = (cols as usize).saturating_sub(gutter).max(1);
         // Graphical views draw one extra row for pixel-smooth scrolling.
         let render_rows = rows as usize + usize::from(graphical);
         let visible = self.visible_rows(id, render_rows);

@@ -274,8 +274,14 @@ impl Layers {
 }
 impl App {
     pub(crate) fn preferences_for_document(&self, id: u64) -> EditorOptions {
-        self.preference_layers
-            .resolve(self.documents.get(&id).and_then(|d| d.path.as_deref()))
+        let mut options = self
+            .preference_layers
+            .resolve(self.documents.get(&id).and_then(|d| d.path.as_deref()));
+        // Padded comparison rows must remain aligned across both panes.
+        if self.is_split_diff(id) {
+            options.soft_wrap = false;
+        }
+        options
     }
     pub(crate) fn sync_document_preferences(&mut self) {
         let path = self

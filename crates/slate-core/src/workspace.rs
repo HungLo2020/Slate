@@ -51,6 +51,7 @@ impl Workspace {
             }
         }
         for v in self.views.values() {
+            anyhow::ensure!(v.image_viewport.valid(), "Invalid recovery image viewport");
             let d = self
                 .documents
                 .get(&v.document)
@@ -628,6 +629,18 @@ impl App {
                     .count();
                 // Clean buffers follow current disk contents. Dirty buffers retain their original save baseline.
                 for d in w.documents.values_mut() {
+                    if d.image.is_some() {
+                        if let Some(path) = d.path.clone() {
+                            match Document::open_image(&path) {
+                                Ok(current) => *d = current,
+                                Err(_) => {
+                                    d.reference = false;
+                                    d.mark_unavailable();
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if d.reference {
                         let read_only = d.read_only;
                         if let Some(path) = d.path.clone() {
@@ -653,6 +666,8 @@ impl App {
                         terminals.insert(*id, self.spawn_shell(cwd)?);
                     }
                 }
+                self.comparisons = Default::default();
+                self.diff_inspections.clear();
                 self.documents = w.documents;
                 self.views = w.views;
                 self.terminals = terminals;
@@ -714,7 +729,7 @@ impl App {
             .filter(|(_, v)| !dropped(&v.document))
             .map(|(id, v)| (*id, v.clone()))
             .collect();
-        let mut layout = self.layout.clone();
+        let (mut layout, focus) = self.comparison_base_layout();
         for pane in layout.panes() {
             if let Some((tabs, active)) = layout.pane_mut(pane) {
                 let before = tabs.len();
@@ -748,7 +763,7 @@ impl App {
                 )
                 .collect(),
             layout,
-            focus: self.focus,
+            focus,
             browser: self.browser.clone(),
             ids: self.ids,
             breakpoints: self.saved_breakpoints(),
@@ -1072,7 +1087,7 @@ mod tests {
         }
         let path = dir.path().join("barrier.txt");
         std::fs::write(&path, "barrier").unwrap();
-        app.services.io.send(IoJob::Open(999, path)).unwrap();
+        app.services.io.send(IoJob::Open(999, path, false)).unwrap();
         app.flush_workspace().unwrap();
     }
 
@@ -1311,7 +1326,11 @@ mod tests {
         fs::write(&source, "queued").unwrap();
         let mut submitted = 0;
         loop {
-            match app.services.io.send(IoJob::Open(999, source.clone())) {
+            match app
+                .services
+                .io
+                .send(IoJob::Open(999, source.clone(), false))
+            {
                 Ok(()) => submitted += 1,
                 Err(error) => {
                     assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);

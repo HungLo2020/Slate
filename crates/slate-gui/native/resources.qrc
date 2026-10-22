@@ -8,6 +8,7 @@
         <file>ActionMenuItem.qml</file>
         <file>PaneTheme.qml</file>
         <file>GitPane.qml</file>
+        <file>ImageViewer.qml</file>
         <file>Theme.qml</file>
     </qresource>
 </RCC>

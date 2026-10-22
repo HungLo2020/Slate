@@ -110,6 +110,8 @@ mod rope_text {
 
 #[derive(Serialize, Deserialize)]
 pub struct Document {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<crate::images::ImageFile>,
     pub path: Option<PathBuf>,
     #[serde(with = "rope_text")]
     pub(crate) text: Rope,
@@ -481,6 +483,7 @@ impl Document {
         let version = new_version();
         Self {
             path: None,
+            image: None,
             read_only: false,
             label: None,
             typing_at: None,
@@ -612,6 +615,10 @@ impl Document {
         )
     }
     fn locked(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.image.is_none(),
+            "Image previews cannot be edited as text"
+        );
         if self.read_only {
             if self.label.is_some() {
                 bail!("This inspection view is read-only");
@@ -812,6 +819,7 @@ impl Document {
     pub fn checkpoint(&self) -> Self {
         let mut copy = Self::scratch();
         copy.path = self.path.clone();
+        copy.image = self.image.clone();
         copy.read_only = self.read_only;
         copy.label = self.label.clone();
         copy.text = self.text.clone();
@@ -836,6 +844,7 @@ impl Document {
         let mut copy = Self::scratch();
         copy.path = self.path.clone();
         copy.read_only = self.read_only;
+        copy.image = self.image.clone();
         copy.format = self.format.clone();
         copy.saved_format = self.format.clone();
         copy.reference = true;
@@ -865,7 +874,16 @@ impl Document {
         self.unavailable = true;
     }
     pub fn valid_recovery(&self) -> bool {
-        !self.recovery_external
+        (self.image.is_none()
+            || (self.read_only
+                && self.path.is_some()
+                && self.is_empty()
+                && self.saved.len_bytes() == 0
+                && self
+                    .image
+                    .as_ref()
+                    .is_some_and(|image| image.bytes <= crate::images::MAX_IMAGE_BYTES)))
+            && !self.recovery_external
             && self.text.len_bytes() <= MAX_FILE_BYTES
             && self.saved.len_bytes() <= MAX_FILE_BYTES
     }
@@ -926,6 +944,10 @@ impl Document {
         destination: Option<&Path>,
         overwrite: bool,
     ) -> Result<()> {
+        anyhow::ensure!(
+            self.image.is_none(),
+            "Image previews cannot be saved as text"
+        );
         if self.label.is_some() {
             bail!("Inspection views cannot be saved");
         }
@@ -958,6 +980,10 @@ impl Document {
         Ok(())
     }
     pub(crate) fn write_prepared(&mut self, options: WriteOptions) -> Result<()> {
+        anyhow::ensure!(
+            self.image.is_none(),
+            "Image previews cannot be saved as text"
+        );
         let path = self
             .path
             .clone()
@@ -1158,7 +1184,7 @@ impl Document {
         }
         let path = self.path.clone()?;
         // A file that has not been created yet has nothing to watch.
-        if self.disk.is_none() && self.stamp.is_none() {
+        if self.disk.is_none() && self.stamp.is_none() && self.image.is_none() {
             return None;
         }
         Some((
@@ -1170,18 +1196,34 @@ impl Document {
     }
 }
 /// Compare a file with its document baseline (runs on the IO worker).
+#[cfg(test)]
 pub(crate) fn examine(
     path: &Path,
     baseline: Option<&Baseline>,
     stamp: Option<FileStamp>,
     encoding: &str,
 ) -> Option<DiskChange> {
+    examine_content(path, baseline, stamp, encoding, false)
+}
+pub(crate) fn examine_content(
+    path: &Path,
+    baseline: Option<&Baseline>,
+    stamp: Option<FileStamp>,
+    encoding: &str,
+    image: bool,
+) -> Option<DiskChange> {
     let current = FileStamp::of(path);
     if current.is_none() {
-        return (baseline.is_some()).then_some(DiskChange::Missing);
+        return (baseline.is_some() || (image && stamp.is_some())).then_some(DiskChange::Missing);
     }
     if current == stamp {
         return None;
+    }
+    if image {
+        return Some(match Document::open_image(path) {
+            Ok(doc) => DiskChange::Changed(Box::new(doc)),
+            Err(_) => DiskChange::Unreadable,
+        });
     }
     // Read once, never blocking on a FIFO or reading past the size limit
     // (the IO worker is shared), and decode those same bytes.

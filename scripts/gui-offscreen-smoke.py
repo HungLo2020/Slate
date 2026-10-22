@@ -20,16 +20,21 @@ with tempfile.TemporaryDirectory(prefix='slate-gui-offscreen-', dir=fixture_pare
     (workspace/'second.txt').write_text('second original')
     if os.environ.get('SLATE_GUI_MARKUP_SMOKE'):
         (workspace/'<i>marked<i>.txt').write_text('A file name that looks like markup\n')
+    diff_smoke = bool(os.environ.get('SLATE_GUI_DIFF_SMOKE'))
     git_smoke = bool(os.environ.get('SLATE_GUI_GIT_SMOKE'))
     command_smoke = bool(os.environ.get('SLATE_GUI_COMMAND_SMOKE'))
-    if os.environ.get('SLATE_GUI_FEATURE_SMOKE') or git_smoke or command_smoke:
+    if os.environ.get('SLATE_GUI_FEATURE_SMOKE') or git_smoke or command_smoke or diff_smoke:
         def git(*args): subprocess.run(['git', '-C', str(workspace), *args], check=True, capture_output=True)
         git('init', '-q'); git('config', 'user.name', 'Slate test'); git('config', 'user.email', 'test@example.invalid')
         if git_smoke:
             (workspace/'src').mkdir()
             for index in range(24):
                 (workspace/'src'/f'tracked_{index:02}.rs').write_text('base\n')
+        if diff_smoke:
+            (workspace/'diff.txt').write_text(''.join(f'old {i} ' + 'x'*400 + '\n' for i in range(180)))
         git('add', '.'); git('commit', '-qm', 'Initial fixture')
+        if diff_smoke:
+            (workspace/'diff.txt').write_text(''.join(f'new {i}\n' for i in range(180)))
         (workspace/'second.txt').write_text('staged change\n'); git('add', 'second.txt')
         (workspace/'second.txt').write_text('working change\n')
         (workspace/'new file.txt').write_text('untracked preview\n')
@@ -59,6 +64,10 @@ with tempfile.TemporaryDirectory(prefix='slate-gui-offscreen-', dir=fixture_pare
         # The feature tour stages files; the trust prompt is covered by the Git smoke.
         (root/'config/slate').mkdir(parents=True, exist_ok=True)
         (root/'config/slate/trusted-folders').write_text(f'{workspace.resolve()}\n')
+    if diff_smoke:
+        (root/'config/slate').mkdir(parents=True, exist_ok=True)
+        (root/'config/slate/trusted-folders').write_text(f'{workspace.resolve()}\n')
+        (root/'config/slate/settings.toml').write_text('gui_diff_viewer = \"side-by-side\"\nsoft_wrap = true\n')
     if command_smoke:
         (root/'config/slate').mkdir(parents=True, exist_ok=True)
         (root/'config/slate/settings.toml').write_text(

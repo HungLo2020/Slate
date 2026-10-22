@@ -86,6 +86,7 @@ impl App {
         view.top = line;
         view.top_row = row;
         view.manual_scroll = true;
+        self.sync_comparison_scroll(id, true, false);
         Ok(())
     }
 }

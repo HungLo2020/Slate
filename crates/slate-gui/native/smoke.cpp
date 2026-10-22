@@ -2347,6 +2347,167 @@ static void startAuditSmoke(Bridge *state, QQuickWindow *window) {
     });
     timer->start(100);
 }
+static void startImageSmoke(Bridge *state, QQuickWindow *window) {
+    const QString dir = qEnvironmentVariable("SLATE_GUI_SMOKE_DIR");
+    const QString vector = dir + "/workspace/vector.svg";
+    auto timer = new QTimer(state);
+    auto step = new int(0), ticks = new int(0), pane = new int(0);
+    auto generation = new qulonglong(0);
+    auto finish = [=](bool pass, const QString &detail) {
+        QFile report(dir + "/report.json"); report.open(QIODevice::WriteOnly);
+        report.write(QJsonDocument(QJsonObject{{"pass", pass}, {"detail", detail}, {"step", *step}}).toJson());
+        window->grabWindow().save(dir + "/gui.png");
+        timer->stop(); QGuiApplication::exit(pass ? 0 : 2);
+    };
+    auto imagePane = [=]() {
+        for (const auto &entry : state->frame().value("panes").toList()) {
+            auto p = entry.toMap();
+            if (p.value("kind") == "image") return p;
+        }
+        return QVariantMap();
+    };
+    auto control = [=](const QString &name) { return findItem(window->contentItem(), name + "_" + QString::number(*pane)); };
+    auto ready = [=]() { auto item = control("imagePicture"); return item && item->property("status").toInt() == 1; };
+    auto click = [=](const QString &name) {
+        auto item = control(name);
+        if (!item) return false;
+        QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, item->mapToScene(QPointF(item->width()/2, item->height()/2)).toPoint());
+        return true;
+    };
+    auto invoke = [=](const QString &id) { state->send({{"action", "invoke_action"}, {"id", id}, {"argument", ""}}); };
+    auto rewrite = [=](int width, int height) {
+        QFile file(vector); file.open(QIODevice::WriteOnly);
+        file.write(QString("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%1\" height=\"%2\"><rect width=\"%1\" height=\"%2\" fill=\"green\"/></svg>").arg(width).arg(height).toUtf8());
+    };
+    QImage jpeg(80, 60, QImage::Format_RGB32); jpeg.fill(Qt::red);
+    if (!jpeg.save(dir + "/workspace/photo.JPEG")) { finish(false, "JPEG writer unavailable"); return; }
+    {
+        QFile input(dir + "/workspace/photo.JPEG"); input.open(QIODevice::ReadOnly);
+        QByteArray data = input.readAll();
+        const QByteArray exif = QByteArray::fromHex("45786966000049492a0008000000010012010300010000000600000000000000");
+        QByteArray marker = QByteArray::fromHex("ffe1");
+        marker.append(char((exif.size()+2) >> 8)); marker.append(char((exif.size()+2) & 255)); marker.append(exif);
+        data.insert(2, marker);
+        QFile output(dir + "/workspace/oriented.jpg"); output.open(QIODevice::WriteOnly); output.write(data);
+    }
+    window->resize(800, 600);
+    QObject::connect(timer, &QTimer::timeout, state, [=]() {
+        if (++*ticks > 240) {
+            auto item = control("imagePicture");
+            finish(false, "Image smoke timeout: " + state->frame().value("status").toString()
+                + " pane=" + QString::fromUtf8(QJsonDocument::fromVariant(imagePane()).toJson(QJsonDocument::Compact))
+                + " picture=" + (item ? item->property("source").toString() + " status=" + item->property("status").toString() : "missing")); return;
+        }
+        state->refresh();
+        auto p = imagePane();
+        if (!p.isEmpty()) *pane = p.value("id").toInt();
+        const auto image = p.value("image").toMap();
+        switch (*step) {
+        case 0: {
+            if (!ready()) return;
+            if (!image.value("path").toString().endsWith("space #% 猫.PNG") || control("imageViewer")->property("naturalWidth").toDouble() != 32 || control("imageViewer")->property("naturalHeight").toDouble() != 24) { finish(false, "Startup PNG URL or original dimensions incorrect"); return; }
+            PreviewProvider provider; QSize original;
+            auto png = provider.requestImage(QString::fromLatin1(image.value("path").toString().toUtf8().toBase64(QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals)) + "?0", &original, QSize(16,16));
+            if (png.isNull() || !png.hasAlphaChannel() || qAlpha(png.pixel(0,0)) != 128 || png.width() > 16 || original != QSize(32,24)) { finish(false, "PNG alpha, bounded decoding or natural size incorrect"); return; }
+            QImage thin(10000,1,QImage::Format_RGB32); thin.fill(Qt::red);
+            const QString thinPath = dir + "/workspace/thin.png";
+            thin.save(thinPath);
+            const QString thinId = PreviewProvider::imageId(thinPath,0);
+            const auto bounded = provider.requestImage(thinId,&original,QSize(4096,4096));
+            if (bounded.isNull() || bounded.width() > 4096 || bounded.height() != 1 || provider.originalSize(thinId) != QSize(10000,1)) { finish(false,"Thin-image scaling or full-size metadata failed"); return; }
+            if (state->commandInfo("save").value("enabled").toBool()) { finish(false, "Image must not enable text saves"); return; }
+            click("imageActual"); click("imageZoomIn"); break;
+        }
+        case 1:
+            if (image.value("viewport").toMap().value("zoom").toDouble() != 1.25) return;
+            click("imageFit"); break;
+        case 2:
+            if (!image.value("viewport").toMap().value("fit").toBool()) return;
+            state->send({{"action", "switch_tab"}, {"pane", *pane}, {"index", 1}}); break;
+        case 3:
+            if (!ready() || !image.value("source_available").toBool()) return;
+            if (control("imageViewer")->property("naturalWidth").toDouble() != 1200 || control("imageViewer")->property("naturalHeight").toDouble() != 900) { finish(false, "SVG original dimensions incorrect"); return; }
+            window->grabWindow().save(dir + "/preview.png");
+            window->resize(480,360);
+            click("imageActual"); break;
+        case 4: {
+            if (image.value("viewport").toMap().value("fit").toBool()) return;
+            for (const auto &name : {"imageSource", "imageReload", "imageZoomIn"}) {
+                auto item = control(name);
+                if (!item || item->mapToScene(QPointF(item->width(),item->height())).x() > window->width()) { finish(false, "Image toolbar overflows a narrow window"); return; }
+            }
+            window->grabWindow().save(dir + "/narrow.png");
+            auto area = control("imagePan");
+            const QPoint start = area->mapToScene(QPointF(area->width()*0.7, area->height()*0.7)).toPoint();
+            QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, start);
+            QTest::mouseMove(window, start - QPoint(35,35), 20);
+            QTest::mouseMove(window, start - QPoint(140,140), 50);
+            QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, start - QPoint(140,140));
+            break;
+        }
+        case 5:
+            if (control("imagePan")->property("contentY").toDouble() <= 0) return;
+            click("imageSource"); break;
+        case 6: {
+            const auto text = state->send({{"action", "document_text"}}).value("text").toString();
+            if (!text.contains("<svg")) return;
+            invoke("select-all");
+            state->send({{"action", "paste"}, {"text", "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"240\" height=\"160\"><rect width=\"240\" height=\"160\" fill=\"red\"/></svg>"}});
+            invoke("save"); break;
+        }
+        case 7:
+            if (!state->frame().value("status").toString().startsWith("Saved")) return;
+            invoke("image-preview"); break;
+        case 8:
+            if (!ready() || control("imageViewer")->property("naturalWidth").toDouble() != 240) return;
+            // The saved source is no longer needed. Leaving it open would
+            // correctly ask about recreating that text file after deletion.
+            for (const auto &entry : p.value("tabs").toList()) {
+                auto tab = entry.toMap();
+                if (tab.value("title") == "vector.svg")
+                    state->send({{"action", "close_tab"}, {"pane", *pane}, {"view", tab.value("close_id")}, {"force", false}});
+            }
+            *generation = image.value("generation").toULongLong();
+            rewrite(64,48); break;
+        case 9:
+            if (!ready() || image.value("generation").toULongLong() <= *generation || control("imageViewer")->property("naturalWidth").toDouble() != 64) return;
+            QFile::remove(vector); break;
+        case 10:
+            if (!image.value("unavailable").toBool()) return;
+            rewrite(1200,900); break;
+        case 11:
+            if (!ready() || image.value("unavailable").toBool()) return;
+            state->send({{"action", "open"}, {"path", dir + "/workspace/photo.JPEG"}}); break;
+        case 12:
+            if (!ready() || !image.value("path").toString().endsWith("photo.JPEG")) return;
+            if (control("imageViewer")->property("naturalWidth").toDouble() != 80 || control("imageViewer")->property("naturalHeight").toDouble() != 60) { finish(false, "JPEG decoding failed"); return; }
+            {
+                PreviewProvider provider; QSize original;
+                const auto id = QString::fromLatin1((dir + "/workspace/oriented.jpg").toUtf8().toBase64(QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals));
+                const auto oriented = provider.requestImage(id + "?0", &original, QSize(4096,4096));
+                if (original != QSize(60,80) || oriented.size() != QSize(60,80)) { finish(false, "JPEG EXIF orientation was not applied"); return; }
+            }
+            state->send({{"action", "open"}, {"path", dir + "/workspace/no-extension"}}); break;
+        case 13:
+            if (!ready() || !image.value("path").toString().endsWith("no-extension")) return;
+            state->send({{"action", "open"}, {"path", dir + "/workspace/broken.png"}}); break;
+        case 14:
+            if (!control("imagePicture") || control("imagePicture")->property("status").toInt() != 3) return;
+            if (!control("imageMessage")->property("text").toString().contains("Cannot display")) { finish(false, "Missing image error message"); return; }
+            state->send({{"action", "open"}, {"path", dir + "/workspace/huge.svg"}}); break;
+        case 15:
+            if (!image.value("path").toString().endsWith("huge.svg") || !control("imagePicture") || control("imagePicture")->property("status").toInt() != 3) return;
+            invoke("close"); break;
+        case 16:
+            if (image.value("path").toString().endsWith("huge.svg")) return;
+            if (state->frame().value("dirty").toBool()) { finish(false, "Image lifecycle left dirty text buffers"); return; }
+            finish(true, "Mixed startup, PNG/JPEG/SVG/extensionless decoding, alpha/EXIF orientation, bounded pixels, normal/narrow layouts, zoom/fit/pan, SVG source/save/preview, live reload/delete/restore, errors and closing"); return;
+        }
+        ++*step;
+    });
+    timer->start(100);
+}
+
 static void startProductionSmoke(Bridge *state, QQuickWindow *window) {
     const QString dir = qEnvironmentVariable("SLATE_GUI_SMOKE_DIR");
     auto timer = new QTimer(state); auto step = new int(0), ticks = new int(0);
@@ -2391,20 +2552,27 @@ static void startProductionSmoke(Bridge *state, QQuickWindow *window) {
             state->send({{"action","dismiss_prompt"}});invoke("settings");break;
         case 5:
             if (!control("shortcutChord")) return;
+            if (!control("guiDiffViewerSetting") || control("guiDiffViewerSetting")->property("currentIndex").toInt() != 0) {finish(false,"GUI diff preference must default to Unified");return;}
+            control("guiDiffViewerSetting")->setProperty("currentIndex",1);
+            if (!QMetaObject::invokeMethod(control("guiDiffViewerSetting"),"activated",Q_ARG(int,1))) {finish(false,"Cannot select the GUI diff viewer");return;}
             control("shortcutChord")->setProperty("text","Ctrl+Alt+j");control("shortcutCommand")->setProperty("text","word-count");
             QMetaObject::invokeMethod(control("saveShortcut"),"clicked");break;
         case 6: {
             if (state->frame().value("settings").toMap().value("global_keys").toMap().value("Ctrl+Alt+j") != "word-count") {finish(false,"Graphical shortcut editor failed to persist binding");return;}
+            if (state->frame().value("settings").toMap().value("gui_diff_viewer") != "side-by-side") {finish(false,"GUI diff viewer control failed to save Side-by-side");return;}
+            control("guiDiffViewerSetting")->setProperty("currentIndex",0);
+            QMetaObject::invokeMethod(control("guiDiffViewerSetting"),"activated",Q_ARG(int,0));
             auto dialog=window->findChild<QObject *>("settingsDialog");QMetaObject::invokeMethod(dialog,"close");invoke("search-in-files");break;
         }
         case 7:
             if (!control("projectInclude")) return;
+            if (state->frame().value("settings").toMap().value("gui_diff_viewer") != "unified") {finish(false,"GUI diff viewer control failed to restore Unified");return;}
             control("projectInclude")->setProperty("text","*.txt");QMetaObject::invokeMethod(control("projectInclude"),"editingFinished");
             click("projectHidden");break;
         case 8: {
             const auto policy=state->frame().value("project_search_policy").toMap();
             if (policy.value("include") != "*.txt" || !policy.value("hidden").toBool()) {finish(false,"Project search controls failed to configure scope");return;}
-            finish(true,"Regex/selection controls, capture replacement, graphical shortcut editor and project search policy");return;
+            finish(true,"Regex/selection controls, capture replacement, graphical shortcut editor, GUI diff viewer preference and project search policy");return;
         }
         }
         ++*step;
@@ -2509,6 +2677,117 @@ static void startMarkupSmoke(Bridge *state, QQuickWindow *window) {
     });
     timer->start(50);
 }
+// Exercise paired comparisons through the real QML scene and input routing.
+static void startDiffSmoke(Bridge *state, QQuickWindow *window) {
+    const auto dir = qEnvironmentVariable("SLATE_GUI_SMOKE_DIR");
+    auto timer = new QTimer(state);
+    auto step = new int(0), ticks = new int(0);
+    auto baseline = new QVariantList;
+    auto left = new QVariantMap, right = new QVariantMap;
+    auto finish = [=](bool pass, const QString &detail) {
+        QFile file(dir + "/report.json"); file.open(QIODevice::WriteOnly);
+        file.write(QJsonDocument(QJsonObject{{"pass", pass}, {"detail", detail}}).toJson());
+        timer->stop(); QGuiApplication::exit(pass ? 0 : 2);
+    };
+    auto shape = [](const QVariantMap &frame) {
+        QVariantList result;
+        for (const auto &entry : frame.value("panes").toList()) {
+            const auto p = entry.toMap();
+            result.append(QVariantMap{{"id", p.value("id")}, {"rect", p.value("rect")}, {"tabs", p.value("tabs")}});
+        }
+        return result;
+    };
+    QObject::connect(timer, &QTimer::timeout, state, [=]() {
+        state->refresh();
+        const auto frame = state->frame();
+        if (++*ticks > 180) { finish(false, QString("Diff smoke timeout %1: %2").arg(*step).arg(frame.value("status").toString())); return; }
+        if (frame.value("git_busy").toBool()) return;
+        if (*step == 0) {
+            if (state->gitEntries().isEmpty()) return;
+            *baseline = shape(frame);
+            state->send({{"action", "focus"}, {"pane", 1}});
+            state->send({{"action", "add_view"}, {"kind", "git"}});
+            *step = 1; return;
+        }
+        if (*step == 1) {
+            *baseline = shape(frame);
+            const auto entries = state->gitEntries();
+            int row = -1;
+            for (int i = 0; i < entries.size(); ++i)
+                if (entries.at(i).toMap().value("path").toString() == "diff.txt") row = i;
+            if (row < 0) { finish(false, "Missing diff fixture"); return; }
+            state->send({{"action", "click"}, {"pane", 1}, {"row", row}, {"col", 0}});
+            state->send({{"action", "invoke_action"}, {"id", "diff"}});
+            *step = 2; return;
+        }
+        left->clear(); right->clear();
+        for (const auto &entry : frame.value("panes").toList()) {
+            const auto p = entry.toMap();
+            for (const auto &tab : p.value("tabs").toList()) {
+                const auto t = tab.toMap();
+                if (!t.value("active").toBool()) continue;
+                if (t.value("title").toString().startsWith("Before")) *left = p;
+                if (t.value("title").toString().startsWith("After")) *right = p;
+            }
+        }
+        if (*step == 2) {
+            if (left->isEmpty() || right->isEmpty()) return;
+            if (left->value("editor").toMap().value("soft_wrap").toBool()) { finish(false, "Wrapped comparison rows"); return; }
+            state->send({{"action", "scroll_to"}, {"pane", left->value("id")}, {"line", 40}});
+            state->send({{"action", "scroll_columns"}, {"pane", left->value("id")}, {"delta", 60}});
+            *step = 3; return;
+        }
+        if (*step == 3 || *step == 4) {
+            const auto a = left->value("editor").toMap(), b = right->value("editor").toMap();
+            if (a.value("top").toInt() < 40 || a.value("top") != b.value("top") ||
+                a.value("left").toInt() <= 0 || a.value("left") != b.value("left")) {
+                finish(false, "Comparison scroll positions diverged"); return;
+            }
+            if (*step == 4 && (a.value("top").toInt() <= 40 || a.value("left").toInt() <= 60)) {
+                finish(false, "Wheel input did not scroll both comparison axes"); return;
+            }
+            if (*step == 3) {
+                for (const auto &p : {*left, *right}) {
+                    auto bar = findItem(window->contentItem(), "horizontalScroll_" + p.value("id").toString());
+                    if (!bar || !bar->isVisible()) { finish(false, "Missing horizontal comparison scrollbar"); return; }
+                }
+                auto cells = findItem(window->contentItem(), "cells_" + right->value("id").toString());
+                if (!cells) { finish(false, "Missing comparison cells"); return; }
+                auto at = cells->mapToScene(QPointF(cells->width()/2, cells->height()/2)).toPoint();
+                QWheelEvent wheel(QPointF(at), window->mapToGlobal(at), {}, QPoint(-120, -120), Qt::NoButton, Qt::NoModifier, Qt::ScrollUpdate, false);
+                QCoreApplication::sendEvent(window, &wheel);
+                *step = 4; return;
+            }
+            auto cells = findItem(window->contentItem(), "cells_" + right->value("id").toString());
+            auto at = cells->mapToScene(QPointF(cells->width()/2, cells->height()/2)).toPoint();
+            QWheelEvent partial(QPointF(at), window->mapToGlobal(at), QPoint(0, -5), QPoint(0, -1), Qt::NoButton, Qt::NoModifier, Qt::ScrollUpdate, false);
+            QCoreApplication::sendEvent(window, &partial);
+            *step = 5; return;
+        }
+        if (*step == 5) {
+            auto a = findItem(window->contentItem(), "cells_" + left->value("id").toString());
+            auto b = findItem(window->contentItem(), "cells_" + right->value("id").toString());
+            if (!a || !b || a->property("scrollPixels").toReal() <= 0 || a->property("scrollPixels") != b->property("scrollPixels")) {
+                finish(false, QString("Smooth wheel pixel offsets diverged: left=%1 right=%2 partner=%3 doc=%4")
+                    .arg(a ? a->property("scrollPixels").toReal() : -1)
+                    .arg(b ? b->property("scrollPixels").toReal() : -1)
+                    .arg(right->value("editor").toMap().value("comparison_partner").toString())
+                    .arg(left->value("editor").toMap().value("document").toString())); return;
+            }
+            const auto tabs = right->value("tabs").toList();
+            auto close = findItem(window->contentItem(), "tabClose_" + right->value("id").toString() + "_" + tabs.last().toMap().value("close_id").toString());
+            if (!close || !close->isVisible()) { finish(false, "Missing comparison close button"); return; }
+            QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, close->mapToScene(QPointF(close->width()/2, close->height()/2)).toPoint());
+            *step = 6; return;
+        }
+        if (*step == 6) {
+            if (shape(frame) != *baseline) { finish(false, "Closing comparison did not restore pane layout and tabs"); return; }
+            finish(true, "Paired diff scrollbars, wheel input and tab close restore the original layout");
+        }
+    });
+    timer->start(120);
+}
+
 void startSmoke(Bridge *state, QQuickWindow *window) {
     // Signal tests terminate an idle running GUI from outside.
     if (qEnvironmentVariable("SLATE_GUI_SMOKE_HOLD") == QLatin1String("event-loop")) {
@@ -2516,6 +2795,8 @@ void startSmoke(Bridge *state, QQuickWindow *window) {
         return;
     }
     if (qEnvironmentVariableIsSet("SLATE_GUI_WAIT_SMOKE")) { startWaitSmoke(state); return; }
+    if (qEnvironmentVariableIsSet("SLATE_GUI_DIFF_SMOKE")) { startDiffSmoke(state, window); return; }
+    if (qEnvironmentVariableIsSet("SLATE_GUI_IMAGE_SMOKE")) { startImageSmoke(state, window); return; }
     if (qEnvironmentVariableIsSet("SLATE_GUI_PRODUCTION_SMOKE") || qEnvironmentVariableIsSet("SLATE_GUI_GEOMETRY_SMOKE")) {startProductionSmoke(state,window);return;}
     if (!qEnvironmentVariableIsEmpty("SLATE_GUI_AUDIT_SMOKE")) { startAuditSmoke(state, window); return; }
     if (!qEnvironmentVariableIsEmpty("SLATE_GUI_MARKUP_SMOKE")) { startMarkupSmoke(state, window); return; }

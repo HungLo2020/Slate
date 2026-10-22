@@ -289,6 +289,9 @@ impl App {
             let view = self.views.get_mut(&id).unwrap();
             view.top_row = 0;
             view.top = top.min(lines.saturating_sub(1));
+            if !v.manual_scroll {
+                self.sync_comparison_scroll(id, true, false);
+            }
             return;
         }
         let width = self.text_width(id);
@@ -413,6 +416,7 @@ impl App {
         let view = self.views.get_mut(&id).unwrap();
         view.top = line;
         view.top_row = row;
+        self.sync_comparison_scroll(id, true, false);
     }
 
     // ----- Saving -----
@@ -485,6 +489,7 @@ impl App {
                 self.documents[&doc].content_version(),
                 path,
                 encoding,
+                self.documents[&doc].image.is_some(),
             ))
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         self.status = "Reloading…".into();
@@ -966,7 +971,7 @@ impl App {
             "toggle-read-only" => {
                 let (_, v) = self.editor_view()?;
                 let doc = self.documents.get_mut(&v.document).unwrap();
-                if doc.label.is_some() {
+                if doc.label.is_some() || doc.image.is_some() {
                     bail!("Inspection views are always read-only");
                 }
                 doc.read_only = !doc.read_only;
@@ -1011,6 +1016,19 @@ impl App {
                 self.configure("auto-reload", &value)?;
             }
             "zoom-in" | "zoom-out" | "zoom-reset" => {
+                if let Some(id) = self.active_editor() {
+                    let view = &self.views[&id];
+                    if self.documents[&view.document].image.is_some() {
+                        let mut viewport = view.image_viewport.clone();
+                        viewport.fit = false;
+                        viewport.zoom = match name {
+                            "zoom-in" => (viewport.zoom * 1.25).min(8.0),
+                            "zoom-out" => (viewport.zoom / 1.25).max(0.1),
+                            _ => 1.0,
+                        };
+                        return self.image_viewport(self.focus, viewport);
+                    }
+                }
                 let size = match name {
                     "zoom-in" => (self.preferences.font_size + 1).min(72),
                     "zoom-out" => self.preferences.font_size.saturating_sub(1).max(6),
@@ -1038,6 +1056,21 @@ impl App {
             "support-report" => self.support_report(),
             "search-settings" => self.search_settings(argument)?,
             "diff-side-by-side" => self.request_comparison()?,
+            "image-source" => self.open_image_source()?,
+            "image-preview" => {
+                anyhow::ensure!(
+                    !self.terminal_frontend,
+                    "Image previews are available in the GUI"
+                );
+                let id = self
+                    .active_editor()
+                    .context("Focus an image source first")?;
+                let path = self.documents[&self.views[&id].document]
+                    .path
+                    .clone()
+                    .context("This document has no file")?;
+                self.queue_open(path)?;
+            }
             "stage-hunk" => self.stage_diff_hunk(false)?,
             "unstage-hunk" => self.stage_diff_hunk(true)?,
             "accept-ours" => self.resolve_conflict("ours")?,

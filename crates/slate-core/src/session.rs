@@ -72,6 +72,11 @@ impl App {
     }
     pub(crate) fn switch_workspace(&mut self, path: &Path) -> Result<()> {
         let launch = cli::Launch {
+            frontend: Some(if self.terminal_frontend {
+                cli::Frontend::Tui
+            } else {
+                cli::Frontend::Gui
+            }),
             directory: Some(path.to_path_buf()),
             recover: true,
             startup: Some(StartupMode::Workspace),
@@ -140,7 +145,7 @@ impl App {
         let skipped = launch.files.len().saturating_sub(room);
         for file in launch.files.iter().take(room) {
             let document = if file.path.exists() {
-                Document::open(&file.path)
+                Document::open_for_frontend(&file.path, launch.frontend == Some(cli::Frontend::Gui))
                     .with_context(|| format!("Cannot open {}", file.path.display()))?
             } else {
                 Document::new_file(&file.path)?
@@ -281,7 +286,7 @@ impl App {
             last_cut: None,
             misspellings: vec![],
             suspend_requested: false,
-            terminal_frontend: true,
+            terminal_frontend: launch.frontend != Some(cli::Frontend::Gui),
             document_search_state: Default::default(),
             disk_check_at: Instant::now(),
             disk_check_pending: false,
@@ -289,6 +294,7 @@ impl App {
             recent: desktop::load_recent(),
             recent_projects: crate::desktop::load_projects(),
             diff_inspections: Default::default(),
+            comparisons: Default::default(),
             history: Default::default(),
             diagnostics: Default::default(),
             file_locks: Default::default(),

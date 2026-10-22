@@ -84,6 +84,9 @@ impl App {
     /// Every path that closes documents goes through here, so per-document
     /// caches cannot outlive them.
     pub(crate) fn forget_document(&mut self, doc: u64) {
+        if self.close_comparison(doc) {
+            return;
+        }
         let views: Vec<u64> = self
             .views
             .iter()

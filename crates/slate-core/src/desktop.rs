@@ -54,8 +54,9 @@ impl App {
             .iter()
             .filter(|(id, _)| !self.saves.pending_save.contains(id))
             .filter_map(|(id, d)| {
-                d.watch_entry()
-                    .map(|(path, baseline, stamp, encoding)| (*id, path, baseline, stamp, encoding))
+                d.watch_entry().map(|(path, baseline, stamp, encoding)| {
+                    (*id, path, baseline, stamp, encoding, d.image.is_some())
+                })
             })
             .collect();
         if entries.is_empty() {
@@ -83,8 +84,12 @@ impl App {
                     if !document.unavailable() {
                         document.mark_unavailable();
                         document.stamp = None;
-                        self.status =
-                            format!("{title} was deleted or moved on disk; save to recreate it");
+                        document.generation += 1;
+                        self.status = if document.image.is_some() {
+                            format!("{title} was deleted or moved on disk")
+                        } else {
+                            format!("{title} was deleted or moved on disk; save to recreate it")
+                        };
                     }
                 }
                 DiskChange::Changed(fresh) => {
@@ -232,7 +237,10 @@ impl App {
     }
     /// Scroll an editor horizontally by display columns.
     pub(crate) fn scroll_columns(&mut self, id: u64, delta: i32) {
-        if self.preferences.soft_wrap {
+        if self
+            .preferences_for_document(self.views[&id].document)
+            .soft_wrap
+        {
             return;
         }
         let widest = self.overview_for(self.views[&id].document).widest;
@@ -240,9 +248,17 @@ impl App {
         let limit = widest.saturating_sub(view.cols as usize / 2);
         view.left = (view.left as i64 + delta as i64).clamp(0, limit as i64) as usize;
         view.manual_scroll = true;
+        self.sync_comparison_scroll(id, false, true);
     }
     /// The (cached) minimap outline of a document.
     pub fn overview_for(&mut self, doc: u64) -> Overview {
+        let mut overview = self.raw_overview_for(doc);
+        if let Some(partner) = self.comparison_partner(doc) {
+            overview.widest = overview.widest.max(self.raw_overview_for(partner).widest);
+        }
+        overview
+    }
+    fn raw_overview_for(&mut self, doc: u64) -> Overview {
         let generation = self.documents[&doc].generation;
         if let Some(cached) = self.overview_cache.get(&doc) {
             if cached.generation == generation {

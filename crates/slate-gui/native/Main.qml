@@ -643,6 +643,8 @@ ApplicationWindow {
             CommandMenuItem { actionId: "toggle-minimap"; label: "Minimap"; checkable: true; checked: !!root.settings.minimap }
             MenuSeparator {}
             CommandMenuItem { actionId: "zoom-in"; label: "Zoom In" }
+            CommandMenuItem { actionId: "image-preview"; label: "Preview Saved Image" }
+            CommandMenuItem { actionId: "image-source"; label: "Open SVG as Text" }
             CommandMenuItem { actionId: "zoom-out"; label: "Zoom Out" }
             CommandMenuItem { actionId: "zoom-reset"; label: "Reset Zoom" }
             MenuSeparator {}
@@ -773,6 +775,8 @@ ApplicationWindow {
                 function focusContent() {
                     if (paneData.kind === "editor" || paneData.kind === "terminal")
                         grid.forceActiveFocus();
+                    else if (paneData.kind === "image")
+                        imageLoader.item && imageLoader.item.forceActiveFocus();
                     else if (paneData.kind === "git")
                         gitLoader.item && gitLoader.item.focusContent();
                     else
@@ -952,6 +956,23 @@ ApplicationWindow {
                     height: Math.max(0, panel.height - y - panel.border.width)
                     color: panel.paneTheme.backgroundColor
                 }
+                Loader {
+                    id: imageLoader
+                    x: grid.x
+                    y: grid.y
+                    width: panel.width - x
+                    height: panel.height - y
+                    active: panel.paneData.kind === "image"
+                    sourceComponent: Component {
+                        ImageViewer {
+                            paneId: panel.paneId
+                            imageData: panel.paneData.image || ({})
+                            bridge: slate
+                            sendCommand: function(command) { root.send(command); }
+                            invoke: function(id) { root.invokeAction(id, "", panel.paneId); }
+                        }
+                    }
+                }
                 CellView {
                     id: grid
                     objectName: "cells_" + panel.paneId
@@ -1017,7 +1038,7 @@ ApplicationWindow {
                     objectName: "horizontalScroll_" + panel.paneId
                     readonly property int contentColumns: minimap.widest
                     readonly property int scrollColumn: panel.paneData.editor ? panel.paneData.editor.left : 0
-                    visible: panel.isEditor && !root.settings.soft_wrap && contentColumns > panel.paneData.cols
+                    visible: panel.isEditor && panel.paneData.editor && !panel.paneData.editor.soft_wrap && contentColumns > panel.paneData.cols
                     x: grid.x
                     y: grid.y + grid.height
                     width: grid.width
@@ -2738,6 +2759,26 @@ ApplicationWindow {
                         model: ["auto", "dark", "light", "editor"]
                         currentIndex: model.indexOf(root.settings.terminal_theme || "dark")
                         onActivated: settingsDialog.configure("terminal-theme", currentText)
+                    }
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    Label {
+                        text: "Preferred GUI diff viewer"
+                        Layout.fillWidth: true
+                        Layout.minimumWidth: 0
+                        wrapMode: Text.Wrap
+                    }
+                    ComboBox {
+                        objectName: "guiDiffViewerSetting"
+                        textRole: "label"
+                        valueRole: "value"
+                        model: [
+                            { "label": "Unified", "value": "unified" },
+                            { "label": "Side-by-side", "value": "side-by-side" }
+                        ]
+                        currentIndex: root.settings.gui_diff_viewer === "side-by-side" ? 1 : 0
+                        onActivated: settingsDialog.configure("gui-diff-viewer", currentValue)
                     }
                 }
                 // The file browser and Git pane follow the editor unless chosen

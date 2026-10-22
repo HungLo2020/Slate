@@ -2,12 +2,16 @@
 use crate::{
     document::Document,
     git::{Context, GitJob},
-    layout::{Axis, View},
+    layout::{Axis, Node, View},
     services::Job,
     App, Command, EditorView,
 };
 use anyhow::{bail, Context as _, Result};
-use std::{ffi::OsString, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
+    time::Duration,
+};
 #[derive(Clone)]
 pub struct Preview {
     pub context: Context,
@@ -22,6 +26,43 @@ pub struct Preview {
 pub(crate) struct Inspection {
     preview: std::sync::Arc<Preview>,
     rows: Vec<(usize, usize)>,
+}
+#[derive(Default)]
+pub(crate) struct Comparisons {
+    pairs: BTreeMap<u64, Pair>,
+    owned_panes: BTreeSet<u64>,
+    editor_only: Option<bool>,
+}
+struct Pair {
+    documents: [u64; 2],
+    previous_active: BTreeMap<u64, View>,
+    previous_focus: u64,
+}
+
+fn strip_views(layout: &mut Node, removed: &BTreeSet<u64>, pairs: &[&Pair], owned: &BTreeSet<u64>) {
+    for pane in layout.panes() {
+        let (tabs, active) = layout.pane_mut(pane).unwrap();
+        let selected = tabs.get(*active).cloned();
+        let is_removed = |view: &View| matches!(view, View::Editor(id) if removed.contains(id));
+        tabs.retain(|v| !is_removed(v));
+        let restore = selected.filter(|v| !is_removed(v)).or_else(|| {
+            pairs
+                .iter()
+                .filter_map(|p| p.previous_active.get(&pane))
+                .find(|v| !is_removed(v) && tabs.contains(v))
+                .cloned()
+        });
+        *active = restore
+            .and_then(|v| tabs.iter().position(|t| *t == v))
+            .unwrap_or((*active).min(tabs.len().saturating_sub(1)));
+    }
+    // Only panes created for comparisons may disappear. A pane reused for a
+    // normal file or terminal survives, including any work done in it.
+    for pane in owned {
+        if layout.tabs(*pane).is_some_and(|tabs| tabs.is_empty()) {
+            layout.remove(*pane);
+        }
+    }
 }
 fn hunks(patch: &str) -> Vec<(usize, usize)> {
     let mut starts = Vec::new();
@@ -90,6 +131,171 @@ pub(crate) fn apply_hunk(preview: &Preview, index: usize) -> Result<String, Stri
     .into())
 }
 impl App {
+    fn comparison_key(&self, doc: u64) -> Option<u64> {
+        self.comparisons
+            .pairs
+            .iter()
+            .find(|(_, p)| p.documents.contains(&doc))
+            .map(|(id, _)| *id)
+    }
+    pub(crate) fn is_split_diff(&self, doc: u64) -> bool {
+        self.comparison_key(doc).is_some()
+    }
+    pub(crate) fn comparison_partner(&self, doc: u64) -> Option<u64> {
+        let pair = self.comparisons.pairs.get(&self.comparison_key(doc)?)?;
+        pair.documents.iter().copied().find(|id| *id != doc)
+    }
+    pub(crate) fn sync_comparison_scroll(&mut self, id: u64, vertical: bool, horizontal: bool) {
+        let Some(source) = self.views.get(&id).cloned() else {
+            return;
+        };
+        let Some(key) = self.comparison_key(source.document) else {
+            return;
+        };
+        let docs = self.comparisons.pairs[&key].documents;
+        for (other, view) in &mut self.views {
+            if *other != id && docs.contains(&view.document) {
+                if vertical {
+                    view.top = source.top;
+                    view.top_row = 0;
+                }
+                if horizontal {
+                    view.left = source.left;
+                }
+                view.manual_scroll = true;
+            }
+        }
+    }
+    /// The layout persisted to disk excludes temporary comparison splits.
+    pub(crate) fn comparison_base_layout(&self) -> (Node, u64) {
+        let mut layout = self.layout.clone();
+        let pairs: Vec<_> = self.comparisons.pairs.values().rev().collect();
+        let removed: BTreeSet<_> = self
+            .views
+            .iter()
+            .filter(|(_, v)| self.is_split_diff(v.document))
+            .map(|(id, _)| *id)
+            .collect();
+        let mut focus = self.focus;
+        if self
+            .layout
+            .view(focus)
+            .is_some_and(|v| matches!(v, View::Editor(id) if removed.contains(id)))
+        {
+            focus = pairs.last().map_or(focus, |p| p.previous_focus);
+        }
+        strip_views(&mut layout, &removed, &pairs, &self.comparisons.owned_panes);
+        if layout.tabs(focus).is_none() {
+            focus = layout.panes()[0];
+        }
+        (layout, focus)
+    }
+    pub(crate) fn close_comparison(&mut self, doc: u64) -> bool {
+        let Some(key) = self.comparison_key(doc) else {
+            return false;
+        };
+        let pair = self.comparisons.pairs.remove(&key).unwrap();
+        let removed: BTreeSet<_> = self
+            .views
+            .iter()
+            .filter(|(_, v)| pair.documents.contains(&v.document))
+            .map(|(id, _)| *id)
+            .collect();
+        let restore_focus = self
+            .layout
+            .view(self.focus)
+            .is_some_and(|v| matches!(v, View::Editor(id) if removed.contains(id)));
+        // A later comparison can have opened from this one's tab. Restore
+        // its predecessor rather than retaining a reference to a closed tab.
+        for other in self.comparisons.pairs.values_mut() {
+            if other
+                .previous_active
+                .get(&other.previous_focus)
+                .is_some_and(|v| matches!(v, View::Editor(id) if removed.contains(id)))
+            {
+                other.previous_focus = pair.previous_focus;
+            }
+            for (pane, prior) in &pair.previous_active {
+                if other
+                    .previous_active
+                    .get(pane)
+                    .is_some_and(|v| matches!(v, View::Editor(id) if removed.contains(id)))
+                {
+                    other.previous_active.insert(*pane, prior.clone());
+                }
+            }
+        }
+        strip_views(
+            &mut self.layout,
+            &removed,
+            &[&pair],
+            &self.comparisons.owned_panes,
+        );
+        for doc in pair.documents {
+            self.forget_document(doc);
+        }
+        // Retain ownership while another comparison is still using the pane.
+        let live: BTreeSet<_> = self
+            .views
+            .iter()
+            .filter(|(_, v)| self.is_split_diff(v.document))
+            .map(|(id, _)| *id)
+            .collect();
+        self.comparisons.owned_panes.retain(|pane| {
+            self.layout.tabs(*pane).is_some_and(|tabs| {
+                tabs.iter()
+                    .any(|v| matches!(v, View::Editor(id) if live.contains(id)))
+            })
+        });
+        for pane in self.layout.panes() {
+            if self.layout.tabs(pane).is_some_and(|tabs| tabs.is_empty()) {
+                let doc = self.id();
+                let view = self.id();
+                self.documents.insert(doc, Document::scratch());
+                self.views.insert(
+                    view,
+                    EditorView {
+                        document: doc,
+                        ..Default::default()
+                    },
+                );
+                self.layout
+                    .pane_mut(pane)
+                    .unwrap()
+                    .0
+                    .push(View::Editor(view));
+            }
+        }
+        if restore_focus && self.layout.tabs(pair.previous_focus).is_some() {
+            self.focus = pair.previous_focus;
+        } else if self.layout.tabs(self.focus).is_none() {
+            self.focus = self.layout.panes()[0];
+        }
+        if self.comparisons.pairs.is_empty() {
+            if let Some(editor_only) = self.comparisons.editor_only.take() {
+                self.editor_only = editor_only;
+                if editor_only {
+                    self.select_editor_pane();
+                }
+            }
+        }
+        self.recovery.dirty = true;
+        self.status = "Closed comparison".into();
+        true
+    }
+    fn rollback_comparison(&mut self, layout: Node, focus: u64, documents: &BTreeSet<u64>) {
+        let added: Vec<_> = self
+            .documents
+            .keys()
+            .copied()
+            .filter(|id| !documents.contains(id))
+            .collect();
+        for doc in added {
+            self.forget_document(doc);
+        }
+        self.layout = layout;
+        self.focus = focus;
+    }
     pub(crate) fn request_comparison(&mut self) -> Result<()> {
         let path = self.selected_path().context("Select a Git file first")?;
         let staged = self
@@ -126,8 +332,22 @@ impl App {
             return;
         }
         let preview = std::sync::Arc::new(preview);
+        let previous_layout = self.layout.clone();
+        let previous_focus = self.focus;
+        let previous_documents: BTreeSet<_> = self.documents.keys().copied().collect();
+        let previous_active = previous_layout
+            .panes()
+            .into_iter()
+            .filter_map(|pane| previous_layout.view(pane).cloned().map(|view| (pane, view)))
+            .collect();
         let _ = self.editor_target();
         if preview.side_by_side {
+            if self.documents.len() + 2 > crate::workspace::MAX_DOCUMENTS || !self.can_split() {
+                self.rollback_comparison(previous_layout, previous_focus, &previous_documents);
+                self.status =
+                    "Not enough room for a split comparison; close a document or pane first".into();
+                return;
+            }
             let mut left = String::new();
             let mut right = String::new();
             let mut rows = Vec::new();
@@ -141,10 +361,11 @@ impl App {
                     rows.push((row, hunk));
                     left.push_str(line);
                     right.push_str(line);
-                } else if line.starts_with("--- ")
-                    || line.starts_with("+++ ")
-                    || line.starts_with("diff ")
-                    || line.starts_with("index ")
+                } else if rows.is_empty()
+                    && (line.starts_with("--- ")
+                        || line.starts_with("+++ ")
+                        || line.starts_with("diff ")
+                        || line.starts_with("index "))
                 {
                     continue;
                 } else if let Some(content) = line.strip_prefix('-') {
@@ -176,19 +397,36 @@ impl App {
                 preview.clone(),
                 rows.clone(),
             );
-            if !self.show_new_document(l) {
+            if !self.show_new_document(l) || !self.can_split() {
+                self.rollback_comparison(previous_layout, previous_focus, &previous_documents);
                 return;
             }
             let r = self.inspect_diff(&format!("After · {title}"), right, preview, rows);
             let pane = self.id();
             let split = self.id();
-            if self.can_split() {
+            self.layout
+                .split(self.focus, Axis::Horizontal, pane, split, View::Editor(r));
+            self.focus = pane;
+            self.comparisons.owned_panes.extend(
                 self.layout
-                    .split(self.focus, Axis::Horizontal, pane, split, View::Editor(r));
-                self.focus = pane;
-            } else if !self.show_new_document(r) {
-                return;
+                    .panes()
+                    .into_iter()
+                    .filter(|pane| previous_layout.tabs(*pane).is_none()),
+            );
+            if self.comparisons.pairs.is_empty() {
+                self.comparisons.editor_only = Some(self.editor_only);
             }
+            self.editor_only = false;
+            let documents = [self.views[&l].document, self.views[&r].document];
+            self.comparisons.pairs.insert(
+                documents[0],
+                Pair {
+                    documents,
+                    previous_active,
+                    previous_focus,
+                },
+            );
+            self.recovery.dirty = true;
         } else {
             let rows = preview
                 .patch

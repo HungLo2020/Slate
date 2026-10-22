@@ -40,6 +40,8 @@ pub struct Preferences {
     /// editor's colours, `auto` the desktop's, or `dark`/`light`.
     pub files_theme: String,
     pub git_theme: String,
+    /// Preferred GUI diff presentation; the terminal keeps unified diffs.
+    pub gui_diff_viewer: String,
     /// Where the GUI opens another folder: `ask` (the default), `current`
     /// (this window) or `new` (a new window). The TUI has one window.
     pub open_folder_in: String,
@@ -298,6 +300,7 @@ impl Default for Preferences {
             terminal_theme: "editor".into(),
             files_theme: "editor".into(),
             git_theme: "editor".into(),
+            gui_diff_viewer: "unified".into(),
             open_folder_in: "ask".into(),
             file_startup: StartupMode::EditorOnly,
             directory_startup: StartupMode::Workspace,
@@ -405,6 +408,11 @@ pub const SETTINGS: &[Setting] = &[
         kind: SettingKind::Choice(&["ask", "current", "new"]),
     },
     Setting {
+        name: "gui-diff-viewer",
+        label: "Preferred GUI diff viewer",
+        kind: SettingKind::Choice(&["unified", "side-by-side"]),
+    },
+    Setting {
         name: "keymap",
         label: "Keymap",
         kind: SettingKind::Choice(&["default", "nano"]),
@@ -499,6 +507,7 @@ impl Preferences {
             "terminal-theme" => self.terminal_theme.clone(),
             "files-theme" => self.files_theme.clone(),
             "git-theme" => self.git_theme.clone(),
+            "gui-diff-viewer" => self.gui_diff_viewer.clone(),
             "open-folder-in" => self.open_folder_in.clone(),
             "keymap" => self.keymap.clone(),
             "soft-wrap" => self.soft_wrap.to_string(),
@@ -582,6 +591,9 @@ impl Preferences {
         }
         if !PANE_THEMES.contains(&self.git_theme.as_str()) {
             bail!("git_theme must be editor, auto, dark or light");
+        }
+        if !["unified", "side-by-side"].contains(&self.gui_diff_viewer.as_str()) {
+            bail!("gui_diff_viewer must be unified or side-by-side");
         }
         if !["ask", "current", "new"].contains(&self.open_folder_in.as_str()) {
             bail!("open_folder_in must be ask, current or new");
@@ -850,6 +862,7 @@ impl App {
                 "terminal-theme" => settings.terminal_theme = value.into(),
                 "files-theme" => settings.files_theme = value.into(),
                 "git-theme" => settings.git_theme = value.into(),
+                "gui-diff-viewer" => settings.gui_diff_viewer = value.into(),
                 "open-folder-in" => settings.open_folder_in = value.into(),
                 "file-startup" | "directory-startup" => {
                     // The minimal and workspace profiles choose both startup

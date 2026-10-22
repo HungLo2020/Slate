@@ -25,6 +25,7 @@ pub mod git_history;
 mod highlight;
 mod history;
 pub mod ide;
+pub mod images;
 pub mod instance;
 pub mod languages;
 pub mod layout;
@@ -85,6 +86,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct EditorView {
+    #[serde(default)]
+    pub image_viewport: images::ImageViewport,
     pub document: u64,
     pub cursor: usize,
     pub anchor: Option<usize>,
@@ -136,6 +139,10 @@ pub enum Command {
     ScrollTo {
         pane: u64,
         line: usize,
+    },
+    ImageViewport {
+        pane: u64,
+        viewport: images::ImageViewport,
     },
     /// Scroll an editor horizontally by display columns.
     ScrollColumns {
@@ -445,6 +452,8 @@ pub struct Tab {
 }
 #[derive(Serialize)]
 pub struct PaneSnapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<images::ImagePresentation>,
     pub id: u64,
     pub rect: Rect,
     pub kind: String,
@@ -479,6 +488,9 @@ pub struct EditorMetadata {
     pub document: u64,
     pub generation: u64,
     pub overview_revision: u64,
+    pub soft_wrap: bool,
+    /// The other document in a temporary split comparison, when present.
+    pub comparison_partner: Option<u64>,
 }
 /// An editor's text around the cursor for input methods, in UTF-16 units.
 #[derive(Serialize)]
@@ -669,6 +681,7 @@ pub struct App {
     recent: Vec<String>,
     recent_projects: Vec<String>,
     diff_inspections: BTreeMap<u64, comparison::Inspection>,
+    comparisons: comparison::Comparisons,
     history: history::History,
     diagnostics: diagnostics::Diagnostics,
     file_locks: file_locks::FileLocks,
@@ -879,6 +892,9 @@ impl App {
             .get(&view)
             .context("Missing editor view")?
             .document;
+        if self.close_comparison(doc) {
+            return Ok(());
+        }
         if self.saves.pending_save.contains(&doc) {
             bail!("Wait for the pending save before closing this tab");
         }
@@ -1381,8 +1397,8 @@ impl App {
                 }
             }
             Command::ScrollTo { pane, line } => {
-                if let Some(View::Editor(id)) = self.layout.view(pane) {
-                    let v = self.views.get_mut(id).context("Missing editor view")?;
+                if let Some(View::Editor(id)) = self.layout.view(pane).cloned() {
+                    let v = self.views.get_mut(&id).context("Missing editor view")?;
                     v.top = line.min(
                         self.documents[&v.document]
                             .line_count()
@@ -1390,8 +1406,10 @@ impl App {
                     );
                     v.top_row = 0;
                     v.manual_scroll = true;
+                    self.sync_comparison_scroll(id, true, false);
                 }
             }
+            Command::ImageViewport { pane, viewport } => self.image_viewport(pane, viewport)?,
             Command::ScrollColumns { pane, delta } => {
                 if let Some(View::Editor(id)) = self.layout.view(pane).cloned() {
                     self.scroll_columns(id, delta);
@@ -1970,6 +1988,12 @@ impl App {
                 self.focus = pane;
             }
             Command::ClosePane => {
+                if self
+                    .active_editor()
+                    .is_some_and(|id| self.close_comparison(self.views[&id].document))
+                {
+                    return Ok(());
+                }
                 if self.editor_only {
                     bail!("Expand the workspace before closing a pane");
                 }
@@ -3135,6 +3159,8 @@ impl App {
 
 /// Command-line verbs handled by `actions.rs`.
 const ACTION_VERBS: &[&str] = &[
+    "image-source",
+    "image-preview",
     "signature-help",
     "open-recent-project",
     "support-report",
@@ -3301,14 +3327,17 @@ impl App {
     fn finish_open(&mut self, pane: u64, mut d: Document) -> Result<u64> {
         let path = d.path.clone();
         let notice = d.notice.take();
-        let (doc, fresh) =
-            if let Some((id, _)) = self.documents.iter().find(|(_, old)| old.path == path) {
-                (*id, false)
-            } else {
-                let id = self.id();
-                self.documents.insert(id, d);
-                (id, true)
-            };
+        let (doc, fresh) = if let Some((id, _)) = self
+            .documents
+            .iter()
+            .find(|(_, old)| old.path == path && old.image.is_some() == d.image.is_some())
+        {
+            (*id, false)
+        } else {
+            let id = self.id();
+            self.documents.insert(id, d);
+            (id, true)
+        };
         if matches!(self.layout.view(pane), Some(View::Editor(_))) {
             self.focus = pane;
         } else {
@@ -3362,6 +3391,12 @@ impl App {
         if let Some(id) = self.active_editor() {
             let v = &self.views[&id];
             let d = &self.documents[&v.document];
+            if let Some(image) = &d.image {
+                return format!(
+                    "Image preview · Read-only · {:.1} KiB",
+                    image.bytes as f64 / 1024.0
+                );
+            }
             let (line, col) = d.line_col(v.cursor, self.preferences.indent_width);
             let mut parts = vec![
                 format!("Ln {}, Col {}", line + 1, col + 1),
@@ -3391,6 +3426,16 @@ impl App {
         }
     }
     fn hints(&self) -> String {
+        if self
+            .active_editor()
+            .is_some_and(|id| self.documents[&self.views[&id].document].image.is_some())
+        {
+            return if self.terminal_frontend {
+                "Image previews are available in slate-gui".into()
+            } else {
+                "Ctrl+wheel zoom · Drag to pan · Fit / 100%".into()
+            };
+        }
         let kind = self.focused_kind();
         let lookup = |verb: &str| {
             let scoped = match kind {

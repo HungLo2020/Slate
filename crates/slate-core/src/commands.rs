@@ -66,6 +66,20 @@ pub fn display_chord(chord: &str) -> String {
 // IDs also retain the existing command-line spelling for scripting compatibility.
 const ACTIONS: &[(&str, &str, &str, &str, &str)] = &[
     (
+        "image-source",
+        "Open SVG as Text",
+        "Edit the SVG source in a text tab",
+        "",
+        "image-svg",
+    ),
+    (
+        "image-preview",
+        "Preview saved image",
+        "View the saved image in an image tab",
+        "",
+        "image-source",
+    ),
+    (
         "profile-save",
         "Save profile…",
         "Save this layout and preferences as a named profile",
@@ -1240,12 +1254,13 @@ impl App {
             Some(crate::layout::View::Files) => "files",
             None => "",
         };
-        let editor = match view {
+        let document = match view {
             Some(crate::layout::View::Editor(id)) => {
                 Some(&self.documents[&self.views[id].document])
             }
             _ => None,
         };
+        let editor = document.filter(|d| d.image.is_none());
         let selected = self.git.entries.get(selection.unwrap_or(self.git.selected));
         let git_ready = self.git.repository && !self.git.restricted && self.git.jobs == 0;
         let mut results = Vec::new();
@@ -1258,7 +1273,21 @@ impl App {
                 continue;
             }
             let mut enabled = match scope {
-                "closable" => editor.is_some() || kind == "terminal",
+                "closable" => document.is_some() || kind == "terminal",
+                "image-svg" => {
+                    !self.terminal_frontend
+                        && document.is_some_and(|d| {
+                            d.image.is_some() && d.path.as_deref().is_some_and(crate::images::svg)
+                        })
+                }
+                "image-source" => {
+                    !self.terminal_frontend
+                        && editor.is_some_and(|d| {
+                            d.path
+                                .as_deref()
+                                .is_some_and(crate::images::image_extension)
+                        })
+                }
                 "editor" => editor.is_some(),
                 "edit" => editor.is_some_and(|d| !d.read_only),
                 "text" => editor.is_some() || kind == "terminal",
@@ -1277,7 +1306,9 @@ impl App {
                         && self.git.entries.iter().any(|e| !e.staged)
                 }
                 "pane" => !self.editor_only && self.layout.panes().len() > 1,
-                "file" => editor.is_some_and(|d| d.path.is_some() && d.label.is_none()),
+                "file" => document.is_some_and(|d| {
+                    d.path.is_some() && d.label.is_none() && (d.image.is_none() || id == "reload")
+                }),
                 "terminal-ui" => self.terminal_frontend,
                 "graphical" => !self.terminal_frontend,
                 "graphical-editor" => !self.terminal_frontend && editor.is_some(),

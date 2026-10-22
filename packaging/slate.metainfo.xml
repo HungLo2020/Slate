@@ -15,6 +15,7 @@
       <li>Encodings, line endings, file watching and metadata-preserving saves</li>
       <li>Syntax highlighting, minimap, soft wrap and printing</li>
       <li>Integrated terminals and a Git changes view</li>
+      <li>Image previews with zoom, panning and editable SVG source in the GUI</li>
     </ul>
   </description>
   <launchable type="desktop-id">slate.desktop</launchable>

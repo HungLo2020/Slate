@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.17 — 2026-10-22
+
+- Add a saved **Preferred GUI diff viewer** setting for unified or side-by-side Git comparisons.
+- Link vertical, horizontal and smooth scrolling between comparison panes; close both halves together and restore the previous layout while preserving other files opened in those panes.
+- Preview PNG, JPEG, SVG and other supported images in the GUI, with zoom, fit, panning, live reload and an editable SVG source view.
+- Cover image previews, paired diff scrolling, comparison cleanup and session recovery with core and GUI regression tests.
+
 ## 0.1.16 — 2026-10-20
 
 - Put a terminal program's copy (OSC 52) on the desktop clipboard immediately, again only with **Terminal programs may set the clipboard** allowed, instead of leaving it until the next explicit copy. The clipboard event is consumed once, so it is not repeated in later frames or restored from a saved one.

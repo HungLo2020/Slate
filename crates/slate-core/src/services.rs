@@ -107,11 +107,11 @@ pub enum Job {
     Spell(String),
 }
 pub enum IoJob {
-    Open(u64, PathBuf),
+    Open(u64, PathBuf, bool),
     PrepareSave(crate::saves::Preparation),
     FileOperation(crate::files::FileOperation),
     /// Reread a document's file, optionally decoding with a chosen encoding.
-    Reload(u64, u64, PathBuf, Option<String>),
+    Reload(u64, u64, PathBuf, Option<String>, bool),
     Save(
         u64,
         Document,
@@ -130,6 +130,7 @@ pub enum IoJob {
             Option<crate::fsio::Baseline>,
             Option<crate::document::FileStamp>,
             String,
+            bool,
         )>,
     ),
     Checkpoint(PathBuf, Workspace, u64),
@@ -280,18 +281,26 @@ impl Services {
                         let result = operation.run();
                         Reply::FileOperation(operation, result)
                     }
-                    IoJob::Open(id, path) => {
+                    IoJob::Open(id, path, images) => {
                         if path.is_dir() {
                             Reply::OpenedDirectory(id, path)
                         } else {
-                            Reply::Opened(id, Document::open(&path).map_err(|e| format!("{e:#}")))
+                            Reply::Opened(
+                                id,
+                                Document::open_for_frontend(&path, images)
+                                    .map_err(|e| format!("{e:#}")),
+                            )
                         }
                     }
-                    IoJob::Reload(id, version, path, encoding) => Reply::Reloaded(
+                    IoJob::Reload(id, version, path, encoding, image) => Reply::Reloaded(
                         id,
                         version,
-                        Document::open_with_encoding(&path, encoding.as_deref())
-                            .map_err(|e| format!("{e:#}")),
+                        (if image {
+                            Document::open_image(&path)
+                        } else {
+                            Document::open_with_encoding(&path, encoding.as_deref())
+                        })
+                        .map_err(|e| format!("{e:#}")),
                     ),
                     IoJob::Save(id, mut doc, destination, overwrite, options) => {
                         let prepared = doc.prepare_save(destination.as_deref(), overwrite);
@@ -349,9 +358,15 @@ impl Services {
                     IoJob::CheckDisk(entries) => {
                         let changes: Vec<_> = entries
                             .into_iter()
-                            .filter_map(|(id, path, baseline, stamp, encoding)| {
-                                crate::document::examine(&path, baseline.as_ref(), stamp, &encoding)
-                                    .map(|change| (id, change))
+                            .filter_map(|(id, path, baseline, stamp, encoding, image)| {
+                                crate::document::examine_content(
+                                    &path,
+                                    baseline.as_ref(),
+                                    stamp,
+                                    &encoding,
+                                    image,
+                                )
+                                .map(|change| (id, change))
                             })
                             .collect();
                         Reply::Disk(changes)

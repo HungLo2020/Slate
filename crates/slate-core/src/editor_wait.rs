@@ -20,13 +20,16 @@ impl Waiting {
 }
 impl App {
     pub(crate) fn queue_open(&mut self, path: PathBuf) -> Result<u64> {
+        self.queue_open_as(path, !self.terminal_frontend)
+    }
+    pub(crate) fn queue_open_as(&mut self, path: PathBuf, images: bool) -> Result<u64> {
         let path = if path.is_absolute() {
             path
         } else {
             self.root.join(path)
         };
         let token = self.id();
-        self.services.io.send(IoJob::Open(token, path))?;
+        self.services.io.send(IoJob::Open(token, path, images))?;
         self.pending_open.insert(token, self.focus);
         self.status = "Opening file…".into();
         Ok(token)

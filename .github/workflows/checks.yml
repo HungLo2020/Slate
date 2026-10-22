@@ -38,10 +38,10 @@ jobs:
         shell: sh
         run: |
           if command -v dnf >/dev/null; then
-            dnf install -y git gcc-c++ cmake pkgconf-pkg-config curl rust cargo qt6-qtbase-devel qt6-qtdeclarative-devel dejavu-sans-mono-fonts python3
+            dnf install -y git gcc-c++ cmake pkgconf-pkg-config curl rust cargo qt6-qtbase-devel qt6-qtdeclarative-devel qt6-qtsvg dejavu-sans-mono-fonts python3
           else
             apt-get update
-            apt-get install -y git g++ cmake pkg-config curl ca-certificates qt6-base-dev qt6-declarative-dev qml6-module-qtquick qml6-module-qtqml qml6-module-qtqml-models qml6-module-qtquick-controls qml6-module-qtquick-layouts qml6-module-qtquick-templates qml6-module-qtquick-window qml6-module-qtqml-workerscript fonts-dejavu-core python3 libglib2.0-bin
+            apt-get install -y git g++ cmake pkg-config curl ca-certificates qt6-base-dev qt6-declarative-dev qt6-svg-plugins qml6-module-qtquick qml6-module-qtqml qml6-module-qtqml-models qml6-module-qtquick-controls qml6-module-qtquick-layouts qml6-module-qtquick-templates qml6-module-qtquick-window qml6-module-qtqml-workerscript fonts-dejavu-core python3 libglib2.0-bin
           fi
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.98.0
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -49,11 +49,13 @@ jobs:
       - run: cargo build --package slate --package slate-gui --features slate-gui/smoke
       - run: python3 scripts/startup-smoke.py target/debug/slate
       - run: python3 scripts/gui-offscreen-smoke.py target/debug/slate
+      - run: python3 scripts/gui-image-smoke.py target/debug/slate-gui
       - run: SLATE_GUI_PRODUCTION_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: python3 scripts/gui-geometry-smoke.py target/debug/slate
       - run: SLATE_GUI_FEATURE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: SLATE_GUI_COMMAND_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: SLATE_GUI_TAB_CLOSE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
+      - run: SLATE_GUI_DIFF_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: SLATE_GUI_GIT_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: SLATE_GUI_DESKTOP_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
       - run: SLATE_GUI_IDE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate

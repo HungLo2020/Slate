@@ -644,7 +644,7 @@ impl App {
         let target = p.entries[*entry].target.clone();
         self.close_picker();
         match target {
-            Target::Location(mut location) => {
+            Target::Location(location) => {
                 if location.line == usize::MAX {
                     // A file without a position keeps its remembered caret.
                     if let Some(doc) = self.document_for(&location.path) {
@@ -652,7 +652,9 @@ impl App {
                         self.reveal_document(doc);
                         return Ok(());
                     }
-                    location.line = 0;
+                    self.remember_position();
+                    self.queue_open(location.path)?;
+                    return Ok(());
                 }
                 self.goto(location)
             }

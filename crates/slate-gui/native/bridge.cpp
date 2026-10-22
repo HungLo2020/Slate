@@ -15,6 +15,12 @@
 #include <QGuiApplication>
 #include <QHoverEvent>
 #include <QIcon>
+#include <QImageReader>
+#ifdef Q_OS_UNIX
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #include <QInputMethod>
 #include <QInputMethodEvent>
 #include <QJsonDocument>
@@ -51,6 +57,52 @@ extern "C" char *slate_request(void *, const char *);
 extern "C" void slate_response_free(char *);
 extern "C" void slate_set_waker(void *, void (*)(void *), void *);
 static Bridge *bridge = nullptr;
+QImage PreviewProvider::requestImage(const QString &id, QSize *size, const QSize &requested) {
+    const QString path = QString::fromUtf8(QByteArray::fromBase64(id.section('?', 0, 0).toLatin1(), QByteArray::Base64UrlEncoding));
+    QFile file(path);
+#ifdef Q_OS_UNIX
+    const int fd = ::open(QFile::encodeName(path).constData(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return {};
+    struct stat info;
+    if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size > 64 * 1024 * 1024) {
+        ::close(fd);
+        return {};
+    }
+    if (!file.open(fd, QIODevice::ReadOnly, QFileDevice::AutoCloseHandle)) {
+        ::close(fd);
+        return {};
+    }
+#else
+    if (!QFileInfo(path).isFile() || !file.open(QIODevice::ReadOnly) || file.size() > 64 * 1024 * 1024) return {};
+#endif
+    QImageReader reader(&file);
+    reader.setAutoTransform(true);
+    const QSize original = reader.size();
+    if (!original.isValid() || original.width() > 1000000 || original.height() > 1000000
+        || qint64(original.width()) * original.height() > 100000000) return {};
+    const QSize bound(qBound(1, requested.width(), 4096), qBound(1, requested.height(), 4096));
+    const QByteArray format = reader.format();
+    if (format == "svg" || format == "svgz") {
+        // Keep vector previews sharp through the supported zoom range,
+        // without inflating small vectors to a full 4096-pixel texture.
+        const QSize vectorBound(qMin(bound.width(), original.width() * 8), qMin(bound.height(), original.height() * 8));
+        reader.setScaledSize(original.scaled(vectorBound, Qt::KeepAspectRatio).expandedTo(QSize(1,1)));
+    } else if (original.width() > bound.width() || original.height() > bound.height())
+        reader.setScaledSize(original.scaled(bound, Qt::KeepAspectRatio).expandedTo(QSize(1,1)));
+    QImage image = reader.read();
+    if (image.isNull()) return {};
+    if (image.width() > bound.width() || image.height() > bound.height())
+        image = image.scaled(bound, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    QSize oriented = original;
+    if (reader.transformation() & QImageIOHandler::TransformationRotate90) oriented.transpose();
+    {
+        QMutexLocker lock(&m_mutex);
+        if (m_sizes.size() >= 128 && !m_sizes.contains(id)) m_sizes.erase(m_sizes.begin());
+        m_sizes.insert(id, oriented);
+    }
+    *size = oriented;
+    return image;
+}
 #ifdef SLATE_SMOKE_TEST
 void startSmoke(Bridge *, QQuickWindow *);
 #endif
@@ -376,6 +428,19 @@ void Bridge::attachView(int id, CellView *view) {
 }
 void Bridge::detachView(int id, CellView *view) {
     if (m_views.value(id) == view) m_views.remove(id);
+}
+void Bridge::linkComparisonScroll(CellView *source, int lines) {
+    const auto partner = source->pane().value("editor").toMap().value("comparison_partner");
+    if (partner.isNull() || !partner.isValid()) return;
+    for (auto view : m_views)
+        if (view != source && view->pane().value("editor").toMap().value("document") == partner)
+            view->setLinkedScroll(source->scrollPixels(), lines);
+}
+void CellView::setLinkedScroll(qreal pixels, int lines) {
+    m_scrollPixels = pixels;
+    m_requestedLines += lines;
+    emit scrollPixelsChanged();
+    update();
 }
 QVariantMap Bridge::send(const QVariantMap &command, QJsonObject *lists) {
     const auto action = command.value("action").toString();
@@ -1347,6 +1412,7 @@ void CellView::wheelEvent(QWheelEvent *e) {
             bridge->send({{"action", "scroll"}, {"pane", m_pane.value("id")}, {"delta", -lines}});
         }
         if (top == 0 && lines == 0 && m_scrollPixels < 0) m_scrollPixels = 0;
+        bridge->linkComparisonScroll(this, lines);
         emit scrollPixelsChanged();
         update();
     }
@@ -1609,6 +1675,9 @@ extern "C" int slate_qt_run(void *context, int argc, char **argv) {
     qmlRegisterSingletonType(QUrl("qrc:/slate/Theme.qml"), "Slate.Native", 1, 0, "Theme");
     QQmlApplicationEngine engine;
     engine.addImageProvider("icon", new IconProvider);
+    auto previews = new PreviewProvider;
+    state.setPreviewProvider(previews);
+    engine.addImageProvider("preview", previews);
     engine.rootContext()->setContextProperty("slate", &state);
     state.applyTheme();
     state.refresh();

@@ -59,7 +59,7 @@ fn main() -> Result<()> {
     }
     let original_arguments = arguments.clone();
     let (args, qt_arguments) = split_arguments(arguments);
-    let launch = cli::parse(args)?;
+    let mut launch = cli::parse(args)?;
     if launch.help {
         println!("{}", cli::USAGE);
         return Ok(());
@@ -71,6 +71,7 @@ fn main() -> Result<()> {
     if launch.frontend == Some(Frontend::Tui) {
         return slate_cli::run(cli::start(&launch)?);
     }
+    launch.frontend = Some(Frontend::Gui);
     let inherited_wait = slate_core::instance::WaitTicket::inherited()?;
     let smoke = std::env::var_os("SLATE_GUI_SMOKE_DIR").is_some();
     let instance_enabled = !smoke || std::env::var_os("SLATE_GUI_WAIT_SMOKE").is_some();
