@@ -2455,9 +2455,14 @@ static void startImageSmoke(Bridge *state, QQuickWindow *window) {
             state->send({{"action", "paste"}, {"text", "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"240\" height=\"160\"><rect width=\"240\" height=\"160\" fill=\"red\"/></svg>"}});
             invoke("save"); break;
         }
-        case 7:
-            if (!state->frame().value("status").toString().startsWith("Saved")) return;
+        case 7: {
+            // The image watcher can replace the transient "Saved" status
+            // before this timer runs. Wait for the completed save itself.
+            QFile saved(vector);
+            if (state->frame().value("dirty").toBool() || !saved.open(QIODevice::ReadOnly)
+                || !saved.readAll().contains("width=\"240\"")) return;
             invoke("image-preview"); break;
+        }
         case 8:
             if (!ready() || control("imageViewer")->property("naturalWidth").toDouble() != 240) return;
             // The saved source is no longer needed. Leaving it open would

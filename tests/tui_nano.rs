@@ -443,7 +443,7 @@ fn permission_denied_offers_a_sudo_save() {
     tui.send(b"\x13");
     tui.wait_for("save with sudo");
     tui.send("y");
-    tui.wait_for("with sudo");
+    tui.wait_for("Saved with sudo");
     let data = fs::read_to_string(env.path("sudo-record.data")).unwrap();
     let (header, data) = data.split_once('\n').unwrap();
     let baseline: slate_core::fsio::Baseline = serde_json::from_str(header).unwrap();
@@ -507,7 +507,7 @@ fn ctrl_c_at_the_sudo_password_prompt_cancels_the_save_but_not_slate() {
     tui.send("y");
     tui.wait_for("Password for fake sudo");
     tui.send("secret\r");
-    tui.wait_for("with sudo");
+    tui.wait_for("Saved with sudo");
     tui.wait_gone(" *");
     let data = fs::read_to_string(&record).unwrap();
     assert!(data.split_once('\n').unwrap().1.starts_with("edited-"));
