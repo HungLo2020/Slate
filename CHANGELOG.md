@@ -3,7 +3,7 @@
 ## 0.1.18 — 2026-10-25
 
 - Keep horizontal scrolling in unwrapped GUI editors when the minimap is hidden: the editor still sends its document width, so the bottom scrollbar works in narrow panes and with the minimap switched off.
-- Move the development smoke tests and dependency policy into `DevUtils/`, document that layout and the shared coding standards in the README's **AGENTS** section, and add a `release` skill that bumps the version and verifies the pushed commit's workflows.
+- Move the development smoke tests and dependency policy into `DevUtils/`, document that layout and the shared coding standards in the README's **AGENTS** section, and add a `release` skill that bumps the version, verifies the pushed commit's workflows and publishes the package to MattPackages.
 
 ## 0.1.17 — 2026-10-22
 

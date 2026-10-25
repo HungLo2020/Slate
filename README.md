@@ -1045,5 +1045,6 @@ GUI and terminal behaviour changes need the matching smoke test from
 **Validation**.
 
 Do not change `[workspace.package].version` in `Cargo.toml`, edit `CHANGELOG.md`
-for a release, or publish a package unless the task asks for a release. Releasing
-is covered by the `release` skill in `.agents/skills/release/SKILL.md`.
+for a release, or publish a package unless the task asks for a release. Releasing,
+including the MattPackages publication, is covered by the `release` skill in
+`.agents/skills/release/SKILL.md`.

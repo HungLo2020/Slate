@@ -1,14 +1,14 @@
 ---
 name: release
-description: Bump Slate's version, update CHANGELOG.md, commit, push to main and wait until every GitHub workflow for that commit succeeds. Use when asked to cut, bump or publish a Slate release, or to "release version X".
+description: Bump Slate's version, update CHANGELOG.md, commit, push to main, wait until every GitHub workflow for that commit succeeds, then publish the package to MattPackages. Use when asked to cut, bump or publish a Slate release, or to "release version X".
 ---
 
 # Slate release
 
 Cuts a Slate release: bump the workspace version, record it in `CHANGELOG.md`,
-commit, push to `main`, and stay with the run until every workflow for that
-commit is green. Stop and report rather than guessing whenever a precondition
-fails.
+commit, push to `main`, wait until every workflow for that commit is green, and
+publish the package to the MattPackages repository. Stop and report rather than
+guessing whenever a precondition fails.
 
 ## 1. Preconditions
 
@@ -171,18 +171,59 @@ Fix the cause, re-run the gate from step 6, and push a **new** commit (never
 amend a pushed commit). Update the version only if the fix changes released
 behaviour enough to justify it. Re-check every run for the new `$sha`.
 
-## 10. Report
+## 10. Publish to MattPackages
+
+Publish only after step 9 is green for the exact commit you are publishing,
+because the guard in `DevUtils/PublishMattOSPackage.py` re-checks all of it.
+Skip this step only when the task says not to publish.
+
+```bash
+python3 DevUtils/PublishMattOSPackage.py doctor
+python3 DevUtils/PublishMattOSPackage.py publish
+```
+
+- `doctor` checks the repository manager, server access and credentials. Fix
+  anything it reports before publishing.
+- `publish` downloads the pinned `ManageMattOSRepository.py` into the ignored
+  `DevUtils/.downloaded/` directory, verifies its SHA-256 and never falls back to
+  a cached copy.
+- It refuses to upload when the tree is dirty, the branch is not `main`, `HEAD`
+  differs from `origin/main`, the latest **Slate checks** `push` run for `HEAD`
+  is missing or not successful, the version already exists in the index, or the
+  package was not built from that clean `HEAD`
+  (`X-Slate-Source-Commit` = `HEAD`, `X-Slate-Source-Dirty` = `false`).
+- It rebuilds through `DevUtils/Build.sh` itself, so a `.deb` left in `builds/`
+  from an earlier dirty run is not reused — expect a full build. It repeats the
+  "version must be new" check after building, so a concurrent publish fails
+  safely. `--package PATH` publishes an existing `.deb` only if its embedded
+  source commit matches `HEAD` and it is marked clean.
+- `publish --dry-run` builds and validates everything without uploading. Use it
+  when the server or credentials are uncertain; it still does a full build.
+- It needs `gh` with `repo` scope, since it reads the branch and workflow runs,
+  plus the manager's server credentials.
+
+Verify the upload from the public index:
+
+```bash
+curl -fsS https://mattpackages.mattsherfey.com/dists/stable/main/binary-amd64/Packages \
+  | grep -A2 '^Package: slate$' | head -3        # must show the new Version
+```
+
+On a client machine the package then arrives through the normal APT update.
+
+## 11. Report
 
 Give the version, the commit SHA, the link to the **Slate checks** run, the gate
-results, anything skipped (for example the manual DEB workflow, or a reduced
-gate on a host without Qt), and any workflow that is still running.
+results, the publication result with the version read back from the index,
+anything skipped (for example the manual DEB workflow, or a reduced gate on a
+host without Qt), and any workflow that is still running.
 
 ## Do not
 
-- Publish to MattPackages. `DevUtils/PublishMattOSPackage.py publish` is a
-  separate, explicitly requested step; it requires clean, committed, pushed
-  `main`, a passing latest **Slate checks** push run for that exact commit, and a
-  package embedding that commit. `--dry-run` is safe when asked for.
 - Tag or create a GitHub release unless the task asks for it.
 - Push to a branch other than `main`, or force-push.
+- Amend a commit that is already pushed. A fix after pushing is a new commit,
+  which needs its own green **Slate checks** run before publishing.
 - Bump the version for unreleased work that the task did not ask to release.
+- Publish when the task explicitly says not to, or when any step 9 run for the
+  release commit is not green.
