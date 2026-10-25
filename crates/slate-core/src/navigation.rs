@@ -58,7 +58,7 @@ impl App {
         self.documents
             .iter()
             .find(|(_, d)| {
-                d.image.is_none()
+                !d.non_text()
                     && d.path
                         .as_deref()
                         .is_some_and(|p| p == path || resolved.as_deref() == Some(p))

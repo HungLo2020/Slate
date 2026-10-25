@@ -777,6 +777,8 @@ ApplicationWindow {
                         grid.forceActiveFocus();
                     else if (paneData.kind === "image")
                         imageLoader.item && imageLoader.item.forceActiveFocus();
+                    else if (paneData.kind === "media")
+                        mediaLoader.item && mediaLoader.item.forceActiveFocus();
                     else if (paneData.kind === "git")
                         gitLoader.item && gitLoader.item.focusContent();
                     else
@@ -973,6 +975,44 @@ ApplicationWindow {
                         }
                     }
                 }
+                Loader {
+                    id: mediaLoader
+                    objectName: "mediaLoader_" + panel.paneId
+                    x: grid.x
+                    y: grid.y
+                    width: panel.width - x
+                    height: panel.height - y
+                    active: panel.paneData.kind === "media"
+                    // A separate file so a missing Qt Multimedia module only
+                    // fails this loader, never the window.
+                    source: active ? "AudioPlayer.qml" : ""
+                    onLoaded: {
+                        item.paneId = panel.paneId;
+                        item.bridge = slate;
+                        item.mediaData = Qt.binding(function() { return panel.paneData.media || ({}); });
+                        item.sendCommand = function(command) { root.send(command); };
+                        item.invoke = function(id) { root.invokeAction(id, "", panel.paneId); };
+                    }
+                }
+                // Shown when Qt Multimedia is not installed.
+                Rectangle {
+                    objectName: "mediaUnavailable_" + panel.paneId
+                    visible: panel.paneData.kind === "media" && mediaLoader.status === Loader.Error
+                    x: grid.x
+                    y: grid.y
+                    width: panel.width - x
+                    height: panel.height - y
+                    color: Theme.viewBackgroundColor
+                    Label {
+                        anchors.centerIn: parent
+                        width: Math.max(1, parent.width - 32)
+                        horizontalAlignment: Text.AlignHCenter
+                        wrapMode: Text.Wrap
+                        textFormat: Text.PlainText
+                        text: "Audio playback needs the Qt Multimedia module.\n"
+                            + "Install qml6-module-qtmultimedia (Debian/Ubuntu) or qt6-multimedia (Fedora)."
+                    }
+                }
                 CellView {
                     id: grid
                     objectName: "cells_" + panel.paneId
@@ -1017,34 +1057,50 @@ ApplicationWindow {
                 ScrollBar {
                     id: editorScroll
                     objectName: "editorScroll_" + panel.paneId
-                    visible: panel.paneData.kind === "editor" && !!panel.paneData.editor
+                    // Wrapped rows make the content taller than the line count, so
+                    // the thumb is approximate there, but both ends stay reachable.
+                    readonly property var editorMeta: panel.paneData.editor || null
+                    readonly property bool wrapped: !!editorMeta && !!editorMeta.soft_wrap
+                    readonly property int lineCount: editorMeta ? Math.max(1, editorMeta.line_count) : 1
+                    readonly property int viewRows: panel.paneData.rows || 1
+                    readonly property int maxTop: !editorMeta ? 0
+                        : wrapped ? Math.max(0, lineCount - 1)
+                        : Math.max(0, lineCount - viewRows)
+                    readonly property real travel: Math.max(0, 1 - size)
+                    visible: panel.paneData.kind === "editor" && !!editorMeta
                     x: Math.max(0, panel.width - width - 2)
                     y: grid.y
                     height: grid.height
                     orientation: Qt.Vertical
                     policy: ScrollBar.AsNeeded
-                    size: panel.paneData.editor ? Math.min(1, panel.paneData.rows / Math.max(1, panel.paneData.editor.line_count)) : 1
-                    position: panel.paneData.editor ? panel.paneData.editor.top / Math.max(1, panel.paneData.editor.line_count) : 0
-                    onPositionChanged: if (pressed)
+                    size: Math.min(1, viewRows / lineCount)
+                    position: maxTop > 0 && travel > 0
+                        ? Math.min(travel, editorMeta.top / maxTop * travel) : 0
+                    onPositionChanged: if (pressed && maxTop > 0 && travel > 0)
                         root.sendLater({
                             "action": "scroll_to",
                             "pane": panel.paneId,
-                            "line": Math.round(position * panel.paneData.editor.line_count)
+                            "line": Math.round(position / travel * maxTop)
                         })
                     Accessible.name: "Document scroll position"
                 }
                 ScrollBar {
                     id: horizontalScroll
                     objectName: "horizontalScroll_" + panel.paneId
-                    readonly property int contentColumns: minimap.widest
-                    readonly property int scrollColumn: panel.paneData.editor ? panel.paneData.editor.left : 0
-                    visible: panel.isEditor && panel.paneData.editor && !panel.paneData.editor.soft_wrap && contentColumns > panel.paneData.cols
+                    readonly property var editorMeta: panel.paneData.editor || null
+                    readonly property int contentColumns: editorMeta ? editorMeta.widest : 0
+                    readonly property int gutterColumns: editorMeta ? editorMeta.gutter : 0
+                    readonly property int usableColumns: Math.max(1, (panel.paneData.cols || 0) - gutterColumns)
+                    readonly property int scrollColumn: editorMeta ? editorMeta.left : 0
+                    visible: panel.isEditor && !!editorMeta && !editorMeta.soft_wrap && contentColumns > usableColumns
                     x: grid.x
                     y: grid.y + grid.height
                     width: grid.width
                     orientation: Qt.Horizontal
                     policy: ScrollBar.AsNeeded
-                    size: Math.min(1, panel.paneData.cols / Math.max(1, contentColumns))
+                    // The thumb spans the text the pane can show, and travels the
+                    // columns the core lets it scroll: the widest line minus those.
+                    size: Math.min(1, usableColumns / Math.max(1, contentColumns))
                     position: scrollColumn / Math.max(1, contentColumns)
                     onPositionChanged: if (pressed)
                         root.sendLater({

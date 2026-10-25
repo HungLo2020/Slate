@@ -434,12 +434,18 @@ void Bridge::linkComparisonScroll(CellView *source, int lines) {
     if (partner.isNull() || !partner.isValid()) return;
     for (auto view : m_views)
         if (view != source && view->pane().value("editor").toMap().value("document") == partner)
-            view->setLinkedScroll(source->scrollPixels(), lines);
+            view->setLinkedScroll(source->scrollPixels(), lines, source->scrollColumns(),
+                                  source->targetLeft());
 }
-void CellView::setLinkedScroll(qreal pixels, int lines) {
+void CellView::setLinkedScroll(qreal pixels, int lines, qreal columns, int left) {
     m_scrollPixels = pixels;
+    m_scrollColumns = columns;
+    // The partner did not ask for this column, so adopt it as its own target:
+    // the frame that follows a linked scroll must not drop the shared offset.
+    if (left >= 0) m_targetLeft = left;
     m_requestedLines += lines;
     emit scrollPixelsChanged();
+    emit scrollColumnsChanged();
     update();
 }
 QVariantMap Bridge::send(const QVariantMap &command, QJsonObject *lists) {
@@ -823,6 +829,8 @@ void CellView::setPaneId(int id) {
     if (bridge) bridge->detachView(m_paneId, this);
     m_paneId = id;
     m_inputContextAt = ~0ull;
+    m_scrollColumns = 0;
+    m_targetLeft = -1;
     if (bridge) bridge->attachView(id, this);
     emit paneIdChanged();
 }
@@ -830,6 +838,8 @@ void CellView::fontChanged() {
     m_lines.clear();
     m_lines.resize(m_lineData.size());
     m_scrollPixels = 0;
+    m_scrollColumns = 0;
+    m_targetLeft = -1;
     update();
 }
 void CellView::restartBlink() {
@@ -870,6 +880,23 @@ void CellView::setPane(const QVariantMap &pane) {
     if (kindChanged && m_scrollPixels != 0) {
         m_scrollPixels = 0;
         emit scrollPixelsChanged();
+    }
+    // Horizontal scrolling is column-based in the core: keep the sub-cell
+    // remainder only when the core moved the view where we asked. A clamp at an
+    // edge, a caret-follow scroll or a comparison sync resets it.
+    {
+        const auto editor = pane.value("editor").toMap();
+        const int left = editor.value("left", -1).toInt();
+        const bool wrapped = editor.value("soft_wrap").toBool();
+        if (!isEditor() || wrapped || m_targetLeft < 0 || left != m_targetLeft) {
+            m_targetLeft = isEditor() ? left : -1;
+            if (m_scrollColumns != 0) {
+                m_scrollColumns = 0;
+                bridge->linkComparisonScroll(this, 0);
+                emit scrollColumnsChanged();
+                update();
+            }
+        }
     }
     // A cursor-driven scroll (not the wheel) aligns rows to the top again.
     const int top = pane.value("editor").toMap().value("top", -1).toInt();
@@ -958,7 +985,8 @@ QRect CellView::accessibleCharacterRect(int offset) const {
     const auto position = accessibleRequest("accessible_position", {{"offset", offset}});
     if (!position.contains("row")) return {};
     const int row = position.value("row").toInt(), col = position.value("col").toInt();
-    const QRectF local(cursorX(row, col), row * bridge->cellHeight() - m_scrollPixels, bridge->cellWidth(), bridge->cellHeight());
+    const QRectF local(cursorX(row, col) - (isEditor() ? m_scrollColumns : 0),
+                       row * bridge->cellHeight() - m_scrollPixels, bridge->cellWidth(), bridge->cellHeight());
     const auto scene = mapRectToScene(local).toRect();
     return QRect(window()->mapToGlobal(scene.topLeft()), scene.size());
 }
@@ -993,7 +1021,7 @@ qreal CellView::cursorX(int row, int column) const {
 QRectF CellView::cursorRectangle() const {
     if (m_cursor.size() != 2 || !bridge) return {};
     const int row = m_cursor[0].toInt(), col = m_cursor[1].toInt();
-    const qreal x = 1 + (isEditor() ? cursorX(row, col) : col * bridge->cellWidth());
+    const qreal x = 1 + (isEditor() ? cursorX(row, col) - m_scrollColumns : col * bridge->cellWidth());
     // Only editors scroll by pixels; terminals draw rows at fixed positions.
     const qreal offset = isEditor() ? m_scrollPixels : 0;
     return QRectF(x, 1 + row * bridge->cellHeight() - offset, bridge->cellWidth(), bridge->cellHeight());
@@ -1067,6 +1095,11 @@ void CellView::paint(QPainter *p) {
     const QRectF clip = p->hasClipping() ? p->clipBoundingRect() : boundingRect();
     if (editor) {
         layoutText();
+        // A sub-cell horizontal offset scrolls the text under the gutter: draw
+        // the gutter cells where they are and the text shifted, so line numbers
+        // never move and the columns stay aligned to the wheel.
+        const qreal shift = m_scrollColumns;
+        const qreal gutter = shift == 0 ? 0 : gutterPixels();
         for (int row = 0; row < int(m_lines.size()); ++row) {
             if (!m_lines[row]) continue;
             const qreal y = 1 + row * ch - offset;
@@ -1074,7 +1107,21 @@ void CellView::paint(QPainter *p) {
             if (y + ch < clip.top()) continue;
             QList<QTextLayout::FormatRange> overlays;
             for (const auto &span : m_overlays[row]) overlays.append(textFormat(span.toMap(), true));
-            m_lines[row]->draw(p, QPointF(1, y), overlays);
+            if (shift == 0) {
+                m_lines[row]->draw(p, QPointF(1, y), overlays);
+                continue;
+            }
+            if (gutter > 0) {
+                p->save();
+                p->setClipRect(clip.intersected(QRectF(0, y, gutter, ch)), Qt::IntersectClip);
+                m_lines[row]->draw(p, QPointF(1, y), overlays);
+                p->restore();
+            }
+            p->save();
+            p->setClipRect(clip.intersected(QRectF(gutter, y, width() - gutter, ch)),
+                           Qt::IntersectClip);
+            m_lines[row]->draw(p, QPointF(1 - shift, y), overlays);
+            p->restore();
         }
     } else if (const auto grid = bridge->terminal(m_paneId)) {
         // Runs of cells with the same style are drawn together; wide and
@@ -1312,12 +1359,53 @@ int CellView::columnAt(int row, qreal x) const {
     int column = qMax(0, int(x - 1) / bridge->cellWidth());
     if (isEditor()) {
         layoutText();
+        // Text is drawn shifted by the sub-cell scroll; the gutter is not.
+        const qreal gutter = gutterPixels();
+        const qreal local = x >= gutter ? x + m_scrollColumns : x;
+        if (local >= gutter || gutter == 0) column = qMax(0, int(local - 1) / bridge->cellWidth());
         if (row < int(m_lines.size()) && m_lines[row] && m_lines[row]->lineCount() > 0) {
-            const int position = m_lines[row]->lineAt(0).xToCursor(qMax(0.0, x - 1));
+            const int position = m_lines[row]->lineAt(0).xToCursor(qMax(0.0, local - 1));
             column = m_columns[row].value(position, column);
         }
     }
     return column;
+}
+int CellView::gutterPixels() const {
+    if (!bridge) return 0;
+    return m_pane.value("editor").toMap().value("gutter").toInt() * bridge->cellWidth();
+}
+void CellView::scrollHorizontally(qreal pixels) {
+    if (!isEditor() || !bridge) return;
+    const auto editor = m_pane.value("editor").toMap();
+    const int cw = qMax(1, bridge->cellWidth());
+    auto stop = [this]() {
+        if (m_scrollColumns == 0) return;
+        m_scrollColumns = 0;
+        emit scrollColumnsChanged();
+        update();
+    };
+    if (editor.value("soft_wrap").toBool()) {
+        stop();
+        return;
+    }
+    // The wheel and the scrollbar share one limit: the widest line minus the
+    // columns the gutter leaves for text.
+    const int usable = qMax(1, m_pane.value("cols").toInt() - editor.value("gutter").toInt());
+    const int maxLeft = qMax(0, editor.value("widest").toInt() - usable);
+    if (m_targetLeft < 0) m_targetLeft = editor.value("left").toInt();
+    const qreal offset =
+        qBound<qreal>(0, m_targetLeft * cw + m_scrollColumns + pixels, maxLeft * cw);
+    const int left = int(offset) / cw;
+    m_scrollColumns = offset - left * cw;
+    if (left != m_targetLeft) {
+        bridge->send({{"action", "scroll_columns"},
+                      {"pane", m_paneId},
+                      {"delta", left - m_targetLeft}});
+        m_targetLeft = left;
+    }
+    bridge->linkComparisonScroll(this, 0);
+    emit scrollColumnsChanged();
+    update();
 }
 void CellView::hoverLeaveEvent(QHoverEvent *e) {
     m_hoverTimer.stop();
@@ -1390,14 +1478,7 @@ void CellView::wheelEvent(QWheelEvent *e) {
         e->accept();
         return;
     }
-    if (pixels.x() != 0) {
-        m_wheelColumns -= pixels.x();
-        const int columns = int(m_wheelColumns / cw);
-        if (columns != 0) {
-            m_wheelColumns -= columns * cw;
-            bridge->send({{"action", "scroll_columns"}, {"pane", m_pane.value("id")}, {"delta", columns}});
-        }
-    }
+    if (pixels.x() != 0) scrollHorizontally(-pixels.x());
     if (pixels.y() != 0) {
         const int top = m_pane.value("editor").toMap().value("top").toInt();
         m_scrollPixels -= pixels.y();

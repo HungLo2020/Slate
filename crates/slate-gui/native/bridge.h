@@ -273,6 +273,7 @@ class CellView : public QQuickPaintedItem {
     Q_PROPERTY(QVariantMap pane READ pane NOTIFY paneChanged)
     Q_PROPERTY(qulonglong layoutBuilds READ layoutBuilds)
     Q_PROPERTY(qreal scrollPixels READ scrollPixels NOTIFY scrollPixelsChanged)
+    Q_PROPERTY(qreal scrollColumns READ scrollColumns NOTIFY scrollColumnsChanged)
   public:
     CellView(QQuickItem *parent = nullptr);
     ~CellView() override;
@@ -280,7 +281,12 @@ class CellView : public QQuickPaintedItem {
     void setPaneId(int id);
     qulonglong layoutBuilds() const { return m_layoutBuilds; }
     qreal scrollPixels() const { return m_scrollPixels; }
-    void setLinkedScroll(qreal pixels, int lines);
+    // The sub-cell part of a horizontal scroll: content shifts left by this
+    // many pixels while the gutter stays put.
+    qreal scrollColumns() const { return m_scrollColumns; }
+    // The column the core was last asked for, so a linked pane adopts it.
+    int targetLeft() const { return m_targetLeft; }
+    void setLinkedScroll(qreal pixels, int lines, qreal columns = 0, int left = -1);
     void applySurface(const QVariantMap &patch);
     QVariantMap pane() const { return m_pane; }
     // The editor's input context, fetched once per state change however
@@ -301,6 +307,7 @@ class CellView : public QQuickPaintedItem {
     void paneChanged();
     void paneIdChanged();
     void scrollPixelsChanged();
+    void scrollColumnsChanged();
     void contextMenuRequested(qreal x, qreal y);
 
   protected:
@@ -336,7 +343,14 @@ class CellView : public QQuickPaintedItem {
     qreal m_scrollPixels = 0;
     int m_lastTop = -1;
     int m_requestedLines = 0;
-    qreal m_wheelColumns = 0, m_wheelTerminal = 0, m_wheelZoom = 0;
+    // Pixel-smooth horizontal scrolling: content is shifted left by this
+    // fraction of a cell, and `m_targetLeft` is the column the core was last
+    // asked for, so a clamped request drops the leftover pixels.
+    qreal m_scrollColumns = 0;
+    int m_targetLeft = -1;
+    void scrollHorizontally(qreal pixels);
+    int gutterPixels() const;
+    qreal m_wheelTerminal = 0, m_wheelZoom = 0;
     QTimer m_blink;
     bool m_cursorShown = true;
     // Language-server hover text for the text the mouse rests on.

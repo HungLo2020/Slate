@@ -55,7 +55,7 @@ impl App {
             .filter(|(id, _)| !self.saves.pending_save.contains(id))
             .filter_map(|(id, d)| {
                 d.watch_entry().map(|(path, baseline, stamp, encoding)| {
-                    (*id, path, baseline, stamp, encoding, d.image.is_some())
+                    (*id, path, baseline, stamp, encoding, d.non_text())
                 })
             })
             .collect();
@@ -85,7 +85,7 @@ impl App {
                         document.mark_unavailable();
                         document.stamp = None;
                         document.generation += 1;
-                        self.status = if document.image.is_some() {
+                        self.status = if document.non_text() {
                             format!("{title} was deleted or moved on disk")
                         } else {
                             format!("{title} was deleted or moved on disk; save to recreate it")
@@ -243,9 +243,13 @@ impl App {
         {
             return;
         }
-        let widest = self.overview_for(self.views[&id].document).widest;
+        let doc = self.views[&id].document;
+        let widest = self.overview_for(doc).widest;
+        // The last column that can still show new text: the widest line minus
+        // the columns the gutter and the pane leave for text. Stopping here
+        // keeps the wheel, the scrollbar and the caret in one coordinate space.
+        let limit = widest.saturating_sub(self.text_width(id));
         let view = self.views.get_mut(&id).unwrap();
-        let limit = widest.saturating_sub(view.cols as usize / 2);
         view.left = (view.left as i64 + delta as i64).clamp(0, limit as i64) as usize;
         view.manual_scroll = true;
         self.sync_comparison_scroll(id, false, true);

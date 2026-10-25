@@ -165,7 +165,31 @@ impl App {
             let mut text = None;
             let (kind, screen, selected) = match view {
                 View::Editor(view) => {
-                    if self.documents[&self.views[&view].document].image.is_some() {
+                    let document = &self.documents[&self.views[&view].document];
+                    if document.media.is_some() {
+                        if graphical || !self.terminal_frontend {
+                            ("media", None, 0)
+                        } else {
+                            let mut cells =
+                                vec![vec![terminal::Cell::text(" "); cols as usize]; rows as usize];
+                            for (cell, ch) in cells[0]
+                                .iter_mut()
+                                .zip("Audio: play this file in slate-gui.".chars())
+                            {
+                                *cell = terminal::Cell::text(ch.to_string());
+                            }
+                            (
+                                "editor",
+                                Some(std::sync::Arc::new(Screen {
+                                    cells,
+                                    cursor: None,
+                                    rows,
+                                    cols,
+                                })),
+                                0,
+                            )
+                        }
+                    } else if document.image.is_some() {
                         if graphical || !self.terminal_frontend {
                             ("image", None, 0)
                         } else {
@@ -209,6 +233,32 @@ impl App {
                 View::Git => ("git", None, self.git.selected),
             };
             panes.push(PaneSnapshot {
+                media: match view {
+                    View::Editor(v) => {
+                        let view = &self.views[&v];
+                        let doc = &self.documents[&view.document];
+                        doc.media.as_ref().map(|media| media::MediaPresentation {
+                            document: view.document,
+                            path: doc
+                                .path
+                                .as_ref()
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                            bytes: media.bytes,
+                            generation: doc.generation,
+                            volume: view.media.volume,
+                            muted: view.media.muted,
+                            loop_playback: view.media.loop_playback,
+                            rate: view.media.rate,
+                            position_ms: view.media.position_ms,
+                            duration_ms: view.media.duration_ms,
+                            playing: view.media.playing,
+                            error: view.media.error.clone(),
+                            unavailable: doc.unavailable_flag(),
+                        })
+                    }
+                    _ => None,
+                },
                 image: match view {
                     View::Editor(v) => {
                         let view = &self.views[&v];
@@ -251,7 +301,7 @@ impl App {
                     _ => false,
                 },
                 editor: match view {
-                    View::Editor(v) if self.documents[&self.views[&v].document].image.is_none() => {
+                    View::Editor(v) if !self.documents[&self.views[&v].document].non_text() => {
                         Some(self.editor_metadata(v))
                     }
                     _ => None,
@@ -342,20 +392,38 @@ impl App {
             _ => None,
         }
     }
-    pub(crate) fn editor_metadata(&self, id: u64) -> EditorMetadata {
-        let v = &self.views[&id];
-        let doc = &self.documents[&v.document];
+    pub(crate) fn editor_metadata(&mut self, id: u64) -> EditorMetadata {
+        let (document, line_count, top, left, cursor, anchor, cols) = {
+            let v = &self.views[&id];
+            let doc = &self.documents[&v.document];
+            (
+                v.document,
+                doc.line_count(),
+                v.top,
+                v.left,
+                v.cursor,
+                v.anchor,
+                v.cols,
+            )
+        };
+        // Frontends draw the gutter and clamp horizontal scrolling, so they
+        // need its width and the document's widest line in the same frame.
+        let gutter = self.gutter_width(document, cols.max(1));
+        let widest = self.overview_for(document).widest;
+        let doc = &self.documents[&document];
         EditorMetadata {
-            cursor: v.cursor,
-            anchor: v.anchor.unwrap_or(v.cursor),
-            line_count: doc.line_count(),
-            top: v.top,
-            left: v.left,
-            document: v.document,
+            cursor,
+            anchor: anchor.unwrap_or(cursor),
+            line_count,
+            top,
+            left,
+            widest,
+            gutter,
+            document,
             generation: doc.generation,
             overview_revision: self.overview_revision,
-            soft_wrap: self.preferences_for_document(v.document).soft_wrap,
-            comparison_partner: self.comparison_partner(v.document),
+            soft_wrap: self.preferences_for_document(document).soft_wrap,
+            comparison_partner: self.comparison_partner(document),
         }
     }
     pub(crate) fn editor_presentation(&self, id: u64) -> EditorPresentation {
@@ -567,6 +635,9 @@ impl App {
         let render_rows = rows as usize + usize::from(graphical);
         let visible = self.visible_rows(id, render_rows);
         let show_whitespace = self.preferences.show_whitespace;
+        // Without line numbers the gutter stays blank for continuation rows and
+        // marks, so a number is only drawn when it is switched on.
+        let line_numbers = self.preferences.line_numbers;
         let whitespace_color = Rgb::parse(&desktop::blend(&self.colors.0, &self.colors.1, 0.6));
         // The theme's colours, parsed once rather than cloned per cell.
         let (text_fg, text_bg, selection_bg, accent) = (
@@ -672,7 +743,7 @@ impl App {
                 cells[y].resize_with(gutter, || Cell::text(" "));
             }
             if gutter > 0 {
-                let number = if row.start == 0 {
+                let number = if row.start == 0 && line_numbers {
                     format!(
                         "{:>width$}{} ",
                         line + 1,
@@ -705,6 +776,14 @@ impl App {
                         mark.text = "▾".into();
                         mark.fg = whitespace_color;
                     }
+                } else if wrapping && gutter >= 2 {
+                    // A wrapped row without its own number points back at the
+                    // line it continues, so the break is visible in the gutter.
+                    // U+21B3 is present in monospace terminal fonts (U+2937 is
+                    // not), so the cell keeps its width in both frontends.
+                    let mark = &mut cells[y][gutter - 2];
+                    mark.text = "↳".into();
+                    mark.fg = whitespace_color;
                 }
             }
             // The first byte to draw: the row start, or the horizontal scroll column.

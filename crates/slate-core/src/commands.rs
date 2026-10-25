@@ -66,6 +66,48 @@ pub fn display_chord(chord: &str) -> String {
 // IDs also retain the existing command-line spelling for scripting compatibility.
 const ACTIONS: &[(&str, &str, &str, &str, &str)] = &[
     (
+        "media-toggle",
+        "Play or pause audio",
+        "Start or pause the audio tab",
+        "",
+        "media",
+    ),
+    (
+        "media-stop",
+        "Stop audio",
+        "Stop the audio tab and rewind it",
+        "",
+        "media",
+    ),
+    (
+        "media-mute",
+        "Mute audio",
+        "Mute or unmute the audio tab",
+        "",
+        "media",
+    ),
+    (
+        "media-loop",
+        "Loop audio",
+        "Repeat the audio tab when it ends",
+        "",
+        "media",
+    ),
+    (
+        "media-volume-up",
+        "Louder",
+        "Raise the audio volume",
+        "",
+        "media",
+    ),
+    (
+        "media-volume-down",
+        "Quieter",
+        "Lower the audio volume",
+        "",
+        "media",
+    ),
+    (
         "image-source",
         "Open SVG as Text",
         "Edit the SVG source in a text tab",
@@ -1260,7 +1302,7 @@ impl App {
             }
             _ => None,
         };
-        let editor = document.filter(|d| d.image.is_none());
+        let editor = document.filter(|d| !d.non_text());
         let selected = self.git.entries.get(selection.unwrap_or(self.git.selected));
         let git_ready = self.git.repository && !self.git.restricted && self.git.jobs == 0;
         let mut results = Vec::new();
@@ -1280,6 +1322,7 @@ impl App {
                             d.image.is_some() && d.path.as_deref().is_some_and(crate::images::svg)
                         })
                 }
+                "media" => !self.terminal_frontend && document.is_some_and(|d| d.media.is_some()),
                 "image-source" => {
                     !self.terminal_frontend
                         && editor.is_some_and(|d| {
@@ -1307,7 +1350,7 @@ impl App {
                 }
                 "pane" => !self.editor_only && self.layout.panes().len() > 1,
                 "file" => document.is_some_and(|d| {
-                    d.path.is_some() && d.label.is_none() && (d.image.is_none() || id == "reload")
+                    d.path.is_some() && d.label.is_none() && (!d.non_text() || id == "reload")
                 }),
                 "terminal-ui" => self.terminal_frontend,
                 "graphical" => !self.terminal_frontend,
@@ -1405,6 +1448,10 @@ impl App {
             } else {
                 match scope {
                     "closable" => "Focus an editor or terminal",
+                    "media" if self.terminal_frontend => {
+                        "Audio playback is available in the graphical interface"
+                    }
+                    "media" => "Focus an audio tab",
                     "edit" => "Focus an editable document",
                     "write" => "Focus an editable document or terminal",
                     "editor" => "Focus an editor",

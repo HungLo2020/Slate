@@ -23,8 +23,12 @@ contributors should start with `Build.sh`, which runs the full local gate.
 | Directory | Coverage |
 | --- | --- |
 | `SmokeTests/Terminal/` | PTY-driven checks: editing and saving (`tui-smoke.py`), startup modes, tab closing, crash recovery and idle CPU. CI also runs the recovery check against `slate-gui`. |
-| `SmokeTests/Gui/` | Qt Quick checks: offscreen feature/settings runs, image previews, geometry and large fonts, layout styles, performance, termination, clipboard, single instance, editor wait and Wayland/AT-SPI desktop integration. |
+| `SmokeTests/Gui/` | Qt Quick checks: offscreen feature/settings runs, image previews, audio playback through the optional Qt Multimedia module, geometry and large fonts, layout styles, performance, termination, clipboard, single instance, editor wait and Wayland/AT-SPI desktop integration. |
 | `SmokeTests/Packaging/` | `install-smoke.py` exercises `scripts/install.sh` in an isolated prefix; `deb-smoke.py` validates and runs a built DEB. |
+
+Audio playback is checked with `SLATE_GUI_MEDIA_SMOKE=1`; it uses the CC0 tones in
+`tests/fixtures/media/` and reports a skip when Qt Multimedia, a decoder or an
+audio device is missing.
 
 Run a smoke test with the executable as its argument, for example:
 

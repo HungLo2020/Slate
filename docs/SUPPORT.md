@@ -1,6 +1,6 @@
 # Supported environments and release policy
 
-Slate supports Linux on amd64. The terminal executable does not link Qt. The graphical executable uses Qt 6.4 or later and Qt Quick Controls; it works without KDE frameworks. KDE desktop integration is additionally tested where installed. Other architectures and operating systems are not release targets.
+Slate supports Linux on amd64. The terminal executable does not link Qt. The graphical executable uses Qt 6.4 or later and Qt Quick Controls; it works without KDE frameworks. Audio playback is optional: the graphical executable links no multimedia library, loads Qt Multimedia at runtime when it is installed, and reports a missing module or an undecodable format on the audio tab instead of failing. KDE desktop integration is additionally tested where installed. Other architectures and operating systems are not release targets.
 
 Source checks cover Ubuntu 24.04, the minimum Rust version (1.89), and GUI/runtime tests on Debian trixie and Fedora. Release builds use Rust 1.98 as declared in `rust-toolchain.toml`. Use `cargo +1.89.0 check --locked --package slate --all-targets` to verify the minimum compiler. Run `DevUtils/Build.sh` for the full local package gate.
 

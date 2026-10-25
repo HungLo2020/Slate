@@ -501,7 +501,7 @@ impl App {
         for pane in self.layout.panes() {
             if let Some(View::Editor(id)) = self.layout.view(pane) {
                 let v = &self.views[id];
-                if self.documents[&v.document].image.is_some() {
+                if self.documents[&v.document].non_text() {
                     continue;
                 }
                 let rows = v.rows.max(24) as usize * 2;

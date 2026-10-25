@@ -2025,4 +2025,79 @@ mod tests {
         assert!(compact < 40_000, "{compact} bytes");
         assert!(compact * 20 < per_cell, "{compact} vs {per_cell} bytes");
     }
+
+    #[test]
+    fn media_transport_changes_are_delivered_in_incremental_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let tone = root.join("tone.wav");
+        std::fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/media/tone.wav"
+            ),
+            &tone,
+        )
+        .unwrap();
+        let mut app = test_app(
+            &root,
+            Some(slate_core::preferences::StartupMode::EditorOnly),
+        )
+        .unwrap();
+        app.terminal_frontend = false;
+        app.refresh();
+        let mut state = GuiContext::new(app);
+        let update = serde_json::json!({"action":"update"});
+        request(&mut state, serde_json::json!({"action":"open","path":tone}));
+        settle(&mut state, &update);
+        let media = |frame: &serde_json::Value| {
+            frame["panes"]
+                .as_array()
+                .expect("frame with panes")
+                .iter()
+                .find(|p| p["kind"] == "media")
+                .cloned()
+                .expect("audio pane")
+        };
+        // An incremental frame must carry the change: a skipped frame would
+        // leave the player showing stale transport state.
+        let changed = |state: &mut GuiContext, what: &str| {
+            let frame = request(state, update.clone());
+            assert!(
+                frame["panes"].is_array(),
+                "{what} was missing from the incremental frame"
+            );
+            frame
+        };
+        let initial = request(&mut state, serde_json::json!({"action":"snapshot"}));
+        let pane = media(&initial);
+        assert_eq!(pane["media"]["playing"], false);
+        let id = pane["id"].as_u64().unwrap();
+        // Playing must arrive as a normal incremental frame; no other part of
+        // the workspace changes here.
+        request(
+            &mut state,
+            serde_json::json!({"action":"media_control","pane":id,"control":"play"}),
+        );
+        let frame = changed(&mut state, "play");
+        let pane = media(&frame);
+        assert_eq!(pane["media"]["playing"], true);
+        request(
+            &mut state,
+            serde_json::json!({"action":"media_playback","pane":id,"position_ms":500,"duration_ms":1000}),
+        );
+        let frame = changed(&mut state, "progress");
+        let pane = media(&frame);
+        assert_eq!(pane["media"]["position_ms"], 500);
+        assert_eq!(pane["media"]["duration_ms"], 1000);
+        request(
+            &mut state,
+            serde_json::json!({"action":"media_control","pane":id,"control":"stop"}),
+        );
+        let frame = changed(&mut state, "stop");
+        let pane = media(&frame);
+        assert_eq!(pane["media"]["playing"], false);
+        assert_eq!(pane["media"]["position_ms"], 0);
+    }
 }

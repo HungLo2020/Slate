@@ -22,6 +22,12 @@ qml6-module-qtqml
 qml6-module-qtqml-models
 qml6-module-qtqml-workerscript
 qt6-svg-plugins
+# Optional audio playback for the media smoke.
+qml6-module-qtmultimedia
+libqt6multimedia6
+gstreamer1.0-plugins-base
+gstreamer1.0-plugins-good
+gstreamer1.0-libav
 breeze-icon-theme
 fonts-dejavu-core
 gdb

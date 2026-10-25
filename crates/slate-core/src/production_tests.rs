@@ -970,3 +970,65 @@ fn terminals_share_a_scrollback_budget() {
     let none = a.new_terminal_in(&root).unwrap();
     assert_eq!(a.terminals[&none].scrollback_lines(), 0);
 }
+
+#[test]
+fn horizontal_scroll_stops_where_the_text_ends() {
+    let (dir, _guard) = setup();
+    let mut a = app(&dir.path().join("workspace"));
+    let (_, view) = content(&mut a, &format!("{}\nshort\n", "x".repeat(400)));
+    // Rendering fills in the pane width the scroll limit depends on.
+    a.snapshot(80, 24, 0, 1, 1, 0);
+    let usable = a.text_width(view);
+    let left = |a: &App| a.views[&view].left;
+    a.execute(Command::ScrollColumns {
+        pane: a.focus,
+        delta: 1000,
+    })
+    .unwrap();
+    assert_eq!(
+        left(&a),
+        400 - usable,
+        "The last column of the widest line is the limit"
+    );
+    a.execute(Command::ScrollColumns {
+        pane: a.focus,
+        delta: -1000,
+    })
+    .unwrap();
+    assert_eq!(left(&a), 0);
+    // Soft wrap has no horizontal scroll at all.
+    a.execute(Command::Configure {
+        name: "soft-wrap".into(),
+        value: "true".into(),
+    })
+    .unwrap();
+    a.snapshot(80, 24, 0, 1, 1, 0);
+    a.execute(Command::ScrollColumns {
+        pane: a.focus,
+        delta: 10,
+    })
+    .unwrap();
+    assert_eq!(left(&a), 0);
+}
+
+#[test]
+fn wrapped_scroll_to_reaches_the_last_line() {
+    let (dir, _guard) = setup();
+    let mut a = app(&dir.path().join("workspace"));
+    let (doc, view) = content(&mut a, &"a wrapped line of text\n".repeat(200));
+    let lines = a.documents[&doc].line_count();
+    a.execute(Command::Configure {
+        name: "soft-wrap".into(),
+        value: "true".into(),
+    })
+    .unwrap();
+    a.snapshot(40, 20, 0, 1, 1, 0);
+    // Wrapped rows make the viewport taller than the line count, so the
+    // scrollbar must still be able to ask for the final line.
+    a.execute(Command::ScrollTo {
+        pane: a.focus,
+        line: lines - 1,
+    })
+    .unwrap();
+    assert_eq!(a.views[&view].top, lines - 1);
+}

@@ -95,13 +95,17 @@ pub fn svg(path: &Path) -> bool {
 }
 
 impl Document {
-    /// A small header probe also recognizes common images without an extension.
-    pub fn open_for_frontend(path: &Path, images: bool) -> Result<Self> {
-        if images {
+    /// A small header probe also recognizes common attachments without an
+    /// extension. Audio is checked first: its extensions never overlap images.
+    pub fn open_for_frontend(path: &Path, attachments: bool) -> Result<Self> {
+        if attachments {
             let (mut file, _) = crate::fsio::open_regular(path)?;
             let mut header = [0u8; 16];
             let n = file.read(&mut header)?;
             let h = &header[..n];
+            if crate::media::media_extension(path) || crate::media::looks_like_media(h) {
+                return Self::open_media(path);
+            }
             if image_extension(path)
                 || h.starts_with(b"\x89PNG\r\n\x1a\n")
                 || h.starts_with(b"\xff\xd8\xff")
@@ -113,6 +117,18 @@ impl Document {
             }
         }
         Self::open(path)
+    }
+
+    /// Reopen a changed attachment from disk, keeping audio and images apart.
+    pub(crate) fn open_attachment(path: &Path) -> Result<Self> {
+        let (mut file, _) = crate::fsio::open_regular(path)?;
+        let mut header = [0u8; 16];
+        let n = file.read(&mut header)?;
+        if crate::media::media_extension(path) || crate::media::looks_like_media(&header[..n]) {
+            Self::open_media(path)
+        } else {
+            Self::open_image(path)
+        }
     }
 
     pub(crate) fn open_image(path: &Path) -> Result<Self> {

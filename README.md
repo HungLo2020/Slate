@@ -136,7 +136,8 @@ legacy terminals' control bytes (Ctrl+], ^\\, ^_, and ^H when the terminal's era
 key is ^H). Copy and paste use the desktop clipboard through `wl-copy`/`xclip`/
 `xsel` when a display is available, and OSC 52 otherwise. **Toggle mouse capture**
 leaves selection to the outer terminal. Soft wrap (**Alt+Z**, or nano's M-S) wraps
-long lines at word boundaries; the cursor moves by screen rows.
+long lines at word boundaries; the cursor moves by screen rows, and each wrapped
+continuation row shows **↳** in the gutter in place of its line number.
 
 ## The desktop editor
 
@@ -169,8 +170,9 @@ saved or discarded.
 
 The editor supports double-click word and triple-click line selection, a
 blinking caret following the desktop's cursor flash time, smooth touchpad and
-wheel scrolling, horizontal scrolling (Shift+wheel or a tilt wheel), a
-horizontal scrollbar and a minimap that scrolls on click or drag. **View** toggles
+wheel scrolling on both axes (Shift+wheel or a tilt wheel scrolls sideways),
+a horizontal scrollbar that stops at the last column of the widest line, and a
+minimap that scrolls on click or drag. **View** toggles
 word wrap, whitespace markers, line numbers and the minimap, and zooms
 (**Ctrl+=**, **Ctrl+-**, **Ctrl+0**, or Ctrl+wheel). Choose the font in Settings.
 **Edit → Document** sets the encoding and line endings, reopens a file with
@@ -184,6 +186,31 @@ editor's text, caret and selection through Qt's accessibility interface. Logging
 out keeps unsaved work (recovery checkpoints or `NAME.save` files); SIGTERM and
 SIGHUP quit through the same path. Qt options such as `-platform`, `-style` and
 `-reverse` pass through to Qt.
+
+### Audio playback
+
+Opening an audio file in the desktop editor (`wav`, `mp3`, `ogg`/`oga`, `opus`,
+`flac`, `m4a`, `aac`, `aiff`, `wma`, `caf`) opens a read-only audio tab. The tab has
+play/pause, stop, a seek bar, volume, mute, loop and a playback-rate selector;
+while it has focus, Space plays or pauses, Left/Right seek five seconds, Home
+rewinds, and M, L and Up/Down change mute, loop and volume. The command palette
+carries the same transport (`Play or pause audio`, `Stop audio`, `Mute audio`,
+`Loop audio`, `Louder`, `Quieter`).
+
+Playback is an optional runtime feature, not a build or install dependency.
+Slate links no multimedia library; the tab loads Qt Multimedia when it is
+available and otherwise explains what to install
+(`qml6-module-qtmultimedia` on Debian/Ubuntu). The amd64 package recommends it,
+so a default install plays audio while `--no-install-recommends` still gives a
+Qt-free terminal editor. Which formats decode is a property of the installed Qt
+multimedia backend and its codecs: Qt's FFmpeg backend covers the list above,
+and GStreamer backends need `gstreamer1.0-plugins-good` plus
+`gstreamer1.0-libav` for MP3 and AAC. A missing decoder is reported on the tab.
+
+Transport settings and the last position are saved with the workspace, but
+reopening a workspace never starts playback. The terminal interface has no
+player: it shows a note in the tab, and the transport commands are disabled.
+Video files are not supported yet.
 
 ## Using Slate as an IDE
 
@@ -576,6 +603,10 @@ slate`; subsequent releases arrive through normal APT updates.
 
 ## Working prototype features
 
+- Audio tabs in the GUI for `wav`, `mp3`, `ogg`, `opus`, `flac`, `m4a`, `aac`,
+  `aiff`, `wma` and `caf`: play/pause, seek, volume, mute, loop and rate, with
+  the optional Qt Multimedia module. The core owns the transport state and
+  recovery; no multimedia library is linked.
 - File-aware editor-only / workspace startup in both frontends; configurable defaults.
 - Lazy directory browsing rooted at the opened workspace; parent navigation
   stops at that root in both frontends. Open UTF-8 files,

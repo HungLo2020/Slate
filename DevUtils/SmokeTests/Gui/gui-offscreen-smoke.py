@@ -21,6 +21,13 @@ with tempfile.TemporaryDirectory(prefix='slate-gui-offscreen-', dir=fixture_pare
     if os.environ.get('SLATE_GUI_MARKUP_SMOKE'):
         (workspace/'<i>marked<i>.txt').write_text('A file name that looks like markup\n')
     diff_smoke = bool(os.environ.get('SLATE_GUI_DIFF_SMOKE'))
+    media_smoke = bool(os.environ.get('SLATE_GUI_MEDIA_SMOKE'))
+    if media_smoke:
+        # Short public-domain tones; decoding is optional, so the smoke skips
+        # formats whose GStreamer plugin is missing.
+        fixtures = pathlib.Path(__file__).resolve().parents[3]/'tests/fixtures/media'
+        for name in ('tone.wav', 'tone.ogg', 'tone.flac', 'tone.mp3', 'tone.m4a'):
+            shutil.copyfile(fixtures/name, workspace/name)
     git_smoke = bool(os.environ.get('SLATE_GUI_GIT_SMOKE'))
     command_smoke = bool(os.environ.get('SLATE_GUI_COMMAND_SMOKE'))
     if os.environ.get('SLATE_GUI_FEATURE_SMOKE') or git_smoke or command_smoke or diff_smoke:
@@ -91,7 +98,8 @@ with tempfile.TemporaryDirectory(prefix='slate-gui-offscreen-', dir=fixture_pare
     with (root/'stdout.log').open('w') as stdout, (root/'stderr.log').open('w') as stderr:
         try:
             result = subprocess.run([binary,'--gui',str(workspace)], env=environment,
-                                    stdout=stdout, stderr=stderr, text=True, timeout=45)
+                                    stdout=stdout, stderr=stderr, text=True,
+                                    timeout=90 if media_smoke else 45)
         except subprocess.TimeoutExpired:
             timed_out = True
     report = json.loads((root/'report.json').read_text()) if (root/'report.json').exists() else {}

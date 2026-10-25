@@ -80,7 +80,7 @@ impl App {
     pub(crate) fn gutter_width(&self, doc: u64, cols: u16) -> usize {
         if !self.preferences.line_numbers {
             // Without line numbers, a narrow margin still shows breakpoints,
-            // the paused line, problems and folds when there are any.
+            // the paused line, problems, folds and wrapped rows when there are any.
             let (breakpoints, paused) = self.debug_marks(doc);
             let marked = !breakpoints.is_empty()
                 || paused.is_some()
@@ -89,7 +89,11 @@ impl App {
                     .views
                     .values()
                     .any(|v| v.document == doc && !v.folds.is_empty());
-            return if marked { 2.min(cols as usize) } else { 0 };
+            // Soft wrap marks continuation rows even when nothing is folded.
+            if marked || self.preferences_for_document(doc).soft_wrap {
+                return 2.min(cols as usize);
+            }
+            return 0;
         }
         let digits = self.documents[&doc].line_count().to_string().len().max(4);
         (digits + 2).min(cols as usize)
@@ -489,7 +493,7 @@ impl App {
                 self.documents[&doc].content_version(),
                 path,
                 encoding,
-                self.documents[&doc].image.is_some(),
+                self.documents[&doc].non_text(),
             ))
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         self.status = "Reloading…".into();
@@ -971,7 +975,7 @@ impl App {
             "toggle-read-only" => {
                 let (_, v) = self.editor_view()?;
                 let doc = self.documents.get_mut(&v.document).unwrap();
-                if doc.label.is_some() || doc.image.is_some() {
+                if doc.label.is_some() || doc.non_text() {
                     bail!("Inspection views are always read-only");
                 }
                 doc.read_only = !doc.read_only;
@@ -1056,6 +1060,16 @@ impl App {
             "support-report" => self.support_report(),
             "search-settings" => self.search_settings(argument)?,
             "diff-side-by-side" => self.request_comparison()?,
+            "media-toggle" => self.media_play(self.focus, None)?,
+            "media-stop" => self.media_stop(self.focus)?,
+            "media-mute" => self.media_mute(self.focus, None)?,
+            "media-loop" => self.media_loop(self.focus, None)?,
+            "media-volume-up" | "media-volume-down" => {
+                let id = self.media_view(self.focus)?;
+                let volume = i16::from(self.views[&id].media.volume);
+                let step = if name == "media-volume-up" { 5 } else { -5 };
+                self.media_volume(self.focus, (volume + step).clamp(0, 100) as u8)?;
+            }
             "image-source" => self.open_image_source()?,
             "image-preview" => {
                 anyhow::ensure!(

@@ -57,7 +57,9 @@ if [[ "$shlib_depends" == *qt6* || "$shlib_depends" == *libqt* ]]; then
 fi
 # QML imports/plugins are loaded dynamically and aren't found by shlibdeps.
 # The GUI uses only Qt Quick Controls; it does not need Kirigami or KDE.
-qml_depends="qml6-module-qtquick, qml6-module-qtquick-controls, qml6-module-qtquick-layouts, qml6-module-qtquick-templates, qml6-module-qtquick-window, qml6-module-qtqml, qml6-module-qtqml-models, qml6-module-qtqml-workerscript, qt6-svg-plugins"
+# Qt Multimedia powers optional audio playback; it stays a recommendation, so
+# --no-install-recommends still gives a Qt-free terminal install.
+qml_depends="qml6-module-qtquick, qml6-module-qtquick-controls, qml6-module-qtquick-layouts, qml6-module-qtquick-templates, qml6-module-qtquick-window, qml6-module-qtqml, qml6-module-qtqml-models, qml6-module-qtqml-workerscript, qt6-svg-plugins, qml6-module-qtmultimedia"
 installed_size="$(du -sk "$package_root/usr" | cut -f1)"
 cat > "$package_root/DEBIAN/control" <<EOF
 Package: slate
@@ -71,7 +73,7 @@ X-Slate-Source-Dirty: $source_dirty
 Installed-Size: $installed_size
 Depends: $shlib_depends, libglib2.0-bin
 Recommends: $gui_depends, $qml_depends, git, plasma-integration, qml6-module-org-kde-desktop, breeze-icon-theme, fonts-dejavu-core
-Suggests: aspell | hunspell, wl-clipboard | xclip, breeze-icon-theme | adwaita-icon-theme, gdb, clangd, python3-pylsp
+Suggests: aspell | hunspell, wl-clipboard | xclip, breeze-icon-theme | adwaita-icon-theme, gdb, clangd, python3-pylsp, gstreamer1.0-libav
 Homepage: https://github.com/HungLo2020/Slate
 Description: Shared graphical and terminal text editor
  Slate provides a Qt Quick graphical editor and a terminal editor using the

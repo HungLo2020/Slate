@@ -9,6 +9,7 @@
         <file>PaneTheme.qml</file>
         <file>GitPane.qml</file>
         <file>ImageViewer.qml</file>
+        <file>AudioPlayer.qml</file>
         <file>Theme.qml</file>
     </qresource>
 </RCC>

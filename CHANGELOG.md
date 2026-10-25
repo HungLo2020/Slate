@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.19 — 2026-10-25
+
+- Open audio files (`wav`, `mp3`, `ogg`/`oga`, `opus`, `flac`, `m4a`, `aac`, `aiff`, `wma`, `caf`) in read-only GUI tabs with play/pause, stop, a seek bar, volume, mute, loop and a playback-rate selector; the command palette carries the same transport, and it only applies to a focused audio tab. The core owns the transport state, so its settings and last position are saved with the workspace, but reopening one never starts playback.
+- Keep audio an optional runtime feature: the GUI links no multimedia library, loads Qt Multimedia from a single lazily loaded `AudioPlayer.qml`, recommends the module in the package (so `--no-install-recommends` still installs a Qt-free terminal editor), and explains a missing module, missing decoder or undecodable format on the tab. The terminal interface shows where audio would play instead of a player.
+- Show **↳** in the gutter for soft-wrap continuation rows in both frontends, in place of a repeated line number, so a wrapped line is no longer mistaken for a new one.
+- Scroll both axes with the wheel and touchpad (Shift+wheel or a tilt wheel scrolls sideways), and clamp horizontal scrolling to the last column of the widest line so the scrollbar cannot scroll text out of view.
+- Cover the transport commands, the terminal note, frame delivery and a real Qt Multimedia playback with fixtures, a GUI smoke step and the optional package recommendation.
+
 ## 0.1.18 — 2026-10-25
 
 - Keep horizontal scrolling in unwrapped GUI editors when the minimap is hidden: the editor still sends its document width, so the bottom scrollbar works in narrow panes and with the minimap switched off.

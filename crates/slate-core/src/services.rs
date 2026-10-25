@@ -281,22 +281,22 @@ impl Services {
                         let result = operation.run();
                         Reply::FileOperation(operation, result)
                     }
-                    IoJob::Open(id, path, images) => {
+                    IoJob::Open(id, path, attachments) => {
                         if path.is_dir() {
                             Reply::OpenedDirectory(id, path)
                         } else {
                             Reply::Opened(
                                 id,
-                                Document::open_for_frontend(&path, images)
+                                Document::open_for_frontend(&path, attachments)
                                     .map_err(|e| format!("{e:#}")),
                             )
                         }
                     }
-                    IoJob::Reload(id, version, path, encoding, image) => Reply::Reloaded(
+                    IoJob::Reload(id, version, path, encoding, attachment) => Reply::Reloaded(
                         id,
                         version,
-                        (if image {
-                            Document::open_image(&path)
+                        (if attachment {
+                            Document::open_attachment(&path)
                         } else {
                             Document::open_with_encoding(&path, encoding.as_deref())
                         })

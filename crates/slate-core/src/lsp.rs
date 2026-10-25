@@ -508,7 +508,7 @@ impl App {
     /// The language configuration for a document.
     pub(crate) fn language_for(&mut self, doc: u64) -> Option<Language> {
         let d = self.documents.get(&doc)?;
-        if d.label.is_some() || d.image.is_some() {
+        if d.label.is_some() || d.non_text() {
             return None;
         }
         let path = d.path.clone()?;

@@ -19,7 +19,7 @@ depends, recommends = fields[3], fields[4]
 assert "private-abi" not in depends + recommends and " (= " not in depends + recommends, fields
 # The terminal interface installs without Qt; the GUI's needs are recommended.
 assert "qt6" not in depends and "libqt" not in depends.lower(), depends
-for dependency in ("qml6-module-qtquick-controls", "qml6-module-qtqml-workerscript", "qt6-svg-plugins", "git"):
+for dependency in ("qml6-module-qtquick-controls", "qml6-module-qtqml-workerscript", "qt6-svg-plugins", "qml6-module-qtmultimedia", "git"):
     assert dependency in recommends, dependency
 assert "kirigami" not in depends + recommends, "The GUI no longer needs Kirigami"
 assert "qt6" in recommends.lower(), recommends

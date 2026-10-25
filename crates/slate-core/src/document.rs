@@ -112,6 +112,8 @@ mod rope_text {
 pub struct Document {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<crate::images::ImageFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<crate::media::MediaFile>,
     pub path: Option<PathBuf>,
     #[serde(with = "rope_text")]
     pub(crate) text: Rope,
@@ -484,6 +486,7 @@ impl Document {
         Self {
             path: None,
             image: None,
+            media: None,
             read_only: false,
             label: None,
             typing_at: None,
@@ -615,10 +618,7 @@ impl Document {
         )
     }
     fn locked(&self) -> Result<()> {
-        anyhow::ensure!(
-            self.image.is_none(),
-            "Image previews cannot be edited as text"
-        );
+        anyhow::ensure!(!self.non_text(), "Previews cannot be edited as text");
         if self.read_only {
             if self.label.is_some() {
                 bail!("This inspection view is read-only");
@@ -820,6 +820,7 @@ impl Document {
         let mut copy = Self::scratch();
         copy.path = self.path.clone();
         copy.image = self.image.clone();
+        copy.media = self.media.clone();
         copy.read_only = self.read_only;
         copy.label = self.label.clone();
         copy.text = self.text.clone();
@@ -845,6 +846,7 @@ impl Document {
         copy.path = self.path.clone();
         copy.read_only = self.read_only;
         copy.image = self.image.clone();
+        copy.media = self.media.clone();
         copy.format = self.format.clone();
         copy.saved_format = self.format.clone();
         copy.reference = true;
@@ -873,16 +875,25 @@ impl Document {
     pub fn mark_unavailable(&mut self) {
         self.unavailable = true;
     }
+    /// An attachment tab (image or audio) is shown, never edited.
+    pub fn non_text(&self) -> bool {
+        self.image.is_some() || self.media.is_some()
+    }
     pub fn valid_recovery(&self) -> bool {
-        (self.image.is_none()
+        let bounded = self
+            .image
+            .as_ref()
+            .is_none_or(|image| image.bytes <= crate::images::MAX_IMAGE_BYTES)
+            && self
+                .media
+                .as_ref()
+                .is_none_or(|media| media.bytes <= crate::media::MAX_MEDIA_BYTES);
+        (!self.non_text()
             || (self.read_only
                 && self.path.is_some()
                 && self.is_empty()
                 && self.saved.len_bytes() == 0
-                && self
-                    .image
-                    .as_ref()
-                    .is_some_and(|image| image.bytes <= crate::images::MAX_IMAGE_BYTES)))
+                && bounded))
             && !self.recovery_external
             && self.text.len_bytes() <= MAX_FILE_BYTES
             && self.saved.len_bytes() <= MAX_FILE_BYTES
@@ -944,10 +955,7 @@ impl Document {
         destination: Option<&Path>,
         overwrite: bool,
     ) -> Result<()> {
-        anyhow::ensure!(
-            self.image.is_none(),
-            "Image previews cannot be saved as text"
-        );
+        anyhow::ensure!(!self.non_text(), "Previews cannot be saved as text");
         if self.label.is_some() {
             bail!("Inspection views cannot be saved");
         }
@@ -980,10 +988,7 @@ impl Document {
         Ok(())
     }
     pub(crate) fn write_prepared(&mut self, options: WriteOptions) -> Result<()> {
-        anyhow::ensure!(
-            self.image.is_none(),
-            "Image previews cannot be saved as text"
-        );
+        anyhow::ensure!(!self.non_text(), "Previews cannot be saved as text");
         let path = self
             .path
             .clone()
@@ -1184,7 +1189,7 @@ impl Document {
         }
         let path = self.path.clone()?;
         // A file that has not been created yet has nothing to watch.
-        if self.disk.is_none() && self.stamp.is_none() && self.image.is_none() {
+        if self.disk.is_none() && self.stamp.is_none() && !self.non_text() {
             return None;
         }
         Some((
@@ -1210,17 +1215,18 @@ pub(crate) fn examine_content(
     baseline: Option<&Baseline>,
     stamp: Option<FileStamp>,
     encoding: &str,
-    image: bool,
+    attachment: bool,
 ) -> Option<DiskChange> {
     let current = FileStamp::of(path);
     if current.is_none() {
-        return (baseline.is_some() || (image && stamp.is_some())).then_some(DiskChange::Missing);
+        return (baseline.is_some() || (attachment && stamp.is_some()))
+            .then_some(DiskChange::Missing);
     }
     if current == stamp {
         return None;
     }
-    if image {
-        return Some(match Document::open_image(path) {
+    if attachment {
+        return Some(match Document::open_attachment(path) {
             Ok(doc) => DiskChange::Changed(Box::new(doc)),
             Err(_) => DiskChange::Unreadable,
         });

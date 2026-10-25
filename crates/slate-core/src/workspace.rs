@@ -629,9 +629,9 @@ impl App {
                     .count();
                 // Clean buffers follow current disk contents. Dirty buffers retain their original save baseline.
                 for d in w.documents.values_mut() {
-                    if d.image.is_some() {
+                    if d.non_text() {
                         if let Some(path) = d.path.clone() {
-                            match Document::open_image(&path) {
+                            match Document::open_attachment(&path) {
                                 Ok(current) => *d = current,
                                 Err(_) => {
                                     d.reference = false;
@@ -670,6 +670,10 @@ impl App {
                 self.diff_inspections.clear();
                 self.documents = w.documents;
                 self.views = w.views;
+                // Transport settings recover; a workspace never reopens playing.
+                for view in self.views.values_mut() {
+                    view.media.clamp();
+                }
                 self.terminals = terminals;
                 self.deferred_terminals = if self.editor_only {
                     w.terminals

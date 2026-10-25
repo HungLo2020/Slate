@@ -267,13 +267,18 @@ fn soft_wrap_renders_rows_and_moves_by_visual_line() {
         value: "true".into(),
     });
     let screen = render(&mut app, 12, 6);
+    // Wrapped rows keep the two-column gutter: the first row of a line is
+    // blank there, its continuations point back with an arrow.
     assert_eq!(
-        screen.lines().take(4).collect::<Vec<_>>(),
-        ["aaaa bbbb", "cccc dddd", "short", ""]
+        screen.lines().take(5).collect::<Vec<_>>(),
+        ["  aaaa", "↳ bbbb", "↳ cccc", "↳ dddd", "  short"]
     );
     key(&mut app, "Right");
     key(&mut app, "Down");
-    assert_eq!(cursor(&app), 11, "Down stays in the wrapped line");
+    assert_eq!(cursor(&app), 6, "Down stays in the wrapped line");
+    key(&mut app, "Down");
+    assert_eq!(cursor(&app), 11, "and keeps moving by visual row");
+    key(&mut app, "Down");
     key(&mut app, "Down");
     assert_eq!(cursor(&app), 21, "then reaches the next line");
     // Clicking the second visual row lands in the wrapped part of line 1.
@@ -283,7 +288,7 @@ fn soft_wrap_renders_rows_and_moves_by_visual_line() {
         col: 2,
         shift: false,
     });
-    assert_eq!(cursor(&app), 12);
+    assert_eq!(cursor(&app), 5);
     // A very long wrapped line keeps the cursor row visible.
     let long = "x".repeat(500);
     fs::write(&path, format!("{long}\n")).unwrap();
@@ -296,6 +301,24 @@ fn soft_wrap_renders_rows_and_moves_by_visual_line() {
     render(&mut app, 40, 5);
     let view = &app.views[&focused_view(&app)];
     assert!(view.top_row > 0, "The view scrolled within the long line");
+}
+
+#[test]
+fn wrapped_rows_show_a_continuation_arrow_beside_line_numbers() {
+    let (dir, _serial) = isolated();
+    let path = dir.path().join("wrapped.txt");
+    fs::write(&path, format!("{}\n", "word ".repeat(30))).unwrap();
+    let mut app = launch(&[(&path, None)]);
+    app.dispatch(Command::Configure {
+        name: "soft-wrap".into(),
+        value: "true".into(),
+    });
+    let screen = render(&mut app, 40, 8);
+    let rows: Vec<&str> = screen.lines().take(3).collect();
+    // Four digits, the annotation column and a space.
+    assert!(rows[0].starts_with("   1  "), "{rows:?}");
+    assert!(rows[1].starts_with("    ↳ "), "{rows:?}");
+    assert!(rows[2].starts_with("    ↳ "), "{rows:?}");
 }
 
 #[test]

@@ -2689,6 +2689,8 @@ static void startDiffSmoke(Bridge *state, QQuickWindow *window) {
     auto step = new int(0), ticks = new int(0);
     auto baseline = new QVariantList;
     auto left = new QVariantMap, right = new QVariantMap;
+    // The column both panes showed before a sub-cell wheel tick.
+    auto leftAt = new int(0);
     auto finish = [=](bool pass, const QString &detail) {
         QFile file(dir + "/report.json"); file.open(QIODevice::WriteOnly);
         file.write(QJsonDocument(QJsonObject{{"pass", pass}, {"detail", detail}}).toJson());
@@ -2765,6 +2767,10 @@ static void startDiffSmoke(Bridge *state, QQuickWindow *window) {
             }
             auto cells = findItem(window->contentItem(), "cells_" + right->value("id").toString());
             auto at = cells->mapToScene(QPointF(cells->width()/2, cells->height()/2)).toPoint();
+            *leftAt = right->value("editor").toMap().value("left").toInt();
+            // A partial horizontal tick scrolls by pixels inside one column.
+            QWheelEvent sideways(QPointF(at), window->mapToGlobal(at), QPoint(-5, 0), QPoint(-1, 0), Qt::NoButton, Qt::NoModifier, Qt::ScrollUpdate, false);
+            QCoreApplication::sendEvent(window, &sideways);
             QWheelEvent partial(QPointF(at), window->mapToGlobal(at), QPoint(0, -5), QPoint(0, -1), Qt::NoButton, Qt::NoModifier, Qt::ScrollUpdate, false);
             QCoreApplication::sendEvent(window, &partial);
             *step = 5; return;
@@ -2778,6 +2784,15 @@ static void startDiffSmoke(Bridge *state, QQuickWindow *window) {
                     .arg(b ? b->property("scrollPixels").toReal() : -1)
                     .arg(right->value("editor").toMap().value("comparison_partner").toString())
                     .arg(left->value("editor").toMap().value("document").toString())); return;
+            }
+            if (!a || a->property("scrollColumns").toReal() <= 0 ||
+                a->property("scrollColumns") != b->property("scrollColumns")) {
+                finish(false, QString("Sub-cell horizontal scroll diverged: left=%1 right=%2")
+                    .arg(a ? a->property("scrollColumns").toReal() : -1)
+                    .arg(b ? b->property("scrollColumns").toReal() : -1)); return;
+            }
+            if (right->value("editor").toMap().value("left").toInt() != *leftAt) {
+                finish(false, "A partial horizontal wheel moved a whole column"); return;
             }
             const auto tabs = right->value("tabs").toList();
             auto close = findItem(window->contentItem(), "tabClose_" + right->value("id").toString() + "_" + tabs.last().toMap().value("close_id").toString());
@@ -2793,6 +2808,156 @@ static void startDiffSmoke(Bridge *state, QQuickWindow *window) {
     timer->start(120);
 }
 
+
+// Play the audio fixtures through the real Qt Multimedia stack. When the QML
+// module or a codec is missing the run reports a skip instead of a failure:
+// playback is an optional feature, and CI containers often lack decoders.
+static void startMediaSmoke(Bridge *state, QQuickWindow *window) {
+    const QString dir = qEnvironmentVariable("SLATE_GUI_SMOKE_DIR");
+    // WAV, Vorbis and FLAC ship with GStreamer's base and good plugin sets;
+    // MP3 and AAC need an extra plugin, so they are only checked when present.
+    const QStringList required = {"tone.wav", "tone.ogg", "tone.flac"};
+    const QStringList optional = {"tone.mp3", "tone.m4a"};
+    const QStringList files = required + optional;
+    auto timer = new QTimer(state);
+    auto step = new int(0), ticks = new int(0), index = new int(0), pane = new int(0);
+    auto waited = new int(0);
+    auto skipped = new QStringList;
+    auto finish = [=](bool pass, const QString &detail) {
+        QFile report(dir + "/report.json"); report.open(QIODevice::WriteOnly);
+        report.write(QJsonDocument(QJsonObject{{"pass", pass}, {"detail", detail}, {"step", *step}}).toJson());
+        window->grabWindow().save(dir + "/gui.png");
+        timer->stop(); QGuiApplication::exit(pass ? 0 : 2);
+    };
+    auto mediaPane = [=](const QString &name) {
+        for (const auto &entry : state->frame().value("panes").toList()) {
+            const auto p = entry.toMap();
+            const auto media = p.value("media").toMap();
+            if (p.value("kind") == "media" && media.value("path").toString().endsWith("/" + name))
+                return p;
+        }
+        return QVariantMap();
+    };
+    auto playerItem = [=]() {
+        return findItem(window->contentItem(), "audioPlayer_" + QString::number(*pane));
+    };
+    auto open = [=](const QString &name) {
+        state->send({{"action", "open"}, {"path", dir + "/workspace/" + name}});
+    };
+    QObject::connect(timer, &QTimer::timeout, state, [=]() {
+        state->refresh();
+        const auto frame = state->frame();
+        if (++*ticks > 420) {
+            finish(false, QString("Media smoke timeout at step %1 on %2")
+                .arg(*step).arg(files.value(*index)));
+            return;
+        }
+        if (frame.value("git_busy").toBool()) return;
+        if (*step == 0) {
+            window->resize(820, 600);
+            open(files.value(*index));
+            *step = 1; *waited = 0; return;
+        }
+        if (*step == 1) {
+            const auto p = mediaPane(files.value(*index));
+            if (p.isEmpty()) {
+                if (++*waited > 60) finish(false, "The audio tab never opened: " + files.value(*index));
+                return;
+            }
+            *pane = p.value("id").toInt();
+            // Without Qt Multimedia the pane shows the install hint instead.
+            if (!findItem(window->contentItem(), "audioPlayer_" + QString::number(*pane))) {
+                const auto hint = findItem(window->contentItem(), "mediaUnavailable_" + QString::number(*pane));
+                if (hint && hint->isVisible()) {
+                    finish(true, "Qt Multimedia is not installed; audio playback and format coverage were skipped");
+                    return;
+                }
+                if (++*waited > 60) finish(false, "The audio player did not load");
+                return;
+            }
+            // Silent output: the smoke must not play a tone through the speakers.
+            state->send({{"action", "media_volume"}, {"pane", *pane}, {"volume", 0}});
+            state->send({{"action", "media_control"}, {"pane", *pane}, {"control", "play"}});
+            *step = 2; *waited = 0; return;
+        }
+        if (*step == 2) {
+            const auto media = mediaPane(files.value(*index)).value("media").toMap();
+            const int position = media.value("position_ms").toInt();
+            const QString error = media.value("error").toString();
+            if (position > 0) { *step = 3; *waited = 0; return; }
+            if (!error.isEmpty()) {
+                // A missing decoder or sound card is a gap in the environment,
+                // not in Slate: report it instead of failing the run.
+                const QString lower = error.toLower();
+                if (lower.contains("device") || lower.contains("sink") ||
+                    lower.contains("pulseaudio") || lower.contains("pipewire"))
+                    { finish(true, "No audio output is available; playback coverage was skipped (" + error + ")"); return; }
+                if (*index >= required.size()) { *skipped << files.value(*index); *step = 5; *waited = 0; return; }
+                finish(false, "Playback failed for " + files.value(*index) + ": " + error);
+                return;
+            }
+            if (++*waited > 80) {
+                if (*index >= required.size()) { *skipped << files.value(*index); *step = 5; *waited = 0; return; }
+                finish(false, "Playback never advanced: " + files.value(*index));
+            }
+            return;
+        }
+        if (*step == 3) {
+            const auto media = mediaPane(files.value(*index)).value("media").toMap();
+            auto audio = playerItem();
+            const qint64 duration = audio ? audio->property("duration").toLongLong() : 0;
+            if (duration <= 0) {
+                if (++*waited > 80) finish(false, "No duration for " + files.value(*index));
+                return;
+            }
+            if (duration < 800 || duration > 1400) {
+                finish(false, QString("Unexpected duration %1 ms for %2").arg(duration).arg(files.value(*index)));
+                return;
+            }
+            if (*index == 0) {
+                // Transport commands round-trip through the core.
+                state->send({{"action", "media_seek"}, {"pane", *pane}, {"position_ms", 500}});
+                state->send({{"action", "media_mute"}, {"pane", *pane}, {"muted", true}});
+                state->send({{"action", "media_loop"}, {"pane", *pane}, {"loop_playback", true}});
+                state->send({{"action", "media_rate"}, {"pane", *pane}, {"rate", 1.5}});
+                *step = 4; *waited = 0; return;
+            }
+            state->send({{"action", "media_control"}, {"pane", *pane}, {"control", "stop"}});
+            *step = 5; *waited = 0; return;
+        }
+        if (*step == 4) {
+            const auto media = mediaPane(files.value(*index)).value("media").toMap();
+            const int position = media.value("position_ms").toInt();
+            if (!media.value("muted").toBool() || !media.value("loop_playback").toBool() ||
+                media.value("volume").toInt() != 0 || qAbs(media.value("rate").toDouble() - 1.5) > 0.001) {
+                if (++*waited > 40) finish(false, "Transport settings did not reach the core");
+                return;
+            }
+            if (position < 400 || position > 900) {
+                if (++*waited > 40) finish(false, QString("Seek landed at %1 ms").arg(position));
+                return;
+            }
+            state->send({{"action", "media_control"}, {"pane", *pane}, {"control", "stop"}});
+            *step = 5; *waited = 0; return;
+        }
+        if (*step == 5) {
+            const auto media = mediaPane(files.value(*index)).value("media").toMap();
+            if (media.value("playing").toBool() || media.value("position_ms").toInt() != 0) {
+                if (++*waited > 40) finish(false, "Stop did not rewind the audio tab");
+                return;
+            }
+            if (++*index >= files.size()) {
+                finish(true, skipped->isEmpty()
+                    ? "Audio: WAV, Vorbis, FLAC, MP3 and AAC played with transport, seek, mute, loop and rate"
+                    : "Audio: WAV, Vorbis and FLAC played; skipped without a decoder: " + skipped->join(", "));
+                return;
+            }
+            *step = 0; *waited = 0;
+        }
+    });
+    timer->start(100);
+}
+
 void startSmoke(Bridge *state, QQuickWindow *window) {
     // Signal tests terminate an idle running GUI from outside.
     if (qEnvironmentVariable("SLATE_GUI_SMOKE_HOLD") == QLatin1String("event-loop")) {
@@ -2802,6 +2967,7 @@ void startSmoke(Bridge *state, QQuickWindow *window) {
     if (qEnvironmentVariableIsSet("SLATE_GUI_WAIT_SMOKE")) { startWaitSmoke(state); return; }
     if (qEnvironmentVariableIsSet("SLATE_GUI_DIFF_SMOKE")) { startDiffSmoke(state, window); return; }
     if (qEnvironmentVariableIsSet("SLATE_GUI_IMAGE_SMOKE")) { startImageSmoke(state, window); return; }
+    if (qEnvironmentVariableIsSet("SLATE_GUI_MEDIA_SMOKE")) { startMediaSmoke(state, window); return; }
     if (qEnvironmentVariableIsSet("SLATE_GUI_PRODUCTION_SMOKE") || qEnvironmentVariableIsSet("SLATE_GUI_GEOMETRY_SMOKE")) {startProductionSmoke(state,window);return;}
     if (!qEnvironmentVariableIsEmpty("SLATE_GUI_AUDIT_SMOKE")) { startAuditSmoke(state, window); return; }
     if (!qEnvironmentVariableIsEmpty("SLATE_GUI_MARKUP_SMOKE")) { startMarkupSmoke(state, window); return; }

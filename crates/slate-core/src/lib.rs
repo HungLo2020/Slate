@@ -30,6 +30,7 @@ pub mod instance;
 pub mod languages;
 pub mod layout;
 mod lsp;
+pub mod media;
 pub mod navigation;
 pub mod outline;
 mod panes;
@@ -88,6 +89,9 @@ use unicode_segmentation::UnicodeSegmentation;
 pub struct EditorView {
     #[serde(default)]
     pub image_viewport: images::ImageViewport,
+    /// Audio transport state for a media tab.
+    #[serde(default)]
+    pub media: media::MediaState,
     pub document: u64,
     pub cursor: usize,
     pub anchor: Option<usize>,
@@ -143,6 +147,45 @@ pub enum Command {
     ImageViewport {
         pane: u64,
         viewport: images::ImageViewport,
+    },
+    /// Play, pause, toggle or stop the audio tab focused in `pane`.
+    MediaControl {
+        pane: u64,
+        control: media::MediaControl,
+    },
+    MediaSeek {
+        pane: u64,
+        position_ms: u64,
+    },
+    MediaVolume {
+        pane: u64,
+        volume: u8,
+    },
+    MediaMute {
+        pane: u64,
+        #[serde(default)]
+        muted: Option<bool>,
+    },
+    MediaLoop {
+        pane: u64,
+        #[serde(default)]
+        loop_playback: Option<bool>,
+    },
+    MediaRate {
+        pane: u64,
+        rate: f32,
+    },
+    /// Playback progress reported by the frontend that owns the decoder.
+    MediaPlayback {
+        pane: u64,
+        #[serde(default)]
+        position_ms: u64,
+        #[serde(default)]
+        duration_ms: u64,
+        #[serde(default)]
+        ended: bool,
+        #[serde(default)]
+        error: Option<String>,
     },
     /// Scroll an editor horizontally by display columns.
     ScrollColumns {
@@ -454,6 +497,8 @@ pub struct Tab {
 pub struct PaneSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<images::ImagePresentation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media: Option<media::MediaPresentation>,
     pub id: u64,
     pub rect: Rect,
     pub kind: String,
@@ -485,6 +530,10 @@ pub struct EditorMetadata {
     pub top: usize,
     /// Horizontal scroll position in display columns.
     pub left: usize,
+    /// Display width of the widest line, shared with a comparison partner.
+    pub widest: usize,
+    /// Gutter columns reserved for line numbers and marks.
+    pub gutter: usize,
     pub document: u64,
     pub generation: u64,
     pub overview_revision: u64,
@@ -1398,18 +1447,40 @@ impl App {
             }
             Command::ScrollTo { pane, line } => {
                 if let Some(View::Editor(id)) = self.layout.view(pane).cloned() {
+                    let document = self.views[&id].document;
+                    // Wrapped rows make the viewport taller than its line count,
+                    // so only an unwrapped view can stop a screenful early.
+                    let lines = self.documents[&document].line_count();
+                    let wrapped = self.preferences_for_document(document).soft_wrap;
                     let v = self.views.get_mut(&id).context("Missing editor view")?;
-                    v.top = line.min(
-                        self.documents[&v.document]
-                            .line_count()
-                            .saturating_sub(v.rows.max(1) as usize),
-                    );
+                    let limit = if wrapped {
+                        lines.saturating_sub(1)
+                    } else {
+                        lines.saturating_sub(v.rows.max(1) as usize)
+                    };
+                    v.top = line.min(limit);
                     v.top_row = 0;
                     v.manual_scroll = true;
                     self.sync_comparison_scroll(id, true, false);
                 }
             }
             Command::ImageViewport { pane, viewport } => self.image_viewport(pane, viewport)?,
+            Command::MediaControl { pane, control } => self.media_control(pane, control)?,
+            Command::MediaSeek { pane, position_ms } => self.media_seek(pane, position_ms)?,
+            Command::MediaVolume { pane, volume } => self.media_volume(pane, volume)?,
+            Command::MediaMute { pane, muted } => self.media_mute(pane, muted)?,
+            Command::MediaLoop {
+                pane,
+                loop_playback,
+            } => self.media_loop(pane, loop_playback)?,
+            Command::MediaRate { pane, rate } => self.media_rate(pane, rate)?,
+            Command::MediaPlayback {
+                pane,
+                position_ms,
+                duration_ms,
+                ended,
+                error,
+            } => self.media_playback(pane, position_ms, duration_ms, ended, error)?,
             Command::ScrollColumns { pane, delta } => {
                 if let Some(View::Editor(id)) = self.layout.view(pane).cloned() {
                     self.scroll_columns(id, delta);
@@ -3159,6 +3230,12 @@ impl App {
 
 /// Command-line verbs handled by `actions.rs`.
 const ACTION_VERBS: &[&str] = &[
+    "media-toggle",
+    "media-stop",
+    "media-mute",
+    "media-loop",
+    "media-volume-up",
+    "media-volume-down",
     "image-source",
     "image-preview",
     "signature-help",
@@ -3327,11 +3404,11 @@ impl App {
     fn finish_open(&mut self, pane: u64, mut d: Document) -> Result<u64> {
         let path = d.path.clone();
         let notice = d.notice.take();
-        let (doc, fresh) = if let Some((id, _)) = self
-            .documents
-            .iter()
-            .find(|(_, old)| old.path == path && old.image.is_some() == d.image.is_some())
-        {
+        let (doc, fresh) = if let Some((id, _)) = self.documents.iter().find(|(_, old)| {
+            old.path == path
+                && old.image.is_some() == d.image.is_some()
+                && old.media.is_some() == d.media.is_some()
+        }) {
             (*id, false)
         } else {
             let id = self.id();
@@ -3397,6 +3474,18 @@ impl App {
                     image.bytes as f64 / 1024.0
                 );
             }
+            if let Some(media) = &d.media {
+                return format!(
+                    "Audio · {}{} · Read-only · {:.1} KiB",
+                    if v.media.playing { "Playing" } else { "Paused" },
+                    if v.media.error.is_some() {
+                        " · Error"
+                    } else {
+                        ""
+                    },
+                    media.bytes as f64 / 1024.0
+                );
+            }
             let (line, col) = d.line_col(v.cursor, self.preferences.indent_width);
             let mut parts = vec![
                 format!("Ln {}, Col {}", line + 1, col + 1),
@@ -3426,15 +3515,22 @@ impl App {
         }
     }
     fn hints(&self) -> String {
-        if self
-            .active_editor()
-            .is_some_and(|id| self.documents[&self.views[&id].document].image.is_some())
-        {
-            return if self.terminal_frontend {
-                "Image previews are available in slate-gui".into()
-            } else {
-                "Ctrl+wheel zoom · Drag to pan · Fit / 100%".into()
-            };
+        if let Some(id) = self.active_editor() {
+            let document = &self.documents[&self.views[&id].document];
+            if document.image.is_some() {
+                return if self.terminal_frontend {
+                    "Image previews are available in slate-gui".into()
+                } else {
+                    "Ctrl+wheel zoom · Drag to pan · Fit / 100%".into()
+                };
+            }
+            if document.media.is_some() {
+                return if self.terminal_frontend {
+                    "Audio playback is available in slate-gui".into()
+                } else {
+                    "Space play/pause · ←/→ seek · M mute · L loop".into()
+                };
+            }
         }
         let kind = self.focused_kind();
         let lookup = |verb: &str| {
