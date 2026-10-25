@@ -10,7 +10,7 @@ import tempfile
 import time
 import tomllib
 
-root = pathlib.Path(__file__).resolve().parent.parent
+root = pathlib.Path(__file__).resolve().parents[3]
 version = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]["package"]["version"]
 artifact = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else root / f"builds/slate_{version}_amd64.deb").resolve()
 fields = subprocess.check_output(["dpkg-deb", "--show", "--showformat=${Package}\n${Version}\n${Architecture}\n${Depends}\n${Recommends}\n", str(artifact)], text=True).splitlines()
@@ -44,8 +44,8 @@ with tempfile.TemporaryDirectory(prefix="slate-deb-smoke-") as temporary:
     assert "Exec=slate-gui %F" in desktop.read_text()
     assert (destination / "usr/share/metainfo/slate.metainfo.xml").exists()
     assert "Icon=slate" in desktop.read_text()
-    subprocess.run([sys.executable, str(root / "scripts/tui-smoke.py"), str(binary)], check=True)
-    subprocess.run([sys.executable, str(root / "scripts/startup-smoke.py"), str(binary), "--tui-only"], check=True)
+    subprocess.run([sys.executable, str(root / "DevUtils/SmokeTests/Terminal/tui-smoke.py"), str(binary)], check=True)
+    subprocess.run([sys.executable, str(root / "DevUtils/SmokeTests/Terminal/startup-smoke.py"), str(binary), "--tui-only"], check=True)
     if "--tui-only" not in sys.argv[2:]:
         (work / "runtime").mkdir(mode=0o700)
         file = work / "edit.txt"; file.write_text("Packaged GUI\n")

@@ -26,7 +26,7 @@ jobs:
       - run: python3 -m unittest discover -s tests -v
       - name: Test and build as an unprivileged user
         run: runuser -u slate-build -- env PATH="/home/slate-build/.cargo/bin:$PATH" bash DevUtils/Build.sh
-      - run: python3 scripts/deb-smoke.py
+      - run: python3 DevUtils/SmokeTests/Packaging/deb-smoke.py
       - uses: actions/upload-artifact@v4
         with:
           name: slate-linux-amd64-deb

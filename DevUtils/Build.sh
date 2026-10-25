@@ -8,10 +8,10 @@ if [[ "$(uname -s)/$(uname -m)" != Linux/x86_64 ]]; then
 fi
 
 cd "$repo_root"
-python3 scripts/dependency-policy.py
+python3 DevUtils/dependency-policy.py
 python3 -m unittest discover -s tests -v
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features
 bash DevUtils/BuildScripts/build-linux-amd64.sh
-python3 scripts/deb-smoke.py
+python3 DevUtils/SmokeTests/Packaging/deb-smoke.py

@@ -53,7 +53,7 @@ with tempfile.TemporaryDirectory(prefix='slate-gui-offscreen-', dir=fixture_pare
             hook.chmod(0o700)
     if os.environ.get('SLATE_GUI_IDE_SMOKE'):
         # A scripted language server, trusted, for hover, completion and problems.
-        server = pathlib.Path(__file__).resolve().parent.parent/'crates/slate-core/tests/fixtures/fake_lsp.py'
+        server = pathlib.Path(__file__).resolve().parents[3]/'crates/slate-core/tests/fixtures/fake_lsp.py'
         (root/'config/slate').mkdir(parents=True, exist_ok=True)
         (root/'config/slate/languages.toml').write_text(
             f'[[language]]\nname = "Fake"\nextensions = ["fk"]\nserver = ["python3", "{server}"]\n')

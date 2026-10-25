@@ -529,7 +529,7 @@ with `bash DevUtils/InstallDependencies.sh`, then:
 
 ```bash
 bash DevUtils/Build.sh
-python3 scripts/deb-smoke.py             # selects the current Cargo.toml version
+python3 DevUtils/SmokeTests/Packaging/deb-smoke.py             # selects the current Cargo.toml version
 package=$(sed -n 's/^BUILD_ARTIFACT_PATH=//p' builds/latest-build.env)
 sudo apt install "$package"
 ```
@@ -893,33 +893,33 @@ cargo test -p slate-core --lib recovery_io  # large buffers, integrity, atomic f
 cargo test -p slate-core --lib terminal_input # stalled writes, byte/message budgets, cleanup
 cargo test -p slate-core --lib workspace # checkpoint failures, pending saves and shutdown
 cargo test -p slate-core --test terminals # real stalled PTY and editor responsiveness
-python3 scripts/tui-smoke.py target/debug/slate
-python3 scripts/tab-close-smoke.py target/debug/slate
-python3 scripts/recovery-smoke.py target/debug/slate
-python3 scripts/install-smoke.py target/release/slate
-python3 scripts/dependency-policy.py
+python3 DevUtils/SmokeTests/Terminal/tui-smoke.py target/debug/slate
+python3 DevUtils/SmokeTests/Terminal/tab-close-smoke.py target/debug/slate
+python3 DevUtils/SmokeTests/Terminal/recovery-smoke.py target/debug/slate
+python3 DevUtils/SmokeTests/Packaging/install-smoke.py target/release/slate
+python3 DevUtils/dependency-policy.py
 cargo build -p slate -p slate-gui --features slate-gui/smoke
-python3 scripts/gui-offscreen-smoke.py target/debug/slate
-python3 scripts/gui-layout-smoke.py target/debug/slate  # Qt Test, Basic/Fusion/KDE styles
-SLATE_GUI_DESKTOP_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
-SLATE_GUI_IDE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
-python3 scripts/single-instance-smoke.py target/debug/slate-gui
-python3 scripts/gui-termination-smoke.py target/debug/slate # SIGTERM at each startup phase
-SLATE_GUI_FEATURE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
-SLATE_GUI_FILE_DIALOG_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
-SLATE_GUI_TAB_CLOSE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
-QT_QPA_PLATFORMTHEME=kde SLATE_GUI_PLATFORM=wayland SLATE_GUI_REQUIRE_KDE_DIALOGS=1 SLATE_GUI_FILE_DIALOG_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate # running Plasma desktop
-SLATE_GUI_GIT_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
-SLATE_GUI_COMMAND_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
-SLATE_GUI_AUDIT_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate
-SLATE_GUI_MARKUP_SMOKE=1 python3 scripts/gui-offscreen-smoke.py target/debug/slate # file names never render as markup
-SLATE_GUI_PLATFORM=wayland python3 scripts/gui-desktop-integration.py target/debug/slate # private AT-SPI bus
-python3 scripts/gui-wayland-smoke.py target/debug/slate # Weston headless + KDE integration
+python3 DevUtils/SmokeTests/Gui/gui-offscreen-smoke.py target/debug/slate
+python3 DevUtils/SmokeTests/Gui/gui-layout-smoke.py target/debug/slate  # Qt Test, Basic/Fusion/KDE styles
+SLATE_GUI_DESKTOP_SMOKE=1 python3 DevUtils/SmokeTests/Gui/gui-offscreen-smoke.py target/debug/slate
+SLATE_GUI_IDE_SMOKE=1 python3 DevUtils/SmokeTests/Gui/gui-offscreen-smoke.py target/debug/slate
+python3 DevUtils/SmokeTests/Gui/single-instance-smoke.py target/debug/slate-gui
+python3 DevUtils/SmokeTests/Gui/gui-termination-smoke.py target/debug/slate # SIGTERM at each startup phase
+SLATE_GUI_FEATURE_SMOKE=1 python3 DevUtils/SmokeTests/Gui/gui-offscreen-smoke.py target/debug/slate
+SLATE_GUI_FILE_DIALOG_SMOKE=1 python3 DevUtils/SmokeTests/Gui/gui-offscreen-smoke.py target/debug/slate
+SLATE_GUI_TAB_CLOSE_SMOKE=1 python3 DevUtils/SmokeTests/Gui/gui-offscreen-smoke.py target/debug/slate
+QT_QPA_PLATFORMTHEME=kde SLATE_GUI_PLATFORM=wayland SLATE_GUI_REQUIRE_KDE_DIALOGS=1 SLATE_GUI_FILE_DIALOG_SMOKE=1 python3 DevUtils/SmokeTests/Gui/gui-offscreen-smoke.py target/debug/slate # running Plasma desktop
+SLATE_GUI_GIT_SMOKE=1 python3 DevUtils/SmokeTests/Gui/gui-offscreen-smoke.py target/debug/slate
+SLATE_GUI_COMMAND_SMOKE=1 python3 DevUtils/SmokeTests/Gui/gui-offscreen-smoke.py target/debug/slate
+SLATE_GUI_AUDIT_SMOKE=1 python3 DevUtils/SmokeTests/Gui/gui-offscreen-smoke.py target/debug/slate
+SLATE_GUI_MARKUP_SMOKE=1 python3 DevUtils/SmokeTests/Gui/gui-offscreen-smoke.py target/debug/slate # file names never render as markup
+SLATE_GUI_PLATFORM=wayland python3 DevUtils/SmokeTests/Gui/gui-desktop-integration.py target/debug/slate # private AT-SPI bus
+python3 DevUtils/SmokeTests/Gui/gui-wayland-smoke.py target/debug/slate # Weston headless + KDE integration
 cargo build --release -p slate -p slate-gui --features slate-gui/smoke
-python3 scripts/gui-performance-smoke.py target/release/slate
-python3 scripts/idle-smoke.py target/release/slate       # Linux, release GUI/TUI idle CPU
-python3 scripts/gui-smoke.py target/debug/slate   # optional X11: Xvfb + xdotool
-SLATE_GUI_PLATFORM=wayland SLATE_GUI_FEATURE_SMOKE=1 python3 scripts/gui-offscreen-smoke.py  # running Wayland desktop
+python3 DevUtils/SmokeTests/Gui/gui-performance-smoke.py target/release/slate
+python3 DevUtils/SmokeTests/Terminal/idle-smoke.py target/release/slate       # Linux, release GUI/TUI idle CPU
+python3 DevUtils/SmokeTests/Gui/gui-smoke.py target/debug/slate   # optional X11: Xvfb + xdotool
+SLATE_GUI_PLATFORM=wayland SLATE_GUI_FEATURE_SMOKE=1 python3 DevUtils/SmokeTests/Gui/gui-offscreen-smoke.py  # running Wayland desktop
 ```
 
 Core tests cover Unicode editing/search/replacement, shared views, incremental
@@ -1010,3 +1010,40 @@ F1; Enter/Right opens directories and Left goes to the parent directory. Trash
 requires `gio` (`libglib2.0-bin` on Debian/Ubuntu) and uses desktop Trash rather
 than permanently deleting files. Save modified files before moving them to Trash.
 Modified-tab confirmations offer Save, Discard and Cancel in both frontends.
+
+## AGENTS
+
+`AGENTS.md` is a symbolic link to this README, so this file is the single source
+of truth for agent instructions.
+
+Work follows the project owner's
+[CODING-STANDARDS.md](https://github.com/HungLo2020/LinuxScripts/blob/master/CODING-STANDARDS.md).
+The documented exception is `scripts/install.sh`: it is the user-facing
+installer described under **Build and launch**, not a development utility, so it
+stays outside `DevUtils/`. Everything else that supports development lives in
+`DevUtils/`:
+
+- Build, install, publish and launcher scripts at the `DevUtils/` root.
+- `DevUtils/BuildScripts/` for packaging.
+- `DevUtils/SmokeTests/Terminal/`, `DevUtils/SmokeTests/Gui/` and
+  `DevUtils/SmokeTests/Packaging/` for black-box tests of real executables.
+
+`DevUtils/README.md` describes that layout. Project skills live in
+`.agents/skills/`, and `.claude/skills` links there.
+
+Implementation is Rust: `slate-core` holds editing and services, `slate-cli` the
+terminal frontend, and `slate-gui` the Qt Quick frontend plus its thin C++
+presentation adapter. Keep editing, terminal and service logic in Rust, and keep
+the Qt adapter to presentation concerns as described under **Architecture and
+dependency policy**.
+
+Before handing work over, run the gate in `DevUtils/Build.sh` (dependency policy,
+Python tests, `cargo fmt --check`, Clippy with warnings denied, the Cargo test
+suite, the amd64 package build and the DEB smoke test). For a faster loop, run
+`cargo test --workspace --all-targets` with `python3 DevUtils/dependency-policy.py`.
+GUI and terminal behaviour changes need the matching smoke test from
+**Validation**.
+
+Do not change `[workspace.package].version` in `Cargo.toml`, edit `CHANGELOG.md`
+for a release, or publish a package unless the task asks for a release. Releasing
+is covered by the `release` skill in `.agents/skills/release/SKILL.md`.

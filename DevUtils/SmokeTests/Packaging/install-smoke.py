@@ -7,7 +7,7 @@ import subprocess
 import sys
 import tempfile
 
-root = pathlib.Path(__file__).resolve().parent.parent
+root = pathlib.Path(__file__).resolve().parents[3]
 binary = pathlib.Path(sys.argv[1] if len(sys.argv)>1 else root/'target/release/slate').resolve()
 tui_only = '--tui-only' in sys.argv[2:]
 with tempfile.TemporaryDirectory(prefix='slate-install-') as temporary:
@@ -41,5 +41,5 @@ with tempfile.TemporaryDirectory(prefix='slate-install-') as temporary:
         # `slate --gui` hands over to the installed slate-gui.
         version = subprocess.check_output([str(installed), '--gui', '--version'], text=True)
         assert version.startswith('Slate '), version
-    subprocess.run([sys.executable, str(root/'scripts/tui-smoke.py'), str(installed)], check=True)
+    subprocess.run([sys.executable, str(root/'DevUtils/SmokeTests/Terminal/tui-smoke.py'), str(installed)], check=True)
 print('PASS installation: Qt-free slate, slate-gui executable, desktop resources, installed TUI')
