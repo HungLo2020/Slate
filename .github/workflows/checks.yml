@@ -25,8 +25,10 @@ jobs:
       - run: python3 DevUtils/SmokeTests/Terminal/recovery-smoke.py target/release/slate-gui
       - name: Verify optional TUI-only installation
         run: cargo build --release --package slate && python3 DevUtils/SmokeTests/Packaging/install-smoke.py target/release/slate --tui-only
-      - name: Install optional audio runtime
-        run: sudo apt-get install -y qml6-module-qtmultimedia libqt6multimedia6 gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
+      # The audio smoke loads a window like a desktop install, so this host needs
+      # the QML runtime modules the GUI job's container installs as well.
+      - name: Install QML runtime and optional audio modules
+        run: sudo apt-get install -y qml6-module-qtquick qml6-module-qtqml qml6-module-qtqml-models qml6-module-qtquick-controls qml6-module-qtquick-layouts qml6-module-qtquick-templates qml6-module-qtquick-window qml6-module-qtqml-workerscript fonts-dejavu-core qml6-module-qtmultimedia libqt6multimedia6 gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
       - run: cargo build --release --package slate --package slate-gui --features slate-gui/smoke
       # Qt Multimedia is optional: the smoke reports a skip when the module,
       # a decoder or an audio device is missing.
