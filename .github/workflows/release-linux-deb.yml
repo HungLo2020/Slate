@@ -29,6 +29,7 @@ jobs:
       - run: python3 DevUtils/SmokeTests/Packaging/deb-smoke.py
       - uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: slate-linux-amd64-deb
           path: builds/*.deb
           if-no-files-found: error
